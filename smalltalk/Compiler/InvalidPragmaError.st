@@ -1,0 +1,3 @@
+InvalidPragmaError := CompileError [
+
+]

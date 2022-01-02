@@ -1,0 +1,5 @@
+ByteArray := ArrayedCollection [
+
+	<shape: BytesShape>
+
+]

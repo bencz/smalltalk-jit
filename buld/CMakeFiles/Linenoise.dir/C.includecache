@@ -1,0 +1,36 @@
+#IncludeRegexLine: ^[ 	]*[#%][ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+/home/bencz/programming/yet-another-smalltalk-vm/linenoise/linenoise.c
+termios.h
+-
+unistd.h
+-
+stdlib.h
+-
+stdio.h
+-
+errno.h
+-
+string.h
+-
+stdlib.h
+-
+sys/types.h
+-
+sys/ioctl.h
+-
+unistd.h
+-
+linenoise.h
+/home/bencz/programming/yet-another-smalltalk-vm/linenoise/linenoise.h
+
+/home/bencz/programming/yet-another-smalltalk-vm/linenoise/linenoise.h
+string.h
+-
+

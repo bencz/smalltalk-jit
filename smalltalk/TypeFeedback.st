@@ -1,0 +1,5 @@
+TypeFeedback := Object [
+
+	| ic hintedClass |
+
+]

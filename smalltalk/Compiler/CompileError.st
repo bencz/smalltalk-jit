@@ -1,0 +1,5 @@
+CompileError := Error [
+
+	| identifier |
+
+]
