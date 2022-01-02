@@ -1,1 +1,0 @@
-/usr/bin/cc -fPIC -std=gnu99 -pedantic -Wno-flexible-array-extensions -Wno-c11-extensions -Wno-gnu -fcommon -g -shared -Wl,-soname,libCityHash.so -o libCityHash.so CMakeFiles/CityHash.dir/cityhash/city.c.o 

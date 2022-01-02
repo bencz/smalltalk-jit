@@ -1,6 +1,0 @@
-/home/bencz/programming/yet-another-smalltalk-vm/buld/CMakeFiles/rebuild_cache.dir
-/home/bencz/programming/yet-another-smalltalk-vm/buld/CMakeFiles/edit_cache.dir
-/home/bencz/programming/yet-another-smalltalk-vm/buld/CMakeFiles/st.dir
-/home/bencz/programming/yet-another-smalltalk-vm/buld/CMakeFiles/VM.dir
-/home/bencz/programming/yet-another-smalltalk-vm/buld/CMakeFiles/Linenoise.dir
-/home/bencz/programming/yet-another-smalltalk-vm/buld/CMakeFiles/CityHash.dir

@@ -1,1 +1,0 @@
-/usr/bin/cc -std=gnu99 -pedantic -Wno-flexible-array-extensions -Wno-c11-extensions -Wno-gnu -fcommon -g -rdynamic CMakeFiles/st.dir/main.c.o -o st  -Wl,-rpath,/home/bencz/programming/yet-another-smalltalk-vm/buld libVM.so libCityHash.so libLinenoise.so -lpthread 

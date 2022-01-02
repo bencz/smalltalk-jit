@@ -1,1 +1,0 @@
-/usr/bin/cc -fPIC -std=gnu99 -pedantic -Wno-flexible-array-extensions -Wno-c11-extensions -Wno-gnu -fcommon -g -shared -Wl,-soname,libLinenoise.so -o libLinenoise.so CMakeFiles/Linenoise.dir/linenoise/linenoise.c.o 
