@@ -10,14 +10,14 @@
 #include <string.h>
 
 #if !defined(TEMP_FAILURE_RETRY)
-	#define TEMP_FAILURE_RETRY(expression) \
-		({ \
-			int64_t __result; \
-			do { \
-				__result = (int64_t) expression; \
-			} while (__result == -1L && errno == EINTR); \
-			__result; \
-		})
+    static inline int64_t temp_failure_retry(int64_t expression) {
+        int64_t __result;
+        do {
+            __result = expression;
+        } while (__result == -1L && errno == EINTR);
+        return __result;
+    }
+    #define TEMP_FAILURE_RETRY(expression) temp_failure_retry(expression)
 #endif
 
 

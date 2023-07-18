@@ -458,15 +458,18 @@ static void generateExitPrimitive(CodeGenerator *generator)
 
 static NativeCodeEntry scopedGetNativeCode(Value vReceiver, Value vMethod)
 {
-	HandleScope scope;
-	openHandleScope(&scope);
+    HandleScope scope;
+    openHandleScope(&scope);
 
-	Class *class = scopeHandle(getClassOf(vReceiver));
-	CompiledMethod *method = scopeHandle(asObject(vMethod));
-	NativeCodeEntry entry = (NativeCodeEntry) getNativeCode(class, method)->insts;
+    Class *class = scopeHandle(getClassOf(vReceiver));
+    CompiledMethod *method = scopeHandle(asObject(vMethod));
 
-	closeHandleScope(&scope, NULL);
-	return entry;
+    union PointerConverter converter;
+    converter.object_pointer = getNativeCode(class, method)->insts;
+    NativeCodeEntry entry = converter.function_pointer;
+
+    closeHandleScope(&scope, NULL);
+    return entry;
 }
 
 

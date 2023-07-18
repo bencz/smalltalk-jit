@@ -41,11 +41,13 @@ static void flushLookupCache(void)
 
 static NativeCodeEntry cachedLookupNativeCode(RawClass *class, RawString *selector)
 {
-	intptr_t hash = lookupHash((intptr_t) class, (intptr_t) selector);
-	if (LookupCache.classes[hash] == class && LookupCache.selectors[hash] == selector) {
-		return (NativeCodeEntry) LookupCache.codes[hash];
-	}
-	return lookupNativeCode(class, selector);
+    intptr_t hash = lookupHash((intptr_t) class, (intptr_t) selector);
+    if (LookupCache.classes[hash] == class && LookupCache.selectors[hash] == selector) {
+        union PointerConverter converter;
+        converter.object_pointer = LookupCache.codes[hash];
+        return converter.function_pointer;
+    }
+    return lookupNativeCode(class, selector);
 }
 
 #endif

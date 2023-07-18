@@ -247,13 +247,12 @@ void printHeap(Heap *heap)
 
 static void printHeapPage(HeapPage *page)
 {
-	printf("page %p size %zi%s\n", page, page->size, page->isExecutable ? " executable" : "");
+    printf("page %p size %zi%s\n", (void *)page, page->size, page->isExecutable ? " executable" : "");
 }
-
 
 static void printFreeSpace(FreeSpace *freeSpace)
 {
-	printf("free space %p size %zi\n", freeSpace, freeSpace->size);
+    printf("free space %p size %llu\n", (void *)freeSpace, (unsigned long long)freeSpace->size);
 }
 
 

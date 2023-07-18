@@ -203,7 +203,7 @@ void freeListPrint(FreeList *freeList)
 		freeList->stats.expanded
 	);
 #else
-	printf("Free list #%p\n", freeList);
+    printf("Free list #%p\n", (void*)freeList);
 #endif
 
 	for (size_t i = 0; i <= FREE_LIST_SIZE; i++) {
@@ -218,22 +218,22 @@ void freeListPrint(FreeList *freeList)
 
 static void freeSpacePrint(FreeSpace *freeSpace)
 {
-	if (freeSpace == NULL) return;
+    if (freeSpace == NULL) return;
 
-	ASSERT((freeSpace->tags & TAG_FREESPACE) != 0);
+    ASSERT((freeSpace->tags & TAG_FREESPACE) != 0);
 
-	size_t count = 1;
-	FreeSpace *next = freeSpace->next;
-	while (next != NULL && next->size == freeSpace->size) {
-		ASSERT((next->tags & TAG_FREESPACE) != 0);
-		count++;
-		next = next->next;
-	}
+    size_t count = 1;
+    FreeSpace *next = freeSpace->next;
+    while (next != NULL && next->size == freeSpace->size) {
+        ASSERT((next->tags & TAG_FREESPACE) != 0);
+        count++;
+        next = next->next;
+    }
 
-	if (count > 1) {
-		printf("\t%zu B * %zu\n", freeSpace->size, count);
-	} else {
-		printf("\t%zu B\n", freeSpace->size);
-	}
-	freeSpacePrint(next);
+    if (count > 1) {
+        printf("\t%llu B * %zu\n", (unsigned long long)freeSpace->size, count);
+    } else {
+        printf("\t%llu B\n", (unsigned long long)freeSpace->size);
+    }
+    freeSpacePrint(next);
 }

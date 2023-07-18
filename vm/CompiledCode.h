@@ -80,6 +80,10 @@ typedef struct {
 	size_t bytecodesSize;
 } CompiledCode;
 
+union PointerConverter {
+    void *object_pointer;
+    NativeCodeEntry function_pointer;
+};
 
 NativeCode *findNativeCodeAtIc(uint8_t *ic);
 void printMethodsUsage(void);

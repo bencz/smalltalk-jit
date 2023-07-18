@@ -20,33 +20,36 @@ LookupTable LookupCache = {
 static void feedbackType(Class *class);
 static NativeCodeEntry doesNotUnderstand(Class *class, String *selector);
 
-
 NativeCodeEntry lookupNativeCode(RawClass *class, RawString *selector)
 {
-	HandleScope scope;
-	openHandleScope(&scope);
+    HandleScope scope;
+    openHandleScope(&scope);
 
-	Class *classHandle = scopeHandle(class);
-	String *selectorHandle = scopeHandle(selector);
-	CompiledMethod *method = lookupSelector(classHandle, selectorHandle);
+    Class *classHandle = scopeHandle(class);
+    String *selectorHandle = scopeHandle(selector);
+    CompiledMethod *method = lookupSelector(classHandle, selectorHandle);
 
-	NativeCodeEntry entry;
-	if (method == NULL) {
-		entry = doesNotUnderstand(classHandle, selectorHandle);
-	} else {
-		entry = (NativeCodeEntry) getNativeCode(classHandle, method)->insts;
-		feedbackType(classHandle);
-	}
+    NativeCodeEntry entry;
+    if (method == NULL) {
+        entry = doesNotUnderstand(classHandle, selectorHandle);
+    } else {
+        union PointerConverter converter;
+        converter.object_pointer = getNativeCode(classHandle, method)->insts;
+        entry = converter.function_pointer;
+        feedbackType(classHandle);
+    }
 
-	intptr_t hash = lookupHash((intptr_t) classHandle->raw, (intptr_t) selectorHandle->raw);
-	LookupCache.classes[hash] = classHandle->raw;
-	LookupCache.selectors[hash] = selectorHandle->raw;
-	LookupCache.codes[hash] = (uint8_t *) entry;
+    intptr_t hash = lookupHash((intptr_t) classHandle->raw, (intptr_t) selectorHandle->raw);
+    LookupCache.classes[hash] = classHandle->raw;
+    LookupCache.selectors[hash] = selectorHandle->raw;
 
-	closeHandleScope(&scope, NULL);
-	return entry;
+    union PointerConverter converter;
+    converter.function_pointer = entry;
+    LookupCache.codes[hash] = converter.object_pointer;
+
+    closeHandleScope(&scope, NULL);
+    return entry;
 }
-
 
 static void feedbackType(Class *class)
 {
@@ -78,10 +81,13 @@ static void feedbackType(Class *class)
 
 static NativeCodeEntry doesNotUnderstand(Class *class, String *selector)
 {
-	intptr_t hash = lookupHash((intptr_t) class->raw, (intptr_t) selector->raw);
-	NativeCode *code = generateDoesNotUnderstand(selector);
-	code->compiledCode = lookupSelector(class, Handles.doesNotUnderstandSymbol)->raw;
-	return (NativeCodeEntry) code->insts;
+    intptr_t hash = lookupHash((intptr_t) class->raw, (intptr_t) selector->raw);
+    NativeCode *code = generateDoesNotUnderstand(selector);
+    code->compiledCode = lookupSelector(class, Handles.doesNotUnderstandSymbol)->raw;
+
+    union PointerConverter converter;
+    converter.object_pointer = code->insts;
+    return converter.function_pointer;
 }
 
 

@@ -19,19 +19,22 @@ static Value evalBlockNode(BlockNode *block);
 
 Value invokeMethod(CompiledMethod *method, EntryArgs *args)
 {
-	HandleScope scope;
-	openHandleScope(&scope);
+    HandleScope scope;
+    openHandleScope(&scope);
 
-	Class *class = scopeHandle(args->values[0].isHandle ? args->values[0].handle->raw->class : getClassOf(args->values[0].value));
-	NativeCodeEntry entry = (NativeCodeEntry) getStubNativeCode(&SmalltalkEntry)->insts;
+    Class *class = scopeHandle(args->values[0].isHandle ? args->values[0].handle->raw->class : getClassOf(args->values[0].value));
 
-	Value rawArgs[args->size];
-	initArgs(rawArgs, args);
-	initThreadContext(&CurrentThread);
-	Value result = entry(method->raw, getNativeCode(class, method)->insts, rawArgs, &CurrentThread);
+    union PointerConverter converter;
+    converter.object_pointer = getStubNativeCode(&SmalltalkEntry)->insts;
+    NativeCodeEntry entry = converter.function_pointer;
 
-	closeHandleScope(&scope, NULL);
-	return result;
+    Value rawArgs[args->size];
+    initArgs(rawArgs, args);
+    initThreadContext(&CurrentThread);
+    Value result = entry(method->raw, getNativeCode(class, method)->insts, rawArgs, &CurrentThread);
+
+    closeHandleScope(&scope, NULL);
+    return result;
 }
 
 
@@ -50,16 +53,22 @@ Value invokeInititalize(Object *object)
 
 Value sendMessage(String *selector, EntryArgs *args)
 {
-	NativeCodeEntry entry = (NativeCodeEntry) getStubNativeCode(&SmalltalkEntry)->insts;
-	RawClass *class = args->values[0].isHandle ? args->values[0].handle->raw->class : getClassOf(args->values[0].value);
-	NativeCodeEntry nativeCodeEntry = cachedLookupNativeCode(class, selector->raw);
-	NativeCode *nativeCode = (NativeCode *) ((uint8_t *) nativeCodeEntry - offsetof(NativeCode, insts));
-	Value rawArgs[args->size];
-	initArgs(rawArgs, args);
-	initThreadContext(&CurrentThread);
-	return entry(nativeCode->compiledCode, nativeCodeEntry, rawArgs, &CurrentThread);
-}
+    union PointerConverter converter;
+    converter.object_pointer = getStubNativeCode(&SmalltalkEntry)->insts;
+    NativeCodeEntry entry = converter.function_pointer;
 
+    RawClass *class = args->values[0].isHandle ? args->values[0].handle->raw->class : getClassOf(args->values[0].value);
+
+    NativeCodeEntry nativeCodeEntry = cachedLookupNativeCode(class, selector->raw);
+
+    converter.function_pointer = nativeCodeEntry;
+    NativeCode *nativeCode = (NativeCode *) ((uint8_t *) converter.object_pointer - offsetof(NativeCode, insts));
+
+    Value rawArgs[args->size];
+    initArgs(rawArgs, args);
+    initThreadContext(&CurrentThread);
+    return entry(nativeCode->compiledCode, nativeCodeEntry, rawArgs, &CurrentThread);
+}
 
 static void initArgs(Value *rawArgs, EntryArgs *args)
 {

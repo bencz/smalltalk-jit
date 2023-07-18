@@ -258,7 +258,7 @@ static Value readObject(int64_t field, Snapshot *snapshot)
 	}
 
 	if (shape.isIndexed && shape.isBytes) {
-		fread(getRawObjectIndexedVarsFromShape(object, shape), sizeof(uint8_t), indexedSize, snapshot->file);
+		size_t numRead = fread(getRawObjectIndexedVarsFromShape(object, shape), sizeof(uint8_t), indexedSize, snapshot->file);
 	}
 
 	return tagPtr(object);

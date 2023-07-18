@@ -1,12 +1,7 @@
 cmake_minimum_required(VERSION 2.8)
-project(myvm)
+project(smalltalk-jit)
 
-#set(CMAKE_BUILD_TYPE "RelWithDebInfo")
-#set(CMAKE_BUILD_TYPE "Release")
-#set(CMAKE_C_FLAGS "-std=gnu99")
-set(CMAKE_BUILD_TYPE "Debug")
-set(CMAKE_C_FLAGS "-std=gnu99 -pedantic -Wno-flexible-array-extensions -Wno-c11-extensions -Wno-gnu -fcommon")
-#set(CMAKE_C_FLAGS "-std=gnu99 -pedantic -Wno-flexible-array-extensions -Wno-c11-extensions -fsanitize=undefined")
+set(CMAKE_C_FLAGS "-std=gnu11 -pedantic -Wno-flexible-array-extensions -Wno-c11-extensions -Wno-gnu -fcommon")
 
 set(vmSources
 	vm/Bootstrap.c
