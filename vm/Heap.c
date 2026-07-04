@@ -111,7 +111,15 @@ static uint8_t *pageSpaceAllocate(PageSpace *pageSpace, size_t size)
 {
 	uint8_t *p = pageSpaceTryAllocate(pageSpace, size);
 	if (p == NULL) {
-		HeapPage *page = mapHeapPage(256 * KB, pageSpace->pagesTail->isExecutable);
+		/* Grow by a fresh page. Pages are 256 KB by default, but a single
+		 * object can be larger than that (e.g. a big Array being promoted to
+		 * old space), so map a page large enough to actually hold it. */
+		size_t pageSize = 256 * KB;
+		size_t needed = size + sizeof(HeapPage) + HEAP_OBJECT_ALIGN;
+		if (needed > pageSize) {
+			pageSize = needed;
+		}
+		HeapPage *page = mapHeapPage(pageSize, pageSpace->pagesTail->isExecutable);
 		pageSpace->pagesTail->next = page;
 		pageSpace->pagesTail = page;
 		expandFreeList(&pageSpace->freeList, page);
