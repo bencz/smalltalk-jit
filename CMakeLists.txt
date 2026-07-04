@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 2.8)
+cmake_minimum_required(VERSION 3.5)
 project(smalltalk-jit)
 
 set(CMAKE_C_FLAGS "-std=gnu11 -pedantic -Wno-flexible-array-extensions -Wno-c11-extensions -Wno-gnu -fcommon")
@@ -48,4 +48,5 @@ add_executable(st main.c)
 target_link_libraries(VM CityHash)
 target_link_libraries(VM Linenoise)
 target_link_libraries(VM ${CMAKE_THREAD_LIBS_INIT})
+target_link_libraries(VM m)
 target_link_libraries(st VM)

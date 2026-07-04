@@ -472,6 +472,16 @@ static void literalNodeSetCharValue(LiteralNode *literal, char value)
 }
 
 
+static void literalNodeSetRawValue(LiteralNode *literal, Value value)
+{
+	if (valueTypeOf(value, VALUE_POINTER)) {
+		rawObjectStorePtr((RawObject *) literal->raw, &literal->raw->value, asObject(value));
+	} else {
+		literal->raw->value = value;
+	}
+}
+
+
 static Value literalNodeGetValue(LiteralNode *literal)
 {
 	return literal->raw->value;

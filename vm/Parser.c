@@ -729,12 +729,105 @@ static Object *parseLiteral(Parser *parser)
  * exponent := "e" sign digits
  * digits := 0-9
  */
+/**
+ * Build an integer literal value from its digit string in the given base.
+ * Answers a tagged SmallInteger when the value fits, otherwise a tagged
+ * pointer to a LargeInteger object (so arbitrary precision literals work).
+ */
+static Value buildIntegerLiteral(const char *str, int base, _Bool negative)
+{
+	size_t n = strlen(str);
+	size_t cap = n + 2;
+	uint16_t *limbs = calloc(cap, sizeof(uint16_t));
+	size_t len = 1;
+	Value result;
+
+	limbs[0] = 0;
+	for (size_t i = 0; i < n; i++) {
+		char c = str[i];
+		int d;
+		if (c >= '0' && c <= '9') {
+			d = c - '0';
+		} else if (c >= 'A' && c <= 'Z') {
+			d = c - 'A' + 10;
+		} else if (c >= 'a' && c <= 'z') {
+			d = c - 'a' + 10;
+		} else {
+			continue;
+		}
+		if (d >= base) {
+			continue;
+		}
+		uint32_t carry = (uint32_t) d;
+		for (size_t j = 0; j < len; j++) {
+			uint32_t v = (uint32_t) limbs[j] * (uint32_t) base + carry;
+			limbs[j] = (uint16_t) (v & 0xFFFF);
+			carry = v >> 16;
+		}
+		while (carry != 0) {
+			limbs[len++] = (uint16_t) (carry & 0xFFFF);
+			carry >>= 16;
+		}
+	}
+	while (len > 1 && limbs[len - 1] == 0) {
+		len--;
+	}
+
+	if (len < 4 || (len == 4 && limbs[3] < 8192)) {
+		int64_t value = 0;
+		for (ptrdiff_t j = (ptrdiff_t) len - 1; j >= 0; j--) {
+			value = value * 65536 + limbs[j];
+		}
+		result = tagInt(negative ? -value : value);
+	} else {
+		HandleScope scope;
+		openHandleScope(&scope);
+		Array *digits = newArray(len);
+		for (size_t j = 0; j < len; j++) {
+			digits->raw->vars[j] = tagInt(limbs[j]);
+		}
+		Class *cls = getClass("LargeInteger");
+		Object *large = newObject(cls, 0);
+		Value *vars = getObjectVars(large);
+		objectStorePtr(large, &vars[0], (Object *) digits);
+		objectStorePtr(large, &vars[1], negative ? Handles.true : Handles.false);
+		result = getTaggedPtr(closeHandleScope(&scope, large));
+	}
+	free(limbs);
+	return result;
+}
+
+
 static LiteralNode *parseNumber(Parser *parser, int8_t sign)
 {
 	LiteralNode *literal = newObject(Handles.IntegerNode, 0);
 	literalNodeSetSourceCode(literal, createSourceCode(parser, 1));
-	CATCH(SignedValue value = parseInteger(parser), NULL);
-	literalNodeSetIntValue(literal, value * sign);
+
+	Token *token = currentToken(&parser->tokenizer);
+	char *content = token->content;
+	int base = 10;
+	char *digits = content;
+	char *r = strchr(content, 'r');
+
+	if (r != NULL) {
+		base = atoi(content);
+		digits = r + 1;
+		if (*digits == '\0') {
+			errorExpected(parser, TOKEN_DIGIT);
+			return NULL;
+		}
+		nextToken(&parser->tokenizer);
+		literalNodeSetRawValue(literal, buildIntegerLiteral(digits, base, sign < 0));
+		return literal;
+	}
+
+	nextToken(&parser->tokenizer);
+	if (strpbrk(content, ".eE") != NULL) {
+		double value = strtod(content, NULL);
+		literalNodeSetRawValue(literal, getTaggedPtr(newFloat(sign < 0 ? -value : value)));
+	} else {
+		literalNodeSetRawValue(literal, buildIntegerLiteral(content, 10, sign < 0));
+	}
 	return literal;
 }
 

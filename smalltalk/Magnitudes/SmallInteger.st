@@ -12,9 +12,16 @@ SmallInteger := Integer [
 	]
 
 
+	= aNumber [
+		(aNumber isKindOf: SmallInteger) ifTrue: [^self == aNumber].
+		(aNumber isKindOf: Number) ifTrue: [^self retryRelationalOp: #= coercing: aNumber].
+		^false
+	]
+
+
 	< aNumber [
 		 <primitive: IntLessThanPrimitive>
-		^self primitiveFailedFor: aNumber.
+		^self retryRelationalOp: #< coercing: aNumber
 	]
 
 
@@ -22,49 +29,57 @@ SmallInteger := Integer [
 
 	+ aNumber [
 		<primitive: IntAddPrimitive>
-		^self primitiveFailedFor: aNumber.
+		(aNumber isKindOf: SmallInteger) ifTrue: [^self asLargeInteger + aNumber asLargeInteger].
+		^self retry: #+ coercing: aNumber
 	]
 
 
 	- aNumber [
 		<primitive: IntSubPrimitive>
-		^self primitiveFailedFor: aNumber.
+		(aNumber isKindOf: SmallInteger) ifTrue: [^self asLargeInteger - aNumber asLargeInteger].
+		^self retry: #- coercing: aNumber
 	]
 
 
 	* aNumber [
 		<primitive: IntMulPrimitive>
-		^self primitiveFailedFor: aNumber.
+		(aNumber isKindOf: SmallInteger) ifTrue: [^self asLargeInteger * aNumber asLargeInteger].
+		^self retry: #* coercing: aNumber
 	]
 
 
 	/ aNumber [
-		"IntDiv"
-		<primitive: IntQuoPrimitive>
-		^self primitiveFailedFor: aNumber.
+		(aNumber isKindOf: Integer) ifTrue: [
+			aNumber = 0 ifTrue: [^self error: 'division by zero'].
+			^Fraction numerator: self denominator: aNumber].
+		^self retry: #/ coercing: aNumber
 	]
-
-
-	"// aNumber [
-		<primitive: IntDivPrimitive>
-	]"
 
 
 	\\ aNumber [
 		<primitive: IntModPrimitive>
-		^self primitiveFailedFor: aNumber.
+		(aNumber isKindOf: SmallInteger) ifTrue: [
+			aNumber = 0 ifTrue: [^self error: 'division by zero'].
+			^self asLargeInteger \\ aNumber asLargeInteger].
+		^self retry: #\\ coercing: aNumber
 	]
 
 
 	quo: aNumber [
 		<primitive: IntQuoPrimitive>
-		^self primitiveFailedFor: aNumber.
+		(aNumber isKindOf: SmallInteger) ifTrue: [
+			aNumber = 0 ifTrue: [^self error: 'division by zero'].
+			^self asLargeInteger quo: aNumber asLargeInteger].
+		^self retry: #quo: coercing: aNumber
 	]
 
 
 	rem: aNumber [
 		<primitive: IntRemPrimitive>
-		^self primitiveFailedFor: aNumber.
+		(aNumber isKindOf: SmallInteger) ifTrue: [
+			aNumber = 0 ifTrue: [^self error: 'division by zero'].
+			^self asLargeInteger rem: aNumber asLargeInteger].
+		^self retry: #rem: coercing: aNumber
 	]
 
 
@@ -166,6 +181,64 @@ SmallInteger := Integer [
 
 	asObject [
 		<primitive: IntAsObjectPrimitive>
+	]
+
+
+	"coercing"
+
+	generality [
+		^100
+	]
+
+
+	coerce: aNumber [
+		"No number has lower generality, so this is only ever a no-op."
+		^aNumber
+	]
+
+
+	asFloat [
+		<primitive: IntAsFloatPrimitive>
+	]
+
+
+	asLargeInteger [
+		"Answer the LargeInteger with the same value. Uses truncating quo:/rem:
+		so it is safe for the most-negative SmallInteger too."
+		| count v limbs |
+
+		self = 0 ifTrue: [^LargeInteger digits: (Array with: 0) negative: false].
+
+		count := 0.
+		v := self.
+		[v = 0] whileFalse: [count := count + 1. v := v quo: 65536].
+
+		limbs := Array new: count.
+		v := self.
+		1 to: count do: [ :i |
+			limbs at: i put: (v rem: 65536) abs.
+			v := v quo: 65536].
+		^LargeInteger digits: limbs negative: self < 0
+	]
+
+
+	truncated [
+		^self
+	]
+
+
+	floor [
+		^self
+	]
+
+
+	ceiling [
+		^self
+	]
+
+
+	rounded [
+		^self
 	]
 
 

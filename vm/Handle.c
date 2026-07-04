@@ -37,6 +37,14 @@ void *newObject(Class *class, size_t size)
 }
 
 
+Float *newFloat(double value)
+{
+	Float *object = (Float *) scopeHandle(allocateObject(&CurrentThread.heap, Handles.Float->raw, 0));
+	object->raw->value = value;
+	return object;
+}
+
+
 Object *copyResizedObject(Object *object, size_t newSize)
 {
 	Object *newObject = scopeHandle(allocateObject(&CurrentThread.heap, object->raw->class, newSize));

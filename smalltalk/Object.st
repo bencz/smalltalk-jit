@@ -190,7 +190,35 @@ Object := nil [
 	]
 
 
+	"message sending"
+
+	perform: aSymbol [
+		^(self class lookupSelector: aSymbol) sendTo: self
+	]
+
+
+	perform: aSymbol with: anObject [
+		^(self class lookupSelector: aSymbol) sendTo: self withArguments: (Array with: anObject)
+	]
+
+
+	perform: aSymbol with: anObject with: anObject2 [
+		^(self class lookupSelector: aSymbol) sendTo: self
+			withArguments: (Array with: anObject with: anObject2)
+	]
+
+
+	perform: aSymbol withArguments: anArray [
+		^(self class lookupSelector: aSymbol) sendTo: self withArguments: anArray
+	]
+
+
 	"error handling"
+
+	error: aString [
+		^Error signal: aString
+	]
+
 
 	doesNotUnderstand: aMessage [
 		MessageNotUnderstood new

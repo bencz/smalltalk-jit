@@ -107,6 +107,12 @@ typedef struct {
 } RawAssociation;
 OBJECT_HANDLE(Association);
 
+typedef struct {
+	OBJECT_HEADER;
+	double value;
+} RawFloat;
+OBJECT_HANDLE(Float);
+
 #define COMPUTE_INST_SHAPE_SIZE(aPayloadSize, aVarsSize, aIsIndexed) \
 	HEADER_SIZE + ((aIsIndexed) + (aPayloadSize) + (aVarsSize)) * sizeof(Value)
 #define DEFINE_INST_SHAPE(aPayloadSize, aVarsSize, aIsIndexed, aIsBytes, aValueType) { \
@@ -127,6 +133,7 @@ static InstanceShape CompiledCodeShape = DEFINE_INST_SHAPE(1, 0, 1, 1, VALUE_INT
 static InstanceShape BlockShape = DEFINE_INST_SHAPE(1, 0, 0, 0, 0);
 static InstanceShape ContextShape = DEFINE_INST_SHAPE(2, 0, 1, 0, VALUE_POINTER);
 static InstanceShape ExceptionHandlerShape = DEFINE_INST_SHAPE(1, 2, 0, 0, VALUE_POINTER);
+static InstanceShape FloatShape = DEFINE_INST_SHAPE(1, 0, 0, 0, VALUE_INT);
 
 #define varOffset(type, member) (offsetof(type, member) - 1)
 
@@ -226,6 +233,12 @@ static inline uint8_t *getRawObjectIndexedVarsFromShape(RawObject *object, Insta
 static inline uintptr_t objectGetHash(Object *object)
 {
 	return object->raw->hash;
+}
+
+
+static inline double rawFloatValue(RawObject *object)
+{
+	return ((RawFloat *) object)->value;
 }
 
 

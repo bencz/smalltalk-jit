@@ -43,7 +43,7 @@ typedef struct {
 	Class *SmallInteger;
 	Class *Symbol;
 	Class *Character;
-	//Class *Float;
+	Class *Float;
 	Class *String;
 	Class *Array;
 	Class *ByteArray;
@@ -106,6 +106,7 @@ void freeHandle(void *handle);
 void freeHandles(void);
 
 void *newObject(Class *class, size_t size);
+Float *newFloat(double value);
 static Value getTaggedPtr(void *handle);
 Object *copyResizedObject(Object *object, size_t newSize);
 

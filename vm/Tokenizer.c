@@ -384,6 +384,22 @@ static void readToken(Tokenizer *tokenizer, Token *token, _Bool isSeparated)
 			while (isDigit(tokenizer->ch, base)) {
 				APPEND();
 			}
+		} else {
+			/* floating point: a '.' must be followed by a digit (otherwise it is
+			   a statement separator), an exponent by a digit or a sign+digit. */
+			if (tokenizer->ch == '.' && isNumeric(peekChar(tokenizer))) {
+				APPEND();
+				APPEND_WHILE(isNumeric(tokenizer->ch));
+			}
+			if ((tokenizer->ch == 'e' || tokenizer->ch == 'E')
+					&& (isNumeric(peekChar(tokenizer))
+						|| peekChar(tokenizer) == '+' || peekChar(tokenizer) == '-')) {
+				APPEND();
+				if (tokenizer->ch == '+' || tokenizer->ch == '-') {
+					APPEND();
+				}
+				APPEND_WHILE(isNumeric(tokenizer->ch));
+			}
 		}
 
 	} else if (isIdentifierBegining(tokenizer->ch)) {

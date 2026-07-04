@@ -121,6 +121,54 @@ Number := Magnitude [
 	]
 
 
+	reciprocal [
+		^self unity / self
+	]
+
+
+	"coercing (generality based, Blue Book style)"
+
+	generality [
+		"Answer a relative ranking used to coerce mixed-type arithmetic to a
+		common type. Higher generality wins: SmallInteger 100 < LargeInteger 300
+		< Fraction 400 < Float 500."
+		SubClassResponsibility signal.
+	]
+
+
+	coerce: aNumber [
+		"Answer aNumber converted to the receiver's own class."
+		SubClassResponsibility signal.
+	]
+
+
+	unity [
+		^1
+	]
+
+
+	zero [
+		^0
+	]
+
+
+	retry: aSymbol coercing: aNumber [
+		"Coerce the receiver and aNumber to a common generality and retry aSymbol."
+		(aNumber isKindOf: Number) ifFalse: [^self error: aNumber printString, ' is not a Number'].
+		^self generality > aNumber generality
+			ifTrue: [self perform: aSymbol with: (self coerce: aNumber)]
+			ifFalse: [(aNumber coerce: self) perform: aSymbol with: aNumber]
+	]
+
+
+	retryRelationalOp: aSymbol coercing: aNumber [
+		(aNumber isKindOf: Number) ifFalse: [^self error: aNumber printString, ' is not a Number'].
+		^self generality > aNumber generality
+			ifTrue: [self perform: aSymbol with: (self coerce: aNumber)]
+			ifFalse: [(aNumber coerce: self) perform: aSymbol with: aNumber]
+	]
+
+
 	"mathematical functions"
 
 	exp [
@@ -144,17 +192,31 @@ Number := Magnitude [
 
 
 	raisedTo: aNumber [
-
+		(aNumber isKindOf: Integer) ifTrue: [^self raisedToInteger: aNumber].
+		^(self ln * aNumber) exp
 	]
 
 
 	raisedToInteger: anInteger [
+		"Fast exponentiation by squaring."
+		| result base exp |
 
+		anInteger = 0 ifTrue: [^self unity].
+		anInteger < 0 ifTrue: [^(self raisedToInteger: anInteger negated) reciprocal].
+
+		result := self unity.
+		base := self.
+		exp := anInteger.
+		[exp > 0] whileTrue: [
+			(exp bitAnd: 1) = 1 ifTrue: [result := result * base].
+			exp := exp bitShift: -1.
+			exp > 0 ifTrue: [base := base * base]].
+		^result
 	]
 
 
 	sqrt [
-
+		^self asFloat sqrt
 	]
 
 

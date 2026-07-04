@@ -66,6 +66,15 @@ void snapshotWrite(FILE *file)
 }
 
 
+static _Bool isFloatShape(InstanceShape shape)
+{
+	/* A boxed Float carries its double in a single unscanned payload word and
+	   has no pointer/indexed slots. This is detectable from the (serialized)
+	   shape alone, so it works during read when Handles is not yet populated. */
+	return shape.payloadSize == 1 && shape.varsSize == 0 && !shape.isIndexed;
+}
+
+
 static void iterateHandles(Snapshot *snapshot)
 {
 	HandlesIterator handlesIterator;
@@ -124,6 +133,11 @@ static void writeObject(Snapshot *snapshot, RawObject *object)
 		size_t written = fwrite(getRawObjectIndexedVars(object), sizeof(uint8_t), rawObjectSize(object), snapshot->file);
 		ASSERT(written == rawObjectSize(object));
 	}
+	if (isFloatShape(object->class->instanceShape)) {
+		/* the double lives in the (unscanned) payload word, which is not a
+		   pointer field, so serialize its raw bits explicitly */
+		writeInt64(snapshot, *(int64_t *) &((RawFloat *) object)->value);
+	}
 }
 
 
@@ -152,7 +166,6 @@ static void writeInt64(Snapshot *snapshot, int64_t value)
 {
 	size_t written = fwrite(&value, sizeof(int64_t), 1, snapshot->file);
 	ASSERT(written == 1);
-	fflush(snapshot->file);
 }
 
 
@@ -179,6 +192,9 @@ static SnapshotAssoc *registerObject(Snapshot *snapshot, RawObject *object, _Boo
 		assoc->flags |= SS_ASSOC_DEFINED;
 		if (dict->tally == dict->size) {
 			snapshotGrowDict(dict);
+			/* the backing array was reallocated: re-find the slot so `assoc`
+			   does not dangle into freed memory */
+			assoc = &dict->array[findIndex(dict, (intptr_t) object)];
 		}
 	}
 	if (written) {
@@ -260,6 +276,10 @@ static Value readObject(int64_t field, Snapshot *snapshot)
 	if (shape.isIndexed && shape.isBytes) {
 		size_t numRead = fread(getRawObjectIndexedVarsFromShape(object, shape), sizeof(uint8_t), indexedSize, snapshot->file);
 	}
+	if (isFloatShape(shape)) {
+		int64_t bits = readInt64(snapshot);
+		((RawFloat *) object)->value = *(double *) &bits;
+	}
 
 	return tagPtr(object);
 }
@@ -314,6 +334,7 @@ static SnapshotAssoc *snapshotDictAtPut(SnapshotDictionary *dict, intptr_t key, 
 	dict->tally++;
 	if (dict->tally == dict->size) {
 		snapshotGrowDict(dict);
+		assoc = &dict->array[findIndex(dict, key)];
 	}
 	return assoc;
 }

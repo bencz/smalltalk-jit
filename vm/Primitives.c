@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <math.h>
 
 typedef struct {
 	Value value;
@@ -73,6 +74,23 @@ static PrimitiveResult compileMethodPrimitive(Value receiver, Value vNode, Value
 static PrimitiveResult collectGarbagePrimitive(Value receiver);
 static PrimitiveResult printHeapPrimitive(Value receiver);
 static PrimitiveResult lastGcStatsPrimitive(Value receiver);
+static PrimitiveResult floatAddPrimitive(Value self, Value arg);
+static PrimitiveResult floatSubPrimitive(Value self, Value arg);
+static PrimitiveResult floatMulPrimitive(Value self, Value arg);
+static PrimitiveResult floatDivPrimitive(Value self, Value arg);
+static PrimitiveResult floatLessThanPrimitive(Value self, Value arg);
+static PrimitiveResult floatEqualsPrimitive(Value self, Value arg);
+static PrimitiveResult floatTruncatedPrimitive(Value self);
+static PrimitiveResult floatFloorPrimitive(Value self);
+static PrimitiveResult floatCeilingPrimitive(Value self);
+static PrimitiveResult floatRoundedPrimitive(Value self);
+static PrimitiveResult floatSqrtPrimitive(Value self);
+static PrimitiveResult floatSinPrimitive(Value self);
+static PrimitiveResult floatCosPrimitive(Value self);
+static PrimitiveResult floatExpPrimitive(Value self);
+static PrimitiveResult floatLnPrimitive(Value self);
+static PrimitiveResult floatAsStringPrimitive(Value self);
+static PrimitiveResult intAsFloatPrimitive(Value self);
 
 #include "PrimitivesX64.c"
 
@@ -126,6 +144,24 @@ Primitive Primitives[] = {
 	{"IntXorPrimitive", GEN, generateIntXorPrimitive},
 	{"IntShiftPrimitive", GEN, generateIntShiftPrimitive},
 	{"IntAsObjectPrimitive", GEN, /*generateIntAsObjectPrimitive*/generateNotImplementedPrimitive},
+
+	{"FloatAddPrimitive", CCALL, .cFunction = floatAddPrimitive, 2},
+	{"FloatSubPrimitive", CCALL, .cFunction = floatSubPrimitive, 2},
+	{"FloatMulPrimitive", CCALL, .cFunction = floatMulPrimitive, 2},
+	{"FloatDivPrimitive", CCALL, .cFunction = floatDivPrimitive, 2},
+	{"FloatLessThanPrimitive", CCALL, .cFunction = floatLessThanPrimitive, 2},
+	{"FloatEqualsPrimitive", CCALL, .cFunction = floatEqualsPrimitive, 2},
+	{"FloatTruncatedPrimitive", CCALL, .cFunction = floatTruncatedPrimitive, 1},
+	{"FloatFloorPrimitive", CCALL, .cFunction = floatFloorPrimitive, 1},
+	{"FloatCeilingPrimitive", CCALL, .cFunction = floatCeilingPrimitive, 1},
+	{"FloatRoundedPrimitive", CCALL, .cFunction = floatRoundedPrimitive, 1},
+	{"FloatSqrtPrimitive", CCALL, .cFunction = floatSqrtPrimitive, 1},
+	{"FloatSinPrimitive", CCALL, .cFunction = floatSinPrimitive, 1},
+	{"FloatCosPrimitive", CCALL, .cFunction = floatCosPrimitive, 1},
+	{"FloatExpPrimitive", CCALL, .cFunction = floatExpPrimitive, 1},
+	{"FloatLnPrimitive", CCALL, .cFunction = floatLnPrimitive, 1},
+	{"FloatAsStringPrimitive", CCALL, .cFunction = floatAsStringPrimitive, 1},
+	{"IntAsFloatPrimitive", CCALL, .cFunction = intAsFloatPrimitive, 1},
 
 	{"StreamOpenPrimitive", CCALL, .cFunction = streamOpenPrimitive, 3},
 	{"StreamClosePrimitive", CCALL, .cFunction = streamClosePrimitive, 2},
@@ -559,6 +595,184 @@ static PrimitiveResult printHeapPrimitive(Value receiver)
 {
 	printHeap(&CurrentThread.heap);
 	return primSuccess(receiver);
+}
+
+
+static _Bool isFloatValue(Value v)
+{
+	return valueTypeOf(v, VALUE_POINTER) && asObject(v)->class == Handles.Float->raw;
+}
+
+
+static PrimitiveResult floatToInteger(double x)
+{
+	double max = (double) ((intptr_t) 1 << 60);
+	if (x >= -max && x <= max) {
+		return primSuccess(tagInt((intptr_t) x));
+	}
+	return primFailed();
+}
+
+
+static PrimitiveResult floatAddPrimitive(Value self, Value arg)
+{
+	if (!isFloatValue(arg)) {
+		return primFailed();
+	}
+	return primSuccess(getTaggedPtr(newFloat(rawFloatValue(asObject(self)) + rawFloatValue(asObject(arg)))));
+}
+
+
+static PrimitiveResult floatSubPrimitive(Value self, Value arg)
+{
+	if (!isFloatValue(arg)) {
+		return primFailed();
+	}
+	return primSuccess(getTaggedPtr(newFloat(rawFloatValue(asObject(self)) - rawFloatValue(asObject(arg)))));
+}
+
+
+static PrimitiveResult floatMulPrimitive(Value self, Value arg)
+{
+	if (!isFloatValue(arg)) {
+		return primFailed();
+	}
+	return primSuccess(getTaggedPtr(newFloat(rawFloatValue(asObject(self)) * rawFloatValue(asObject(arg)))));
+}
+
+
+static PrimitiveResult floatDivPrimitive(Value self, Value arg)
+{
+	if (!isFloatValue(arg)) {
+		return primFailed();
+	}
+	return primSuccess(getTaggedPtr(newFloat(rawFloatValue(asObject(self)) / rawFloatValue(asObject(arg)))));
+}
+
+
+static PrimitiveResult floatLessThanPrimitive(Value self, Value arg)
+{
+	if (!isFloatValue(arg)) {
+		return primFailed();
+	}
+	return primSuccess(getTaggedPtr(asBool(rawFloatValue(asObject(self)) < rawFloatValue(asObject(arg)))));
+}
+
+
+static PrimitiveResult floatEqualsPrimitive(Value self, Value arg)
+{
+	if (!isFloatValue(arg)) {
+		return primFailed();
+	}
+	return primSuccess(getTaggedPtr(asBool(rawFloatValue(asObject(self)) == rawFloatValue(asObject(arg)))));
+}
+
+
+static PrimitiveResult floatTruncatedPrimitive(Value self)
+{
+	return floatToInteger(trunc(rawFloatValue(asObject(self))));
+}
+
+
+static PrimitiveResult floatFloorPrimitive(Value self)
+{
+	return floatToInteger(floor(rawFloatValue(asObject(self))));
+}
+
+
+static PrimitiveResult floatCeilingPrimitive(Value self)
+{
+	return floatToInteger(ceil(rawFloatValue(asObject(self))));
+}
+
+
+static PrimitiveResult floatRoundedPrimitive(Value self)
+{
+	return floatToInteger(round(rawFloatValue(asObject(self))));
+}
+
+
+static PrimitiveResult floatSqrtPrimitive(Value self)
+{
+	return primSuccess(getTaggedPtr(newFloat(sqrt(rawFloatValue(asObject(self))))));
+}
+
+
+static PrimitiveResult floatSinPrimitive(Value self)
+{
+	return primSuccess(getTaggedPtr(newFloat(sin(rawFloatValue(asObject(self))))));
+}
+
+
+static PrimitiveResult floatCosPrimitive(Value self)
+{
+	return primSuccess(getTaggedPtr(newFloat(cos(rawFloatValue(asObject(self))))));
+}
+
+
+static PrimitiveResult floatExpPrimitive(Value self)
+{
+	return primSuccess(getTaggedPtr(newFloat(exp(rawFloatValue(asObject(self))))));
+}
+
+
+static PrimitiveResult floatLnPrimitive(Value self)
+{
+	return primSuccess(getTaggedPtr(newFloat(log(rawFloatValue(asObject(self))))));
+}
+
+
+static PrimitiveResult intAsFloatPrimitive(Value self)
+{
+	return primSuccess(getTaggedPtr(newFloat((double) asCInt(self))));
+}
+
+
+static PrimitiveResult floatAsStringPrimitive(Value self)
+{
+	double x = rawFloatValue(asObject(self));
+	char buf[64];
+
+	if (isnan(x)) {
+		strcpy(buf, "nan");
+	} else if (isinf(x)) {
+		strcpy(buf, x < 0 ? "-inf" : "inf");
+	} else if (x == 0.0) {
+		strcpy(buf, signbit(x) ? "-0.0" : "0.0");
+	} else {
+		/* shortest number of significant digits that round-trips */
+		int sig = 17;
+		for (int s = 1; s <= 17; s++) {
+			snprintf(buf, sizeof(buf), "%.*e", s - 1, x);
+			if (strtod(buf, NULL) == x) {
+				sig = s;
+				break;
+			}
+		}
+		/* prefer plain decimal notation for human-friendly magnitudes */
+		int exp10 = (int) floor(log10(fabs(x)));
+		if (exp10 >= -4 && exp10 < 16) {
+			int frac = sig - 1 - exp10;
+			if (frac < 0) {
+				frac = 0;
+			}
+			snprintf(buf, sizeof(buf), "%.*f", frac, x);
+			if (strtod(buf, NULL) != x) {
+				snprintf(buf, sizeof(buf), "%.*e", sig - 1, x);
+			}
+		} else {
+			snprintf(buf, sizeof(buf), "%.*e", sig - 1, x);
+		}
+		if (strpbrk(buf, ".eEnN") == NULL) {
+			strcat(buf, ".0");
+		}
+	}
+
+	HandleScope scope;
+	openHandleScope(&scope);
+	Value result = getTaggedPtr(asString(buf));
+	closeHandleScope(&scope, NULL);
+	return primSuccess(result);
 }
 
 

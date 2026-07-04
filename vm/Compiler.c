@@ -381,8 +381,15 @@ static void compileLiteral(Compiler *compiler, LiteralNode *literal, Operand *op
 		operand->type = OPERAND_FALSE;
 
 	} else if (literal->raw->class == Handles.IntegerNode->raw || literal->raw->class == Handles.CharacterNode->raw) {
-		operand->type = OPERAND_VALUE;
-		operand->value = literalNodeGetValue(literal);
+		Value value = literalNodeGetValue(literal);
+		if (valueTypeOf(value, VALUE_POINTER)) {
+			/* arbitrary precision integer literal: keep it in the literal frame */
+			operand->type = OPERAND_LITERAL;
+			operand->index = ordCollAddObjectIfNotExists(compiler->literals, scopeHandle(asObject(value)));
+		} else {
+			operand->type = OPERAND_VALUE;
+			operand->value = value;
+		}
 
 	} else if (literal->raw->class == Handles.StringNode->raw) {
 		operand->type = OPERAND_LITERAL;

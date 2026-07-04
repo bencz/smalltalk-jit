@@ -45,7 +45,7 @@ static void initSmalltalkStubs(void)
 	Handles.SmallInteger = newStubClass(metaClass, FixedShape, 0);
 	Handles.Symbol = newStubClass(metaClass, StringShape, 0);
 	Handles.Character = newStubClass(metaClass, FixedShape, 0);
-	// Handles.Float = newStubClass(metaClass, FixedShape, 0);
+	Handles.Float = newStubClass(metaClass, FloatShape, 0);
 	Handles.String = newStubClass(metaClass, StringShape, 0);
 	Handles.Array = newStubClass(metaClass, IndexedShape, 0);
 	Handles.ByteArray = newStubClass(metaClass, BytesShape, 0);
@@ -108,8 +108,10 @@ static void initSmalltalkStubs(void)
 	setGlobalObject("false", Handles.false);
 	setGlobalObject("SmallInteger", (Object *) Handles.SmallInteger);
 	setGlobalObject("Character", (Object *) Handles.Character);
+	setGlobalObject("Float", (Object *) Handles.Float);
 
 	setGlobal("FixedShape", *(Value *) &FixedShape);
+	setGlobal("FloatShape", *(Value *) &FloatShape);
 	setGlobal("IndexedShape", *(Value *) &IndexedShape);
 	setGlobal("StringShape", *(Value *) &StringShape);
 	setGlobal("BytesShape", *(Value *) &BytesShape);
@@ -237,6 +239,9 @@ static _Bool parseKernelFiles(char *kernelDir)
 		"Magnitudes/Number.st",
 		"Magnitudes/Integer.st",
 		"Magnitudes/SmallInteger.st",
+		"Magnitudes/LargeInteger.st",
+		"Magnitudes/Fraction.st",
+		"Magnitudes/Float.st",
 		"Magnitudes/Character.st",
 		"Magnitudes/DateTime.st",
 		"Iterator.st",

@@ -88,7 +88,36 @@ Block := Object [
 	]
 
 
-	on: anException do: aBlock [
+	"guaranteed evaluation"
+
+	ensure: aBlock [
+		"Evaluate the receiver and answer its value, evaluating aBlock afterwards
+		whether the receiver completes normally or is unwound by an exception."
+		| result |
+
+		result := [self value] on: Exception do: [:ex | aBlock value. ex pass].
+		aBlock value.
+		^result
+	]
+
+
+	ifCurtailed: aBlock [
+		"Evaluate aBlock only if the receiver is curtailed by an exception."
+		^[self value] on: Exception do: [:ex | aBlock value. ex pass]
+	]
+
+
+	on: anExceptionClass do: aHandlerBlock [
+		"Evaluate the receiver; if it signals an exception handled by
+		anExceptionClass, evaluate aHandlerBlock with the exception. The handler
+		may answer a value, or send #return:/#retry/#pass to the exception."
+		^self basicOn: anExceptionClass do: [:ex |
+			ex setRetryProtected: self class: anExceptionClass handler: aHandlerBlock.
+			aHandlerBlock value: ex]
+	]
+
+
+	basicOn: anException do: aBlock [
 		<primitive: BlockOnExceptionPrimitive>
 	]
 
