@@ -614,10 +614,32 @@ static PrimitiveResult floatToInteger(double x)
 }
 
 
+/*
+ * newFloat() scopes a handle for the freshly allocated Float in the current
+ * handle scope so it survives a GC. During a long-running expression (e.g. a
+ * hot arithmetic loop) that scope is the top-level activation's and is not
+ * closed until it returns, so those transient handles pile up and eventually
+ * trip the 256-handle assertion in Handle.h, crashing the VM.
+ *
+ * A primitive's result is a self-contained tagged pointer, so once we have read
+ * it the Float's handle is redundant and can be popped. Popping is valid only
+ * because that handle is guaranteed to be the topmost one in the current scope:
+ * allocateObject() balances its own inner scope (Heap.c closes it before it
+ * returns a raw pointer), so newFloat() adds exactly one handle, and the
+ * primitive scopes nothing else in between. The assertions make that invariant
+ * explicit and fail loudly if it is ever broken. This keeps float arithmetic
+ * O(1) and leak-free, without paying for a full openHandleScope/closeHandleScope
+ * (an 8 KB memset) on every operation.
+ */
 static Value floatResult(Float *object)
 {
+	HandleScope *scope = CurrentThread.handleScopes;
 	Value result = getTaggedPtr(object);
-	CurrentThread.handleScopes->size--;
+
+	ASSERT(scope != NULL && scope->size > 0);
+	ASSERT((Object *) object == &scope->handles[scope->size - 1]);
+	scope->size--;
+
 	return result;
 }
 
