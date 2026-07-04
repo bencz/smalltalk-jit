@@ -17,6 +17,11 @@ Bag := Collection [
 	]
 
 
+	class withAll: aCollection [
+		^self new addAll: aCollection; yourself
+	]
+
+
 	"initialization"
 
 	initialize: anInteger [

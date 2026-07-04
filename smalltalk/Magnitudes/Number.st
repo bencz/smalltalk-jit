@@ -172,22 +172,32 @@ Number := Magnitude [
 	"mathematical functions"
 
 	exp [
-
+		^self asFloat exp
 	]
 
 
 	ln [
+		^self asFloat ln
+	]
 
+
+	sin [
+		^self asFloat sin
+	]
+
+
+	cos [
+		^self asFloat cos
 	]
 
 
 	log: aNumber [
-
+		^self ln / aNumber ln
 	]
 
 
 	floorLog: aNumber [
-
+		^(self log: aNumber) floor
 	]
 
 

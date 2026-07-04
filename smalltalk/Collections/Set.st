@@ -7,6 +7,11 @@ Set := HashedCollection [
 	]
 
 
+	class withAll: aCollection [
+		^self new addAll: aCollection; yourself
+	]
+
+
 	"accessing"
 
 	add: anObject [

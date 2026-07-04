@@ -258,6 +258,7 @@ static _Bool parseKernelFiles(char *kernelDir)
 		"Collections/ByteArray.st",
 		"Collections/Bag.st",
 		"Collections/OrderedCollection.st",
+		"Collections/SortedCollection.st",
 		"Collections/Interval.st",
 		"CompiledCode.st",
 		"CompiledBlock.st",

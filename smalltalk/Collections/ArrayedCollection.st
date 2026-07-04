@@ -18,6 +18,16 @@ ArrayedCollection := SequenceableCollection [
 	]
 
 
+	class withAll: aCollection [
+		| result index |
+
+		result := self new: aCollection size.
+		index := 0.
+		aCollection do: [ :v | result at: (index := index + 1) put: v].
+		^result
+	]
+
+
 	"accessing"
 
 	size [

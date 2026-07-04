@@ -277,4 +277,30 @@ SequenceableCollection := Collection [
 		^(Array new: self size) replaceFrom: 1 to: self size with: self
 	]
 
+
+	reverse [
+		| size result |
+
+		size := self size.
+		result := self species new: size.
+		1 to: size do: [ :i | result at: i put: (self at: size - i + 1)].
+		^result
+	]
+
+
+	reversed [
+		^self reverse
+	]
+
+
+	with: aCollection collect: aBlock [
+		| size result |
+
+		size := self size.
+		result := self species new: size.
+		1 to: size do: [ :i |
+			result at: i put: (aBlock value: (self at: i) value: (aCollection at: i))].
+		^result
+	]
+
 ]

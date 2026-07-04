@@ -31,6 +31,15 @@ String := ArrayedCollection [
 	]
 
 
+	asUppercase [
+		| newString |
+
+		newString := self class new: self size.
+		1 to: self size do: [ :i | newString at: i put: (self at: i) asUppercase].
+		^newString
+	]
+
+
 	asNumber [
 		^Number readFrom: (CollectionStream on: self)
 	]

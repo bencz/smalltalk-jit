@@ -30,6 +30,11 @@ OrderedCollection := SequenceableCollection [
 	]
 
 
+	class withAll: aCollection [
+		^self new addAll: aCollection; yourself
+	]
+
+
 	"initialization"
 
 	initialize: anInteger [
@@ -218,7 +223,11 @@ OrderedCollection := SequenceableCollection [
 
 
 	insert: anObject beforeIndex: anInteger [
-		self size = contents size ifTrue: [self growBy: 8 shiftBy: 8].
+		"Opens a hole by shifting elements toward the back, so we need
+		 room at the back: grow when lastIndex has reached the end of
+		 contents (not merely when the collection is completely full,
+		 since free slots may sit at the front)."
+		lastIndex = contents size ifTrue: [self growBy: 8 shiftBy: 0].
 		lastIndex := lastIndex + 1.
 		lastIndex to: anInteger + firstIndex by: -1 do: [ :i |
 			contents at: i put: (contents at: i - 1)].
@@ -237,6 +246,36 @@ OrderedCollection := SequenceableCollection [
 		contents at: lastIndex put: nil.
 		lastIndex := lastIndex - 1.
 		^object
+	]
+
+
+	"copying"
+
+	, aCollection [
+		| new |
+
+		new := OrderedCollection new.
+		new addAll: self.
+		new addAll: aCollection.
+		^new
+	]
+
+
+	reverse [
+		| new |
+
+		new := OrderedCollection new.
+		self reverseDo: [ :v | new add: v].
+		^new
+	]
+
+
+	copyFrom: start to: stop [
+		| new |
+
+		new := OrderedCollection new.
+		start to: stop do: [ :i | new add: (self at: i)].
+		^new
 	]
 
 

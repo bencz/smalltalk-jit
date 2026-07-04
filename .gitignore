@@ -2,3 +2,4 @@
 /cmake-*
 *.so
 st
+/build

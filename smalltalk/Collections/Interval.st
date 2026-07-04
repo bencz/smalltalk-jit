@@ -91,6 +91,23 @@ Interval := ArrayedCollection [
 	]
 
 
+	"copying"
+
+	, aCollection [
+		^self asArray , aCollection
+	]
+
+
+	reverse [
+		^self asArray reverse
+	]
+
+
+	copyFrom: start to: stop [
+		^self asArray copyFrom: start to: stop
+	]
+
+
 	"enumerating"
 
 	collect: aBlock [

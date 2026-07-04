@@ -41,6 +41,40 @@ Object := nil [
 	]
 
 
+	"nil testing (non-nil branch; UndefinedObject overrides these)"
+
+	ifNil: aBlock [
+		^self
+	]
+
+
+	ifNotNil: aBlock [
+		^aBlock value: self
+	]
+
+
+	ifNil: nilBlock ifNotNil: notNilBlock [
+		^notNilBlock value: self
+	]
+
+
+	ifNotNil: notNilBlock ifNil: nilBlock [
+		^notNilBlock value: self
+	]
+
+
+	"error signalling"
+
+	subclassResponsibility [
+		^SubClassResponsibility signal
+	]
+
+
+	shouldNotImplement [
+		^ShouldNotImplement signal
+	]
+
+
 	"system primitives"
 
 	instVarAt: anInteger [

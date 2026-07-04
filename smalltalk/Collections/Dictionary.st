@@ -175,7 +175,7 @@ Dictionary := HashedCollection [
 		items := 0.
 		aStream nextPutAll: ' ('.
 		self associationsDo: [ :v |
-			(items := items + 1) = 7 ifTrue: [
+			(items := items + 1) = 201 ifTrue: [
 				aStream nextPutAll: '...)'.
 				^self].
 			v value == self
