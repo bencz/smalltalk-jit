@@ -80,7 +80,11 @@ static NativeCode *generateBlockCode(CompiledBlock *block, CodeGenerator *parent
 
 static void generateCode(CodeGenerator *generator)
 {
+#ifdef PROFILE_METHOD_USAGE
+	// Per-method-entry invocation counter, read only by printMethodsUsage (debug).
+	// Off by default: it was a memory RMW on every single call/primitive.
 	asmIncqMem(&generator->buffer, asmMem(RIP, NO_REGISTER, SS_1, -(sizeof(size_t) + 7)));
+#endif
 
 	if (generator->code.header.primitive > 0) {
 		generator->regsAlloc.varsSize = 1;

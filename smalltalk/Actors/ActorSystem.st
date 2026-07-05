@@ -59,7 +59,10 @@ ActorSystem := Object [
 
 	deliverUser: aMessage to: aPid from: aSenderPid [
 		| endpoint |
-		endpoint := self endpointFor: aPid.
+		"Direct pids (Futures) carry their endpoint — no registry lookup, no
+		 dead-letter routing needed (they complete at most once)."
+		endpoint := aPid endpoint.
+		endpoint isNil ifTrue: [ endpoint := self endpointFor: aPid ].
 		endpoint isNil
 			ifTrue: [ deadLetters postUser: aMessage sender: aSenderPid ]
 			ifFalse: [ endpoint postUser: aMessage sender: aSenderPid ].

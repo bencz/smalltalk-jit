@@ -3,11 +3,18 @@
  a dead or restarted actor is handled transparently (dead letters)."
 Pid := Object [
 
-	| system id |
+	| system id endpoint |
 
 
 	class system: anActorSystem id: anId [
 		^self new setSystem: anActorSystem id: anId
+	]
+
+
+	class system: anActorSystem id: anId endpoint: anEndpoint [
+		"A direct pid carries its endpoint, so delivery skips the registry.
+		 Used for single-use Futures that never need dead-letter routing."
+		^(self new setSystem: anActorSystem id: anId) setEndpoint: anEndpoint
 	]
 
 
@@ -18,10 +25,14 @@ Pid := Object [
 	]
 
 
+	setEndpoint: anEndpoint [ endpoint := anEndpoint. ^self ]
+
+
 	"accessing"
 
 	id [ ^id ]
 	system [ ^system ]
+	endpoint [ ^endpoint ]
 
 
 	"telling (fire and forget)"

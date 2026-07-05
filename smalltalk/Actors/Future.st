@@ -1,10 +1,13 @@
-"A Future is the reply side of request/response. It registers itself as an
- endpoint so it has a real Pid that can be used as the sender of a request; when
- the target actor responds, the reply is delivered here and completes the
- Future, waking whoever is awaiting it."
+"A Future is the reply side of request/response. It is a single-use endpoint: it
+ carries its own *direct* Pid (so replies reach it without touching the system
+ registry — no register/unregister, no dead-letter routing) and it IS its own
+ synchronization (the value is stored here and the one waiter is parked/resumed
+ directly), so a round-trip allocates just the Future and its Pid. Correct under
+ the cooperative scheduler: check-then-park and complete-then-resume each run
+ without an intervening context switch, exactly like Semaphore."
 Future := Object [
 
-	| system pid channel completed value |
+	| pid completed value waiterId |
 
 
 	class in: aSystem [
@@ -13,10 +16,10 @@ Future := Object [
 
 
 	initIn: aSystem [
-		system := aSystem.
-		channel := Channel new.
 		completed := false.
-		pid := system registerEndpoint: self.
+		"a direct pid: delivery uses `pid endpoint` (this Future) and never the
+		 registry. Keep a real id so Pid>>= / hash stay valid."
+		pid := Pid system: aSystem id: aSystem nextId endpoint: self.
 		^self
 	]
 
@@ -40,8 +43,7 @@ Future := Object [
 		completed ifTrue: [ ^self ].
 		completed := true.
 		value := aValue.
-		system unregister: pid.
-		channel send: aValue.
+		waiterId ifNotNil: [:w | Processor resumeId: w ].
 		^self
 	]
 
@@ -49,17 +51,20 @@ Future := Object [
 	"awaiting"
 
 	await [
-		"Block the current process until the reply arrives."
+		"Park the current process until the reply arrives."
 		completed ifTrue: [ ^value ].
-		^channel receive
+		waiterId := Processor currentId.
+		Processor suspendCurrent.
+		^value
 	]
 
 
 	awaitFor: milliseconds [
-		"Block until the reply arrives or the timeout elapses (then answer nil)."
+		"Park until the reply arrives or the timeout elapses (then answer nil)."
 		completed ifTrue: [ ^value ].
-		[ (Delay forMilliseconds: milliseconds) wait.
-		  completed ifFalse: [ channel send: nil ] ] fork.
-		^channel receive
+		waiterId := Processor currentId.
+		[ (Delay forMilliseconds: milliseconds) wait. self complete: nil ] fork.
+		Processor suspendCurrent.
+		^value
 	]
 ]

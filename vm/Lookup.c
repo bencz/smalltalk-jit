@@ -17,7 +17,6 @@ LookupTable LookupCache = {
 	.codes = { NULL },
 };
 
-static void feedbackType(Class *class);
 static NativeCodeEntry doesNotUnderstand(Class *class, String *selector);
 
 NativeCodeEntry lookupNativeCode(RawClass *class, RawString *selector)
@@ -36,7 +35,6 @@ NativeCodeEntry lookupNativeCode(RawClass *class, RawString *selector)
         union PointerConverter converter;
         converter.object_pointer = getNativeCode(classHandle, method)->insts;
         entry = converter.function_pointer;
-        feedbackType(classHandle);
     }
 
     intptr_t hash = lookupHash((intptr_t) classHandle->raw, (intptr_t) selectorHandle->raw);
@@ -51,32 +49,11 @@ NativeCodeEntry lookupNativeCode(RawClass *class, RawString *selector)
     return entry;
 }
 
-static void feedbackType(Class *class)
-{
-	EntryStackFrame *entryFrame = CurrentThread.stackFramesTail;
-	if (entryFrame == NULL) {
-		return;
-	}
-
-	StackFrame *frame = stackFrameGetParent(entryFrame->exit, entryFrame);
-	NativeCode *code = stackFrameGetNativeCode(frame);
-	OrderedCollection *typeFeedback;
-	if (code->typeFeedback == NULL) {
-		typeFeedback = newOrdColl(8);
-		code->typeFeedback = typeFeedback->raw;
-	} else {
-		typeFeedback = scopeHandle(code->typeFeedback);
-		if (ordCollSize(typeFeedback) > 16) {
-			typeFeedback = newOrdColl(8);
-			code->typeFeedback = typeFeedback->raw;
-		}
-	}
-
-	TypeFeedback *type = newObject(Handles.TypeFeedback, 0);
-	type->raw->ic = tagInt(entryFrame->exit->parentIc - code->insts);
-	type->raw->hintedClass = getTaggedPtr(class);
-	ordCollAddObject(typeFeedback, (Object *) type);
-}
+// Type feedback was collected here on every lookup-cache miss but never consumed
+// (the Optimizer's feedback-driven inliner is not wired up), so it was pure
+// allocation + GC-tracing overhead and has been removed. `NativeCode.typeFeedback`
+// now stays NULL and the GC walkers skip it. Revive deliberately if/when an
+// adaptive recompiler is added.
 
 
 static NativeCodeEntry doesNotUnderstand(Class *class, String *selector)
