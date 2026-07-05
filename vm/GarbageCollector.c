@@ -7,6 +7,9 @@
 #include "Entry.h"
 #include "StackFrame.h"
 #include "Thread.h"
+#include "Exception.h"
+#include "Scheduler.h"
+#include "Fiber.h"
 #include "Assert.h"
 #include <stdio.h>
 #include <inttypes.h>
@@ -39,9 +42,11 @@ void gcMarkRoots(Thread *thread)
 		.objects = malloc(QUEUE_INIT_SIZE * sizeof(RawObject *)),
 		.index = 0,
 	};
+	schedulerSyncCurrentRoots();
 	iterateStack(&queue, thread);
 	iterateHandles(&queue, thread);
 	iterateNativeCode(&queue, thread);
+	schedulerRestoreCurrentRoots();
 
 	while (!markingQueueIsEmpty(&queue)) {
 		iterateObject(&queue, thread, markingQueuePop(&queue));
@@ -51,9 +56,18 @@ void gcMarkRoots(Thread *thread)
 }
 
 
-static void iterateStack(MarkingQueue *queue, Thread *thread)
+static void iterateExceptionHandlerChain(MarkingQueue *queue, Thread *thread, Value handlerValue)
 {
-	EntryStackFrame *entryFrame = thread->stackFramesTail;
+	while (handlerValue != 0) {
+		RawExceptionHandler *handler = (RawExceptionHandler *) asObject(handlerValue);
+		markObject(queue, thread, (RawObject *) handler);
+		handlerValue = handler->parent;
+	}
+}
+
+
+static void iterateStackFrames(MarkingQueue *queue, Thread *thread, EntryStackFrame *entryFrame)
+{
 	while (entryFrame != NULL) {
 		StackFrame *prev = entryFrame->exit;
 		StackFrame *frame = stackFrameGetParent(prev, entryFrame);
@@ -93,6 +107,43 @@ static void iterateStack(MarkingQueue *queue, Thread *thread)
 }
 
 
+static void iterateStack(MarkingQueue *queue, Thread *thread)
+{
+	if (!schedulerActive()) {
+		iterateStackFrames(queue, thread, thread->stackFramesTail);
+		return;
+	}
+	size_t slots = schedulerFiberSlots();
+	for (size_t i = 0; i < slots; i++) {
+		Fiber *fiber = schedulerFiberAt(i);
+		if (fiber == NULL) {
+			continue;
+		}
+		if (valueTypeOf(fiber->entryBlock, VALUE_POINTER)) {
+			markObject(queue, thread, asObject(fiber->entryBlock));
+		}
+		if (valueTypeOf(fiber->process, VALUE_POINTER)) {
+			markObject(queue, thread, asObject(fiber->process));
+		}
+		iterateStackFrames(queue, thread, fiber->roots.stackFramesTail);
+		iterateExceptionHandlerChain(queue, thread, fiber->roots.exceptionHandler);
+	}
+}
+
+
+static void iterateHandleScopes(MarkingQueue *queue, Thread *thread, HandleScope *scopes)
+{
+	HandleScopeIterator handleScopeIterator;
+	initHandleScopeIterator(&handleScopeIterator, scopes);
+	while (handleScopeIteratorHasNext(&handleScopeIterator)) {
+		HandleScope *scope = handleScopeIteratorNext(&handleScopeIterator);
+		for (ptrdiff_t i = 0; i < scope->size; i++) {
+			markObject(queue, thread, scope->handles[i].raw);
+		}
+	}
+}
+
+
 static void iterateHandles(MarkingQueue *queue, Thread *thread)
 {
 	HandlesIterator handlesIterator;
@@ -101,17 +152,24 @@ static void iterateHandles(MarkingQueue *queue, Thread *thread)
 		markObject(queue, thread, handlesIteratorNext(&handlesIterator)->raw);
 	}
 
-	HandleScopeIterator handleScopeIterator;
-	initHandleScopeIterator(&handleScopeIterator, thread->handleScopes);
-	while (handleScopeIteratorHasNext(&handleScopeIterator)) {
-		HandleScope *scope = handleScopeIteratorNext(&handleScopeIterator);
-		for (ptrdiff_t i = 0; i < scope->size; i++) {
-			markObject(queue, thread, scope->handles[i].raw);
+	if (!schedulerActive()) {
+		iterateHandleScopes(queue, thread, thread->handleScopes);
+		if (CurrentThread.context != 0) {
+			markObject(queue, thread, asObject(CurrentThread.context));
 		}
+		return;
 	}
 
-	if (CurrentThread.context != 0) {
-		markObject(queue, thread, asObject(CurrentThread.context));
+	size_t slots = schedulerFiberSlots();
+	for (size_t i = 0; i < slots; i++) {
+		Fiber *fiber = schedulerFiberAt(i);
+		if (fiber == NULL) {
+			continue;
+		}
+		iterateHandleScopes(queue, thread, fiber->roots.handleScopes);
+		if (fiber->roots.context != 0) {
+			markObject(queue, thread, asObject(fiber->roots.context));
+		}
 	}
 }
 

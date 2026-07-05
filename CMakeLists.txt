@@ -13,6 +13,7 @@ set(vmSources
 	vm/Dictionary.c
 	vm/Entry.c
 	vm/Exception.c
+	vm/Fiber.c
 	vm/FreeList.c
 	vm/GarbageCollector.c
 	vm/Handle.c
@@ -27,6 +28,7 @@ set(vmSources
 	vm/RegisterAllocator.c
 	vm/Repl.c
 	vm/Scavenger.c
+	vm/Scheduler.c
 	vm/Scope.c
 	vm/Smalltalk.c
 	vm/Snapshot.c

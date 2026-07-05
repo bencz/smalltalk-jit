@@ -286,7 +286,10 @@ static _Bool parseKernelFiles(char *kernelDir)
 		"GarbageCollector.st",
 		"Processes/ProcessorScheduler.st",
 		"Processes/Process.st",
-		// "Processes/Delay.st",
+		"Processes/Semaphore.st",
+		"Processes/Channel.st",
+		"Processes/Actor.st",
+		"Processes/Delay.st",
 
 		"Exception.st",
 		"Error.st",

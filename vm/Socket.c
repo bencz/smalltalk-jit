@@ -1,10 +1,24 @@
 #include "Socket.h"
+#include "Scheduler.h"
 #include "Assert.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netdb.h>
 #include <unistd.h>
 #include <string.h>
+#include <fcntl.h>
+#include <errno.h>
+
+
+// Put a descriptor into non-blocking mode so its I/O parks the fiber (via the
+// scheduler's epoll loop) instead of stalling the whole VM.
+void socketSetNonBlocking(int descriptor)
+{
+	int flags = fcntl(descriptor, F_GETFL, 0);
+	if (flags >= 0) {
+		fcntl(descriptor, F_SETFL, flags | O_NONBLOCK);
+	}
+}
 
 
 int socketConnect(uint32_t ip, uint16_t port)
@@ -15,17 +29,29 @@ int socketConnect(uint32_t ip, uint16_t port)
 	if (descriptor < 0) {
 		return -1;
 	}
+	socketSetNonBlocking(descriptor);
 
 	address.sin_family = AF_INET;
 	address.sin_port = htons(port);
 	memcpy(&address.sin_addr, &ip, sizeof(ip));
 
-	if (connect(descriptor, (struct sockaddr *) &address, sizeof(address)) != 0) {
-		close(descriptor);
-		return -1;
-	} else {
+	int result = connect(descriptor, (struct sockaddr *) &address, sizeof(address));
+	if (result != 0 && errno == EINPROGRESS) {
+		// connection in progress: park until the socket is writable, then check
+		schedulerWaitFd(descriptor, 1);
+		int error = 0;
+		socklen_t len = sizeof(error);
+		if (getsockopt(descriptor, SOL_SOCKET, SO_ERROR, &error, &len) != 0 || error != 0) {
+			close(descriptor);
+			return -1;
+		}
 		return descriptor;
 	}
+	if (result != 0) {
+		close(descriptor);
+		return -1;
+	}
+	return descriptor;
 }
 
 
@@ -43,6 +69,9 @@ int socketBind(uint32_t ip, uint16_t port, int backlog)
 	memcpy(&address.sin_addr, &ip, sizeof(ip));
 	//address.sin_addr.s_addr = INADDR_ANY;
 
+	int reuse = 1;
+	setsockopt(descriptor, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
 	if (bind(descriptor, (struct sockaddr *) &address, sizeof(address)) != 0) {
 		close(descriptor);
 		return -1;
@@ -51,13 +80,30 @@ int socketBind(uint32_t ip, uint16_t port, int backlog)
 		close(descriptor);
 		return -1;
 	}
+	socketSetNonBlocking(descriptor);
 	return descriptor;
 }
 
 
+// Accept a connection, parking the fiber until one arrives. The returned
+// client descriptor is itself non-blocking.
 int socketAccept(int descriptor)
 {
-	return accept(descriptor, NULL, 0);
+	for (;;) {
+		int client = accept(descriptor, NULL, 0);
+		if (client >= 0) {
+			socketSetNonBlocking(client);
+			return client;
+		}
+		if (errno == EAGAIN || errno == EWOULDBLOCK) {
+			schedulerWaitFd(descriptor, 0);
+			continue;
+		}
+		if (errno == EINTR) {
+			continue;
+		}
+		return -1;
+	}
 }
 
 

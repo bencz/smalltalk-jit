@@ -134,13 +134,23 @@ Block := Object [
 
 	"schedulling"
 
-	fork [
-		Error signal.
+	basicSpawn [
+		<primitive: ProcessSpawnPrimitive>
 	]
 
 
 	newProcess [
-		Error signal.
+		"Create a suspended process that will evaluate this block. Send #resume to start it."
+		^Process fromId: self basicSpawn
+	]
+
+
+	fork [
+		"Create and immediately schedule a process evaluating this block."
+		| process |
+		process := self newProcess.
+		process resume.
+		^process
 	]
 
 ]

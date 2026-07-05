@@ -16,12 +16,14 @@
 #include "GarbageCollector.h"
 #include "Entry.h"
 #include "Os.h"
+#include "Scheduler.h"
 #include "Assert.h"
 
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
 #include <math.h>
 
 typedef struct {
@@ -56,6 +58,8 @@ static PrimitiveResult streamAvailablePrimitive(Value receiver, Value descriptor
 static PrimitiveResult socketConnectPrimitive(Value socket, Value ip, Value port);
 static PrimitiveResult socketBindPrimitive(Value socket, Value ip, Value port, Value queueSize);
 static PrimitiveResult socketAcceptPrimitive(Value socket);
+static PrimitiveResult socketReadPrimitive(Value self, Value fd, Value buffer, Value size, Value start);
+static PrimitiveResult socketWritePrimitive(Value self, Value fd, Value buffer, Value size);
 static PrimitiveResult socketHostLookupPrimitive(Value class, Value vHost);
 static PrimitiveResult lastIoErrorPrimitive(Value receiver);
 static PrimitiveResult currentMicroTimePrimitive(Value receiver);
@@ -74,6 +78,13 @@ static PrimitiveResult compileMethodPrimitive(Value receiver, Value vNode, Value
 static PrimitiveResult collectGarbagePrimitive(Value receiver);
 static PrimitiveResult printHeapPrimitive(Value receiver);
 static PrimitiveResult lastGcStatsPrimitive(Value receiver);
+static PrimitiveResult processSpawnPrimitive(Value block);
+static PrimitiveResult processResumePrimitive(Value self, Value id);
+static PrimitiveResult processYieldPrimitive(Value self);
+static PrimitiveResult processTerminatePrimitive(Value self, Value id);
+static PrimitiveResult processCurrentIdPrimitive(Value self);
+static PrimitiveResult processSuspendPrimitive(Value self);
+static PrimitiveResult processSleepPrimitive(Value self, Value micros);
 static PrimitiveResult floatAddPrimitive(Value self, Value arg);
 static PrimitiveResult floatSubPrimitive(Value self, Value arg);
 static PrimitiveResult floatMulPrimitive(Value self, Value arg);
@@ -175,6 +186,8 @@ Primitive Primitives[] = {
 	{"SocketConnectPrimitive", CCALL, .cFunction = socketConnectPrimitive, 3},
 	{"SocketBindPrimitive", CCALL, .cFunction = socketBindPrimitive, 4},
 	{"SocketAcceptPrimitive", CCALL, .cFunction = socketAcceptPrimitive, 1},
+	{"SocketReadPrimitive", CCALL, .cFunction = socketReadPrimitive, 5},
+	{"SocketWritePrimitive", CCALL, .cFunction = socketWritePrimitive, 4},
 	{"SocketHostLookup", CCALL, .cFunction = socketHostLookupPrimitive, 2},
 
 	{"LastIoErrorPrimitive", CCALL, .cFunction = lastIoErrorPrimitive, 1},
@@ -186,6 +199,14 @@ Primitive Primitives[] = {
 	{"PrintHeapPrimitive", CCALL, .cFunction = printHeapPrimitive, 1},
 	{"InterruptPrimitive", GEN, generateInterruptPrimitive},
 	{"ExitPrimitive", GEN, generateExitPrimitive}, // TODO: remove replace with process primitive
+
+	{"ProcessSpawnPrimitive", CCALL, .cFunction = processSpawnPrimitive, 1},
+	{"ProcessResumePrimitive", CCALL, .cFunction = processResumePrimitive, 2},
+	{"ProcessYieldPrimitive", CCALL, .cFunction = processYieldPrimitive, 1},
+	{"ProcessTerminatePrimitive", CCALL, .cFunction = processTerminatePrimitive, 2},
+	{"ProcessCurrentIdPrimitive", CCALL, .cFunction = processCurrentIdPrimitive, 1},
+	{"ProcessSuspendPrimitive", CCALL, .cFunction = processSuspendPrimitive, 1},
+	{"ProcessSleepPrimitive", CCALL, .cFunction = processSleepPrimitive, 2},
 
 	{"ParseClassPrimitive", CCALL, .cFunction = parseClassPrimitive, 1},
 	{"ParseMethodPrimitive", CCALL, .cFunction = parseMethodPrimitive, 1},
@@ -392,6 +413,87 @@ static PrimitiveResult socketAcceptPrimitive(Value socket)
 }
 
 
+// Read up to `size` bytes into `buffer` at `start` (1-based), parking the
+// current fiber until data arrives. Returns the count read (0 == peer closed).
+// The buffer is handle-protected because the fiber may be moved by a GC while
+// parked, so its raw pointer is re-fetched on every attempt.
+static PrimitiveResult socketReadPrimitive(Value self, Value vFd, Value vBuffer, Value vSize, Value vStart)
+{
+	HandleScope scope;
+	openHandleScope(&scope);
+
+	String *buffer = scopeHandle(asObject(vBuffer));
+	int fd = (int) asCInt(vFd);
+	intptr_t size = asCInt(vSize);
+	intptr_t start = asCInt(vStart) - 1;
+
+	if (start < 0 || start >= buffer->raw->size) {
+		closeHandleScope(&scope, NULL);
+		return primFailed();
+	}
+	if (size > buffer->raw->size - start) {
+		size = buffer->raw->size - start;
+	}
+
+	ptrdiff_t n;
+	for (;;) {
+		n = read(fd, buffer->raw->contents + start, size);
+		if (n >= 0) {
+			break;
+		}
+		if (errno == EAGAIN || errno == EWOULDBLOCK) {
+			schedulerWaitFd(fd, 0);
+			continue;
+		}
+		if (errno == EINTR) {
+			continue;
+		}
+		break;
+	}
+
+	closeHandleScope(&scope, NULL);
+	return n < 0 ? primFailed() : primSuccess(tagInt(n));
+}
+
+
+// Write exactly `size` bytes from `buffer`, parking the fiber whenever the
+// socket send buffer is full. Returns the number of bytes written.
+static PrimitiveResult socketWritePrimitive(Value self, Value vFd, Value vBuffer, Value vSize)
+{
+	HandleScope scope;
+	openHandleScope(&scope);
+
+	String *buffer = scopeHandle(asObject(vBuffer));
+	int fd = (int) asCInt(vFd);
+	intptr_t size = asCInt(vSize);
+
+	if (size > buffer->raw->size) {
+		size = buffer->raw->size;
+	}
+
+	intptr_t total = 0;
+	while (total < size) {
+		ptrdiff_t n = write(fd, buffer->raw->contents + total, size - total);
+		if (n >= 0) {
+			total += n;
+			continue;
+		}
+		if (errno == EAGAIN || errno == EWOULDBLOCK) {
+			schedulerWaitFd(fd, 1);
+			continue;
+		}
+		if (errno == EINTR) {
+			continue;
+		}
+		closeHandleScope(&scope, NULL);
+		return primFailed();
+	}
+
+	closeHandleScope(&scope, NULL);
+	return primSuccess(tagInt(total));
+}
+
+
 static PrimitiveResult socketHostLookupPrimitive(Value class, Value vHost)
 {
 	HandleScope scope;
@@ -432,6 +534,62 @@ static PrimitiveResult lastIoErrorPrimitive(Value receiver)
 static PrimitiveResult currentMicroTimePrimitive(Value receiver)
 {
 	return primSuccess(tagInt(osCurrentMicroTime()));
+}
+
+
+// ---- process / scheduling primitives -------------------------------------
+
+// Create a fiber that will evaluate `block` (suspended). Returns its id.
+static PrimitiveResult processSpawnPrimitive(Value block)
+{
+	return primSuccess(tagInt((intptr_t) schedulerSpawnBlock(block)));
+}
+
+
+// Schedule a suspended fiber by id.
+static PrimitiveResult processResumePrimitive(Value self, Value id)
+{
+	schedulerResume((size_t) asCInt(id));
+	return primSuccess(self);
+}
+
+
+// Yield the CPU cooperatively; returns when scheduled again.
+static PrimitiveResult processYieldPrimitive(Value self)
+{
+	schedulerYield();
+	return primSuccess(self);
+}
+
+
+// Terminate a fiber by id. Does not return if it is the current fiber.
+static PrimitiveResult processTerminatePrimitive(Value self, Value id)
+{
+	schedulerTerminate((size_t) asCInt(id));
+	return primSuccess(self);
+}
+
+
+// Id of the currently running fiber.
+static PrimitiveResult processCurrentIdPrimitive(Value self)
+{
+	return primSuccess(tagInt((intptr_t) schedulerCurrentId()));
+}
+
+
+// Park the current fiber until it is explicitly resumed (semaphore/channel).
+static PrimitiveResult processSuspendPrimitive(Value self)
+{
+	schedulerSuspend();
+	return primSuccess(self);
+}
+
+
+// Park the current fiber for at least `micros` microseconds.
+static PrimitiveResult processSleepPrimitive(Value self, Value micros)
+{
+	schedulerSleep((int64_t) asCInt(micros));
+	return primSuccess(self);
 }
 
 

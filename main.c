@@ -3,6 +3,7 @@
 #include "vm/Entry.h"
 #include "vm/Repl.h"
 #include "vm/Thread.h"
+#include "vm/Scheduler.h"
 #include "vm/Cli.h"
 #include <unistd.h>
 #include <string.h>
@@ -11,38 +12,60 @@
 
 static void bootstrapSmalltalk(char *snapshotFileName, char *bootstrapDir);
 
+typedef struct {
+	CliArgs *cliArgs;
+	int result;
+} ProgramContext;
+
+
+// Runs the user program on the main fiber. Everything the program does
+// (compiling, evaluating, the REPL) executes as fiber #0 so that forked
+// processes can be scheduled cooperatively alongside it.
+static void runProgram(void *arg)
+{
+	ProgramContext *ctx = arg;
+	CliArgs *cliArgs = ctx->cliArgs;
+
+	if (cliArgs->error != NULL) {
+		printf(cliArgs->error, cliArgs->operand);
+		printf("\n");
+		ctx->result = EXIT_FAILURE;
+	} else if (cliArgs->printHelp) {
+		printCliHelp();
+	} else if (cliArgs->fileName != NULL) {
+		Value blockResult;
+		if (parseFileAndInitialize(cliArgs->fileName, &blockResult)) {
+			ctx->result = valueTypeOf(blockResult, VALUE_INT) ? asCInt(blockResult) : ctx->result;
+		} else {
+			ctx->result = EXIT_FAILURE;
+		}
+	} else if (cliArgs->eval != NULL) {
+		ctx->result = asCInt(evalCode(cliArgs->eval));
+	} else {
+		runRepl();
+	}
+}
+
 
 int main(int argc, char **args)
 {
 	CliArgs cliArgs;
-	int result = EXIT_SUCCESS;
+	ProgramContext ctx = { .cliArgs = &cliArgs, .result = EXIT_SUCCESS };
 
 	parseCliArgs(&cliArgs, argc, args);
 	initThread(&CurrentThread);
 	bootstrapSmalltalk(cliArgs.snapshotFileName, cliArgs.bootstrapDir);
 
-	if (cliArgs.error != NULL) {
-		printf(cliArgs.error, cliArgs.operand);
-		printf("\n");
-		result = EXIT_FAILURE;
-	} else if (cliArgs.printHelp) {
-		printCliHelp();
-	} else if (cliArgs.fileName != NULL) {
-		Value blockResult;
-		if (parseFileAndInitialize(cliArgs.fileName, &blockResult)) {
-			result = valueTypeOf(blockResult, VALUE_INT) ? asCInt(blockResult) : result;
-		} else {
-			result = EXIT_FAILURE;
-		}
-	} else if (cliArgs.eval != NULL) {
-		result = asCInt(evalCode(cliArgs.eval));
-	} else {
-		runRepl();
-	}
+	// Hand execution over to the cooperative fiber scheduler: the program runs
+	// as the first fiber and the loop keeps running until it (and any processes
+	// it forked) are done.
+	schedulerInit();
+	schedulerSpawnC(runProgram, &ctx, 0);
+	schedulerRun();
 
 	freeHandles();
 	freeThread(&CurrentThread);
-	return result;
+	return ctx.result;
 }
 
 

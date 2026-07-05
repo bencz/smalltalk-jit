@@ -24,7 +24,9 @@ Delay := Object [
 
 
 	wait [
-		<primitive: DelayWaitPrimitive>
+		"Block the current process for the configured duration."
+		Processor sleepMicroseconds: microseconds.
+		^self
 	]
 
 ]

@@ -4,6 +4,8 @@
 #include "CodeDescriptors.h"
 #include "Thread.h"
 #include "Exception.h"
+#include "Scheduler.h"
+#include "Fiber.h"
 #include <string.h>
 
 #define SCAVENGER_ALIGN 8
@@ -70,11 +72,13 @@ void scavengerScavenge(Scavenger *scavenger)
 	scavenger->fromSpace = fromSpace;
 	scavenger->toSpace = toSpace;
 
+	schedulerSyncCurrentRoots();
 	iterateRememberedSet(scavenger);
 	iterateStack(scavenger);
 	iterateExceptionHandlers(scavenger);
 	iterateHandles(scavenger);
 	iterateNativeCode(scavenger);
+	schedulerRestoreCurrentRoots();
 	scavenger->survivorEnd = scavenger->top;
 	memset(scavenger->toSpace, scavenger->size, 0);
 
@@ -91,9 +95,8 @@ _Bool scavengerIncludes(Scavenger *scavenger, uint8_t *addr)
 }
 
 
-static void iterateStack(Scavenger *scavenger)
+static void iterateStackFrames(Scavenger *scavenger, EntryStackFrame *entryFrame)
 {
-	EntryStackFrame *entryFrame = scavenger->heap->thread->stackFramesTail;
 	while (entryFrame != NULL) {
 		StackFrame *prev = entryFrame->exit;
 		StackFrame *frame = stackFrameGetParent(prev, entryFrame);
@@ -133,22 +136,77 @@ static void iterateStack(Scavenger *scavenger)
 }
 
 
-static void iterateExceptionHandlers(Scavenger *scavenger)
+static void iterateStack(Scavenger *scavenger)
 {
-	Value handlerValue = CurrentExceptionHandler;
+	if (!schedulerActive()) {
+		iterateStackFrames(scavenger, scavenger->heap->thread->stackFramesTail);
+		return;
+	}
+	size_t slots = schedulerFiberSlots();
+	for (size_t i = 0; i < slots; i++) {
+		Fiber *fiber = schedulerFiberAt(i);
+		if (fiber == NULL) {
+			continue;
+		}
+		if (valueTypeOf(fiber->entryBlock, VALUE_POINTER)) {
+			processTaggedPointer(scavenger, &fiber->entryBlock);
+		}
+		if (valueTypeOf(fiber->process, VALUE_POINTER)) {
+			processTaggedPointer(scavenger, &fiber->process);
+		}
+		iterateStackFrames(scavenger, fiber->roots.stackFramesTail);
+	}
+}
+
+
+static void iterateExceptionHandlerSlot(Scavenger *scavenger, Value *slot)
+{
+	Value handlerValue = *slot;
 
 	while (handlerValue != 0) {
 		RawExceptionHandler *handler = (RawExceptionHandler *) asObject(handlerValue);
 		RawContext *context = (RawContext *) asObject(handler->context);
 		if (contextHasValidFrame(context)) {
-			CurrentExceptionHandler = handlerValue;
+			*slot = handlerValue;
 			break;
 		}
 		handlerValue = handler->parent;
 	}
+	if (handlerValue == 0) {
+		*slot = 0;
+	}
 
-	if (CurrentExceptionHandler != 0) {
-		processTaggedPointer(scavenger, &CurrentExceptionHandler);
+	if (*slot != 0) {
+		processTaggedPointer(scavenger, slot);
+	}
+}
+
+
+static void iterateExceptionHandlers(Scavenger *scavenger)
+{
+	if (!schedulerActive()) {
+		iterateExceptionHandlerSlot(scavenger, &CurrentExceptionHandler);
+		return;
+	}
+	size_t slots = schedulerFiberSlots();
+	for (size_t i = 0; i < slots; i++) {
+		Fiber *fiber = schedulerFiberAt(i);
+		if (fiber != NULL) {
+			iterateExceptionHandlerSlot(scavenger, &fiber->roots.exceptionHandler);
+		}
+	}
+}
+
+
+static void iterateHandleScopes(Scavenger *scavenger, HandleScope *scopes)
+{
+	HandleScopeIterator handleScopeIterator;
+	initHandleScopeIterator(&handleScopeIterator, scopes);
+	while (handleScopeIteratorHasNext(&handleScopeIterator)) {
+		HandleScope *scope = handleScopeIteratorNext(&handleScopeIterator);
+		for (ptrdiff_t i = 0; i < scope->size; i++) {
+			processPointer(scavenger, &scope->handles[i].raw);
+		}
 	}
 }
 
@@ -156,23 +214,32 @@ static void iterateExceptionHandlers(Scavenger *scavenger)
 static void iterateHandles(Scavenger *scavenger)
 {
 	Thread *thread = scavenger->heap->thread;
+
+	// persistent handle list is shared across all fibers
 	HandlesIterator handlesIterator;
 	initHandlesIterator(&handlesIterator, thread->handles);
 	while (handlesIteratorHasNext(&handlesIterator)) {
 		processPointer(scavenger, &handlesIteratorNext(&handlesIterator)->raw);
 	}
 
-	HandleScopeIterator handleScopeIterator;
-	initHandleScopeIterator(&handleScopeIterator, thread->handleScopes);
-	while (handleScopeIteratorHasNext(&handleScopeIterator)) {
-		HandleScope *scope = handleScopeIteratorNext(&handleScopeIterator);
-		for (ptrdiff_t i = 0; i < scope->size; i++) {
-			processPointer(scavenger, &scope->handles[i].raw);
+	if (!schedulerActive()) {
+		iterateHandleScopes(scavenger, thread->handleScopes);
+		if (thread->context != 0) {
+			processTaggedPointer(scavenger, &thread->context);
 		}
+		return;
 	}
 
-	if (thread->context != 0) {
-		processTaggedPointer(scavenger, &thread->context);
+	size_t slots = schedulerFiberSlots();
+	for (size_t i = 0; i < slots; i++) {
+		Fiber *fiber = schedulerFiberAt(i);
+		if (fiber == NULL) {
+			continue;
+		}
+		iterateHandleScopes(scavenger, fiber->roots.handleScopes);
+		if (fiber->roots.context != 0) {
+			processTaggedPointer(scavenger, &fiber->roots.context);
+		}
 	}
 }
 
