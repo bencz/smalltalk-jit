@@ -84,6 +84,23 @@ CollectionStream := PositionableStream [
 	]
 
 
+	nextPutAll: aCollection [
+		"Bulk-append via one (primitive-backed) replaceFrom: instead of the
+		 inherited char-by-char nextPut: loop — the hot path for building HTTP
+		 responses, requests and JSON."
+		| n newEnd |
+		n := aCollection size.
+		n = 0 ifTrue: [^aCollection].
+		newEnd := position + n - 1.
+		newEnd > collection size ifTrue: [
+			collection := collection copyResized: (newEnd max: collection size * 2)].
+		collection replaceFrom: position to: newEnd with: aCollection startingAt: 1.
+		position := newEnd + 1.
+		end := end max: position.
+		^aCollection
+	]
+
+
 	atEnd [
 		^position >= end
 	]

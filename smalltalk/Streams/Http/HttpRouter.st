@@ -43,34 +43,42 @@ HttpRouter := Object [
 	"---- dispatch ----"
 
 	dispatch: aRequest [
-		| reqSegs pathMatched bindings |
+		| reqSegs pathMatched |
 		reqSegs := aRequest pathSegments.
 		pathMatched := false.
 		routes do: [:route |
-			bindings := self match: (route at: 2) against: reqSegs.
-			bindings notNil ifTrue: [
+			(self segments: (route at: 2) match: reqSegs) ifTrue: [
 				pathMatched := true.
 				(route at: 1) = aRequest method ifTrue: [
-					bindings keysAndValuesDo: [:k :v | aRequest param: k put: v ].
+					self bind: (route at: 2) from: reqSegs into: aRequest.
 					^(route at: 3) value: aRequest ] ] ].
 		pathMatched ifTrue: [ ^HttpResponse methodNotAllowed ].
 		^HttpResponse notFound
 	]
 
 
-	match: routeSegs against: reqSegs [
-		"Answer a Dictionary of bound params if the patterns match, else nil."
-		| bindings |
-		routeSegs size = reqSegs size ifFalse: [ ^nil ].
-		bindings := Dictionary new.
+	segments: routeSegs match: reqSegs [
+		"Does the route pattern match the request path? Allocation-free — a `:name`
+		 segment matches anything, other segments must be equal."
+		routeSegs size = reqSegs size ifFalse: [ ^false ].
 		1 to: routeSegs size do: [:i |
-			| rs qs |
+			| rs |
 			rs := routeSegs at: i.
-			qs := reqSegs at: i.
-			(rs size > 0 and: [ (rs at: 1) = $: ])
-				ifTrue: [ bindings at: (rs copyFrom: 2 to: rs size) put: qs ]
-				ifFalse: [ rs = qs ifFalse: [ ^nil ] ] ].
-		^bindings
+			(rs size > 0 and: [ (rs at: 1) = $: ]) ifFalse: [
+				rs = (reqSegs at: i) ifFalse: [ ^false ] ] ].
+		^true
+	]
+
+
+	bind: routeSegs from: reqSegs into: aRequest [
+		"Bind the :name params of the winning route into the request (only now,
+		 so non-matching routes and param-less routes allocate nothing)."
+		1 to: routeSegs size do: [:i |
+			| rs |
+			rs := routeSegs at: i.
+			(rs size > 0 and: [ (rs at: 1) = $: ]) ifTrue: [
+				aRequest param: (rs copyFrom: 2 to: rs size) put: (reqSegs at: i) ] ].
+		^self
 	]
 
 ]

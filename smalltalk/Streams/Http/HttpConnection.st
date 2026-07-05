@@ -6,7 +6,7 @@
  HttpClient (via HttpResponse readFrom:) to read responses."
 HttpConnection := Object [
 
-	| socket pending chunk |
+	| socket pending pos chunk |
 
 
 	class on: aSocket [
@@ -17,6 +17,9 @@ HttpConnection := Object [
 	setSocket: aSocket [
 		socket := aSocket.
 		pending := String new: 0.
+		"pos = 1-based index of the next unconsumed byte in `pending`. Parsing
+		 advances the cursor instead of re-slicing the buffer per line."
+		pos := 1.
 		"one reusable read buffer per connection, so the hot path allocates
 		 nothing large per request"
 		chunk := String new: 4096.
@@ -30,9 +33,12 @@ HttpConnection := Object [
 	"---- low-level buffered reads ----"
 
 	readMore [
-		"Pull one chunk from the socket into the pending buffer. Answers the
-		 number of bytes read; 0 means the peer closed the connection."
+		"Drop the already-consumed prefix, then pull one chunk from the socket.
+		 Answers the number of bytes read; 0 means the peer closed."
 		| n |
+		pos > 1 ifTrue: [
+			pending := pending copyFrom: pos to: pending size.
+			pos := 1 ].
 		n := socket directNext: 4096 into: chunk startingAt: 1.
 		n > 0 ifTrue: [ pending := pending , (chunk copyFrom: 1 to: n) ].
 		^n
@@ -41,31 +47,40 @@ HttpConnection := Object [
 
 	readLine [
 		"Answer the next CRLF- (or LF-) terminated line without its terminator,
-		 or nil if the peer closes before a full line arrives."
-		| idx line |
+		 or nil if the peer closes before a full line arrives. Scans in place
+		 from the cursor with a memchr-backed indexOfByte:."
+		| idx stop |
 		[
-			idx := pending indexOf: Character lf.
+			idx := pending indexOfByte: 10 startingAt: pos.   "LF"
 			idx > 0 ifTrue: [
-				line := pending copyFrom: 1 to: idx - 1.
-				pending := pending copyFrom: idx + 1 to: pending size.
-				(line size > 0 and: [ (line at: line size) = Character cr ])
-					ifTrue: [ line := line copyFrom: 1 to: line size - 1 ].
-				^line ].
+				stop := idx - 1.
+				(stop >= pos and: [ (pending at: stop) codePoint = 13 ])
+					ifTrue: [ stop := stop - 1 ].              "drop trailing CR"
+				^self consumeFrom: pos to: stop advancingTo: idx + 1 ].
 			self readMore = 0 ifTrue: [ ^nil ]
 		] repeat.
+	]
+
+
+	consumeFrom: start to: stop advancingTo: nextPos [
+		| line |
+		line := pending copyFrom: start to: stop.
+		pos := nextPos.
+		^line
 	]
 
 
 	readBytes: n [
 		"Answer exactly n bytes (fewer only if the peer closes early)."
 		| result |
-		[ pending size < n ] whileTrue: [
+		[ (pending size - pos + 1) < n ] whileTrue: [
 			self readMore = 0 ifTrue: [
-				result := pending.
+				result := pending copyFrom: pos to: pending size.
 				pending := String new: 0.
+				pos := 1.
 				^result ] ].
-		result := pending copyFrom: 1 to: n.
-		pending := pending copyFrom: n + 1 to: pending size.
+		result := pending copyFrom: pos to: pos + n - 1.
+		pos := pos + n.
 		^result
 	]
 
@@ -96,7 +111,7 @@ HttpConnection := Object [
 		[
 			line := self readLine.
 			(line isNil or: [ line isEmpty ]) ifTrue: [ ^self ].
-			idx := line indexOf: $:.
+			idx := line indexOfByte: 58 startingAt: 1.   "$:"
 			idx > 0 ifTrue: [
 				request
 					setHeader: (line copyFrom: 1 to: idx - 1) trimSeparators asLowercase

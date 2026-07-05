@@ -10,9 +10,23 @@ String := ArrayedCollection [
 	]
 
 
-	"= aCollection [
+	= aCollection [
+		"memcmp fast path; falls back to the element-by-element compare for
+		 non-String operands."
 		<primitive: ArrayEqualsPrimitive>
-	]"
+		^super = aCollection
+	]
+
+
+	"scanning"
+
+	indexOfByte: anInteger startingAt: start [
+		"memchr fast path for a raw byte value (0..255); answers a 1-based index
+		 or 0. Used by the HTTP parser to find line terminators quickly."
+		<primitive: IndexOfBytePrimitive>
+		start to: self size do: [ :i | (self at: i) codePoint = anInteger ifTrue: [ ^i ] ].
+		^0
+	]
 
 
 	"converting"

@@ -12,9 +12,10 @@ HttpRequest := Object [
 
 
 	initRequest [
-		headers := Dictionary new.
-		query := Dictionary new.
-		params := Dictionary new.
+		"Only the header map is always needed. query/params stay nil until a
+		 query string or a route param actually appears — most requests have
+		 neither, so this saves two 64-slot Dictionary allocations each."
+		headers := Dictionary new: 8.
 		body := ''.
 		^self
 	]
@@ -43,6 +44,7 @@ HttpRequest := Object [
 
 
 	parseQuery: aString [
+		query isNil ifTrue: [ query := Dictionary new: 8 ].
 		(aString splitBy: $&) do: [:pair |
 			| eq |
 			eq := pair indexOf: $=.
@@ -91,9 +93,11 @@ HttpRequest := Object [
 
 
 	header: aKey [ ^headers at: aKey asLowercase ifAbsent: [ nil ] ]
-	query: aKey [ ^query at: aKey ifAbsent: [ nil ] ]
-	param: aKey [ ^params at: aKey ifAbsent: [ nil ] ]
-	param: aKey put: aValue [ params at: aKey put: aValue. ^self ]
+	query: aKey [ query isNil ifTrue: [ ^nil ]. ^query at: aKey ifAbsent: [ nil ] ]
+	param: aKey [ params isNil ifTrue: [ ^nil ]. ^params at: aKey ifAbsent: [ nil ] ]
+	param: aKey put: aValue [
+		params isNil ifTrue: [ params := Dictionary new: 8 ].
+		params at: aKey put: aValue. ^self ]
 
 
 	pathSegments [

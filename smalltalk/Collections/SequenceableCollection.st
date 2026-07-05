@@ -135,10 +135,11 @@ SequenceableCollection := Collection [
 
 
 	replaceFrom: start to: stop with: replacement startingAt: replacementStart [
-		| delta |
-
-		delta := replacementStart - start.
-		start to: stop do: [ :i | self at: i put: (replacement at: i + delta)].
+		"Bulk memmove for byte collections (String/Symbol/ByteArray); the loop is
+		 the fallback for pointer Arrays (its at:put: runs the GC write barrier)."
+		<primitive: ReplaceBytesPrimitive>
+		start to: stop do: [ :i |
+			self at: i put: (replacement at: i - start + replacementStart) ].
 	]
 
 

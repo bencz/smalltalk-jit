@@ -43,7 +43,9 @@ typedef struct {
 
 static PrimitiveResult primSuccess(Value resultValue);
 static PrimitiveResult primFailed();
-//static PrimitiveResult arrayEqualsPrimitive(Value receiver, Value operand, ErrorHandler handler);
+static PrimitiveResult arrayEqualsPrimitive(Value receiver, Value operand);
+static PrimitiveResult replaceBytesPrimitive(Value self, Value start, Value stop, Value replacement, Value replacementStart);
+static PrimitiveResult indexOfBytePrimitive(Value self, Value byte, Value start);
 static PrimitiveResult becomePrimitive(Value object, Value other);
 static PrimitiveResult contextPositionDescriptorPrimitive(Value vContext);
 static PrimitiveResult stringAsSymbolPrimitive(Value receiver);
@@ -141,7 +143,9 @@ Primitive Primitives[] = {
 
 	{"StringHashPrimitive", GEN, generateStringHashPrimitive},
 	{"StringAsSymbolPrimitive", CCALL, .cFunction = stringAsSymbolPrimitive, 1},
-	/*{"ArrayEqualsPrimitive", CCALL, .cFunction = arrayEqualsPrimitive, 3},*/
+	{"ArrayEqualsPrimitive", CCALL, .cFunction = arrayEqualsPrimitive, 2},
+	{"ReplaceBytesPrimitive", CCALL, .cFunction = replaceBytesPrimitive, 5},
+	{"IndexOfBytePrimitive", CCALL, .cFunction = indexOfBytePrimitive, 3},
 
 	{"IntLessThanPrimitive", GEN, generateIntLessThanPrimitive},
 	{"IntAddPrimitive", GEN, generateIntAddPrimitive},
@@ -262,26 +266,86 @@ static PrimitiveResult primFailed()
 }
 
 
-/*static Value arrayEqualsPrimitive(Value receiver, Value operand)
+// Byte-collection equality via memcmp (String/Symbol/ByteArray). Fails for
+// non-byte or mixed-class operands so the Smalltalk `=` loop handles them (a
+// pointer Array's `=` compares elements by value, not by identity — memcmp
+// would be wrong there).
+static PrimitiveResult arrayEqualsPrimitive(Value receiver, Value operand)
 {
-	RawIndexedObject *obj1 = (RawIndexedObject *) asObject(receiver);
-	RawIndexedObject *obj2 = (RawIndexedObject *) asObject(operand);
-
-	if (obj1->class != obj2->class || obj1->size != obj2->size) {
-		return getTaggedPtr(Handles.false);
+	if (!valueTypeOf(operand, VALUE_POINTER)) {
+		return primFailed();
 	}
-
-	InstanceShape shape = obj1->class->instanceShape;
-	if (!shape.isIndexed) {
-		handler(receiver, operand);
+	RawObject *a = asObject(receiver);
+	RawObject *b = asObject(operand);
+	if (!a->class->instanceShape.isBytes) {
+		return primFailed();
 	}
+	if (a->class != b->class) {
+		return primFailed();
+	}
+	size_t sizeA = rawObjectSize(a);
+	if (sizeA != rawObjectSize(b)) {
+		return primSuccess(getTaggedPtr(Handles.false));
+	}
+	_Bool equal = memcmp(getRawObjectIndexedVars(a), getRawObjectIndexedVars(b), sizeA) == 0;
+	return primSuccess(getTaggedPtr(equal ? Handles.true : Handles.false));
+}
 
-	return asBool(memcmp(
-		getObjectIndexedVars((Object *) obj1),
-		getObjectIndexedVars((Object *) obj2),
-		obj1->size * (shape.isBytes ? 1 : sizeof(Value))
-	) == 0);
-}*/
+
+// Bulk memmove for `replaceFrom: start to: stop with: repl startingAt: repStart`
+// when both receiver and replacement are byte-shaped (String/Symbol/ByteArray).
+// Fails otherwise so the Smalltalk per-element loop (which runs the write barrier
+// for pointer Arrays) takes over.
+static PrimitiveResult replaceBytesPrimitive(Value vSelf, Value vStart, Value vStop, Value vRepl, Value vRepStart)
+{
+	if (!valueTypeOf(vRepl, VALUE_POINTER)) {
+		return primFailed();
+	}
+	RawObject *self = asObject(vSelf);
+	RawObject *repl = asObject(vRepl);
+	if (!self->class->instanceShape.isBytes || !repl->class->instanceShape.isBytes) {
+		return primFailed();
+	}
+	intptr_t start = asCInt(vStart);
+	intptr_t stop = asCInt(vStop);
+	intptr_t repStart = asCInt(vRepStart);
+	intptr_t count = stop - start + 1;
+	if (count <= 0) {
+		return primSuccess(vSelf);
+	}
+	intptr_t selfSize = (intptr_t) rawObjectSize(self);
+	intptr_t replSize = (intptr_t) rawObjectSize(repl);
+	if (start < 1 || stop > selfSize || repStart < 1 || repStart + count - 1 > replSize) {
+		return primFailed();
+	}
+	memmove(getRawObjectIndexedVars(self) + (start - 1),
+	        getRawObjectIndexedVars(repl) + (repStart - 1),
+	        (size_t) count);
+	return primSuccess(vSelf);
+}
+
+
+// memchr for a byte value (0..255) in a byte-shaped collection, starting at a
+// 1-based index. Answers the 1-based index or 0.
+static PrimitiveResult indexOfBytePrimitive(Value vSelf, Value vByte, Value vStart)
+{
+	RawObject *self = asObject(vSelf);
+	if (!self->class->instanceShape.isBytes) {
+		return primFailed();
+	}
+	intptr_t byte = asCInt(vByte);
+	intptr_t start = asCInt(vStart);
+	intptr_t size = (intptr_t) rawObjectSize(self);
+	if (byte < 0 || byte > 255 || start > size) {
+		return primSuccess(tagInt(0));
+	}
+	if (start < 1) {
+		start = 1;
+	}
+	uint8_t *data = getRawObjectIndexedVars(self);
+	uint8_t *found = memchr(data + (start - 1), (int) byte, (size_t) (size - (start - 1)));
+	return primSuccess(tagInt(found == NULL ? 0 : (intptr_t) (found - data) + 1));
+}
 
 
 static PrimitiveResult becomePrimitive(Value object, Value other)
