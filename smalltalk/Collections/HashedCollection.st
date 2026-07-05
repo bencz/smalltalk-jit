@@ -76,11 +76,21 @@ HashedCollection := Collection [
 	"removing"
 
 	remove: anObject ifAbsent: aBlock [
-		| index |
+		| index size item |
 
 		index := self findIndex: anObject ifAbsent: [^aBlock value].
+		size := contents size.
 		contents at: index put: nil.
 		tally := tally - 1.
+
+		"Linear probing: rehash the rest of this contiguous cluster so no probe
+		 chain is left with a hole (which would orphan later entries)."
+		index := index == size ifTrue: [1] ifFalse: [index + 1].
+		[ (item := contents at: index) notNil ] whileTrue: [
+			contents at: index put: nil.
+			tally := tally - 1.
+			self add: item.
+			index := index == size ifTrue: [1] ifFalse: [index + 1] ].
 		"TODO: shrink contents array?"
 		^anObject
 	]

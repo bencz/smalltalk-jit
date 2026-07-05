@@ -283,6 +283,17 @@ static _Bool parseKernelFiles(char *kernelDir)
 		"Streams/ServerSocket.st",
 		"Streams/InternetAddress.st",
 
+		// general-purpose JSON codec (used by the HTTP framework, but standalone)
+		"Json.st",
+
+		// HTTP framework (server + client) on top of the non-blocking sockets
+		"Streams/Http/HttpRequest.st",
+		"Streams/Http/HttpConnection.st",
+		"Streams/Http/HttpResponse.st",
+		"Streams/Http/HttpRouter.st",
+		"Streams/Http/HttpServer.st",
+		"Streams/Http/HttpClient.st",
+
 		"GarbageCollector.st",
 
 		// scheduling kernel

@@ -103,13 +103,25 @@ Dictionary := HashedCollection [
 
 
 	removeKey: anObject ifAbsent: aBlock [
-		| index assoc |
+		| index size value slot |
 
 		index := self findIndex: anObject ifAbsent: [^aBlock value].
-		assoc := contents at: index.
+		size := contents size.
+		value := (contents at: index) value.
 		contents at: index put: nil.
 		tally := tally - 1.
-		^assoc value
+
+		"Open addressing with linear probing: clearing a slot must not leave a
+		 hole in the middle of a probe chain, or entries beyond it become
+		 unreachable. Rehash the rest of this contiguous cluster."
+		index := index == size ifTrue: [1] ifFalse: [index + 1].
+		[ (slot := contents at: index) notNil ] whileTrue: [
+			contents at: index put: nil.
+			tally := tally - 1.
+			self add: slot.
+			index := index == size ifTrue: [1] ifFalse: [index + 1] ].
+
+		^value
 	]
 
 

@@ -60,6 +60,7 @@ static PrimitiveResult socketBindPrimitive(Value socket, Value ip, Value port, V
 static PrimitiveResult socketAcceptPrimitive(Value socket);
 static PrimitiveResult socketReadPrimitive(Value self, Value fd, Value buffer, Value size, Value start);
 static PrimitiveResult socketWritePrimitive(Value self, Value fd, Value buffer, Value size);
+static PrimitiveResult socketSetNoDelayPrimitive(Value self, Value fd);
 static PrimitiveResult socketHostLookupPrimitive(Value class, Value vHost);
 static PrimitiveResult lastIoErrorPrimitive(Value receiver);
 static PrimitiveResult currentMicroTimePrimitive(Value receiver);
@@ -188,6 +189,7 @@ Primitive Primitives[] = {
 	{"SocketAcceptPrimitive", CCALL, .cFunction = socketAcceptPrimitive, 1},
 	{"SocketReadPrimitive", CCALL, .cFunction = socketReadPrimitive, 5},
 	{"SocketWritePrimitive", CCALL, .cFunction = socketWritePrimitive, 4},
+	{"SocketSetNoDelayPrimitive", CCALL, .cFunction = socketSetNoDelayPrimitive, 2},
 	{"SocketHostLookup", CCALL, .cFunction = socketHostLookupPrimitive, 2},
 
 	{"LastIoErrorPrimitive", CCALL, .cFunction = lastIoErrorPrimitive, 1},
@@ -410,6 +412,15 @@ static PrimitiveResult socketAcceptPrimitive(Value socket)
 	RawServerSocket *server = (RawServerSocket *) asObject(socket);
 	int descriptor = socketAccept(asCInt(server->descriptor));
 	return descriptor < 0 ? primFailed() : primSuccess(tagInt(descriptor));
+}
+
+
+// Explicitly disable Nagle on a descriptor. Connected/accepted sockets already
+// get this automatically; this primitive is for explicit control from Smalltalk.
+static PrimitiveResult socketSetNoDelayPrimitive(Value self, Value vFd)
+{
+	socketSetNoDelay((int) asCInt(vFd));
+	return primSuccess(self);
 }
 
 

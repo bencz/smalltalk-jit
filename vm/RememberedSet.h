@@ -36,14 +36,19 @@ static void initRememberedSet(RememberedSet *rememberedSet)
 
 static void rememberedSetAdd(RememberedSet *rememberedSet, RawObject *object)
 {
+	// Grow BEFORE writing when the head block is full, so the store is always in
+	// bounds. (A grow-AFTER-write scheme corrupts the C heap the moment the head
+	// is ever observed full on entry, because the store has already run.) Every
+	// remembered-set writer — the C barrier, the scavenger, and the JIT barrier
+	// (generateStoreCheck) — funnels through here so the invariant holds.
 	RememberedSetBlock *block = rememberedSet->blocks;
-	ASSERT(block->current < block->end);
+	if (block->current >= block->end) {
+		rememberedSetGrow(rememberedSet);
+		block = rememberedSet->blocks;
+	}
 	ASSERT((object->tags & TAG_REMEMBERED) == 0);
 	object->tags |= TAG_REMEMBERED;
 	*block->current++ = tagPtr(object);
-	if (block->current == block->end) {
-		rememberedSetGrow(rememberedSet);
-	}
 }
 
 

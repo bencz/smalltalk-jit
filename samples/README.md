@@ -71,6 +71,33 @@ done
 | `09_chain_of_responsibility.st` | **Chain of Responsibility** — a support-desk escalation chain |
 | `10_game_of_life.st`            | Conway's **Game of Life** — a glider walking the grid |
 
+## Concurrency & networking (`samples/concurrency/`)
+
+Cooperative green threads (fibers) on a single OS thread, with an epoll-backed
+scheduler, channels, an actor layer, and non-blocking sockets.
+
+| File | Shows |
+|------|-------|
+| `01_channels.st`            | **Channels** — a worker pool and a producer→filter→printer pipeline |
+| `02_actors_intro.st`        | **Actors** — a bank-account actor and "let it crash" supervision |
+| `03_user_registry.st`       | **Actors** — a registry that spawns/supervises one actor per user |
+| `04_webserver.st`           | Non-blocking **sockets** — a tiny concurrent HTTP server + clients |
+| `05_business_card_api.st`   | **HTTP + actors** — a business-card API (users and cards are actors, each card counts its views), driven by an in-VM client with a throughput burst |
+| `06_business_card_server.st`| The same API as a **standalone server** bound to `0.0.0.0:8080`, seeded with one card; hammer it with `curl`, `ab -k -n 50000 -c 200`, or `wrk` |
+
+The HTTP server, client and JSON codec used by 05/06 live in the kernel
+(`smalltalk/Streams/Http/*.st` and `smalltalk/Json.st`), so they are reusable
+building blocks, not just sample code:
+
+```smalltalk
+server := HttpServer port: 8080.
+server get: '/cards/:id' do: [:req | (HttpResponse ok) json: aDictionary ].
+server start.
+
+client := HttpClient on: (InternetAddress lookup: '127.0.0.1') port: 8080.
+(client get: '/cards/1') jsonBody printNl.
+```
+
 ## Notes for writing your own samples
 
 A few things specific to this VM that are worth knowing:

@@ -17,6 +17,7 @@ typedef struct {
 OBJECT_HANDLE(InternetAddress);
 
 void socketSetNonBlocking(int descriptor);
+void socketSetNoDelay(int descriptor);
 int socketConnect(uint32_t ip, uint16_t port);
 int socketBind(uint32_t ip, uint16_t port, int backlog);
 int socketAccept(int descriptor);

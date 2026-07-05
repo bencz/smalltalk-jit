@@ -69,14 +69,27 @@ uint8_t *freeListTryAllocate(FreeList *freeList, size_t size)
 		}
 	}
 
+	// The oversized bin holds free spaces of DIFFERENT sizes, so we must split
+	// the one the scan actually found — not the head of the list — and unlink it
+	// in place.
+	FreeSpace *prev = NULL;
 	FreeSpace *freeSpace = freeList->freeSpaces[FREE_LIST_SIZE];
 	while (freeSpace != NULL) {
 		if (freeSpace->size >= size) {
 #if FREE_LIST_COLLECT_STATS
 			freeList->stats.fallbackAllocs++;
 #endif
-			return (uint8_t *) popAndSplitFreeSpace(freeList, FREE_LIST_SIZE, size);
+			if (prev == NULL) {
+				freeList->freeSpaces[FREE_LIST_SIZE] = freeSpace->next;
+			} else {
+				prev->next = freeSpace->next;
+			}
+			if (freeList->freeSpaces[FREE_LIST_SIZE] == NULL) {
+				freeList->freeMap[FREE_LIST_SIZE / 8] &= ~(1 << (FREE_LIST_SIZE % 8));
+			}
+			return (uint8_t *) splitFreeSpace(freeList, freeSpace, size);
 		}
+		prev = freeSpace;
 		freeSpace = freeSpace->next;
 	}
 
@@ -134,10 +147,14 @@ static FreeSpace *popAndSplitFreeSpace(FreeList *freeList, ptrdiff_t index, size
 
 static FreeSpace *splitFreeSpace(FreeList *freeList, FreeSpace *freeSpace, size_t size)
 {
-	ASSERT(freeSpace->size > size);
+	ASSERT(freeSpace->size >= size);
 	//ASSERT(pageSpaceIncludes(&_Heap.oldSpace, (uint8_t *) freeSpace)
 	//	|| pageSpaceIncludes(&_Heap.execSpace, (uint8_t *) freeSpace));
 	size_t newSize = freeSpace->size - size;
+	// Exact fit: nothing left over to return to the free list.
+	if (newSize == 0) {
+		return freeSpace;
+	}
 	FreeSpace *newFreeSpace = createFreeSpace((uint8_t *) freeSpace + size, newSize);
 	freeListAddFreeSpace(freeList, newFreeSpace);
 	return freeSpace;

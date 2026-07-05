@@ -365,58 +365,56 @@ void generateStoreCheck(CodeGenerator *generator, Register object, Register valu
 	ASSERT(object != TMP && value != TMP);
 	MemoryOperand tags = asmMem(object, NO_REGISTER, SS_1, varOffset(RawObject, tags));
 	AssemblerBuffer *buffer = &generator->buffer;
-	AssemblerLabel newObject;
-	AssemblerLabel alreadyInSet;
+	// Each AssemblerLabel supports a single forward reference, so every jump
+	// needs its own label; the skips are all bound to the exit point below.
+	AssemblerLabel objectIsNew;
 	AssemblerLabel valueIsNotPtr;
 	AssemblerLabel valueIsOld;
-	AssemblerLabel dontGrow;
+	AssemblerLabel alreadyInSet;
+	AssemblerLabel notFull;
 
-	asmInitLabel(&newObject);
-	asmInitLabel(&alreadyInSet);
+	asmInitLabel(&objectIsNew);
 	asmInitLabel(&valueIsNotPtr);
 	asmInitLabel(&valueIsOld);
-	asmInitLabel(&dontGrow);
+	asmInitLabel(&alreadyInSet);
+	asmInitLabel(&notFull);
 
 	ptrdiff_t rememberedSetOffset = offsetof(Thread, heap) + offsetof(Heap, rememberedSet);
 	ptrdiff_t blocksOffset = rememberedSetOffset + offsetof(RememberedSet, blocks);
+	MemoryOperand blockCurrent = asmMem(TMP, NO_REGISTER, SS_1, offsetof(RememberedSetBlock, current));
+	MemoryOperand blockEnd = asmMem(TMP, NO_REGISTER, SS_1, offsetof(RememberedSetBlock, end));
 
-	// test if object is new object
-	asmTestqImm(buffer, object, NEW_SPACE_TAG);
-	asmJ(buffer, COND_NOT_ZERO, &newObject);
-
-	// test if value is object
-	asmTestqImm(buffer, value, VALUE_POINTER);
+	// Fast-path skips: only an old object gaining a pointer to a young object
+	// that is not already remembered needs recording.
+	asmTestqImm(buffer, object, NEW_SPACE_TAG);   // object is young -> nothing to do
+	asmJ(buffer, COND_NOT_ZERO, &objectIsNew);
+	asmTestqImm(buffer, value, VALUE_POINTER);    // value is not a pointer
 	asmJ(buffer, COND_ZERO, &valueIsNotPtr);
-
-	// test if value is old object
-	asmTestqImm(buffer, value, NEW_SPACE_TAG);
+	asmTestqImm(buffer, value, NEW_SPACE_TAG);    // value is old
 	asmJ(buffer, COND_ZERO, &valueIsOld);
-
-	// test if object is already remembered
-	asmTestbMemImm(buffer, tags, TAG_REMEMBERED);
+	asmTestbMemImm(buffer, tags, TAG_REMEMBERED); // object already remembered
 	asmJ(buffer, COND_NOT_ZERO, &alreadyInSet);
 
 	// mark as remembered
 	asmOrbMemImm(buffer, tags, TAG_REMEMBERED);
 
-	// load thread
+	// TMP = remembered set head block
 	asmMovqMem(buffer, asmMem(CTX, NO_REGISTER, SS_1, varOffset(RawContext, thread)), TMP);
-	// load current block
 	asmMovqMem(buffer, asmMem(TMP, NO_REGISTER, SS_1, blocksOffset), TMP);
 
-	// store object in remembered set
-	asmAddqMemImm(buffer, asmMem(TMP, NO_REGISTER, SS_1, offsetof(RememberedSetBlock, current)), sizeof(intptr_t));
-	asmMovqMem(buffer, asmMem(TMP, NO_REGISTER, SS_1, offsetof(RememberedSetBlock, current)), TMP);
-	asmMovqToMem(buffer, object, asmMem(TMP, NO_REGISTER, SS_1, -sizeof(intptr_t)));
+	// Grow BEFORE the store when the block is full (current >= end), so the store
+	// is always in bounds. `cmp end, [current]` leaves end > current (room) as
+	// COND_ABOVE. (RAX is only a scratch for `end`; push/pop keeps it intact even
+	// if object/value happen to live in it.) Growing AFTER the store — as the old
+	// inline code did on a mis-read condition — writes one slot past objects[]
+	// and corrupts the C heap under sustained load.
+	asmPushq(buffer, RAX);
+	asmMovqMem(buffer, blockEnd, RAX);              // RAX = block->end
+	asmCmpqMem(buffer, blockCurrent, RAX);          // compare end with block->current
+	asmPopq(buffer, RAX);
+	asmJ(buffer, COND_ABOVE, &notFull);             // end > current -> room, skip grow
 
-	// test if remembered set block is full
-	asmPushq(buffer, object);
-	asmMovqMem(buffer, asmMem(TMP, NO_REGISTER, SS_1, offsetof(RememberedSetBlock, end)), object);
-	asmCmpqMem(buffer, asmMem(TMP, NO_REGISTER, SS_1, offsetof(RememberedSetBlock, current)), object);
-	asmPopq(buffer, object);
-	asmJ(buffer, COND_EQUAL, &dontGrow);
-
-	// grow remembered set
+	// grow (rare: once per 1024 remembered objects) via the C helper, then reload
 	asmPushq(buffer, RAX);
 	asmPushq(buffer, RCX);
 	asmPushq(buffer, RDX);
@@ -424,15 +422,11 @@ void generateStoreCheck(CodeGenerator *generator, Register object, Register valu
 	asmPushq(buffer, RDI);
 	asmPushq(buffer, R8);
 	asmPushq(buffer, R9);
-	asmPushq(buffer, R10);
 	asmPushq(buffer, R11);
-	// load thread
 	asmMovqMem(buffer, asmMem(CTX, NO_REGISTER, SS_1, varOffset(RawContext, thread)), TMP);
-	// load remembered set
 	asmLeaq(buffer, asmMem(TMP, NO_REGISTER, SS_1, rememberedSetOffset), RDI);
 	generateCCall(generator, (intptr_t) rememberedSetGrow, 1, 0);
 	asmPopq(buffer, R11);
-	asmPopq(buffer, R10);
 	asmPopq(buffer, R9);
 	asmPopq(buffer, R8);
 	asmPopq(buffer, RDI);
@@ -440,12 +434,20 @@ void generateStoreCheck(CodeGenerator *generator, Register object, Register valu
 	asmPopq(buffer, RDX);
 	asmPopq(buffer, RCX);
 	asmPopq(buffer, RAX);
+	asmMovqMem(buffer, asmMem(CTX, NO_REGISTER, SS_1, varOffset(RawContext, thread)), TMP);
+	asmMovqMem(buffer, asmMem(TMP, NO_REGISTER, SS_1, blocksOffset), TMP);
 
-	asmLabelBind(buffer, &dontGrow, asmOffset(buffer));
-	asmLabelBind(buffer, &newObject, asmOffset(buffer));
-	asmLabelBind(buffer, &alreadyInSet, asmOffset(buffer));
+	asmLabelBind(buffer, &notFull, asmOffset(buffer));
+	// store: advance block->current in memory, then write object at the old slot.
+	// Uses only TMP as scratch (never `object`/`value`, which may alias).
+	asmAddqMemImm(buffer, blockCurrent, sizeof(intptr_t));  // block->current += 8
+	asmMovqMem(buffer, blockCurrent, TMP);          // TMP = block->current (advanced)
+	asmMovqToMem(buffer, object, asmMem(TMP, NO_REGISTER, SS_1, -(ptrdiff_t) sizeof(intptr_t)));  // *(current-8) = object
+
+	asmLabelBind(buffer, &objectIsNew, asmOffset(buffer));
 	asmLabelBind(buffer, &valueIsNotPtr, asmOffset(buffer));
 	asmLabelBind(buffer, &valueIsOld, asmOffset(buffer));
+	asmLabelBind(buffer, &alreadyInSet, asmOffset(buffer));
 }
 
 

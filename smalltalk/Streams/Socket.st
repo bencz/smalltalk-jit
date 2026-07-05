@@ -33,6 +33,13 @@ Socket := ExternalStream [
 	]
 
 
+	class setNoDelay: descriptor [
+		"Disable Nagle's algorithm. Connected/accepted sockets get this
+		 automatically; kept here for explicit control."
+		<primitive: SocketSetNoDelayPrimitive>
+	]
+
+
 	"accessing private"
 
 	directNext: anInteger into: aCollection startingAt: start [

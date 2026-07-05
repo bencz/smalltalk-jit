@@ -3,6 +3,7 @@
 #include "Assert.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <netdb.h>
 #include <unistd.h>
 #include <string.h>
@@ -21,6 +22,15 @@ void socketSetNonBlocking(int descriptor)
 }
 
 
+// Disable Nagle's algorithm so small HTTP responses are sent immediately instead
+// of being coalesced. Applied automatically to every connected/accepted socket.
+void socketSetNoDelay(int descriptor)
+{
+	int one = 1;
+	setsockopt(descriptor, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+}
+
+
 int socketConnect(uint32_t ip, uint16_t port)
 {
 	int descriptor = socket(AF_INET, SOCK_STREAM, 0);
@@ -30,6 +40,7 @@ int socketConnect(uint32_t ip, uint16_t port)
 		return -1;
 	}
 	socketSetNonBlocking(descriptor);
+	socketSetNoDelay(descriptor);
 
 	address.sin_family = AF_INET;
 	address.sin_port = htons(port);
@@ -93,6 +104,7 @@ int socketAccept(int descriptor)
 		int client = accept(descriptor, NULL, 0);
 		if (client >= 0) {
 			socketSetNonBlocking(client);
+			socketSetNoDelay(client);
 			return client;
 		}
 		if (errno == EAGAIN || errno == EWOULDBLOCK) {

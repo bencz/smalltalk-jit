@@ -126,7 +126,11 @@ ExternalStream := BufferedStream [
 	"closing"
 
 	close [
+		"Idempotent: closing an already-closed stream (e.g. when the finalizer
+		 runs after an explicit close) must not re-close a stale descriptor."
+		descriptor isNil ifTrue: [ ^self ].
 		self class close: descriptor.
+		descriptor := nil.
 	]
 
 
