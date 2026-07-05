@@ -284,12 +284,27 @@ static _Bool parseKernelFiles(char *kernelDir)
 		"Streams/InternetAddress.st",
 
 		"GarbageCollector.st",
+
+		// scheduling kernel
 		"Processes/ProcessorScheduler.st",
 		"Processes/Process.st",
-		"Processes/Semaphore.st",
-		"Processes/Channel.st",
-		"Processes/Actor.st",
 		"Processes/Delay.st",
+
+		// synchronisation primitives
+		"Concurrency/Semaphore.st",
+		"Concurrency/Channel.st",
+
+		// actor framework (ProtoActor-style)
+		"Actors/SystemMessages.st",
+		"Actors/Pid.st",
+		"Actors/Mailbox.st",
+		"Actors/Actor.st",
+		"Actors/Supervision.st",
+		"Actors/Props.st",
+		"Actors/ActorContext.st",
+		"Actors/Future.st",
+		"Actors/DeadLetters.st",
+		"Actors/ActorSystem.st",
 
 		"Exception.st",
 		"Error.st",
