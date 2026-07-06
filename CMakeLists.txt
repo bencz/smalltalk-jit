@@ -35,6 +35,7 @@ set(vmSources
 	vm/GarbageCollector.c
 	vm/Handle.c
 	vm/Isolate.c
+	vm/Message.c
 	vm/Heap.c
 	vm/HeapPage.c
 	vm/Iterator.c

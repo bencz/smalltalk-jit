@@ -129,6 +129,44 @@ Value evalCode(char *source)
 }
 
 
+// Like evalCode, but RETURNS the doit's result value (rooted in the caller's
+// handle scope) instead of printing it — for C callers that need the object.
+Value evalObject(char *source)
+{
+	HandleScope scope;
+	openHandleScope(&scope);
+
+	size_t sourceSize = strlen(source);
+	char *eval = malloc(sourceSize + 7);
+	memcpy(eval, "eval[", 5);
+	memcpy(eval + 5, source, sourceSize);
+	eval[sourceSize + 5] = ']';
+	eval[sourceSize + 6] = '\0';
+
+	Parser parser;
+	initParser(&parser, asString(eval));
+	MethodNode *node = parseMethod(&parser);
+	Value result = tagInt(0);
+	if (node != NULL) {
+		patchMethodNode(node);
+		Object *method = compileMethod(node, Handles.UndefinedObject);
+		if (method->raw->class == Handles.CompiledMethod->raw) {
+			EntryArgs args = { .size = 0 };
+			entryArgsAddObject(&args, Handles.nil);
+			result = invokeMethod((CompiledMethod *) method, &args);
+		}
+	}
+	freeParser(&parser);
+	free(eval);
+
+	if (valueTypeOf(result, VALUE_POINTER)) {
+		return getTaggedPtr(closeHandleScope(&scope, scopeHandle(asObject(result))));
+	}
+	closeHandleScope(&scope, NULL);
+	return result;
+}
+
+
 static void patchMethodNode(MethodNode *method)
 {
 	OrderedCollection *expressions = blockNodeGetExpressions(methodNodeGetBody(method));

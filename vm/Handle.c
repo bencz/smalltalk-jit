@@ -15,6 +15,9 @@ void freeHandle(void *handle)
 	} else {
 		CurrentThread.handles = p->next;
 	}
+	if (p->next != NULL) {
+		p->next->prev = p->prev; // maintain both directions
+	}
 	free(handle);
 }
 

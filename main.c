@@ -5,6 +5,7 @@
 #include "vm/Thread.h"
 #include "vm/Scheduler.h"
 #include "vm/Isolate.h"
+#include "vm/Message.h"
 #include "vm/Cli.h"
 #include <unistd.h>
 #include <string.h>
@@ -48,6 +49,12 @@ static void runProgram(void *arg)
 }
 
 
+static void runMessageTest(void *arg)
+{
+	*(int *) arg = messageSelfTest();
+}
+
+
 int main(int argc, char **args)
 {
 	CliArgs cliArgs;
@@ -58,6 +65,19 @@ int main(int argc, char **args)
 	// Phase 2 transport self-test (C-level): ST_TRANSPORT_TEST=1 ./st
 	if (getenv("ST_TRANSPORT_TEST") != NULL) {
 		return isolateTransportSelfTest();
+	}
+
+	// Phase 2 message-serializer self-test (needs the image): ST_MESSAGE_TEST=1 -s snap
+	if (getenv("ST_MESSAGE_TEST") != NULL) {
+		initThread(&CurrentThread);
+		bootstrapSmalltalk(cliArgs.snapshotFileName, cliArgs.bootstrapDir);
+		schedulerInit();
+		int msgResult = 0;
+		schedulerSpawnC(runMessageTest, &msgResult, 0);
+		schedulerRun();
+		freeHandles();
+		freeThread(&CurrentThread);
+		return msgResult;
 	}
 
 	// Multi-isolate mode (-i N): each isolate boots its own independent VM on its

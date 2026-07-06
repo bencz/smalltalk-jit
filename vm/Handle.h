@@ -174,6 +174,9 @@ static void *handle(void *object)
 	handle->object = object;
 	handle->prev = NULL;
 	handle->next = CurrentThread.handles;
+	if (handle->next != NULL) {
+		handle->next->prev = handle; // keep the list doubly-linked so freeHandle works
+	}
 	CurrentThread.handles = handle;
 	return (void *) handle;
 }
