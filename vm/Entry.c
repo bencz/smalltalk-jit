@@ -150,15 +150,19 @@ _Bool parseFileAndInitialize(char *filename, Value *lastBlockResult)
 		return 0;
 	}
 
-	Iterator iterator;
-	initOrdCollIterator(&iterator, classes, 0, 0);
-	while (iteratorHasNext(&iterator)) {
-		invokeInititalize(iteratorNextObject(&iterator));
+	// Iterate by index, re-fetching each element from the (rooted) collection.
+	// invokeInititalize / evalBlockNode run arbitrary Smalltalk code that can
+	// scavenge — a raw-pointer Iterator would dangle when the backing array moves,
+	// leaving the NEXT element a stale pointer. ordCollObjectAt re-reads the live
+	// collection and returns a fresh scope handle, so it survives GC mid-loop.
+	size_t classesSize = ordCollSize(classes);
+	for (size_t i = 0; i < classesSize; i++) {
+		invokeInititalize(ordCollObjectAt(classes, i));
 	}
 
-	initOrdCollIterator(&iterator, blocks, 0, 0);
-	while (iteratorHasNext(&iterator)) {
-		*lastBlockResult = evalBlockNode((BlockNode *) iteratorNextObject(&iterator));
+	size_t blocksSize = ordCollSize(blocks);
+	for (size_t i = 0; i < blocksSize; i++) {
+		*lastBlockResult = evalBlockNode((BlockNode *) ordCollObjectAt(blocks, i));
 	}
 
 	closeHandleScope(&scope, NULL);

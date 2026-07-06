@@ -7,7 +7,9 @@
 #include "Handle.h"
 #include "Iterator.h"
 #include "Class.h"
+#include "String.h"
 #include "Bytecodes.h"
+#include <stdlib.h>
 #include "Assert.h"
 #include <string.h>
 
@@ -216,6 +218,67 @@ static CompileError *createReadonlyVariableError(LiteralNode *node)
 }
 
 
+// A block argument to a control-flow selector is inlined (its body spliced into
+// the enclosing method) only when it is a literal block with no args and no
+// temps — see compileInlinedControlFlow in Compiler.c, which must agree.
+static _Bool isInlinableBlockNode(Object *node)
+{
+	if (node->raw->class != Handles.BlockNode->raw) {
+		return 0;
+	}
+	BlockNode *block = (BlockNode *) node;
+	return ordCollSize(blockNodeGetArgs(block)) == 0
+		&& ordCollSize(blockNodeGetTempVars(block)) == 0;
+}
+
+
+static _Bool messageIsInlinableControlFlow(MessageExpressionNode *node)
+{
+	static int enabled = -1;
+	if (enabled < 0) {
+		enabled = getenv("ST_NO_INLINE_CF") == NULL;
+	}
+	if (!enabled) {
+		return 0;
+	}
+	String *selector = messageExpressionNodeGetSelector(node);
+	if (!(stringEqualsC(selector, "ifTrue:")
+		|| stringEqualsC(selector, "ifFalse:")
+		|| stringEqualsC(selector, "ifTrue:ifFalse:")
+		|| stringEqualsC(selector, "ifFalse:ifTrue:")
+		|| stringEqualsC(selector, "and:")
+		|| stringEqualsC(selector, "or:"))) {
+		return 0;
+	}
+	Iterator it;
+	initOrdCollIterator(&it, messageExpressionNodeGetArgs(node), 0, 0);
+	while (iteratorHasNext(&it)) {
+		if (!isInlinableBlockNode(iteratorNextObject(&it))) {
+			return 0;
+		}
+	}
+	return 1;
+}
+
+
+// Analyze an inlined block's statements directly in the ENCLOSING scope so its
+// variable references resolve at the enclosing level (no context promotion, no
+// forced context). Valid only for arg-free/temp-free blocks.
+static void analyzeInlinedBlock(BlockScope *blockScope, BlockNode *node)
+{
+	blockNodeSetScope(node, blockScope);
+	Iterator iterator;
+	initOrdCollIterator(&iterator, blockNodeGetExpressions(node), 0, 0);
+	while (iteratorHasNext(&iterator)) {
+		HandleScope scope;
+		openHandleScope(&scope);
+		analyzeExpression(blockScope, (ExpressionNode *) iteratorNextObject(&iterator));
+		RETURN_IF_ERROR();
+		closeHandleScope(&scope, NULL);
+	}
+}
+
+
 static void analyzeMessageExpression(BlockScope *blockScope, MessageExpressionNode *node)
 {
 	HandleScope scope;
@@ -223,6 +286,14 @@ static void analyzeMessageExpression(BlockScope *blockScope, MessageExpressionNo
 
 	Iterator iterator;
 	initOrdCollIterator(&iterator, messageExpressionNodeGetArgs(node), 0, 0);
+	if (messageIsInlinableControlFlow(node)) {
+		while (iteratorHasNext(&iterator)) {
+			analyzeInlinedBlock(blockScope, (BlockNode *) iteratorNextObject(&iterator));
+			RETURN_IF_ERROR();
+		}
+		closeHandleScope(&scope, NULL);
+		return;
+	}
 	while (iteratorHasNext(&iterator)) {
 		analyzeLiteral(blockScope, iteratorNextObject(&iterator));
 		RETURN_IF_ERROR();

@@ -95,6 +95,31 @@ _Bool scavengerIncludes(Scavenger *scavenger, uint8_t *addr)
 }
 
 
+// Process one stackmap-live frame slot.
+//
+// A stackmap slot can legitimately still hold the prologue's nil-init value when
+// the running code has not assigned it on the path actually taken — most notably
+// the result temp of an inlined `ifTrue:ifFalse:`, which the register allocator
+// (linear-scan, control-flow-unaware) marks live from its first arm store even at
+// call sites in the *other* arm that precede any store. `nil` (and true/false)
+// are ordinary movable young objects, so once nil-init writes `nil` into such a
+// slot and a later scavenge moves `nil` without walking this (then-unmarked)
+// frame, the slot is left pointing at nil's stale location.
+//
+// A young-tagged pointer that is NOT inside the space currently being evacuated
+// is exactly that stale nil-init value (its true logical value is nil). Restore
+// the current `nil` and forward it normally, honouring the nil-init contract.
+static void scavengeStackSlot(Scavenger *scavenger, Value *value)
+{
+	RawObject *object = asObject(*value);
+	if (((uintptr_t) object & SPACE_TAG) != OLD_SPACE_TAG
+		&& !(scavenger->toSpace <= (uint8_t *) object && (uint8_t *) object <= scavenger->toSpace + scavenger->size)) {
+		*value = tagPtr(Handles.nil->raw);
+	}
+	processTaggedPointer(scavenger, value);
+}
+
+
 static void iterateStackFrames(Scavenger *scavenger, EntryStackFrame *entryFrame)
 {
 	while (entryFrame != NULL) {
@@ -110,7 +135,7 @@ static void iterateStackFrames(Scavenger *scavenger, EntryStackFrame *entryFrame
 			for (ptrdiff_t i = 0; i < argsSize; i++) {
 				Value *value = stackFrameGetArgPtr(frame, i);
 				if (valueTypeOf(*value, VALUE_POINTER)) {
-					processTaggedPointer(scavenger, value);
+					scavengeStackSlot(scavenger, value);
 				}
 			}
 
@@ -123,7 +148,7 @@ static void iterateStackFrames(Scavenger *scavenger, EntryStackFrame *entryFrame
 					Value *value = stackFrameGetSlotPtr(frame, i);
 					if (valueTypeOf(*value, VALUE_POINTER)) {
 						//ASSERT(pageSpaceIncludes(&_Heap.space, (uint8_t *) asObject(value)));
-						processTaggedPointer(scavenger, value);
+						scavengeStackSlot(scavenger, value);
 					}
 				}
 			}

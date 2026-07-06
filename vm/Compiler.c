@@ -23,6 +23,7 @@ typedef struct Compiler {
 	OrderedCollection *literals;
 	OrderedCollection *descriptors;
 	uintptr_t startLine;
+	_Bool isBlock;
 } Compiler;
 
 static void compileMethodBody(Compiler *compiler, MethodNode *node);
@@ -182,6 +183,11 @@ static void compileBody(Compiler *compiler, BlockNode *node, _Bool isBlock)
 	Operand result;
 	Iterator iterator;
 
+	// Record whether this compilation unit is a block, so an inlined conditional
+	// that contains a `^` emits an outer (non-local) return when spliced into a
+	// real block, and a plain method return when spliced into a method.
+	compiler->isBlock = isBlock;
+
 	processVariables(compiler);
 	initOrdCollIterator(&iterator, blockNodeGetExpressions(node), 0, 0);
 	while (iteratorHasNext(&iterator)) {
@@ -193,8 +199,13 @@ static void compileBody(Compiler *compiler, BlockNode *node, _Bool isBlock)
 		result.isValid = 0;
 		compileExpression(compiler, expr, returns, &result);
 		if (returns) {
-			compiler->header.outerReturns = isBlock && expressionNodeReturns(expr);
-			bytecodeReturn(&compiler->buffer, &result, compiler->header.outerReturns);
+			// Whether THIS return is a non-local (outer) return. Accumulate into the
+			// header flag rather than overwriting it: an inlined conditional compiled
+			// by compileExpression above may already have emitted an outer return and
+			// set the flag, which setupMethodToBlocks needs to keep.
+			_Bool outer = isBlock && expressionNodeReturns(expr);
+			compiler->header.outerReturns = compiler->header.outerReturns || outer;
+			bytecodeReturn(&compiler->buffer, &result, outer);
 		}
 
 		closeHandleScope(&scope, NULL);
@@ -329,8 +340,180 @@ static void compileAssigments(Compiler *compiler, OrderedCollection *assigments,
 
 static _Bool compareOperands(Operand *a, Operand *b)
 {
-	return (a->type == OPERAND_TEMP_VAR || a->type == OPERAND_CONTEXT_VAR)
-		&& a->type == b->type && a->index == b->index;
+	if (a->type != b->type) {
+		return 0;
+	}
+	if (a->type == OPERAND_TEMP_VAR) {
+		return a->index == b->index;
+	}
+	// Context vars are only the same location if BOTH index AND level match: two
+	// captured vars can share an index at different nesting levels, and treating
+	// them as equal would drop a real assignment (e.g. `a := b`).
+	if (a->type == OPERAND_CONTEXT_VAR) {
+		return a->index == b->index && a->level == b->level;
+	}
+	return 0;
+}
+
+
+// Inlined control-flow selectors (must agree with Scope.c's inline predicate).
+enum { CF_NONE = 0, CF_IF_TRUE, CF_IF_FALSE, CF_IF_TRUE_FALSE, CF_IF_FALSE_TRUE, CF_AND, CF_OR };
+
+static _Bool cfIsInlinableBlockNode(Object *node)
+{
+	if (node->raw->class != Handles.BlockNode->raw) {
+		return 0;
+	}
+	BlockNode *block = (BlockNode *) node;
+	return ordCollSize(blockNodeGetArgs(block)) == 0
+		&& ordCollSize(blockNodeGetTempVars(block)) == 0;
+}
+
+
+// Returns the control-flow kind IF this message is an inlinable conditional (a
+// control-flow selector whose every arg is an arg-free/temp-free literal block),
+// else CF_NONE. Kept in sync with Scope.c's messageIsInlinableControlFlow.
+static _Bool inlineControlFlowEnabled(void)
+{
+	static int enabled = -1;
+	if (enabled < 0) {
+		enabled = getenv("ST_NO_INLINE_CF") == NULL;
+	}
+	return enabled;
+}
+
+
+static int compileControlFlowKind(MessageExpressionNode *node)
+{
+	if (!inlineControlFlowEnabled()) {
+		return CF_NONE;
+	}
+	String *selector = messageExpressionNodeGetSelector(node);
+	int kind = CF_NONE;
+	if (stringEqualsC(selector, "ifTrue:")) kind = CF_IF_TRUE;
+	else if (stringEqualsC(selector, "ifFalse:")) kind = CF_IF_FALSE;
+	else if (stringEqualsC(selector, "ifTrue:ifFalse:")) kind = CF_IF_TRUE_FALSE;
+	else if (stringEqualsC(selector, "ifFalse:ifTrue:")) kind = CF_IF_FALSE_TRUE;
+	else if (stringEqualsC(selector, "and:")) kind = CF_AND;
+	else if (stringEqualsC(selector, "or:")) kind = CF_OR;
+	if (kind == CF_NONE) {
+		return CF_NONE;
+	}
+	Iterator it;
+	initOrdCollIterator(&it, messageExpressionNodeGetArgs(node), 0, 0);
+	while (iteratorHasNext(&it)) {
+		if (!cfIsInlinableBlockNode(iteratorNextObject(&it))) {
+			return CF_NONE;
+		}
+	}
+	return kind;
+}
+
+
+// Splice an inlined block's body into the current method: its last value is
+// stored to `result` (a valid temp/context var, or NULL if unused); an explicit
+// `^` becomes a PLAIN method return (BYTECODE_RETURN), since the block is not a
+// real closure but part of the enclosing frame.
+static void compileInlinedBlockBody(Compiler *compiler, BlockNode *block, Operand *result)
+{
+	Iterator iterator;
+	initOrdCollIterator(&iterator, blockNodeGetExpressions(block), 0, 0);
+	if (!iteratorHasNext(&iterator)) {
+		if (result != NULL) {
+			Operand nilOp = { .isValid = 1, .type = OPERAND_NIL };
+			bytecodeCopy(&compiler->buffer, &nilOp, result);
+		}
+		return;
+	}
+	while (iteratorHasNext(&iterator)) {
+		HandleScope scope;
+		openHandleScope(&scope);
+		ExpressionNode *expr = (ExpressionNode *) iteratorNextObject(&iterator);
+		_Bool isLast = !iteratorHasNext(&iterator);
+		_Bool explicitReturn = expressionNodeReturns(expr);
+		Operand exprResult;
+		exprResult.isValid = 0;
+		compileExpression(compiler, expr, explicitReturn || (isLast && result != NULL), &exprResult);
+		if (explicitReturn) {
+			// A `^` in the inlined block is a return from the ENCLOSING unit: a
+			// non-local (outer) return if that unit is a real block, else a plain
+			// method return. When it is an outer return, flag it exactly like
+			// compileBody does so setupMethodToBlocks forces the home context to be
+			// materialized (else generateOuterReturn walks a missing context).
+			if (compiler->isBlock) {
+				compiler->header.outerReturns = 1;
+				compiler->header.hasContext = 1;
+			}
+			bytecodeReturn(&compiler->buffer, &exprResult, compiler->isBlock);
+		} else if (isLast && result != NULL && !compareOperands(&exprResult, result)) {
+			bytecodeCopy(&compiler->buffer, &exprResult, result);
+		}
+		closeHandleScope(&scope, NULL);
+	}
+}
+
+
+// Emit an inlined conditional: run the true-arm if the receiver is `true`, the
+// false-arm if `false`, else send #mustBeBoolean. Each arm is either a spliced
+// block body or a constant (for and:/or:). Value (if used) lands in `result`.
+static void compileInlinedControlFlow(Compiler *compiler, Operand *receiver, int kind, OrderedCollection *args, Operand *result)
+{
+	AssemblerBuffer *buffer = &compiler->buffer;
+
+	BlockNode *blocks[2] = { NULL, NULL };
+	Iterator it;
+	initOrdCollIterator(&it, args, 0, 0);
+	for (int n = 0; n < 2 && iteratorHasNext(&it); n++) {
+		blocks[n] = (BlockNode *) iteratorNextObject(&it);
+	}
+
+	BlockNode *trueBlk = NULL, *falseBlk = NULL;
+	Operand trueConst = { .isValid = 1, .type = OPERAND_NIL };
+	Operand falseConst = { .isValid = 1, .type = OPERAND_NIL };
+	switch (kind) {
+	case CF_IF_TRUE:       trueBlk = blocks[0]; break;
+	case CF_IF_FALSE:      falseBlk = blocks[0]; break;
+	case CF_IF_TRUE_FALSE: trueBlk = blocks[0]; falseBlk = blocks[1]; break;
+	case CF_IF_FALSE_TRUE: falseBlk = blocks[0]; trueBlk = blocks[1]; break;
+	case CF_AND:           trueBlk = blocks[0]; falseConst.type = OPERAND_FALSE; break;
+	case CF_OR:            falseBlk = blocks[0]; trueConst.type = OPERAND_TRUE; break;
+	}
+
+	uint8_t trueClassIdx = ordCollAddObjectIfNotExists(compiler->literals, (Object *) Handles.True);
+	uint8_t falseClassIdx = ordCollAddObjectIfNotExists(compiler->literals, (Object *) Handles.False);
+
+	AssemblerLabel lFalse, lNotBool, lEnd1, lEnd2;
+	asmInitLabel(&lFalse);
+	asmInitLabel(&lNotBool);
+	asmInitLabel(&lEnd1);
+	asmInitLabel(&lEnd2);
+
+	// true arm: taken when the receiver IS true
+	bytecodeJumpNotMemberOf(buffer, receiver, trueClassIdx, &lFalse);
+	if (trueBlk != NULL) {
+		compileInlinedBlockBody(compiler, trueBlk, result);
+	} else if (result != NULL) {
+		bytecodeCopy(buffer, &trueConst, result);
+	}
+	bytecodeJump(buffer, &lEnd1);
+
+	// false arm: taken when the receiver IS false
+	asmLabelBind(buffer, &lFalse, asmOffset(buffer));
+	bytecodeJumpNotMemberOf(buffer, receiver, falseClassIdx, &lNotBool);
+	if (falseBlk != NULL) {
+		compileInlinedBlockBody(compiler, falseBlk, result);
+	} else if (result != NULL) {
+		bytecodeCopy(buffer, &falseConst, result);
+	}
+	bytecodeJump(buffer, &lEnd2);
+
+	// neither true nor false -> #mustBeBoolean (raises)
+	asmLabelBind(buffer, &lNotBool, asmOffset(buffer));
+	uint8_t mbbIdx = ordCollAddObjectIfNotExists(compiler->literals, (Object *) asSymbol(asString("mustBeBoolean")));
+	bytecodeSend(buffer, mbbIdx, receiver, NULL, 0);
+
+	asmLabelBind(buffer, &lEnd1, asmOffset(buffer));
+	asmLabelBind(buffer, &lEnd2, asmOffset(buffer));
 }
 
 
@@ -339,6 +522,13 @@ static void compileMessageExpression(Compiler *compiler, Operand *receiver, Mess
 	HandleScope scope;
 	openHandleScope(&scope);
 	AssemblerBuffer *buffer = &compiler->buffer;
+
+	int cfKind = compileControlFlowKind(node);
+	if (cfKind != CF_NONE) {
+		compileInlinedControlFlow(compiler, receiver, cfKind, messageExpressionNodeGetArgs(node), result);
+		closeHandleScope(&scope, NULL);
+		return;
+	}
 
 	Operand args[256];
 	Iterator iterator;

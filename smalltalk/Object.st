@@ -254,6 +254,13 @@ Object := nil [
 	]
 
 
+	mustBeBoolean [
+		"Sent by inlined conditionals (ifTrue:/and:/...) when the receiver is
+		 neither true nor false."
+		^self error: 'NonBoolean receiver: does not understand a Boolean message'
+	]
+
+
 	doesNotUnderstand: aMessage [
 		MessageNotUnderstood new
 			receiver: self;

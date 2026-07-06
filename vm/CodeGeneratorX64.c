@@ -1,3 +1,5 @@
+#include <stdio.h>
+#include <stdlib.h>
 #include "CodeGenerator.h"
 #include "AssemblerX64.h"
 #include "Object.h"
@@ -133,6 +135,18 @@ static void generatePrologue(CodeGenerator *generator, size_t frameSize)
 	asmPushq(&generator->buffer, RBP);
 	asmMovq(&generator->buffer, RSP, RBP);
 	asmSubqImm(&generator->buffer, RSP, generator->frameSize * sizeof(intptr_t));
+	// Nil-initialise the local frame slots. A temp assigned on only one arm of an
+	// inlined conditional (or otherwise not written on every path) would otherwise
+	// read as stack garbage — wrong for Smalltalk semantics, and worse, the GC
+	// stackmap can mark such a slot as a live root and the scavenger then chases the
+	// garbage. The context/return-IC slots are overwritten right after this by
+	// generateContextDefinition.
+	if (frameSize > 0) {
+		generateLoadObject(&generator->buffer, Handles.nil->raw, TMP, 1);
+		for (size_t i = 0; i < frameSize; i++) {
+			asmMovqToMem(&generator->buffer, TMP, asmMem(RBP, NO_REGISTER, SS_1, -(ptrdiff_t)(i + 1) * sizeof(intptr_t)));
+		}
+	}
 }
 
 
@@ -192,7 +206,10 @@ static void generateBody(CodeGenerator *generator)
 {
 	BytecodesIterator iterator;
 	_Bool returns = 0;
-	BytecodeLabel labels[16];
+	// One label per emitted jump (targets are resolved forward as the iterator
+	// reaches them). A jump bytecode is at least 5 bytes, so bytecodesSize is a
+	// safe upper bound on the number of jumps — allocate that many to avoid a cap.
+	BytecodeLabel *labels = malloc(sizeof(BytecodeLabel) * (generator->code.bytecodesSize + 1));
 	BytecodeLabel *currentLabel = labels;
 
 	bytecodeInitIterator(&iterator, generator->code.bytecodes, generator->code.bytecodesSize);
@@ -201,12 +218,30 @@ static void generateBody(CodeGenerator *generator)
 		openHandleScope(&scope);
 
 		ptrdiff_t offset = bytecodeOffset(&iterator);
+		_Bool isJumpTarget = 0;
 		BytecodeLabel *label = labels;
 		while (label < currentLabel) {
 			if (label->offset == offset) {
 				asmLabelBind(&generator->buffer, &label->label, asmOffset(&generator->buffer));
+				isJumpTarget = 1;
 			}
 			label++;
+		}
+		// A jump target is a control-flow merge/branch-entry: code can arrive here
+		// from a jump, so no lazily-FILLED register cache can be assumed live (an arm
+		// may have filled it on a path that a jump skipped). Drop only the caches
+		// that reload from a stable home: stack-homed vars (from their slot) and the
+		// context/assoc special vars (re-derived via fillContext/fillAssoc). A
+		// register-HOMED temp (VAR_IN_REG with no stack slot) lives in its dedicated
+		// register across the whole range and must be kept — clearing it would read
+		// an unwritten slot / nil.
+		if (isJumpTarget) {
+			for (uint8_t i = 0; i < generator->regsAlloc.varsSize; i++) {
+				Variable *v = &generator->regsAlloc.vars[i];
+				if ((v->flags & VAR_ON_STACK) || v->type != VAR_TMP) {
+					v->flags &= ~VAR_IN_REG;
+				}
+			}
 		}
 
 		Bytecode bytecode = bytecodeNext(&iterator);
@@ -227,7 +262,17 @@ static void generateBody(CodeGenerator *generator)
 
 		case BYTECODE_RETURN:
 			movOperand(generator, bytecodeNextOperand(&iterator), RAX);
-			returns = 1;
+			if (bytecodeHasNext(&iterator)) {
+				// Not in tail position (e.g. a `^` inside an inlined conditional
+				// arm): jump to the shared epilogue so following code cannot clobber
+				// RAX. Marked offset -1 and bound after the fall-through self-load.
+				currentLabel->offset = -1;
+				asmInitLabel(&currentLabel->label);
+				asmJmpLabel(&generator->buffer, &currentLabel->label);
+				currentLabel++;
+			} else {
+				returns = 1;
+			}
 			break;
 
 		case BYTECODE_OUTER_RETURN:
@@ -235,19 +280,23 @@ static void generateBody(CodeGenerator *generator)
 			generateOuterReturn(generator, &iterator);
 			break;
 
-		case BYTECODE_JUMP:
-			currentLabel->offset = bytecodeNextInt32(&iterator);
+		case BYTECODE_JUMP: {
+			// The IR stores a relative displacement (target - here - 4); recover the
+			// absolute target-bytecode offset by adding the post-read position.
+			int32_t disp = bytecodeNextInt32(&iterator);
+			currentLabel->offset = bytecodeOffset(&iterator) + disp;
 			asmInitLabel(&currentLabel->label);
 			asmJmpLabel(&generator->buffer, &currentLabel->label);
 			currentLabel++;
 			break;
+		}
 
 		case BYTECODE_JUMP_NOT_MEMBER_OF: {
 			RawObject *class = compiledCodeLiteralAt(&generator->code, bytecodeNextByte(&iterator));
 			Operand receiver = bytecodeNextOperand(&iterator);
+			int32_t disp = bytecodeNextInt32(&iterator);
 
-			asmInt3(&generator->buffer);
-			currentLabel->offset = bytecodeNextInt32(&iterator);
+			currentLabel->offset = bytecodeOffset(&iterator) + disp;
 			asmInitLabel(&currentLabel->label);
 			generateClassCheck(generator, receiver, (RawClass *) class, &currentLabel->label);
 			currentLabel++;
@@ -260,10 +309,29 @@ static void generateBody(CodeGenerator *generator)
 		closeHandleScope(&scope, NULL);
 	}
 
+	// Bind any jumps whose target is the end of the bytecode stream (e.g. an
+	// inlined conditional that is the last thing in the method): the in-loop bind
+	// only sees bytecode starts, never the one-past-the-end offset.
+	for (BytecodeLabel *label = labels; label < currentLabel; label++) {
+		if (label->offset == (ptrdiff_t) generator->code.bytecodesSize) {
+			asmLabelBind(&generator->buffer, &label->label, asmOffset(&generator->buffer));
+		}
+	}
+
 	if (!returns) {
 		ASSERT(!generator->code.isBlock);
 		movVar(generator, variableAt(generator, SELF_INDEX), RAX);
 	}
+
+	// Non-tail returns (offset -1) jump here, past the self-load, into the shared
+	// method epilogue that generateCode emits next.
+	for (BytecodeLabel *label = labels; label < currentLabel; label++) {
+		if (label->offset == -1) {
+			asmLabelBind(&generator->buffer, &label->label, asmOffset(&generator->buffer));
+		}
+	}
+
+	free(labels);
 }
 
 
@@ -298,6 +366,36 @@ static void generateCopy(CodeGenerator *generator, BytecodesIterator *iterator)
 }
 
 
+// SmallInteger selectors inlined at the call site (fast path in generateSend).
+enum { ARITH_NONE = 0, ARITH_ADD, ARITH_SUB, ARITH_MUL,
+       ARITH_LT, ARITH_LE, ARITH_GT, ARITH_GE, ARITH_EQ, ARITH_NE };
+
+static int classifyArith(RawObject *selector)
+{
+	size_t n = rawObjectSize(selector);
+	char *s = (char *) getRawObjectIndexedVars(selector);
+	if (n == 1) {
+		switch (s[0]) {
+		case '+': return ARITH_ADD;
+		case '-': return ARITH_SUB;
+		case '*': return ARITH_MUL;
+		case '<': return ARITH_LT;
+		case '>': return ARITH_GT;
+		case '=': return ARITH_EQ;
+		}
+	} else if (n == 2 && s[1] == '=') {
+		switch (s[0]) {
+		case '<': return ARITH_LE;
+		case '>': return ARITH_GE;
+		case '~': return ARITH_NE;
+		}
+	}
+	return ARITH_NONE;
+}
+
+static _Bool arithIsCompare(int kind) { return kind >= ARITH_LT; }
+
+
 // TMP: receiver
 // RDI: receiver class
 // RSI: selector
@@ -319,38 +417,76 @@ static void generateSend(CodeGenerator *generator, BytecodesIterator *iterator)
 	asmPushq(buffer, TMP);
 	generator->frameSize++;
 
+	// --- inline SmallInteger arithmetic fast path ---------------------------
+	// Operands are on the stack (receiver at [rsp], arg at [rsp+8]); if both are
+	// SmallIntegers do the tagged op inline and skip the dispatch, otherwise fall
+	// through to the normal send (which handles overflow/coercion via retry:).
+	// Uses ONLY RAX/RSI as scratch — both are re-established by the dispatch path —
+	// and leaves TMP (= receiver) untouched, so the class computation below is
+	// unaffected. Two separate tag tests avoid needing a third scratch register.
+	int arithKind = argsSize == 1 ? classifyArith(selector) : ARITH_NONE;
+	AssemblerLabel arithMerge, tagMissR, tagMissA, overflowMiss;
+	if (arithKind != ARITH_NONE) {
+		asmInitLabel(&arithMerge);
+		asmInitLabel(&tagMissR);
+		asmInitLabel(&tagMissA);
+		asmInitLabel(&overflowMiss);
+		asmMovqMem(buffer, asmMem(RSP, NO_REGISTER, SS_1, 0), RAX);                    // receiver
+		asmMovqMem(buffer, asmMem(RSP, NO_REGISTER, SS_1, sizeof(intptr_t)), RSI);     // arg
+		asmTestqImm(buffer, RAX, 3);                                                    // receiver SmallInt?
+		asmJ(buffer, COND_NOT_ZERO, &tagMissR);
+		asmTestqImm(buffer, RSI, 3);                                                    // arg SmallInt?
+		asmJ(buffer, COND_NOT_ZERO, &tagMissA);
+		switch (arithKind) {
+		case ARITH_ADD:
+			asmAddq(buffer, RSI, RAX);
+			asmJ(buffer, COND_OVERFLOW, &overflowMiss);                                 // -> LargeInteger via send
+			break;
+		case ARITH_SUB:
+			asmSubq(buffer, RSI, RAX);
+			asmJ(buffer, COND_OVERFLOW, &overflowMiss);
+			break;
+		case ARITH_MUL:
+			asmSarqImm(buffer, RAX, 2);                                                 // untag receiver -> a
+			asmImulq(buffer, RSI, RAX);                                                 // a * (b<<2) = (a*b)<<2
+			asmJ(buffer, COND_OVERFLOW, &overflowMiss);
+			break;
+		default: {   // comparisons: cmp then branch on FRESH flags (loads clobber flags)
+			AssemblerLabel cmpTrue, cmpDone;
+			uint8_t cond = arithKind == ARITH_LT ? COND_LESS
+				: arithKind == ARITH_LE ? COND_LESS_EQUAL
+				: arithKind == ARITH_GT ? COND_GREATER
+				: arithKind == ARITH_GE ? COND_GREATER_EQUAL
+				: arithKind == ARITH_EQ ? COND_EQUAL
+				: COND_NOT_EQUAL;
+			asmInitLabel(&cmpTrue);
+			asmInitLabel(&cmpDone);
+			asmCmpq(buffer, RAX, RSI);                                                  // cmp receiver, arg (receiver - arg)
+			asmJ(buffer, cond, &cmpTrue);
+			generateLoadObject(buffer, Handles.false->raw, RAX, 1);
+			asmJmpLabel(buffer, &cmpDone);
+			asmLabelBind(buffer, &cmpTrue, asmOffset(buffer));
+			generateLoadObject(buffer, Handles.true->raw, RAX, 1);
+			asmLabelBind(buffer, &cmpDone, asmOffset(buffer));
+			break;
+		}
+		}
+		asmJmpLabel(buffer, &arithMerge);
+		asmLabelBind(buffer, &tagMissR, asmOffset(buffer));
+		asmLabelBind(buffer, &tagMissA, asmOffset(buffer));
+		asmLabelBind(buffer, &overflowMiss, asmOffset(buffer));
+	}
+
 	RawClass *class = compiledCodeResolveOperandClass(&generator->code, receiver);
 	if (class != NULL) {
 		asmMovqImm(buffer, (int64_t) lookupNativeCode(class, (RawString *) selector), R11);
 	} else {
-		if (receiver.type == OPERAND_TEMP_VAR || receiver.type == OPERAND_ARG_VAR) {
-			Variable *class = specialVariableAt(generator, VAR_CLASS, receiver.index);
-			ptrdiff_t offset = class->frameOffset * sizeof(intptr_t);
-
-			if (class->reg == SPILLED_REG) {
-				if ((class->flags & VAR_ON_STACK) != 0) {
-					asmMovqMem(buffer, asmMem(RBP, NO_REGISTER, SS_1, offset), RDI);
-				} else {
-					generateLoadClass(buffer, TMP, RDI);
-					asmMovqToMem(buffer, RDI, asmMem(RBP, NO_REGISTER, SS_1, offset));
-				}
-
-			} else {
-				if ((class->flags & VAR_IN_REG) != 0) {
-
-				} else if ((class->flags & VAR_ON_STACK) != 0) {
-					asmMovqMem(buffer, asmMem(RBP, NO_REGISTER, SS_1, offset), class->reg);
-					class->flags |= VAR_IN_REG;
-				} else {
-					generateLoadClass(buffer, TMP, class->reg);
-					class->flags |= VAR_IN_REG;
-					spillVar(generator, class);
-				}
-				asmMovq(buffer, class->reg, RDI);
-			}
-		} else {
-			generateLoadClass(buffer, TMP, RDI);
-		}
+		// Always recompute the receiver's class from TMP. The old VAR_CLASS spill
+		// cache (keyed by the receiver variable) is UNSAFE once inlined control flow
+		// exists: a send inside a conditional arm would spill the class on a path
+		// that is not always taken, and a later send would read the unpopulated slot
+		// as a garbage class. Recomputing per send is a few instructions and correct.
+		generateLoadClass(buffer, TMP, RDI);
 		generateLoadObject(buffer, selector, RSI, 0);
 		generateMethodLookup(generator);
 	}
@@ -359,8 +495,25 @@ static void generateSend(CodeGenerator *generator, BytecodesIterator *iterator)
 	asmCallq(buffer, R11);
 	generateStackmap(generator);
 	ordCollAdd(generator->descriptors, createBytecodeDescriptor(asmOffset(&generator->buffer), generator->bytecodeNumber));
+	// Both the inline fast path and the dispatched call converge here (result in
+	// RAX) so they share the single arg-pop.
+	if (arithKind != ARITH_NONE) {
+		asmLabelBind(buffer, &arithMerge, asmOffset(buffer));
+	}
 	asmAddqImm(buffer, RSP, (argsSize + 1) * sizeof(intptr_t));
 	invalidateRegs(&generator->regsAlloc);
+
+	// The dispatch path above computes the receiver's class and SPILLS it to the
+	// VAR_CLASS frame slot so later sends to the same variable can reuse it. Our
+	// fast path skips that spill at runtime (it jumps straight to the merge), so
+	// the slot would be left unpopulated. Forget the cached/spilled class for this
+	// receiver so the next send recomputes it from the receiver instead of reading
+	// the stale slot.
+	if (arithKind != ARITH_NONE &&
+	    (receiver.type == OPERAND_TEMP_VAR || receiver.type == OPERAND_ARG_VAR)) {
+		Variable *classVar = specialVariableAt(generator, VAR_CLASS, receiver.index);
+		classVar->flags &= ~(VAR_ON_STACK | VAR_IN_REG);
+	}
 }
 
 
@@ -864,24 +1017,15 @@ static void generateClassCheck(CodeGenerator *generator, Operand operand, RawCla
 			asmTestqImm(buffer, var->reg, VALUE_CHAR);
 			asmJ(buffer, COND_ZERO, label);
 		} else {
-			Variable *class = specialVariableAt(generator, VAR_CLASS, operand.index);
-
-			ASSERT(class->reg != SPILLED_REG);
+			// Compute the receiver's class exactly like generateSend does
+			// (generateLoadClass: correct tag handling, tagged result) into scratch
+			// RAX, and compare to the tested class in TMP. The VAR_CLASS cache is
+			// deliberately NOT touched here — generateSend owns it and stores it in
+			// a form this path must not corrupt.
+			fillVar(generator, var);
+			generateLoadClass(buffer, var->reg, RAX);
 			generateLoadObject(buffer, (RawObject *) class, TMP, 1);
-
-			if ((class->flags & VAR_IN_REG) != 0) {
-				asmCmpq(buffer, class->reg, TMP);
-			} else if ((class->flags & VAR_ON_STACK) != 0) {
-				ptrdiff_t offset = class->frameOffset * sizeof(intptr_t);
-				asmCmpqMem(buffer, asmMem(RBP, NO_REGISTER, SS_1, offset), TMP);
-			} else {
-				fillVar(generator, var);
-				asmMovqMem(buffer, asmMem(var->reg, NO_REGISTER, SS_1, varOffset(RawObject, class)), class->reg);
-				asmIncq(buffer, class->reg);
-				class->flags |= VAR_IN_REG;
-				spillVar(generator, class);
-				asmCmpq(buffer, class->reg, TMP);
-			}
+			asmCmpq(buffer, RAX, TMP);
 			asmJ(buffer, COND_NOT_EQUAL, label);
 		}
 		break;
@@ -1007,7 +1151,11 @@ static void fillContext(CodeGenerator *generator, uint8_t level)
 	Variable *context = specialVariableAt(generator, VAR_CONTEXT, level);
 	if (context->flags & VAR_IN_REG) {
 		// nothing
-	} else if (context->flags & VAR_ON_STACK) {
+	} else if (level == 0 && (context->flags & VAR_ON_STACK)) {
+		// Only the level-0 context has a slot that is ALWAYS written (in the
+		// prologue), so it is safe to reload from the stack. An outer (level>0)
+		// context is spilled only on the path that walked it, so across control flow
+		// its slot may be unwritten — fall through and re-walk it from level 0.
 		fillVar(generator, context);
 	} else {
 		Variable *outer = specialVariableAt(generator, VAR_CONTEXT, 0);
@@ -1017,7 +1165,14 @@ static void fillContext(CodeGenerator *generator, uint8_t level)
 			outer = context;
 		}
 		context->flags |= VAR_IN_REG;
-		spillVar(generator, context);
+		// Do NOT spill an outer (level>0) context to a frame slot: it is always
+		// re-walked from level 0 (never reloaded), so a spill would only leave a
+		// conditionally-written slot that the GC stackmap scans as a bogus root. It
+		// is not a live root across a send either — invalidateRegs after each send
+		// drops the register and it is re-walked afresh.
+		if (level == 0) {
+			spillVar(generator, context);
+		}
 	}
 }
 
