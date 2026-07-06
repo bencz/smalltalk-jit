@@ -10,6 +10,7 @@
 #include "Exception.h"
 #include "Scheduler.h"
 #include "Fiber.h"
+#include <sys/mman.h>
 #include "Assert.h"
 #include <stdio.h>
 #include <inttypes.h>
@@ -32,7 +33,7 @@ static _Bool markingQueueIsEmpty(MarkingQueue *queue);
 static RawObject *markingQueuePop(MarkingQueue *queue);
 static _Bool hasFinalizer(RawObject *object);
 
-GCStats LastGCStats = { 0 };
+PER_ISOLATE GCStats LastGCStats = { 0 };
 
 
 void gcMarkRoots(Thread *thread)
@@ -274,38 +275,103 @@ static _Bool markingQueueIsEmpty(MarkingQueue *queue)
 
 void gcSweep(PageSpace *space)
 {
-	PageSpaceIterator iterator;
-	pageSpaceIteratorInit(&iterator, space);
-	RawObject *object = pageSpaceIteratorNext(&iterator);
-	RawObject *prev = NULL;
-
 	RawObject *finalize[256] = { NULL };
 	size_t finalizeSize = 0;
 
-	while (object != NULL) {
-		LastGCStats.total++;
-		if ((object->tags & (TAG_MARKED | TAG_FREESPACE)) == 0) {
-			if ((object->tags & TAG_FINALIZED) == 0 && hasFinalizer(object)) {
-				ASSERT(finalizeSize < 256); // TODO: realloc instead
-				finalize[finalizeSize++] = object;
-				object->tags = (object->tags ^ TAG_MARKED) | TAG_FINALIZED;
-				prev = object;
-			/*} else if (prev != NULL && prev->tags & TAG_FREESPACE && heapPageIncludes(iterator.page, (uint8_t *) prev)) {
-				extendFreeSpace((FreeSpace *) prev, align(computeRawObjectSize(object), HEAP_OBJECT_ALIGN));
-				LastGCStats.extended++;
-				LastGCStats.sweeped++;*/
+	// Rebuild the freelist from scratch, fully coalesced. Resetting the bins first
+	// lets a page that ends up ENTIRELY free be handed back to the OS (unmapped)
+	// instead of lingering forever: otherwise, under a concurrent server, promoted-
+	// then-dead objects keep the old-space page count — and thus every markAndSweep's
+	// scan cost — growing without bound, so throughput drifts down over time and RSS
+	// tracks the high-water mark. Consecutive dead objects / existing free chunks are
+	// coalesced into one run; `createFreeSpace` writes the header only on flush, so
+	// the mid-run objects are subsumed.
+	memset(space->freeList.freeSpaces, 0, sizeof(space->freeList.freeSpaces));
+	memset(space->freeList.freeMap, 0, sizeof(space->freeList.freeMap));
+
+	uint8_t *runStart = NULL;
+	size_t runSize = 0;
+	// Flush a coalesced run to the freelist. For a large run (in a page we are
+	// keeping) hand its interior's physical pages back to the OS with MADV_DONTNEED;
+	// the 16-byte header (and rest of its page) stays for the freelist, and the
+	// virtual mapping stays so a later split/alloc just re-faults zeroed pages.
+	#define FLUSH_RUN() do { \
+		if (runStart != NULL) { \
+			freeListAddFreeSpace(&space->freeList, createFreeSpace(runStart, runSize)); \
+			if (runSize >= 256 * 1024) { \
+				uintptr_t lo = ((uintptr_t) runStart + sizeof(FreeSpace) + 4095) & ~(uintptr_t) 4095; \
+				uintptr_t hi = ((uintptr_t) runStart + runSize) & ~(uintptr_t) 4095; \
+				if (hi > lo) madvise((void *) lo, hi - lo, MADV_DONTNEED); \
+			} \
+			runStart = NULL; runSize = 0; \
+		} \
+	} while (0)
+
+	HeapPage *prev = NULL;
+	HeapPage *page = space->pages;
+	while (page != NULL) {
+		HeapPage *nextPage = page->next;
+		uint8_t *p = (uint8_t *) align((uintptr_t) page->body, HEAP_OBJECT_ALIGN);
+		uint8_t *pageEnd = page->body + page->bodySize;
+		_Bool pageHasLive = 0;
+		runStart = NULL;
+		runSize = 0;
+
+		while (p < pageEnd) {
+			RawObject *object = (RawObject *) p;
+			LastGCStats.total++;
+			size_t objSize;
+			if ((object->tags & TAG_FREESPACE) != 0) {
+				objSize = align(((FreeSpace *) object)->size, HEAP_OBJECT_ALIGN);
 			} else {
-				freeObject(space, object);
-				prev = object;
+				objSize = align(computeRawObjectSize(object), HEAP_OBJECT_ALIGN);
+				if ((object->tags & TAG_MARKED) != 0) {
+					FLUSH_RUN();
+					object->tags = object->tags ^ TAG_MARKED;
+					pageHasLive = 1;
+					p += objSize;
+					continue;
+				}
+				if ((object->tags & TAG_FINALIZED) == 0 && hasFinalizer(object)) {
+					FLUSH_RUN();
+					ASSERT(finalizeSize < 256); // TODO: realloc instead
+					finalize[finalizeSize++] = object;
+					object->tags = (object->tags ^ TAG_MARKED) | TAG_FINALIZED;
+					pageHasLive = 1;
+					p += objSize;
+					continue;
+				}
 				LastGCStats.freed++;
 				LastGCStats.sweeped++;
 			}
-		} else {
-			object->tags = object->tags ^ TAG_MARKED;
-			prev = object;
+			// free region (existing free chunk, or an unmarked dead object): coalesce
+			if (runStart != NULL && (uint8_t *) object == runStart + runSize) {
+				runSize += objSize;
+			} else {
+				FLUSH_RUN();
+				runStart = (uint8_t *) object;
+				runSize = objSize;
+			}
+			p += objSize;
 		}
-		object = pageSpaceIteratorNext(&iterator);
+
+		// Keep the head page (it anchors the list and holds always-live kernel
+		// objects); reclaim any other page that turned out entirely free.
+		if (pageHasLive || prev == NULL) {
+			FLUSH_RUN();
+			prev = page;
+		} else {
+			runStart = NULL;
+			runSize = 0; // discard the page-spanning free run; the page is going away
+			prev->next = nextPage;
+			if (space->pagesTail == page) {
+				space->pagesTail = prev;
+			}
+			unmapHeapPage(page);
+		}
+		page = nextPage;
 	}
+	#undef FLUSH_RUN
 
 	for (size_t i = 0; i < finalizeSize; i++) {
 		HandleScope scope;

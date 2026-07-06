@@ -4,6 +4,7 @@
 #include "Object.h"
 #include "CompiledCode.h"
 #include "String.h"
+#include "Thread.h"
 #include <stdint.h>
 
 #define LOOKUP_CACHE_SIZE 4096
@@ -21,7 +22,7 @@ typedef struct {
 	uint8_t *codes[LOOKUP_CACHE_SIZE];
 } LookupTable;
 
-extern LookupTable LookupCache;
+extern PER_ISOLATE LookupTable LookupCache;
 
 NativeCodeEntry lookupNativeCode(RawClass *class, RawString *selector);
 NativeCode *getNativeCode(Class *class, CompiledMethod *method);

@@ -4,6 +4,7 @@
 #include "vm/Repl.h"
 #include "vm/Thread.h"
 #include "vm/Scheduler.h"
+#include "vm/Isolate.h"
 #include "vm/Cli.h"
 #include <unistd.h>
 #include <string.h>
@@ -53,6 +54,19 @@ int main(int argc, char **args)
 	ProgramContext ctx = { .cliArgs = &cliArgs, .result = EXIT_SUCCESS };
 
 	parseCliArgs(&cliArgs, argc, args);
+
+	// Phase 2 transport self-test (C-level): ST_TRANSPORT_TEST=1 ./st
+	if (getenv("ST_TRANSPORT_TEST") != NULL) {
+		return isolateTransportSelfTest();
+	}
+
+	// Multi-isolate mode (-i N): each isolate boots its own independent VM on its
+	// own OS thread (own heap/GC/scheduler/kernel), loading -s <snapshot> and
+	// evaluating -e <program>. The main thread just spawns and joins them.
+	if (cliArgs.isolates > 1) {
+		return isolatesRun(cliArgs.isolates, cliArgs.snapshotFileName, cliArgs.eval);
+	}
+
 	initThread(&CurrentThread);
 	bootstrapSmalltalk(cliArgs.snapshotFileName, cliArgs.bootstrapDir);
 

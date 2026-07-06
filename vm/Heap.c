@@ -26,7 +26,7 @@ static void printPageSpace(PageSpace *space);
 void initHeap(Heap *heap, struct Thread *thread)
 {
 	heap->thread = thread;
-	initScavenger(&heap->newSpace, heap, 32 * MB);
+	initScavenger(&heap->newSpace, heap, 64 * MB);
 	initPageSpace(&heap->oldSpace, 256 * KB, 0);
 	initPageSpace(&heap->execSpace, 256 * KB, 1);
 	initRememberedSet(&heap->rememberedSet);

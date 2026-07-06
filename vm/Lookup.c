@@ -11,7 +11,7 @@
 #include "Thread.h"
 #include "StackFrame.h"
 
-LookupTable LookupCache = {
+PER_ISOLATE LookupTable LookupCache = {
 	.classes = { NULL },
 	.selectors = { NULL },
 	.codes = { NULL },

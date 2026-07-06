@@ -95,7 +95,7 @@ typedef struct {
 	String *generateBacktraceSymbol;
 } SmalltalkHandles;
 
-extern SmalltalkHandles Handles;
+extern PER_ISOLATE SmalltalkHandles Handles;
 
 static void *scopeHandle(void *object);
 static void *closeHandleScope(HandleScope *scope, void *handle);

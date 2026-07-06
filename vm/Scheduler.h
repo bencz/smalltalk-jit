@@ -21,6 +21,17 @@ Fiber *schedulerSpawnC(FiberCEntry entry, void *arg, size_t stackSize);
 // runnable or pending work left. Returns the recorded exit result.
 Value schedulerRun(void);
 
+// ---- cross-isolate inbox ------------------------------------------------
+
+// Register `eventFd` (an isolate's inbox eventfd) in this scheduler's epoll set.
+// While an inbox is registered the run loop keeps blocking on events (it does not
+// exit for lack of local work), and when the fd fires it calls isolateDrainInbox.
+void schedulerRegisterInboxFd(int eventFd);
+
+// Stop keeping the loop alive for the inbox (lets schedulerRun exit once local
+// work drains). The caller should also poke the eventfd to wake the loop.
+void schedulerStopInbox(void);
+
 // ---- process operations (called from primitives, on a fiber) -------------
 
 // Create a fiber that will evaluate `block`, SUSPENDED (not scheduled).

@@ -137,7 +137,7 @@ static void generateSmalltalkEntry(CodeGenerator *generator)
 	asmPopq(buffer, RBP);
 	asmRet(buffer);
 }
-StubCode SmalltalkEntry = { .generator = generateSmalltalkEntry, .nativeCode = NULL };
+PER_ISOLATE StubCode SmalltalkEntry = { .generator = generateSmalltalkEntry, .nativeCode = NULL };
 
 
 static void generateAllocate(CodeGenerator *generator)
@@ -280,7 +280,7 @@ static void generateAllocate(CodeGenerator *generator)
 	asmIncq(buffer, RAX);
 	asmRet(buffer);
 }
-StubCode AllocateStub = { .generator = generateAllocate, .nativeCode = NULL };
+PER_ISOLATE StubCode AllocateStub = { .generator = generateAllocate, .nativeCode = NULL };
 
 
 static void generateLookup(CodeGenerator *generator)
@@ -290,7 +290,7 @@ static void generateLookup(CodeGenerator *generator)
 	asmMovq(buffer, RAX, R11);
 	asmRet(buffer);
 }
-StubCode LookupStub = { .generator = generateLookup, .nativeCode = NULL };
+PER_ISOLATE StubCode LookupStub = { .generator = generateLookup, .nativeCode = NULL };
 
 
 static void generateDoesNotUnderstandStub(CodeGenerator *generator)
@@ -362,7 +362,7 @@ static void generateDoesNotUnderstandStub(CodeGenerator *generator)
 	asmPopq(buffer, RBP);
 	asmRet(buffer);
 }
-StubCode DoesNotUnderstandStub = { .generator = generateDoesNotUnderstandStub, .nativeCode = NULL };
+PER_ISOLATE StubCode DoesNotUnderstandStub = { .generator = generateDoesNotUnderstandStub, .nativeCode = NULL };
 
 
 static CompiledMethod *createDoesNotUnderstandCode(void)

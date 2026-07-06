@@ -109,11 +109,52 @@ _Bool scavengerIncludes(Scavenger *scavenger, uint8_t *addr)
 // A young-tagged pointer that is NOT inside the space currently being evacuated
 // is exactly that stale nil-init value (its true logical value is nil). Restore
 // the current `nil` and forward it normally, honouring the nil-init contract.
+static _Bool ptrInHeap(Scavenger *scavenger, uint8_t *addr)
+{
+	return pageSpaceIncludes(&scavenger->heap->oldSpace, addr)
+		|| scavengerIncludes(scavenger, addr)
+		|| (scavenger->toSpace <= addr && addr <= scavenger->toSpace + scavenger->size);
+}
+
+// Does `object` (a young pointer that lands in the source space) actually look
+// like a live object, or is it a stale value left in a dead / not-yet-assigned
+// inlined-control-flow slot? A live object's class is a real heap pointer and its
+// computed size is bounded by a semispace; garbage fails one of these (the crash
+// symptom is a wild size fed to the promotion allocator). The class must be
+// validated as mapped BEFORE dereferencing it for the size (an old-space page
+// walk) — trusting the space tag alone segfaults on an unmapped garbage class.
+static _Bool plausibleObject(Scavenger *scavenger, RawObject *object)
+{
+	uint8_t *class = (uint8_t *) ((uintptr_t) object->class & ~(uintptr_t) SPACE_TAG);
+	if (!ptrInHeap(scavenger, class)) {
+		return 0;
+	}
+	size_t size = computeRawObjectSize(object);
+	return size > 0 && size <= (size_t) scavenger->size;
+}
+
 static void scavengeStackSlot(Scavenger *scavenger, Value *value)
 {
 	RawObject *object = asObject(*value);
 	if (((uintptr_t) object & SPACE_TAG) != OLD_SPACE_TAG
 		&& !(scavenger->toSpace <= (uint8_t *) object && (uint8_t *) object <= scavenger->toSpace + scavenger->size)) {
+		*value = tagPtr(Handles.nil->raw);
+		processTaggedPointer(scavenger, value);
+		return;
+	}
+
+	// A young pointer that lands INSIDE the source space can still be stale:
+	// semispaces swap each scavenge, so a nil-init / prior-loop-iteration value
+	// left in an inlined-control-flow result temp (marked live by the CF-unaware
+	// linear-scan allocator at a call site that precedes its store on the taken
+	// path) can fall within the current source space yet point at no live object
+	// (seen under load in HttpServer>>serve:'s whileTrue: block, slot 4). Tell a
+	// live object from that garbage by validating its header (real class pointer +
+	// a size bounded by a semispace); if implausible, the slot was never validly
+	// assigned on this path -> its logical value is nil.
+	if (((uintptr_t) object & SPACE_TAG) != OLD_SPACE_TAG
+		&& (object->tags & TAG_FORWARDED) == 0
+		&& !plausibleObject(scavenger, object)) {
 		*value = tagPtr(Handles.nil->raw);
 	}
 	processTaggedPointer(scavenger, value);

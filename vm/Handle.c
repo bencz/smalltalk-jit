@@ -4,7 +4,7 @@
 #include "Assert.h"
 #include <stdlib.h>
 
-SmalltalkHandles Handles = { NULL };
+PER_ISOLATE SmalltalkHandles Handles = { NULL };
 
 
 void freeHandle(void *handle)

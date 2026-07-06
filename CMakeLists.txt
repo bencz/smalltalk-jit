@@ -34,6 +34,7 @@ set(vmSources
 	vm/FreeList.c
 	vm/GarbageCollector.c
 	vm/Handle.c
+	vm/Isolate.c
 	vm/Heap.c
 	vm/HeapPage.c
 	vm/Iterator.c
@@ -69,6 +70,7 @@ target_link_libraries(VM Linenoise)
 target_link_libraries(VM ${CMAKE_THREAD_LIBS_INIT})
 target_link_libraries(VM m)
 target_link_libraries(st VM)
+
 
 # Run the whole Smalltalk test suite: `cmake --build <build> --target check`
 # (bootstraps a fresh image and runs every tests/*.st).

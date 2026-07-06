@@ -24,27 +24,34 @@
 // data structures stay single-threaded and lock-free.
 // ---------------------------------------------------------------------------
 
-static Fiber gScheduler;          // scheduler context (stackBase == NULL)
-static Fiber *gCurrent = NULL;    // running fiber, NULL while in the scheduler
-static _Bool gActive = 0;
-static Value gExitResult = 0;
+static PER_ISOLATE Fiber gScheduler;          // scheduler context (stackBase == NULL)
+static PER_ISOLATE Fiber *gCurrent = NULL;    // running fiber, NULL while in the scheduler
+static PER_ISOLATE _Bool gActive = 0;
+static PER_ISOLATE Value gExitResult = 0;
 
 // ready queue (intrusive FIFO through Fiber.queueNext)
-static Fiber *gReadyHead = NULL;
-static Fiber *gReadyTail = NULL;
+static PER_ISOLATE Fiber *gReadyHead = NULL;
+static PER_ISOLATE Fiber *gReadyTail = NULL;
 
 // timer min-heap: fibers sleeping until a deadline (Delay wait)
 typedef struct {
 	int64_t deadline; // absolute microseconds
 	size_t fiberId;
 } Timer;
-static Timer *gTimers = NULL;
-static size_t gTimerCount = 0;
-static size_t gTimerCap = 0;
+static PER_ISOLATE Timer *gTimers = NULL;
+static PER_ISOLATE size_t gTimerCount = 0;
+static PER_ISOLATE size_t gTimerCap = 0;
 
 // epoll-based I/O readiness
-static int gEpollFd = -1;
-static size_t gArmedWaiters = 0; // fibers currently parked on an fd
+static PER_ISOLATE int gEpollFd = -1;
+static PER_ISOLATE size_t gArmedWaiters = 0; // fibers currently parked on an fd
+
+// cross-isolate inbox: an eventfd another OS thread pokes to hand us a message.
+// Marked in epoll with a reserved data.u64 that can never be a fiber id.
+#define SCHED_INBOX_MARKER ((uint64_t) -1)
+static PER_ISOLATE int gInboxFd = -1;
+static PER_ISOLATE _Bool gInboxActive = 0;
+void isolateDrainInbox(void); // vm/Isolate.c
 
 // Fiber registry: a slot array with a free-list for reuse. Ids handed to
 // Smalltalk pack a generation counter in the high bits so that a stale Process
@@ -55,13 +62,13 @@ static size_t gArmedWaiters = 0; // fibers currently parked on an fd
 #define ID_SLOT_MASK ((((size_t) 1) << ID_SLOT_BITS) - 1)
 #define idSlot(id)   ((id) & ID_SLOT_MASK)
 
-static Fiber **gFibers = NULL;
-static size_t *gSlotGeneration = NULL; // per-slot generation, bumped on free
-static size_t gFiberSlots = 0;
-static size_t gFiberCap = 0;
-static size_t *gFreeIds = NULL;
-static size_t gFreeCount = 0;
-static size_t gFreeCap = 0;
+static PER_ISOLATE Fiber **gFibers = NULL;
+static PER_ISOLATE size_t *gSlotGeneration = NULL; // per-slot generation, bumped on free
+static PER_ISOLATE size_t gFiberSlots = 0;
+static PER_ISOLATE size_t gFiberCap = 0;
+static PER_ISOLATE size_t *gFreeIds = NULL;
+static PER_ISOLATE size_t gFreeCount = 0;
+static PER_ISOLATE size_t gFreeCap = 0;
 
 #define MAIN_STACK_SIZE   (8 * 1024 * 1024)
 #define WORKER_STACK_SIZE (512 * 1024)
@@ -334,6 +341,24 @@ void schedulerInit(void)
 }
 
 
+void schedulerRegisterInboxFd(int eventFd)
+{
+	gInboxFd = eventFd;
+	gInboxActive = 1;
+	struct epoll_event ev = { .events = EPOLLIN, .data.u64 = SCHED_INBOX_MARKER };
+	epoll_ctl(gEpollFd, EPOLL_CTL_ADD, eventFd, &ev);
+}
+
+
+void schedulerStopInbox(void)
+{
+	gInboxActive = 0;
+	if (gInboxFd >= 0) {
+		epoll_ctl(gEpollFd, EPOLL_CTL_DEL, gInboxFd, NULL);
+	}
+}
+
+
 Fiber *schedulerSpawnC(FiberCEntry entry, void *arg, size_t stackSize)
 {
 	Fiber *fiber = fiberCreate(stackSize ? stackSize : MAIN_STACK_SIZE);
@@ -481,6 +506,10 @@ static void waitForEvents(void)
 	struct epoll_event events[64];
 	int n = epoll_wait(gEpollFd, events, 64, timeout);
 	for (int i = 0; i < n; i++) {
+		if (events[i].data.u64 == SCHED_INBOX_MARKER) {
+			isolateDrainInbox(); // a peer isolate handed us a message
+			continue;
+		}
 		if (gArmedWaiters > 0) {
 			gArmedWaiters--;
 		}
@@ -497,7 +526,7 @@ Value schedulerRun(void)
 		if (fiber == NULL) {
 			// Nothing runnable. If fibers are sleeping or waiting on I/O, block
 			// until something happens; otherwise there is no more work to do.
-			if (gArmedWaiters > 0 || gTimerCount > 0) {
+			if (gArmedWaiters > 0 || gTimerCount > 0 || gInboxActive) {
 				waitForEvents();
 				continue;
 			}

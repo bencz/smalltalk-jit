@@ -16,7 +16,7 @@ typedef struct {
 	int64_t totalTime;
 } GCStats;
 
-extern GCStats LastGCStats;
+extern PER_ISOLATE GCStats LastGCStats;
 
 void gcMarkRoots(Thread *thread);
 void gcSweep(PageSpace *space);

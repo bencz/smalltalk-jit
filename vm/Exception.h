@@ -2,6 +2,7 @@
 #define EXCEPTION_H
 
 #include "Object.h"
+#include "Thread.h"
 
 typedef struct {
 	OBJECT_HEADER;
@@ -11,7 +12,7 @@ typedef struct {
 } RawExceptionHandler;
 OBJECT_HANDLE(ExceptionHandler);
 
-extern /*__thread */Value CurrentExceptionHandler;
+extern PER_ISOLATE Value CurrentExceptionHandler;
 
 Value  unwindExceptionHandler(RawObject *exception);
 
