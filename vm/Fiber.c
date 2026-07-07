@@ -37,41 +37,65 @@ __asm__(
 );
 
 
+// In-place growable stacks: a fiber reserves its whole stack region PROT_NONE
+// (no RAM, no overcommit charge) and commits only a small window at the high end;
+// the SIGSEGV handler grows the window downward on the guard fault. These are set
+// once per OS thread by fiberInitStackGrowth (from schedulerInit).
+static size_t gInitialCommit = 64 * 1024;
+static long gPageSize = 4096;
+
+void fiberInitStackGrowth(size_t initialCommitBytes)
+{
+	long pg = sysconf(_SC_PAGESIZE);
+	gPageSize = pg > 0 ? pg : 4096;
+	gInitialCommit = initialCommitBytes;
+}
+
 Fiber *fiberCreate(size_t stackSize)
 {
-	long pageSize = sysconf(_SC_PAGESIZE);
-	if (pageSize <= 0) {
-		pageSize = 4096;
-	}
+	long pageSize = gPageSize;
 
-	// round up to a page and add one guard page at the low (growth) end
+	// Reserve the whole region + a permanent floor page as PROT_NONE (address
+	// space only), then commit a small window at the high end. The stack grows
+	// DOWN; a fault in the reserved-but-uncommitted span triggers growth, and the
+	// floor page below reserveFloor is the hard overflow backstop.
 	stackSize = (stackSize + pageSize - 1) & ~((size_t) pageSize - 1);
 	size_t mapSize = stackSize + pageSize;
 
-	uint8_t *base = mmap(NULL, mapSize, PROT_READ | PROT_WRITE,
-	                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	uint8_t *base = mmap(NULL, mapSize, PROT_NONE,
+	                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
 	if (base == MAP_FAILED) {
 		return NULL;
 	}
-	// guard page: hitting it (stack overflow) faults instead of corrupting the heap
-	mprotect(base, pageSize, PROT_NONE);
+
+	size_t commit = (gInitialCommit + pageSize - 1) & ~((size_t) pageSize - 1);
+	if (commit > stackSize) {
+		commit = stackSize;
+	}
+	if (commit == 0) {
+		commit = pageSize;
+	}
+	uint8_t *top = base + mapSize;
+	uint8_t *committedLow = top - commit;
+	if (mprotect(committedLow, commit, PROT_READ | PROT_WRITE) != 0) {
+		munmap(base, mapSize);
+		return NULL;
+	}
 
 	Fiber *fiber = calloc(1, sizeof(Fiber));
 	fiber->stackBase = base;
 	fiber->stackSize = mapSize;
+	fiber->committedLow = committedLow;
+	fiber->reserveFloor = base + pageSize; // never grow below this
 	fiber->state = FIBER_SUSPENDED;
-	fiber->entryBlock = 0;
-	fiber->process = 0;
-	fiber->cEntry = NULL;
-	fiber->cArg = NULL;
 	fiber->waitFd = -1;
-	fiber->queueNext = NULL;
+	// calloc zeroed entryBlock/process/cEntry/cArg/queueNext/dirty*.
 
 	// Prime the stack so the first fiberSwitchAsm into it pops six zeroed
 	// callee-saved slots and `ret`s straight into fiberTrampoline, with the
-	// ABI's 16-byte alignment (rsp % 16 == 8 at function entry).
-	uintptr_t top = (uintptr_t) base + mapSize;
-	uintptr_t sp = (top - 64) & ~(uintptr_t) 15; // sp % 16 == 0
+	// ABI's 16-byte alignment (rsp % 16 == 8 at function entry). top-64 is inside
+	// the committed window (commit >= one page).
+	uintptr_t sp = ((uintptr_t) top - 64) & ~(uintptr_t) 15; // sp % 16 == 0
 	uintptr_t *slots = (uintptr_t *) sp;
 	slots[0] = 0; // r15
 	slots[1] = 0; // r14
@@ -83,6 +107,35 @@ Fiber *fiberCreate(size_t stackSize)
 	fiber->sp = (void *) sp;
 
 	return fiber;
+}
+
+
+// Grow `fiber`'s committed RW window down to cover `faultAddr` (called from the
+// SIGSEGV handler — must be async-signal-safe: only mprotect + plain arithmetic).
+// Returns 1 if grown (retry the faulting instruction), 0 if the fault is outside
+// the growable window (below the floor / not this fiber's stack → genuine fault).
+int fiberGrowStack(Fiber *fiber, uintptr_t faultAddr)
+{
+	if (fiber == NULL || fiber->stackBase == NULL) {
+		return 0;
+	}
+	uintptr_t floor = (uintptr_t) fiber->reserveFloor;
+	uintptr_t clow = (uintptr_t) fiber->committedLow;
+	if (faultAddr < floor || faultAddr >= clow) {
+		return 0; // below the hard floor, or already committed / not in this window
+	}
+	uintptr_t pageMask = ~((uintptr_t) gPageSize - 1);
+	uintptr_t faultPage = faultAddr & pageMask;
+	uintptr_t chunkLow = clow - (64 * 1024); // grow at least a 64 KB chunk
+	uintptr_t newLow = faultPage < chunkLow ? faultPage : chunkLow;
+	if (newLow < floor) {
+		newLow = floor;
+	}
+	if (mprotect((void *) newLow, clow - newLow, PROT_READ | PROT_WRITE) != 0) {
+		return 0; // ENOMEM etc. → let the handler treat it as fatal
+	}
+	fiber->committedLow = (void *) newLow;
+	return 1;
 }
 
 
@@ -109,11 +162,12 @@ void fiberReleaseIdleStack(Fiber *fiber)
 	if (fiber->stackBase == NULL) {
 		return; // the scheduler context has no fiber stack
 	}
-	long pageSize = sysconf(_SC_PAGESIZE);
-	if (pageSize <= 0) {
-		pageSize = 4096;
-	}
-	uintptr_t lo = (uintptr_t) fiber->stackBase + pageSize;                 // past the guard page
+	long pageSize = gPageSize;
+	// Only the committed (RW) window [committedLow, sp) is backed by pages; the
+	// span below committedLow is PROT_NONE (reserved, unbacked). Reclaim the dead
+	// part of the RW window below the saved sp. committedLow stays put (monotonic);
+	// re-deepening re-faults these RW pages as ordinary zero-fill, not a SIGSEGV.
+	uintptr_t lo = (uintptr_t) fiber->committedLow;
 	uintptr_t hi = ((uintptr_t) fiber->sp - pageSize) & ~((uintptr_t) pageSize - 1); // cushion below sp
 	if (hi > lo && (hi - lo) >= FIBER_STACK_RELEASE_THRESHOLD) {
 		madvise((void *) lo, hi - lo, MADV_DONTNEED);

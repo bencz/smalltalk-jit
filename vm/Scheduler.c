@@ -9,6 +9,8 @@
 #include "Os.h"
 #include "Assert.h"
 #include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 #include <time.h>
 #include <errno.h>
 #include <signal.h>
@@ -66,11 +68,11 @@ static PER_ISOLATE size_t gFreeCap = 0;
 #define MAIN_STACK_SIZE   (8 * 1024 * 1024)
 #define WORKER_STACK_SIZE (512 * 1024)
 
-// Per-worker-fiber stack size, tunable via ST_FIBER_STACK_KB (default 512 KB).
-// Smaller stacks let many more fibers fit in virtual address space; overflow
-// still faults on the guard page (a clean crash, not corruption) until a
-// recoverable stack-limit check lands.
-static PER_ISOLATE size_t gWorkerStackSize = WORKER_STACK_SIZE;
+// Per-worker-fiber stack RESERVATION (PROT_NONE address space, tunable via
+// ST_FIBER_STACK_KB, default 1 MB). Only a small window (ST_FIBER_COMMIT_KB,
+// default 64 KB — see fiberInitStackGrowth) is committed RW; the SIGSEGV handler
+// grows it downward on demand up to this reservation, then aborts at the floor.
+static PER_ISOLATE size_t gWorkerStackSize = 1024 * 1024;
 
 
 // ---- GC dirty-fiber list --------------------------------------------------
@@ -384,6 +386,62 @@ void schedulerFiberMain(void)
 
 // ---- public API -----------------------------------------------------------
 
+// ---- growable-stack SIGSEGV handler --------------------------------------
+// A downward stack overflow into a fiber's reserved-but-uncommitted window
+// faults; this handler (running on a per-thread sigaltstack, since the fault
+// happens with RSP at the guard) grows the committed window and retries. A fault
+// outside the current fiber's window / below the floor is a genuine bug → restore
+// the default handler and re-raise for a core dump at the real PC.
+
+#ifndef __SANITIZE_ADDRESS__
+static PER_ISOLATE char *gAltStack = NULL;   // per-thread signal stack
+static int gSegvHandlerInstalled = 0;        // process-global, once
+
+static void fiberSegvHandler(int sig, siginfo_t *si, void *ucontext)
+{
+	(void) sig;
+	(void) ucontext;
+	Fiber *fiber = gCurrent; // initial-exec TLS load: async-signal-safe
+	if (fiber != NULL
+#ifdef SEGV_ACCERR
+	    && si->si_code == SEGV_ACCERR // mapped-but-PROT_NONE, i.e. our reserved window
+#endif
+	    && fiberGrowStack(fiber, (uintptr_t) si->si_addr)) {
+		return; // grown -> retry the faulting instruction
+	}
+	static const char msg[] = "fatal: stack overflow past reservation / invalid memory access\n";
+	ssize_t w = write(2, msg, sizeof(msg) - 1);
+	(void) w;
+	signal(SIGSEGV, SIG_DFL); // return re-faults into the default handler -> core at real PC
+}
+
+static void installStackGrowthHandler(void)
+{
+	if (gAltStack == NULL) {
+		size_t altSize = 32 * 1024; // handler is tiny; SIGSTKSZ headroom
+		gAltStack = malloc(altSize);
+		if (gAltStack != NULL) {
+			stack_t ss;
+			ss.ss_sp = gAltStack;
+			ss.ss_size = altSize;
+			ss.ss_flags = 0;
+			sigaltstack(&ss, NULL); // per-thread
+		}
+	}
+	if (__sync_bool_compare_and_swap(&gSegvHandlerInstalled, 0, 1)) {
+		struct sigaction sa;
+		memset(&sa, 0, sizeof(sa));
+		sa.sa_sigaction = fiberSegvHandler;
+		sigemptyset(&sa.sa_mask);
+		sa.sa_flags = SA_SIGINFO | SA_ONSTACK; // NOT SA_NODEFER / SA_RESETHAND
+		sigaction(SIGSEGV, &sa, NULL);         // process-global, once
+	}
+}
+#else
+static void installStackGrowthHandler(void) {} // ASan owns SIGSEGV + intercepts mmap/mprotect
+#endif
+
+
 void schedulerInit(void)
 {
 	gScheduler.stackBase = NULL;
@@ -394,13 +452,24 @@ void schedulerInit(void)
 	signal(SIGPIPE, SIG_IGN);
 	gActive = 1;
 
-	char *stackEnv = getenv("ST_FIBER_STACK_KB");
+	char *stackEnv = getenv("ST_FIBER_STACK_KB"); // reservation ceiling
 	if (stackEnv != NULL) {
 		long kb = atol(stackEnv);
-		if (kb >= 16) { // floor: keep room for at least a frame + the guard page
+		if (kb >= 64) {
 			gWorkerStackSize = (size_t) kb * 1024;
 		}
 	}
+	size_t commit = 64 * 1024;
+	char *commitEnv = getenv("ST_FIBER_COMMIT_KB");
+	if (commitEnv != NULL) {
+		long kb = atol(commitEnv);
+		if (kb >= 16) {
+			commit = (size_t) kb * 1024;
+		}
+	}
+	fiberInitStackGrowth(commit); // caches page size + initial commit for fiberCreate
+
+	installStackGrowthHandler();  // per-thread sigaltstack + once-global SIGSEGV handler
 }
 
 

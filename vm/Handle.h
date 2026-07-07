@@ -16,7 +16,7 @@ typedef struct Handle {
 
 typedef struct HandleScope {
 	struct HandleScope *parent;
-	Object handles[1024];
+	Object handles[256];   // scopeHandle hard-bounds size < 256 (was [1024], 4× oversized)
 	size_t size;
 #if REMEMBER_SCOPE_POSITION
 	char *file;
@@ -119,11 +119,16 @@ _Bool handleScopeIteratorHasNext(HandleScopeIterator *iterator);
 HandleScope *handleScopeIteratorNext(HandleScopeIterator *iterator);
 
 
+// NB: do NOT memset the whole scope — `handles[]` is up to ~4 KB of stack and is
+// pure waste to zero (every consumer reads only [0..size), and scopeHandle writes
+// slots sequentially as size grows). Zeroing only `size` (and `parent`) is enough.
+// This is a hot path (every allocateObject / primitive / entry) and a big chunk of
+// each C frame's stack, so the memset dominated both perf and the compile spike.
 #if REMEMBER_SCOPE_POSITION
 	#define openHandleScope(scope) _openHandleScope(scope, __FILE__, __LINE__)
 	static void _openHandleScope(HandleScope *scope, char *file, size_t line)
 	{
-		memset(scope, 0, sizeof(*scope));
+		scope->size = 0;
 		scope->parent = CurrentThread.handleScopes;
 		scope->file = file;
 		scope->line = line;
@@ -132,7 +137,7 @@ HandleScope *handleScopeIteratorNext(HandleScopeIterator *iterator);
 #else
 	static void openHandleScope(HandleScope *scope)
 	{
-		memset(scope, 0, sizeof(*scope));
+		scope->size = 0;
 		scope->parent = CurrentThread.handleScopes;
 		CurrentThread.handleScopes = scope;
 	}
@@ -154,7 +159,11 @@ static void *closeHandleScope(HandleScope *scope, void *handle)
 static void *scopeHandle(void *object)
 {
 	ASSERT(CurrentThread.handleScopes != NULL);
-	ASSERT(CurrentThread.handleScopes->size < 256);
+	// HARD bound (survives -DNDEBUG): handles[] is exactly 256, so a 257th handle
+	// would corrupt the stack. FAIL() aborts instead.
+	if (CurrentThread.handleScopes->size >= 256) {
+		FAIL();
+	}
 	Object *handle = &CurrentThread.handleScopes->handles[CurrentThread.handleScopes->size++];
 	handle->raw = object;
 	return handle;

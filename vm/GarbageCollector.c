@@ -10,6 +10,7 @@
 #include "Exception.h"
 #include "Scheduler.h"
 #include "Fiber.h"
+#include <stdlib.h>
 #include <sys/mman.h>
 #include "Assert.h"
 #include <stdio.h>
@@ -275,8 +276,12 @@ static _Bool markingQueueIsEmpty(MarkingQueue *queue)
 
 void gcSweep(PageSpace *space)
 {
-	RawObject *finalize[256] = { NULL };
+	// Objects with finalizers found dead this sweep, run after the sweep. Grows on
+	// demand — a fixed cap overflowed once full GCs became rare (grow-threshold
+	// policy) and a sweep reclaims a large batch (e.g. many dead server sockets).
+	RawObject **finalize = NULL;
 	size_t finalizeSize = 0;
+	size_t finalizeCap = 0;
 
 	// Rebuild the freelist from scratch, fully coalesced. Resetting the bins first
 	// lets a page that ends up ENTIRELY free be handed back to the OS (unmapped)
@@ -334,7 +339,10 @@ void gcSweep(PageSpace *space)
 				}
 				if ((object->tags & TAG_FINALIZED) == 0 && hasFinalizer(object)) {
 					FLUSH_RUN();
-					ASSERT(finalizeSize < 256); // TODO: realloc instead
+					if (finalizeSize == finalizeCap) {
+						finalizeCap = finalizeCap ? finalizeCap * 2 : 256;
+						finalize = realloc(finalize, finalizeCap * sizeof(RawObject *));
+					}
 					finalize[finalizeSize++] = object;
 					object->tags = (object->tags ^ TAG_MARKED) | TAG_FINALIZED;
 					pageHasLive = 1;
@@ -382,6 +390,7 @@ void gcSweep(PageSpace *space)
 		sendMessage(Handles.finalizeSymbol, &args);
 		closeHandleScope(&scope, NULL);
 	}
+	free(finalize);
 }
 
 

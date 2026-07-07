@@ -31,8 +31,14 @@ typedef void (*FiberCEntry)(void *arg);
 
 typedef struct Fiber {
 	void *sp;               // saved stack pointer while not running
-	void *stackBase;        // mmap base (guard page here); NULL for the scheduler ctx
-	size_t stackSize;       // total mapped size including guard page
+	void *stackBase;        // mmap base (low end); NULL for the scheduler ctx
+	size_t stackSize;       // total mapped (reserved) size incl. the floor page
+	// In-place growable stack: the region is reserved PROT_NONE and only a small
+	// window at the high end is committed RW. `committedLow` is that window's low
+	// edge (moves DOWN as the SIGSEGV handler grows it); `reserveFloor` is the hard
+	// limit below which a fault is a genuine overflow, not a grow.
+	void *committedLow;
+	void *reserveFloor;
 
 	FiberState state;
 	FiberRoots roots;
@@ -63,6 +69,13 @@ void fiberSwitchAsm(void **saveSp, void *newSp);
 Fiber *fiberCreate(size_t stackSize);
 void fiberDestroy(Fiber *fiber);
 void fiberReleaseIdleStack(Fiber *fiber); // madvise the dead stack region on park
+// Set the initial committed window (bytes) for new fiber stacks + cache the page
+// size. Call once per OS thread from schedulerInit before any fiber is created.
+void fiberInitStackGrowth(size_t initialCommitBytes);
+// Grow `fiber`'s committed window down to cover `faultAddr` (called from the
+// SIGSEGV handler). Returns 1 if it grew (retry the instruction), 0 if the fault
+// is outside the growable window / below the floor (a genuine fault).
+int fiberGrowStack(Fiber *fiber, uintptr_t faultAddr);
 
 // The trampoline the freshly-created stack "returns" into on first switch.
 void fiberTrampoline(void);
