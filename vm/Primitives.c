@@ -82,6 +82,7 @@ static PrimitiveResult buildClassPrimitive(Value receiver, Value vNode);
 static PrimitiveResult compileMethodPrimitive(Value receiver, Value vNode, Value class);
 static PrimitiveResult collectGarbagePrimitive(Value receiver);
 static PrimitiveResult printHeapPrimitive(Value receiver);
+static PrimitiveResult heapHistogramPrimitive(Value receiver);
 static PrimitiveResult lastGcStatsPrimitive(Value receiver);
 static PrimitiveResult processSpawnPrimitive(Value block);
 static PrimitiveResult processResumePrimitive(Value self, Value id);
@@ -209,6 +210,7 @@ Primitive Primitives[] = {
 	{"GCPrimitive", CCALL, .cFunction = collectGarbagePrimitive, 1},
 	{"LastGCStatsPrimitive", CCALL, .cFunction = lastGcStatsPrimitive, 1},
 	{"PrintHeapPrimitive", CCALL, .cFunction = printHeapPrimitive, 1},
+	{"HeapHistogramPrimitive", CCALL, .cFunction = heapHistogramPrimitive, 1},
 	{"InterruptPrimitive", GEN, generateInterruptPrimitive},
 	{"ExitPrimitive", GEN, generateExitPrimitive}, // TODO: remove replace with process primitive
 
@@ -919,6 +921,175 @@ static PrimitiveResult printHeapPrimitive(Value receiver)
 }
 
 
+// TEMPORARY diagnostic: print a census of LIVE old-space objects by class, most
+// numerous first. Allocates NOTHING (prints straight to stderr), so it is safe to
+// walk the heap without perturbing it. Call after a full GC so floating garbage is
+// already gone and only genuinely-retained objects remain.
+#define HISTO_MAX_CLASSES 4096
+typedef struct { RawClass *cls; size_t count; } HistoEntry;
+
+static int histoCompare(const void *a, const void *b)
+{
+	size_t ca = ((const HistoEntry *) a)->count;
+	size_t cb = ((const HistoEntry *) b)->count;
+	return (cb > ca) - (cb < ca);
+}
+
+static void histoPrintLine(size_t count, RawClass *cls)
+{
+	const char *name = "?";
+	int len = 1;
+	if (cls != NULL && ((uintptr_t) cls & SPACE_TAG) == OLD_SPACE_TAG) {
+		Value nameVal = cls->name;
+		if (valueTypeOf(nameVal, VALUE_POINTER)) {
+			RawIndexedObject *s = (RawIndexedObject *) asObject(nameVal);
+			int l = (int) s->size; // indexed size is stored raw (untagged)
+			if (l >= 1 && l <= 128) { name = (const char *) s->body; len = l; }
+		}
+	}
+	fprintf(stderr, "  %9zu  %.*s\n", count, len, name);
+}
+
+static PrimitiveResult heapHistogramPrimitive(Value receiver)
+{
+	static HistoEntry entries[HISTO_MAX_CLASSES];
+	size_t used = 0, overflow = 0;
+
+	PageSpaceIterator iterator;
+	pageSpaceIteratorInit(&iterator, &CurrentThread.heap.oldSpace);
+	for (RawObject *o = pageSpaceIteratorNext(&iterator); o != NULL; o = pageSpaceIteratorNext(&iterator)) {
+		if (o->tags & TAG_FREESPACE) {
+			continue;
+		}
+		RawClass *cls = o->class;
+		size_t i;
+		for (i = 0; i < used; i++) {
+			if (entries[i].cls == cls) {
+				entries[i].count++;
+				break;
+			}
+		}
+		if (i == used) {
+			if (used < HISTO_MAX_CLASSES) {
+				entries[used].cls = cls;
+				entries[used].count = 1;
+				used++;
+			} else {
+				overflow++;
+			}
+		}
+	}
+
+	qsort(entries, used, sizeof(HistoEntry), histoCompare);
+	fprintf(stderr, "=== old-space live histogram (%zu classes%s) ===\n",
+	        used, overflow ? ", + overflow" : "");
+	size_t top = used < 30 ? used : 30;
+	for (size_t i = 0; i < top; i++) {
+		histoPrintLine(entries[i].count, entries[i].cls);
+	}
+
+	// Second pass: who RETAINS the leaking BlockContexts? Count, per holder class,
+	// how many of its fields point at a live BlockContext. Names the retention root.
+	static HistoEntry refs[HISTO_MAX_CLASSES];
+	size_t rused = 0;
+	RawClass *target = Handles.BlockContext->raw;
+	pageSpaceIteratorInit(&iterator, &CurrentThread.heap.oldSpace);
+	for (RawObject *o = pageSpaceIteratorNext(&iterator); o != NULL; o = pageSpaceIteratorNext(&iterator)) {
+		if (o->tags & TAG_FREESPACE) {
+			continue;
+		}
+		Value *vars = getRawObjectVars(o);
+		size_t n = o->class->instanceShape.varsSize;
+		if (o->class->instanceShape.isIndexed && !o->class->instanceShape.isBytes) {
+			n += rawObjectSize(o);
+		}
+		for (size_t i = 0; i < n; i++) {
+			if (valueTypeOf(vars[i], VALUE_POINTER) && asObject(vars[i])->class == target) {
+				size_t j;
+				for (j = 0; j < rused; j++) {
+					if (refs[j].cls == o->class) { refs[j].count++; break; }
+				}
+				if (j == rused && rused < HISTO_MAX_CLASSES) {
+					refs[rused].cls = o->class;
+					refs[rused].count = 1;
+					rused++;
+				}
+			}
+		}
+	}
+	qsort(refs, rused, sizeof(HistoEntry), histoCompare);
+	fprintf(stderr, "--- holders of BlockContext (by class) ---\n");
+	size_t rtop = rused < 15 ? rused : 15;
+	for (size_t i = 0; i < rtop; i++) {
+		histoPrintLine(refs[i].count, refs[i].cls);
+	}
+
+	// Which link field chains the leaked contexts? Count BlockContexts whose
+	// parent / home / outer points at another BlockContext.
+	size_t viaParent = 0, viaHome = 0, viaOuter = 0;
+	pageSpaceIteratorInit(&iterator, &CurrentThread.heap.oldSpace);
+	for (RawObject *o = pageSpaceIteratorNext(&iterator); o != NULL; o = pageSpaceIteratorNext(&iterator)) {
+		if ((o->tags & TAG_FREESPACE) || o->class != target) continue;
+		RawContext *c = (RawContext *) o;
+		if (valueTypeOf(c->parent, VALUE_POINTER) && asObject(c->parent)->class == target) viaParent++;
+		if (valueTypeOf(c->home, VALUE_POINTER) && asObject(c->home)->class == target) viaHome++;
+		if (valueTypeOf(c->outer, VALUE_POINTER) && asObject(c->outer)->class == target) viaOuter++;
+	}
+	fprintf(stderr, "--- BlockContext links: parent->BC=%zu home->BC=%zu outer->BC=%zu ---\n",
+	        viaParent, viaHome, viaOuter);
+
+	// Third pass: which BLOCK do the leaked BlockContexts belong to? Count by the
+	// context's code->method selector (interned Symbol pointer), print the top.
+	static HistoEntry sels[HISTO_MAX_CLASSES];
+	size_t sused = 0;
+	pageSpaceIteratorInit(&iterator, &CurrentThread.heap.oldSpace);
+	for (RawObject *o = pageSpaceIteratorNext(&iterator); o != NULL; o = pageSpaceIteratorNext(&iterator)) {
+		if ((o->tags & TAG_FREESPACE) || o->class != target) {
+			continue;
+		}
+		RawContext *ctx = (RawContext *) o;
+		if (!valueTypeOf(ctx->code, VALUE_POINTER)) {
+			continue;
+		}
+		RawObject *code = asObject(ctx->code);
+		RawObject *method = code;
+		if (code->class == Handles.CompiledBlock->raw) {
+			Value mv = ((RawCompiledBlock *) code)->method;
+			if (!valueTypeOf(mv, VALUE_POINTER)) continue;
+			method = asObject(mv);
+		}
+		if (method->class != Handles.CompiledMethod->raw) {
+			continue;
+		}
+		RawClass *selCls = (RawClass *) asObject(((RawCompiledMethod *) method)->selector); // reuse cls slot to hold the selector object
+		size_t j;
+		for (j = 0; j < sused; j++) {
+			if (sels[j].cls == selCls) { sels[j].count++; break; }
+		}
+		if (j == sused && sused < HISTO_MAX_CLASSES) {
+			sels[sused].cls = selCls;
+			sels[sused].count = 1;
+			sused++;
+		}
+	}
+	qsort(sels, sused, sizeof(HistoEntry), histoCompare);
+	fprintf(stderr, "--- leaked BlockContext by owner method selector ---\n");
+	size_t stop = sused < 15 ? sused : 15;
+	for (size_t i = 0; i < stop; i++) {
+		RawObject *sel = (RawObject *) sels[i].cls; // a byte-indexed Symbol/String
+		const char *name = "?";
+		int len = 1;
+		if (sel != NULL && ((uintptr_t) sel & SPACE_TAG) == OLD_SPACE_TAG) {
+			int l = (int) ((RawIndexedObject *) sel)->size;
+			if (l >= 1 && l <= 128) { name = (const char *) ((RawIndexedObject *) sel)->body; len = l; }
+		}
+		fprintf(stderr, "  %9zu  #%.*s\n", sels[i].count, len, name);
+	}
+	fflush(stderr);
+	return primSuccess(receiver);
+}
+
+
 static _Bool isFloatValue(Value v)
 {
 	return valueTypeOf(v, VALUE_POINTER) && asObject(v)->class == Handles.Float->raw;
@@ -1131,13 +1302,18 @@ static PrimitiveResult lastGcStatsPrimitive(Value receiver)
 {
 	HandleScope scope;
 	openHandleScope(&scope);
-	Dictionary *stats = newDictionary(8);
+	Dictionary *stats = newDictionary(16);
 	stringDictAtPut(stats, asString("count"), tagInt(LastGCStats.count));
 	stringDictAtPut(stats, asString("total"), tagInt(LastGCStats.total));
 	stringDictAtPut(stats, asString("marked"), tagInt(LastGCStats.marked));
 	stringDictAtPut(stats, asString("sweeped"), tagInt(LastGCStats.sweeped));
 	stringDictAtPut(stats, asString("freed"), tagInt(LastGCStats.freed));
 	stringDictAtPut(stats, asString("extended"), tagInt(LastGCStats.extended));
+	stringDictAtPut(stats, asString("fullTimeUs"), tagInt(LastGCStats.totalTime));
+	stringDictAtPut(stats, asString("scavengeCount"), tagInt(LastGCStats.scavengeCount));
+	stringDictAtPut(stats, asString("scavengeTimeUs"), tagInt(LastGCStats.scavengeTimeUs));
+	stringDictAtPut(stats, asString("oldBytes"), tagInt(CurrentThread.heap.oldSpace.totalBytes));
+	stringDictAtPut(stats, asString("remembered"), tagInt(rememberedSetCount(&CurrentThread.heap.rememberedSet)));
 	Value result = getTaggedPtr(stats);
 	closeHandleScope(&scope, NULL);
 	return primSuccess(result);

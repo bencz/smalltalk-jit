@@ -84,6 +84,28 @@ static void rememberedSetReset(RememberedSet *rememberedSet)
 }
 
 
+// Free an entire block chain (unlike rememberedSetReset, which keeps the head).
+// Used by the scavenger to discard a detached set after rebuilding a fresh one.
+static void rememberedSetFreeBlocks(RememberedSetBlock *block)
+{
+	while (block != NULL) {
+		RememberedSetBlock *prev = block->prev;
+		free(block);
+		block = prev;
+	}
+}
+
+
+static size_t rememberedSetCount(RememberedSet *rememberedSet)
+{
+	size_t total = 0;
+	for (RememberedSetBlock *block = rememberedSet->blocks; block != NULL; block = block->prev) {
+		total += (size_t) (block->current - block->objects);
+	}
+	return total;
+}
+
+
 static void initRememberedSetIterator(RememberedSetIterator *iterator, RememberedSet *rememberedSet)
 {
 	RememberedSetBlock *block = rememberedSet->blocks;

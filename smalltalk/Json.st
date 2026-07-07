@@ -65,8 +65,29 @@ Json := Object [
 
 
 	class encodeString: aString on: aStream [
+		| size start i |
 		aStream nextPut: $".
-		aString do: [:ch | self encodeChar: ch on: aStream ].
+		"Bulk-write maximal runs of characters that need no escaping in one
+		 memcpy-backed nextPutAll:, escaping individual characters only where needed.
+		 The scan uses an inlined 1 to: size do: with at: (no per-character block
+		 invocation), so a typical escape-free string costs one scan + one bulk copy
+		 rather than one message-send per character."
+		size := aString size.
+		start := 1.
+		i := 1.
+		[ i <= size ] whileTrue: [
+			| ch code needsEscape |
+			ch := aString at: i.
+			code := ch codePoint.
+			needsEscape := code < 32 or: [ ch = $" or: [ ch = $\ ] ].
+			needsEscape ifTrue: [
+				i > start ifTrue: [ aStream nextPutAll: (aString copyFrom: start to: i - 1) ].
+				self encodeChar: ch on: aStream.
+				start := i + 1 ].
+			i := i + 1 ].
+		start = 1
+			ifTrue: [ aStream nextPutAll: aString ]
+			ifFalse: [ start <= size ifTrue: [ aStream nextPutAll: (aString copyFrom: start to: size) ] ].
 		aStream nextPut: $".
 		^aStream
 	]

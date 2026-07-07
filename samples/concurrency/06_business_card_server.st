@@ -77,7 +77,7 @@ UserActor := Actor [
 	]
 	profile [
 		| d |
-		d := Dictionary new.
+		d := Dictionary new: 8.
 		d at: 'id' put: id. d at: 'name' put: name. d at: 'email' put: email.
 		d at: 'cards' put: cardIds asArray.
 		^d
@@ -98,14 +98,14 @@ BusinessCardActor := Actor [
 	]
 	dataWithViews [
 		| d |
-		d := Dictionary new.
+		d := Dictionary new: 8.
 		fields keysAndValuesDo: [:k :v | d at: k put: v ].
 		d at: 'id' put: id. d at: 'owner' put: ownerId. d at: 'views' put: views.
 		^d
 	]
 	stats [
 		| d |
-		d := Dictionary new.
+		d := Dictionary new: 8.
 		d at: 'id' put: id. d at: 'owner' put: ownerId. d at: 'views' put: views.
 		^d
 	]
@@ -117,6 +117,7 @@ Directory := Actor [
 	receiveMessage: ctx [
 		| m |
 		m := ctx message.
+		m == #ping ifTrue: [ ^ctx respond: ((Dictionary new: 8) at: 'status' put: 'ok'; yourself) ].
 		(m isKindOf: RegisterUser) ifTrue: [
 			| uid pid |
 			userSeq := userSeq + 1. uid := userSeq.
@@ -178,6 +179,38 @@ BusinessCardApi := Object [
 
 		aServer get: '/health' do: [:req |
 			(HttpResponse ok) json: (Dictionary new at: 'status' put: 'ok'; yourself) ].
+
+		"---- diagnostic endpoints (layer bisection for the req/s investigation) ----"
+		"HTTP + exactly ONE actor round-trip + a tiny JSON payload."
+		aServer get: '/actor-ping' do: [:req |
+			(HttpResponse ok) json: ((directory request: #ping) await) ].
+
+		"HTTP + a card-shaped Dictionary build + JSON encode, but NO actor round-trip.
+		 Isolates the JSON/Dictionary allocation cost from the actor-message cost."
+		aServer get: '/json-heavy' do: [:req |
+			| d |
+			d := Dictionary new: 8.
+			d at: 'title' put: 'Founder'.    d at: 'company' put: 'Smalltalk Works'.
+			d at: 'phone' put: '+1-555-0100'. d at: 'id' put: 1.
+			d at: 'owner' put: 1.             d at: 'views' put: 12345.
+			(HttpResponse ok) json: d ].
+
+		"VM GC/heap counters, sampled between stress waves."
+		aServer get: '/__stats' do: [:req |
+			(HttpResponse ok) json: GarbageCollector lastStats ].
+
+		"Force a full GC and report the resulting live/scanned counts — used to tell
+		 a genuine leak (marked stays huge) from floating garbage (marked small)."
+		aServer get: '/__gc' do: [:req |
+			GarbageCollector collectGarbage.
+			(HttpResponse ok) json: GarbageCollector lastStats ].
+
+		"Force a full GC then print a live-object-by-class census to stderr."
+		aServer get: '/__histo' do: [:req |
+			GarbageCollector collectGarbage.
+			GarbageCollector printHistogram.
+			(HttpResponse ok) json: GarbageCollector lastStats ].
+
 		^aServer
 	]
 ]

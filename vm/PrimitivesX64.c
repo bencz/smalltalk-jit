@@ -1006,6 +1006,10 @@ static void generateBlockWhileTrue(CodeGenerator *generator)
 	asmMovqToMem(buffer, TMP, asmMem(RSP, NO_REGISTER, SS_1, 0));
 	// call block native code
 	asmMovqMem(buffer, asmMem(RSP, NO_REGISTER, SS_1, sizeof(intptr_t)), R11);
+	// Reload CTX from this frame's stable context slot so the block parents to the
+	// same context every iteration (see generateBlockWhileTrue2 for the rationale —
+	// prevents an unbounded BlockContext parent-chain when the body parks/resumes).
+	asmMovqMem(buffer, asmMem(RBP, NO_REGISTER, SS_1, -2 * sizeof(intptr_t)), CTX);
 	asmCallq(buffer, R11);
 	generateStackmap(generator);
 
@@ -1060,6 +1064,14 @@ static void generateBlockWhileTrue2(CodeGenerator *generator)
 	asmLabelBind(buffer, &loop, asmOffset(buffer));
 	asmPushqMem(buffer, asmMem(RBP, NO_REGISTER, SS_1, 2 * sizeof(intptr_t)));
 	asmMovqMem(buffer, asmMem(RSP, NO_REGISTER, SS_1, sizeof(intptr_t)), R11);
+	// Reload CTX from this frame's stable context slot ([RBP-2*8], the pushed
+	// dummy) so the invoked block's context always parents to the SAME context
+	// every iteration. Without this, the block-value primitive parents each
+	// iteration's context to whatever CTX happens to hold — which, when the block
+	// parks and resumes across a fiber switch inside a nested call, drifts into the
+	// previous iteration's context and builds an unbounded parent chain that a full
+	// GC keeps alive (a per-iteration BlockContext leak in every blocking loop).
+	asmMovqMem(buffer, asmMem(RBP, NO_REGISTER, SS_1, -2 * sizeof(intptr_t)), CTX);
 	asmCallq(buffer, R11);
 	generateStackmap(generator);
 	asmAddqImm(buffer, RSP, sizeof(intptr_t));
@@ -1072,6 +1084,7 @@ static void generateBlockWhileTrue2(CodeGenerator *generator)
 	// value second block
 	asmPushqMem(buffer, asmMem(RBP, NO_REGISTER, SS_1, 3 * sizeof(intptr_t)));
 	asmMovqMem(buffer, asmMem(RSP, NO_REGISTER, SS_1, sizeof(intptr_t)), R11);
+	asmMovqMem(buffer, asmMem(RBP, NO_REGISTER, SS_1, -2 * sizeof(intptr_t)), CTX);
 	asmCallq(buffer, R11);
 	generateStackmap(generator);
 	asmAddqImm(buffer, RSP, sizeof(intptr_t));

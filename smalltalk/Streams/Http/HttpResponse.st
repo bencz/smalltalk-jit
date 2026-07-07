@@ -19,7 +19,9 @@ HttpResponse := Object [
 	initResponse [
 		status := 200.
 		reason := 'OK'.
-		headers := Dictionary new.
+		"a response carries a handful of headers at most — an 8-slot dict avoids the
+		 default 64-slot backing array on every request (same trick as HttpRequest)."
+		headers := Dictionary new: 8.
 		body := ''.
 		^self
 	]
@@ -39,7 +41,7 @@ HttpResponse := Object [
 
 	class errorBody: aString [
 		| d |
-		d := Dictionary new.
+		d := Dictionary new: 8.
 		d at: 'error' put: aString.
 		^d
 	]

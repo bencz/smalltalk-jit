@@ -6,6 +6,8 @@
 #include "Exception.h"
 #include "Scheduler.h"
 #include "Fiber.h"
+#include "GarbageCollector.h"
+#include "Os.h"
 #include <string.h>
 
 #define SCAVENGER_ALIGN 8
@@ -65,6 +67,7 @@ uint8_t *scavengerTryAllocate(Scavenger *scavenger, size_t size)
 
 void scavengerScavenge(Scavenger *scavenger)
 {
+	int64_t scavengeStart = osCurrentMicroTime();
 	scavenger->hasPromotionFailure = 0;
 	scavenger->top = (uint8_t *) ((uintptr_t) scavenger->toSpace | NEW_SPACE_TAG);
 	scavenger->end = scavenger->toSpace + scavenger->size;
@@ -101,8 +104,11 @@ void scavengerScavenge(Scavenger *scavenger)
 	scavenger->survivorEnd = scavenger->top;
 	memset(scavenger->toSpace, scavenger->size, 0);
 
+	LastGCStats.scavengeCount++;
+	LastGCStats.scavengeTimeUs += osCurrentMicroTime() - scavengeStart;
+
 #if VERIFY_HEAP_AFTER_GC
-	verifyHeap();
+	verifyHeap(scavenger->heap);
 #endif
 }
 
@@ -329,11 +335,32 @@ static void iteratePersistentHandles(Scavenger *scavenger)
 
 static void iterateRememberedSet(Scavenger *scavenger)
 {
+	// Rebuild the remembered set from scratch each scavenge: detach the current
+	// entries, then re-scan each remembered old object. iterateObject's tail
+	// re-adds it — into the FRESH set — iff it STILL points into the new young
+	// space after its young referents are forwarded; entries whose referents were
+	// all promoted (or are dead) are dropped. Clearing TAG_REMEMBERED first is
+	// what lets iterateObject re-add it.
+	//
+	// Previously the set was only pruned at a full GC (rememberedSetReset), and
+	// full GCs get exponentially rarer as old space grows — so under a sustained
+	// actor/message workload it grew without bound and every scavenge re-scanned
+	// an ever-larger set (O(scavenges × set)), collapsing req/s and, because a
+	// dead old entry keeps resurrecting its young referents, exploding old space.
+	RememberedSet *rememberedSet = &scavenger->heap->rememberedSet;
+	RememberedSet detached;
+	detached.blocks = rememberedSet->blocks;
+	rememberedSet->blocks = createRememberedSetBlock(NULL);
+
 	RememberedSetIterator iterator;
-	initRememberedSetIterator(&iterator, &scavenger->heap->rememberedSet);
+	initRememberedSetIterator(&iterator, &detached);
 	while (rememberedSetIteratorHasNext(&iterator)) {
-		iterateObject(scavenger, rememberedSetIteratorNext(&iterator));
+		RawObject *root = rememberedSetIteratorNext(&iterator);
+		root->tags &= ~TAG_REMEMBERED;
+		iterateObject(scavenger, root);
 	}
+
+	rememberedSetFreeBlocks(detached.blocks);
 }
 
 
