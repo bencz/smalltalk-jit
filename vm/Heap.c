@@ -17,7 +17,7 @@
 // that itself grows with the live set — instead of on every page growth. Without
 // this, a workload that steadily promotes (e.g. 100k live fibers' contexts)
 // triggers a full GC on nearly every scavenge = O(N) full GCs = O(N²).
-#define OLD_GC_MIN_THRESHOLD (128 * MB)
+#define OLD_GC_MIN_THRESHOLD (16 * MB)
 #define OLD_GC_GROWTH 2
 
 static void nilVars(Value *vars, size_t count);
