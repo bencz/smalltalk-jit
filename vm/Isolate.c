@@ -7,18 +7,20 @@
 #include "Object.h"
 #include <pthread.h>
 #include <sys/eventfd.h>
+#include <poll.h>
 #include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-// ---- cross-isolate inbox (Phase 2 transport) ----------------------------
+// ---- cross-isolate inbox transport --------------------------------------
 //
-// Each isolate owns one inbox in the shared `gIsolates` registry: an eventfd it
-// registers in its own epoll, plus a mutex-protected singly-linked MPSC queue of
-// message buffers. Any OS thread posts a buffer with isolatePostBytes(target,..)
-// — it copies the bytes under the target's lock and pokes the target's eventfd,
-// which wakes the target scheduler's epoll loop into isolateDrainInbox().
+// Each isolate owns one inbox in the shared `gIsolates` registry: an eventfd
+// plus a mutex-protected singly-linked MPSC queue of message buffers. Any OS
+// thread posts a buffer with isolatePostBytes(target,..) — it copies the bytes
+// under the target's lock and pokes the target's eventfd. A consumer fiber in
+// the target isolate waits on isolateInboxFd() (via the ordinary scheduler
+// fd-wait) and drains with isolateInboxPop(). The VM never interprets the bytes.
 
 typedef struct InboxMsg {
 	struct InboxMsg *next;
@@ -36,16 +38,10 @@ typedef struct {
 
 static IsolateInbox gIsolates[MAX_ISOLATES];       // SHARED across all isolates
 static PER_ISOLATE int gMyIsolateId = 0;
-static PER_ISOLATE IsolateReceiveFn gReceiveHandler = NULL;
 
 int isolateCurrentId(void)
 {
 	return gMyIsolateId;
-}
-
-void isolateSetReceiveHandler(IsolateReceiveFn handler)
-{
-	gReceiveHandler = handler;
 }
 
 void isolateInboxInit(int id)
@@ -55,13 +51,16 @@ void isolateInboxInit(int id)
 	pthread_mutex_init(&inbox->mutex, NULL);
 	inbox->head = inbox->tail = NULL;
 	inbox->eventFd = eventfd(0, EFD_NONBLOCK);
-	schedulerRegisterInboxFd(inbox->eventFd);
-	inbox->ready = 1; // publish last: peers wait on this before posting
+	// Release store, paired with the acquire loads below: a peer that observes
+	// ready==1 is guaranteed to see the initialised mutex/eventfd/queue too (the
+	// bare `volatile` gives no such ordering on weakly-ordered CPUs).
+	__atomic_store_n(&inbox->ready, 1, __ATOMIC_RELEASE);
 }
 
 int isolatePostBytes(int target, const uint8_t *bytes, size_t size)
 {
-	if (target < 0 || target >= MAX_ISOLATES || !gIsolates[target].ready) {
+	if (target < 0 || target >= MAX_ISOLATES
+	    || !__atomic_load_n(&gIsolates[target].ready, __ATOMIC_ACQUIRE)) {
 		return -1;
 	}
 	InboxMsg *msg = malloc(sizeof(InboxMsg) + size);
@@ -83,158 +82,189 @@ int isolatePostBytes(int target, const uint8_t *bytes, size_t size)
 	pthread_mutex_unlock(&inbox->mutex);
 
 	uint64_t one = 1;
-	ssize_t w = write(inbox->eventFd, &one, sizeof(one)); // wake the target's epoll
+	ssize_t w = write(inbox->eventFd, &one, sizeof(one)); // wake the target's waiter
 	(void) w;
 	return 0;
 }
 
-void isolateDrainInbox(void)
+int isolateInboxPop(uint8_t **outBytes, size_t *outSize)
 {
 	IsolateInbox *inbox = &gIsolates[gMyIsolateId];
-	uint64_t counter;
-	ssize_t r = read(inbox->eventFd, &counter, sizeof(counter)); // clear readiness
-	(void) r;
-
 	pthread_mutex_lock(&inbox->mutex);
-	InboxMsg *list = inbox->head;
-	inbox->head = inbox->tail = NULL;
-	pthread_mutex_unlock(&inbox->mutex);
-
-	while (list != NULL) {
-		InboxMsg *next = list->next;
-		if (gReceiveHandler != NULL) {
-			gReceiveHandler(-1, list->bytes, list->size);
+	InboxMsg *msg = inbox->head;
+	if (msg != NULL) {
+		inbox->head = msg->next;
+		if (inbox->head == NULL) {
+			inbox->tail = NULL;
 		}
-		free(list);
-		list = next;
 	}
+	pthread_mutex_unlock(&inbox->mutex);
+	if (msg == NULL) {
+		return 0;
+	}
+	uint8_t *buf = malloc(msg->size ? msg->size : 1);
+	if (buf == NULL) {
+		free(msg); // out of memory: drop the message rather than deref NULL
+		return 0;
+	}
+	memcpy(buf, msg->bytes, msg->size);
+	*outBytes = buf;
+	*outSize = msg->size;
+	free(msg);
+	return 1;
 }
 
-// ---- isolate lifecycle (Phase 1) ----------------------------------------
+int isolateInboxFd(void)
+{
+	return gIsolates[gMyIsolateId].eventFd;
+}
+
+void isolateInboxClearSignal(void)
+{
+	uint64_t counter;
+	ssize_t r = read(gIsolates[gMyIsolateId].eventFd, &counter, sizeof(counter));
+	(void) r; // EAGAIN when already drained is fine (eventfd is non-blocking)
+}
+
+// ---- isolate lifecycle (runtime worker spawn) ---------------------------
+//
+// A program on the main isolate spawns WORKER isolates at runtime with
+// isolateSpawn (`Isolate spawn:` in Smalltalk) — like Thread/Worker/Ractor, NOT
+// a second copy of the process. Each worker is a fresh VM on its own OS thread
+// that reloads the shared image and runs a source program; the spawner keeps
+// running. Ids are handed out atomically (main = 0, workers = 1,2,...). Spawned
+// threads are tracked so the process can join them at exit.
+
+static const char *gSnapshotPath = NULL;              // image workers reload (shared code)
+static int gNextIsolateId = 1;                        // 0 is the main isolate
+static pthread_mutex_t gSpawnMutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t gWorkerThreads[MAX_ISOLATES];
+static int gWorkerCount = 0;
+
+void isolateSetSnapshotPath(const char *path)
+{
+	gSnapshotPath = path;
+}
 
 typedef struct {
 	int id;
-	const char *snapshotFile;
-	const char *program;
-	int booted;   // 1 once the image loaded successfully
-	long value;   // the doit's result, if it is a SmallInteger
-} Isolate;
+	char *source; // owned; freed by the worker thread
+} WorkerArg;
 
-// Runs as the isolate's top-level fiber (fiber #0 on this OS thread).
-static void isolateProgram(void *arg)
+// Runs as the worker's top-level fiber. Source (not a live block) crosses the
+// isolate boundary, so a worker can define classes and run blocks freshly.
+static void workerProgram(void *arg)
 {
-	Isolate *iso = arg;
-	if (iso->program == NULL) {
-		return;
-	}
-	Value result = evalCode((char *) iso->program);
-	iso->value = valueTypeOf(result, VALUE_INT) ? asCInt(result) : 0;
+	WorkerArg *wa = arg;
+	Value result;
+	parseSourceAndInitialize(wa->source, &result);
 }
 
-// pthread entry: replicate the single-VM boot path (main.c) on a worker thread.
-static void *isolateThreadMain(void *arg)
+// pthread entry for a worker isolate: a full independent VM boot + its inbox.
+static void *isolateWorkerMain(void *arg)
 {
-	Isolate *iso = arg;
+	WorkerArg *wa = arg;
 
 	initThread(&CurrentThread);
 
-	FILE *snapshot = fopen(iso->snapshotFile, "r");
+	FILE *snapshot = gSnapshotPath != NULL ? fopen(gSnapshotPath, "r") : NULL;
 	if (snapshot == NULL) {
-		fprintf(stderr, "isolate %d: cannot open snapshot '%s'\n", iso->id, iso->snapshotFile);
+		fprintf(stderr, "isolate %d: cannot open snapshot '%s'\n",
+			wa->id, gSnapshotPath ? gSnapshotPath : "(null)");
+		free(wa->source);
+		free(wa);
 		return NULL;
 	}
 	snapshotRead(snapshot);
 	fclose(snapshot);
-	iso->booted = 1;
 
 	schedulerInit();
-	// NB: the cross-isolate inbox (isolateInboxInit) is intentionally NOT started
-	// here — it keeps the scheduler loop alive, which is right for an actor-hosting
-	// isolate (Phase 3) but would hang this "run a program then exit" isolate.
-	schedulerSpawnC(isolateProgram, iso, 0);
-	schedulerRun();
+	isolateInboxInit(wa->id);
+	schedulerSpawnC(workerProgram, wa, 0);
+	schedulerRun(); // exits once the worker's fibers (incl. any receiver) drain
 
 	freeHandles();
 	freeThread(&CurrentThread);
+	free(wa->source);
+	free(wa);
 	return NULL;
 }
 
-int isolatesRun(int count, const char *snapshotFile, const char *program)
+int isolateSpawn(const char *source)
 {
-	if (count < 1) {
-		count = 1;
+	pthread_mutex_lock(&gSpawnMutex);
+	if (gNextIsolateId >= MAX_ISOLATES) {
+		pthread_mutex_unlock(&gSpawnMutex);
+		return -1;
 	}
-	pthread_t *threads = malloc(count * sizeof(pthread_t));
-	Isolate *isolates = malloc(count * sizeof(Isolate));
+	int id = gNextIsolateId++;
 
-	for (int i = 0; i < count; i++) {
-		isolates[i] = (Isolate) {
-			.id = i,
-			.snapshotFile = snapshotFile,
-			.program = program,
-			.booted = 0,
-			.value = 0,
-		};
-		if (pthread_create(&threads[i], NULL, isolateThreadMain, &isolates[i]) != 0) {
-			fprintf(stderr, "isolate %d: pthread_create failed\n", i);
-			isolates[i].booted = -1;
-		}
+	WorkerArg *wa = malloc(sizeof(WorkerArg));
+	wa->id = id;
+	wa->source = strdup(source);
+
+	pthread_t thread;
+	if (pthread_create(&thread, NULL, isolateWorkerMain, wa) != 0) {
+		gNextIsolateId--; // hand the id back
+		pthread_mutex_unlock(&gSpawnMutex);
+		fprintf(stderr, "isolate %d: pthread_create failed\n", id);
+		free(wa->source);
+		free(wa);
+		return -1;
 	}
-
-	int failures = 0;
-	for (int i = 0; i < count; i++) {
-		pthread_join(threads[i], NULL);
-		if (isolates[i].booted != 1) {
-			failures++;
-		}
-		fprintf(stderr, "isolate %d: booted=%d result=%ld\n",
-			isolates[i].id, isolates[i].booted, isolates[i].value);
-	}
-
-	free(threads);
-	free(isolates);
-	return failures;
+	gWorkerThreads[gWorkerCount++] = thread;
+	pthread_mutex_unlock(&gSpawnMutex);
+	return id;
 }
 
-// ---- Phase 2 transport self-test ----------------------------------------
-// Pure C: no heap/image needed — proves the eventfd wakeup + MPSC queue deliver
-// buffers from one OS thread to another isolate's scheduler loop, in order.
-
-static PER_ISOLATE int gTestCount = 0;
-static PER_ISOLATE size_t gTestBytes = 0;
-static PER_ISOLATE int gTestOrdered = 1;
-static PER_ISOLATE int gTestExpect = 0;
-
-static void transportTestHandler(int fromHint, const uint8_t *bytes, size_t size)
+void isolateJoinWorkers(void)
 {
-	(void) fromHint;
-	if (size >= 1 && bytes[0] == 0) { // type 0 = stop sentinel
-		schedulerStopInbox();
-		return;
+	// Re-read the count each iteration so workers that spawn sub-workers are
+	// joined too; read each handle under the lock, join outside it.
+	int joined = 0;
+	for (;;) {
+		pthread_mutex_lock(&gSpawnMutex);
+		if (joined >= gWorkerCount) {
+			pthread_mutex_unlock(&gSpawnMutex);
+			break;
+		}
+		pthread_t thread = gWorkerThreads[joined];
+		pthread_mutex_unlock(&gSpawnMutex);
+		pthread_join(thread, NULL);
+		joined++;
 	}
-	// type 1 = data: bytes[1..4] hold a 32-bit little-endian sequence number
-	int seq = (size >= 5)
-		? (bytes[1] | (bytes[2] << 8) | (bytes[3] << 16) | (bytes[4] << 24))
-		: -1;
-	if (seq != gTestExpect) {
-		gTestOrdered = 0;
-	}
-	gTestExpect++;
-	gTestCount++;
-	gTestBytes += size;
 }
+
+// ---- transport self-test ------------------------------------------------
+// Pure C (no heap/image): proves the eventfd wakeup + MPSC queue deliver buffers
+// from one OS thread to another isolate's inbox, in order, via the pop API.
 
 typedef struct { int id; int count; int ordered; } TransportTestArg;
 
 static void *transportReceiver(void *arg)
 {
 	TransportTestArg *ta = arg;
-	schedulerInit();
 	isolateInboxInit(ta->id);
-	isolateSetReceiveHandler(transportTestHandler);
-	schedulerRun(); // blocks on inbox, drains, exits when the stop sentinel arrives
-	ta->count = gTestCount;
-	ta->ordered = gTestOrdered;
+	int count = 0, expect = 0, ordered = 1;
+	for (;;) {
+		uint8_t *bytes;
+		size_t size;
+		if (isolateInboxPop(&bytes, &size)) {
+			if (size >= 1 && bytes[0] == 0) { free(bytes); break; } // stop sentinel
+			int seq = (size >= 5)
+				? (bytes[1] | (bytes[2] << 8) | (bytes[3] << 16) | (bytes[4] << 24))
+				: -1;
+			if (seq != expect) ordered = 0;
+			expect++; count++;
+			free(bytes);
+		} else {
+			struct pollfd pfd = { .fd = isolateInboxFd(), .events = POLLIN };
+			poll(&pfd, 1, -1);          // block until a buffer arrives
+			isolateInboxClearSignal();  // drain the eventfd counter
+		}
+	}
+	ta->count = count;
+	ta->ordered = ordered;
 	return NULL;
 }
 
@@ -245,7 +275,7 @@ int isolateTransportSelfTest(void)
 	TransportTestArg ta = { .id = 1, .count = 0, .ordered = 0 };
 	pthread_create(&recv, NULL, transportReceiver, &ta);
 
-	while (!gIsolates[1].ready) { /* wait for the receiver's inbox */ }
+	while (!__atomic_load_n(&gIsolates[1].ready, __ATOMIC_ACQUIRE)) { /* wait for the receiver's inbox */ }
 
 	for (int i = 0; i < N; i++) {
 		uint8_t buf[8] = { 1, (uint8_t) i, (uint8_t) (i >> 8), (uint8_t) (i >> 16), (uint8_t) (i >> 24), 0xAA, 0xBB, 0xCC };

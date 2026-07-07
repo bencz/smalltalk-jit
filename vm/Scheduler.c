@@ -46,13 +46,6 @@ static PER_ISOLATE size_t gTimerCap = 0;
 static PER_ISOLATE int gEpollFd = -1;
 static PER_ISOLATE size_t gArmedWaiters = 0; // fibers currently parked on an fd
 
-// cross-isolate inbox: an eventfd another OS thread pokes to hand us a message.
-// Marked in epoll with a reserved data.u64 that can never be a fiber id.
-#define SCHED_INBOX_MARKER ((uint64_t) -1)
-static PER_ISOLATE int gInboxFd = -1;
-static PER_ISOLATE _Bool gInboxActive = 0;
-void isolateDrainInbox(void); // vm/Isolate.c
-
 // Fiber registry: a slot array with a free-list for reuse. Ids handed to
 // Smalltalk pack a generation counter in the high bits so that a stale Process
 // referring to a recycled slot cannot act on the fiber that replaced it.
@@ -341,24 +334,6 @@ void schedulerInit(void)
 }
 
 
-void schedulerRegisterInboxFd(int eventFd)
-{
-	gInboxFd = eventFd;
-	gInboxActive = 1;
-	struct epoll_event ev = { .events = EPOLLIN, .data.u64 = SCHED_INBOX_MARKER };
-	epoll_ctl(gEpollFd, EPOLL_CTL_ADD, eventFd, &ev);
-}
-
-
-void schedulerStopInbox(void)
-{
-	gInboxActive = 0;
-	if (gInboxFd >= 0) {
-		epoll_ctl(gEpollFd, EPOLL_CTL_DEL, gInboxFd, NULL);
-	}
-}
-
-
 Fiber *schedulerSpawnC(FiberCEntry entry, void *arg, size_t stackSize)
 {
 	Fiber *fiber = fiberCreate(stackSize ? stackSize : MAIN_STACK_SIZE);
@@ -455,7 +430,9 @@ void schedulerWaitFd(int fd, int forWrite)
 	}
 
 	gArmedWaiters++;
+	self->waitFd = fd;  // recorded so schedulerTerminate can disarm a killed waiter
 	schedulerSuspend(); // resumed by the event loop when the fd is ready
+	self->waitFd = -1;  // woken normally: the event loop already accounted for us
 }
 
 
@@ -479,6 +456,15 @@ void schedulerTerminate(size_t id)
 
 	if (fiber->state == FIBER_READY) {
 		readyRemove(fiber);
+	} else if (fiber->state == FIBER_SUSPENDED && fiber->waitFd >= 0) {
+		// Killing a fiber parked on an fd: undo its epoll arming and its armed-
+		// waiter accounting, else the run loop keeps blocking on an event that
+		// will never be dispatched to a live fiber (the isolate would hang).
+		epoll_ctl(gEpollFd, EPOLL_CTL_DEL, fiber->waitFd, NULL);
+		if (gArmedWaiters > 0) {
+			gArmedWaiters--;
+		}
+		fiber->waitFd = -1;
 	}
 	fiber->state = FIBER_DONE;
 	unregisterFiber(fiber);
@@ -506,10 +492,6 @@ static void waitForEvents(void)
 	struct epoll_event events[64];
 	int n = epoll_wait(gEpollFd, events, 64, timeout);
 	for (int i = 0; i < n; i++) {
-		if (events[i].data.u64 == SCHED_INBOX_MARKER) {
-			isolateDrainInbox(); // a peer isolate handed us a message
-			continue;
-		}
 		if (gArmedWaiters > 0) {
 			gArmedWaiters--;
 		}
@@ -526,7 +508,7 @@ Value schedulerRun(void)
 		if (fiber == NULL) {
 			// Nothing runnable. If fibers are sleeping or waiting on I/O, block
 			// until something happens; otherwise there is no more work to do.
-			if (gArmedWaiters > 0 || gTimerCount > 0 || gInboxActive) {
+			if (gArmedWaiters > 0 || gTimerCount > 0) {
 				waitForEvents();
 				continue;
 			}

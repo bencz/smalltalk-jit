@@ -64,6 +64,7 @@ Fiber *fiberCreate(size_t stackSize)
 	fiber->process = 0;
 	fiber->cEntry = NULL;
 	fiber->cArg = NULL;
+	fiber->waitFd = -1;
 	fiber->queueNext = NULL;
 
 	// Prime the stack so the first fiberSwitchAsm into it pops six zeroed

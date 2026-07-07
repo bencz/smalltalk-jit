@@ -171,11 +171,11 @@ static void writeValue(Writer *w, Value v)
 	writeObjectRef(w, asObject(v));
 }
 
-uint8_t *messageSerialize(RawObject *root, size_t *outSize)
+uint8_t *messageSerialize(Value root, size_t *outSize)
 {
 	Writer w = { .buf = { 0 }, .nextId = 0 };
 	idmapInit(&w.map);
-	writeObjectRef(&w, root);
+	writeValue(&w, root); // handles both immediate roots (e.g. a bare integer) and objects
 	idmapFree(&w.map);
 	if (w.buf.error) {
 		free(w.buf.data);
@@ -295,7 +295,7 @@ static Value readValue(Cursor *c, Registry *reg)
 	}
 }
 
-Value messageDeserialize(const uint8_t *bytes, size_t size)
+_Bool messageDeserialize(const uint8_t *bytes, size_t size, Value *out)
 {
 	Cursor c = { .data = bytes, .pos = 0, .size = size, .error = 0 };
 	Registry reg = { 0 };
@@ -303,12 +303,13 @@ Value messageDeserialize(const uint8_t *bytes, size_t size)
 	// Re-root the whole graph via its root in the CALLER's handle scope, then drop
 	// the per-object persistent handles (no allocation happens between, so nothing
 	// moves). The graph stays alive via the caller's scope until it uses/roots the
-	// returned value — same convention as evalCode().
+	// returned value (an immediate root, e.g. a SmallInteger, needs no rooting).
 	Object *rooted = valueTypeOf(root, VALUE_POINTER) ? scopeHandle(asObject(root)) : NULL;
 	for (size_t i = 0; i < reg.count; i++) freeHandle(reg.handles[i]);
 	free(reg.handles);
 	if (c.error) return 0;
-	return rooted != NULL ? getTaggedPtr(rooted) : root;
+	*out = rooted != NULL ? getTaggedPtr(rooted) : root;
+	return 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -359,17 +360,19 @@ int messageSelfTest(void)
 		if (!valueTypeOf(origV, VALUE_POINTER)) { fprintf(stderr, "  case %zu: eval did not yield an object\n", k); failures++; continue; }
 		Object *orig = scopeHandle(asObject(origV));
 		size_t size = 0;
-		uint8_t *bytes = messageSerialize(orig->raw, &size);
+		uint8_t *bytes = messageSerialize(getTaggedPtr(orig), &size);
 		if (bytes == NULL) { fprintf(stderr, "  case %zu: serialize rejected\n", k); failures++; continue; }
-		Value copyV = messageDeserialize(bytes, size);
+		Value copyV;
+		_Bool ok = messageDeserialize(bytes, size, &copyV);
 		free(bytes);
-		if (copyV == 0 || !valueTypeOf(copyV, VALUE_POINTER)) { fprintf(stderr, "  case %zu: deserialize failed\n", k); failures++; continue; }
+		if (!ok || !valueTypeOf(copyV, VALUE_POINTER)) { fprintf(stderr, "  case %zu: deserialize failed\n", k); failures++; continue; }
 		Object *copy = scopeHandle(asObject(copyV));
 		_Bool eq = structEqual(orig->raw, copy->raw, 0);
 		_Bool distinct = orig->raw != copy->raw;
 		fprintf(stderr, "  case %zu: bytes=%zu equal=%d distinct=%d\n", k, size, eq, distinct);
 		if (!eq || !distinct) failures++;
 	}
+
 	closeHandleScope(&scope, NULL);
 	fprintf(stderr, "message self-test: %d failures\n", failures);
 	return failures;

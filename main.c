@@ -80,22 +80,24 @@ int main(int argc, char **args)
 		return msgResult;
 	}
 
-	// Multi-isolate mode (-i N): each isolate boots its own independent VM on its
-	// own OS thread (own heap/GC/scheduler/kernel), loading -s <snapshot> and
-	// evaluating -e <program>. The main thread just spawns and joins them.
-	if (cliArgs.isolates > 1) {
-		return isolatesRun(cliArgs.isolates, cliArgs.snapshotFileName, cliArgs.eval);
-	}
-
 	initThread(&CurrentThread);
 	bootstrapSmalltalk(cliArgs.snapshotFileName, cliArgs.bootstrapDir);
+
+	// The program runs on the MAIN isolate (id 0). It can spawn worker isolates
+	// at runtime (`Isolate spawn:`), each a fresh VM on another core that reloads
+	// this same image; the main isolate keeps running. Give it an inbox so
+	// workers can message it, and remember the image path so workers can reload.
+	isolateSetSnapshotPath(cliArgs.snapshotFileName);
+	schedulerInit();
+	isolateInboxInit(0);
 
 	// Hand execution over to the cooperative fiber scheduler: the program runs
 	// as the first fiber and the loop keeps running until it (and any processes
 	// it forked) are done.
-	schedulerInit();
 	schedulerSpawnC(runProgram, &ctx, 0);
 	schedulerRun();
+
+	isolateJoinWorkers(); // wait for any worker isolates the program spawned
 
 	freeHandles();
 	freeThread(&CurrentThread);

@@ -11,7 +11,6 @@ typedef struct {
 	char *snapshotFileName;
 	char *fileName;
 	char *eval;
-	int isolates;
 	_Bool printHelp;
 } CliArgs;
 
@@ -24,18 +23,14 @@ static void parseCliArgs(CliArgs *cliArgs, int argc, char **args)
 	cliArgs->snapshotFileName = "snapshot";
 	cliArgs->fileName = NULL;
 	cliArgs->eval = NULL;
-	cliArgs->isolates = 1;
 	cliArgs->printHelp = 0;
 
 	int arg;
 	opterr = 0;
-	while ((arg = getopt(argc, args, "hb:s:f:e:i:")) != -1) {
+	while ((arg = getopt(argc, args, "hb:s:f:e:")) != -1) {
 		switch (arg) {
 		case 'e':
 			cliArgs->eval = optarg;
-			break;
-		case 'i':
-			cliArgs->isolates = atoi(optarg);
 			break;
 		case 'f':
 			cliArgs->fileName = optarg;

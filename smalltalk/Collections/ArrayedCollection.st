@@ -18,6 +18,25 @@ ArrayedCollection := SequenceableCollection [
 	]
 
 
+	class with: anObject with: anObject2 with: anObject3 [
+		^(self new: 3)
+			at: 1 put: anObject;
+			at: 2 put: anObject2;
+			at: 3 put: anObject3;
+			yourself
+	]
+
+
+	class with: anObject with: anObject2 with: anObject3 with: anObject4 [
+		^(self new: 4)
+			at: 1 put: anObject;
+			at: 2 put: anObject2;
+			at: 3 put: anObject3;
+			at: 4 put: anObject4;
+			yourself
+	]
+
+
 	class withAll: aCollection [
 		| result index |
 

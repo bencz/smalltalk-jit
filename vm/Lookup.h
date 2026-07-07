@@ -1,5 +1,5 @@
-#ifndef MESSAGE_H
-#define MESSAGE_H
+#ifndef LOOKUP_H
+#define LOOKUP_H
 
 #include "Object.h"
 #include "CompiledCode.h"

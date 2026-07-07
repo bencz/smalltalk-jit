@@ -24,6 +24,8 @@ Value evalCode(char *source);
 Value evalObject(char *source);
 _Bool parseFileAndInitialize(char *filename, Value *lastBlockResult);
 _Bool parseFile(char *filename, OrderedCollection *classes, OrderedCollection *blocks);
+_Bool parseSourceAndInitialize(char *source, Value *lastBlockResult);
+_Bool parseSource(char *source, OrderedCollection *classes, OrderedCollection *blocks);
 
 
 static void entryArgsAddObject(EntryArgs *args, Object *object)

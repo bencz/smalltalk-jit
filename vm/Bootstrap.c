@@ -304,6 +304,7 @@ static _Bool parseKernelFiles(char *kernelDir)
 		// synchronisation primitives
 		"Concurrency/Semaphore.st",
 		"Concurrency/Channel.st",
+		"Concurrency/Isolate.st",
 
 		// actor framework (ProtoActor-style)
 		"Actors/SystemMessages.st",

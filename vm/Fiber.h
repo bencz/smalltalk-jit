@@ -43,6 +43,7 @@ typedef struct Fiber {
 	void *cArg;
 
 	size_t id;              // stable id, index into the scheduler fiber registry
+	int waitFd;             // fd this fiber is EPOLLONESHOT-armed on, or -1
 	struct Fiber *queueNext; // intrusive link for the ready queue / wait queues
 } Fiber;
 

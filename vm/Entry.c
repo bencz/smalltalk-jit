@@ -260,6 +260,79 @@ _Bool parseFile(char *filename, OrderedCollection *classes, OrderedCollection *b
 }
 
 
+// Like parseFile, but the program text comes from a source STRING rather than a
+// file. Used to run a spawned isolate's entry program (which may define classes
+// and then run top-level blocks): source is portable across isolates, a live
+// block is not.
+_Bool parseSource(char *source, OrderedCollection *classes, OrderedCollection *blocks)
+{
+	HandleScope scope;
+	openHandleScope(&scope);
+
+	Parser parser;
+	initParser(&parser, asString(source));
+
+	while (!parserAtEnd(&parser)) {
+		if (blocks != NULL && currentToken(&parser.tokenizer)->type == TOKEN_OPEN_SQUARE_BRACKET) {
+			BlockNode *node = parseBlock(&parser);
+			if (node == NULL) {
+				printParseError(&parser, source);
+				closeHandleScope(&scope, NULL);
+				return 0;
+			}
+			ordCollAddObject(blocks, (Object *) node);
+		} else {
+			ClassNode *node = parseClass(&parser);
+			if (node == NULL) {
+				printParseError(&parser, source);
+				closeHandleScope(&scope, NULL);
+				return 0;
+			}
+			Object *class = buildClass(node);
+			if (isCompileError(class)) {
+				printCompileError((CompileError *) class);
+				closeHandleScope(&scope, NULL);
+				return 0;
+			}
+			if (classes != NULL) {
+				ordCollAddObject(classes, class);
+			}
+		}
+	}
+
+	freeParser(&parser);
+	closeHandleScope(&scope, NULL);
+	return 1;
+}
+
+
+_Bool parseSourceAndInitialize(char *source, Value *lastBlockResult)
+{
+	HandleScope scope;
+	openHandleScope(&scope);
+
+	OrderedCollection *classes = newOrdColl(8);
+	OrderedCollection *blocks = newOrdColl(8);
+	if (!parseSource(source, classes, blocks)) {
+		closeHandleScope(&scope, NULL);
+		return 0;
+	}
+
+	size_t classesSize = ordCollSize(classes);
+	for (size_t i = 0; i < classesSize; i++) {
+		invokeInititalize(ordCollObjectAt(classes, i));
+	}
+
+	size_t blocksSize = ordCollSize(blocks);
+	for (size_t i = 0; i < blocksSize; i++) {
+		*lastBlockResult = evalBlockNode((BlockNode *) ordCollObjectAt(blocks, i));
+	}
+
+	closeHandleScope(&scope, NULL);
+	return 1;
+}
+
+
 static Value evalBlockNode(BlockNode *block)
 {
 	HandleScope scope;
