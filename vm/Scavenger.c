@@ -10,9 +10,11 @@
 
 #define SCAVENGER_ALIGN 8
 
-static void iterateStack(Scavenger *scavenger);
-static void iterateExceptionHandlers(Scavenger *scavenger);
-static void iterateHandles(Scavenger *scavenger);
+static void iterateFiberRoots(Scavenger *scavenger, Fiber *fiber);
+static void iteratePersistentHandles(Scavenger *scavenger);
+static void iterateThreadRoots(Scavenger *scavenger);
+static void iterateExceptionHandlerSlot(Scavenger *scavenger, Value *slot);
+static void iterateHandleScopes(Scavenger *scavenger, HandleScope *scopes);
 static void iterateRememberedSet(Scavenger *scavenger);
 static void iterateNativeCode(Scavenger *scavenger);
 static RawObject *processPointer(Scavenger *scavenger, RawObject **p);
@@ -73,10 +75,27 @@ void scavengerScavenge(Scavenger *scavenger)
 	scavenger->toSpace = toSpace;
 
 	schedulerSyncCurrentRoots();
-	iterateRememberedSet(scavenger);
-	iterateStack(scavenger);
-	iterateExceptionHandlers(scavenger);
-	iterateHandles(scavenger);
+	iterateRememberedSet(scavenger);       // shared: covers every old→young edge
+	iteratePersistentHandles(scavenger);   // shared across all fibers
+	if (schedulerActive()) {
+		// Walk ONLY dirty fibers; clean any (non-current) whose direct roots are
+		// all old — their reachable young objects are already covered by the
+		// remembered set. This is what turns O(fibers × scavenges) into
+		// O(dirty × scavenges).
+		Fiber *current = schedulerCurrentFiber();
+		Fiber *fiber = schedulerDirtyHead();
+		while (fiber != NULL) {
+			Fiber *next = fiber->dirtyNext; // capture before a possible unlink
+			scavenger->fiberHasYoungRoot = 0;
+			iterateFiberRoots(scavenger, fiber);
+			if (fiber != current && !scavenger->fiberHasYoungRoot) {
+				schedulerMarkFiberClean(fiber);
+			}
+			fiber = next;
+		}
+	} else {
+		iterateThreadRoots(scavenger); // bootstrap: no scheduler yet
+	}
 	iterateNativeCode(scavenger);
 	schedulerRestoreCurrentRoots();
 	scavenger->survivorEnd = scavenger->top;
@@ -133,6 +152,18 @@ static _Bool plausibleObject(Scavenger *scavenger, RawObject *object)
 	return size > 0 && size <= (size_t) scavenger->size;
 }
 
+// Record whether a DIRECT fiber root slot, AFTER processing, still holds a young
+// pointer. A fiber with no young direct root can be skipped by future scavenges
+// (its reachable young objects are covered by the remembered set). Must be called
+// on the post-processing value: stale nil-init garbage has been rewritten to old
+// `nil`, and a genuine young survivor stays young until it promotes (≤2 scavenges).
+static inline void noteYoungRoot(Scavenger *scavenger, Value v)
+{
+	if (valueTypeOf(v, VALUE_POINTER) && isNewObject(asObject(v))) {
+		scavenger->fiberHasYoungRoot = 1;
+	}
+}
+
 static void scavengeStackSlot(Scavenger *scavenger, Value *value)
 {
 	RawObject *object = asObject(*value);
@@ -158,6 +189,7 @@ static void scavengeStackSlot(Scavenger *scavenger, Value *value)
 		*value = tagPtr(Handles.nil->raw);
 	}
 	processTaggedPointer(scavenger, value);
+	noteYoungRoot(scavenger, *value);
 }
 
 
@@ -166,7 +198,9 @@ static void iterateStackFrames(Scavenger *scavenger, EntryStackFrame *entryFrame
 	while (entryFrame != NULL) {
 		StackFrame *prev = entryFrame->exit;
 		StackFrame *frame = stackFrameGetParent(prev, entryFrame);
-		processTaggedPointer(scavenger, stackFrameGetSlotPtr(prev, 0));
+		Value *slot0 = stackFrameGetSlotPtr(prev, 0);
+		processTaggedPointer(scavenger, slot0);
+		noteYoungRoot(scavenger, *slot0);
 
 		while (frame != NULL) {
 			NativeCode *code = stackFrameGetNativeCode(frame);
@@ -202,25 +236,39 @@ static void iterateStackFrames(Scavenger *scavenger, EntryStackFrame *entryFrame
 }
 
 
-static void iterateStack(Scavenger *scavenger)
+// Walk one fiber's six DIRECT roots in the required per-fiber order (entryBlock/
+// process, then stack → exception handler → handle scopes → context — the
+// exception-handler walk reads the fiber's already-forwarded stack). Sets
+// scavenger->fiberHasYoungRoot if any direct slot ends up young after processing.
+static void iterateFiberRoots(Scavenger *scavenger, Fiber *fiber)
 {
-	if (!schedulerActive()) {
-		iterateStackFrames(scavenger, scavenger->heap->thread->stackFramesTail);
-		return;
+	if (valueTypeOf(fiber->entryBlock, VALUE_POINTER)) {
+		processTaggedPointer(scavenger, &fiber->entryBlock);
+		noteYoungRoot(scavenger, fiber->entryBlock);
 	}
-	size_t slots = schedulerFiberSlots();
-	for (size_t i = 0; i < slots; i++) {
-		Fiber *fiber = schedulerFiberAt(i);
-		if (fiber == NULL) {
-			continue;
-		}
-		if (valueTypeOf(fiber->entryBlock, VALUE_POINTER)) {
-			processTaggedPointer(scavenger, &fiber->entryBlock);
-		}
-		if (valueTypeOf(fiber->process, VALUE_POINTER)) {
-			processTaggedPointer(scavenger, &fiber->process);
-		}
-		iterateStackFrames(scavenger, fiber->roots.stackFramesTail);
+	if (valueTypeOf(fiber->process, VALUE_POINTER)) {
+		processTaggedPointer(scavenger, &fiber->process);
+		noteYoungRoot(scavenger, fiber->process);
+	}
+	iterateStackFrames(scavenger, fiber->roots.stackFramesTail);
+	iterateExceptionHandlerSlot(scavenger, &fiber->roots.exceptionHandler);
+	iterateHandleScopes(scavenger, fiber->roots.handleScopes);
+	if (fiber->roots.context != 0) {
+		processTaggedPointer(scavenger, &fiber->roots.context);
+		noteYoungRoot(scavenger, fiber->roots.context);
+	}
+}
+
+
+// Non-scheduler (bootstrap) path: the single thread's roots, walked directly.
+static void iterateThreadRoots(Scavenger *scavenger)
+{
+	Thread *thread = scavenger->heap->thread;
+	iterateStackFrames(scavenger, thread->stackFramesTail);
+	iterateExceptionHandlerSlot(scavenger, &CurrentExceptionHandler);
+	iterateHandleScopes(scavenger, thread->handleScopes);
+	if (thread->context != 0) {
+		processTaggedPointer(scavenger, &thread->context);
 	}
 }
 
@@ -244,22 +292,7 @@ static void iterateExceptionHandlerSlot(Scavenger *scavenger, Value *slot)
 
 	if (*slot != 0) {
 		processTaggedPointer(scavenger, slot);
-	}
-}
-
-
-static void iterateExceptionHandlers(Scavenger *scavenger)
-{
-	if (!schedulerActive()) {
-		iterateExceptionHandlerSlot(scavenger, &CurrentExceptionHandler);
-		return;
-	}
-	size_t slots = schedulerFiberSlots();
-	for (size_t i = 0; i < slots; i++) {
-		Fiber *fiber = schedulerFiberAt(i);
-		if (fiber != NULL) {
-			iterateExceptionHandlerSlot(scavenger, &fiber->roots.exceptionHandler);
-		}
+		noteYoungRoot(scavenger, *slot);
 	}
 }
 
@@ -271,41 +304,25 @@ static void iterateHandleScopes(Scavenger *scavenger, HandleScope *scopes)
 	while (handleScopeIteratorHasNext(&handleScopeIterator)) {
 		HandleScope *scope = handleScopeIteratorNext(&handleScopeIterator);
 		for (ptrdiff_t i = 0; i < scope->size; i++) {
-			processPointer(scavenger, &scope->handles[i].raw);
+			RawObject *obj = processPointer(scavenger, &scope->handles[i].raw);
+			if (isNewObject(obj)) {
+				scavenger->fiberHasYoungRoot = 1;
+			}
 		}
 	}
 }
 
 
-static void iterateHandles(Scavenger *scavenger)
+// The persistent handle list is SHARED across all fibers — walked once per
+// scavenge regardless of the dirty-fiber optimization. (Per-fiber handle scopes
+// and context are walked in iterateFiberRoots.)
+static void iteratePersistentHandles(Scavenger *scavenger)
 {
 	Thread *thread = scavenger->heap->thread;
-
-	// persistent handle list is shared across all fibers
 	HandlesIterator handlesIterator;
 	initHandlesIterator(&handlesIterator, thread->handles);
 	while (handlesIteratorHasNext(&handlesIterator)) {
 		processPointer(scavenger, &handlesIteratorNext(&handlesIterator)->raw);
-	}
-
-	if (!schedulerActive()) {
-		iterateHandleScopes(scavenger, thread->handleScopes);
-		if (thread->context != 0) {
-			processTaggedPointer(scavenger, &thread->context);
-		}
-		return;
-	}
-
-	size_t slots = schedulerFiberSlots();
-	for (size_t i = 0; i < slots; i++) {
-		Fiber *fiber = schedulerFiberAt(i);
-		if (fiber == NULL) {
-			continue;
-		}
-		iterateHandleScopes(scavenger, fiber->roots.handleScopes);
-		if (fiber->roots.context != 0) {
-			processTaggedPointer(scavenger, &fiber->roots.context);
-		}
 	}
 }
 

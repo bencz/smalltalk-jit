@@ -13,6 +13,13 @@
 #define SCAVENGE_EVERY_ALLOC 0
 #define VERIFY_HEAP_AFTER_GC 0
 
+// Full GC (mark/sweep) runs only once old-space capacity grows past a threshold
+// that itself grows with the live set — instead of on every page growth. Without
+// this, a workload that steadily promotes (e.g. 100k live fibers' contexts)
+// triggers a full GC on nearly every scavenge = O(N) full GCs = O(N²).
+#define OLD_GC_MIN_THRESHOLD (16 * MB)
+#define OLD_GC_GROWTH 2
+
 static void nilVars(Value *vars, size_t count);
 static uint8_t *pageSpaceAllocate(PageSpace *pageSpace, size_t size);
 static void emptyRememberedSet(void);
@@ -30,6 +37,7 @@ void initHeap(Heap *heap, struct Thread *thread)
 	initPageSpace(&heap->oldSpace, 256 * KB, 0);
 	initPageSpace(&heap->execSpace, 256 * KB, 1);
 	initRememberedSet(&heap->rememberedSet);
+	heap->oldGcThreshold = OLD_GC_MIN_THRESHOLD;
 }
 
 
@@ -122,6 +130,7 @@ static uint8_t *pageSpaceAllocate(PageSpace *pageSpace, size_t size)
 		HeapPage *page = mapHeapPage(pageSize, pageSpace->pagesTail->isExecutable);
 		pageSpace->pagesTail->next = page;
 		pageSpace->pagesTail = page;
+		pageSpaceIndexAdd(pageSpace, page); // before the alloc below (its assert queries the index)
 		expandFreeList(&pageSpace->freeList, page);
 		p = pageSpaceTryAllocate(pageSpace, size);
 		ASSERT(p != NULL);
@@ -137,8 +146,15 @@ uint8_t *allocate(Heap *heap, size_t size)
 	uint8_t *p = scavengerTryAllocate(&heap->newSpace, realSize);
 	if (p == NULL) {
 		scavengerScavenge(&heap->newSpace);
-		if (heap->newSpace.hasPromotionFailure) {
+		// A scavenge that had to grow old space signals promotion pressure. Only
+		// escalate to a full GC once old-space capacity has grown past the moving
+		// threshold — growing to hold live promotions must NOT force a full GC.
+		if (heap->newSpace.hasPromotionFailure && heap->oldSpace.totalBytes >= heap->oldGcThreshold) {
 			markAndSweep(&CurrentThread);
+			heap->oldGcThreshold = heap->oldSpace.totalBytes * OLD_GC_GROWTH;
+			if (heap->oldGcThreshold < OLD_GC_MIN_THRESHOLD) {
+				heap->oldGcThreshold = OLD_GC_MIN_THRESHOLD;
+			}
 		}
 		p = scavengerTryAllocate(&heap->newSpace, realSize);
 	}

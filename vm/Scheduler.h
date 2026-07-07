@@ -59,8 +59,15 @@ void schedulerFiberMain(void);
 // ---- GC integration ------------------------------------------------------
 
 _Bool schedulerActive(void);
-size_t schedulerFiberSlots(void);         // upper bound for iteration
+size_t schedulerFiberSlots(void);         // upper bound for iteration (full GC)
 Fiber *schedulerFiberAt(size_t slot);     // may be NULL (freed slot)
+
+// Scavenger-only: walk just the "dirty" fibers (those that may hold a young root
+// directly), cleaning any whose direct roots are all old. The full GC still uses
+// schedulerFiberSlots/At to walk ALL fibers.
+Fiber *schedulerDirtyHead(void);          // head of the intrusive dirty list
+Fiber *schedulerCurrentFiber(void);       // the running fiber (never cleaned)
+void schedulerMarkFiberClean(Fiber *fiber);
 
 // Copy the running fiber's live roots into its record before a GC walk, and
 // copy them back afterwards (so forwarded context/handler pointers stay live).

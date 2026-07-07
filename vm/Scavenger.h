@@ -15,6 +15,7 @@ typedef struct {
 	uint8_t *top;
 	uint8_t *end;
 	uint8_t *survivorEnd;
+	_Bool fiberHasYoungRoot; // set while walking one fiber if any DIRECT root is young
 } Scavenger;
 
 void initScavenger(Scavenger *scavenger, struct Heap *heap, size_t size);

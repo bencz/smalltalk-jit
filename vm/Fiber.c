@@ -95,6 +95,32 @@ void fiberDestroy(Fiber *fiber)
 }
 
 
+// Return the dead region of a just-parked fiber's stack to the OS. The stack
+// grows DOWN with the guard page at the low (base) end, so live frames occupy
+// [sp, top) and everything below the saved sp is unused / already-returned
+// frames. MADV_DONTNEED drops those committed pages; they re-fault zero if the
+// fiber later runs deeper (and the JIT prologue nil-inits every slot before
+// reading it, so zero-fill is safe). Keep a one-page cushion below sp and never
+// touch the guard page. Only worth a syscall when a real span can be reclaimed.
+#define FIBER_STACK_RELEASE_THRESHOLD (32 * 1024)
+
+void fiberReleaseIdleStack(Fiber *fiber)
+{
+	if (fiber->stackBase == NULL) {
+		return; // the scheduler context has no fiber stack
+	}
+	long pageSize = sysconf(_SC_PAGESIZE);
+	if (pageSize <= 0) {
+		pageSize = 4096;
+	}
+	uintptr_t lo = (uintptr_t) fiber->stackBase + pageSize;                 // past the guard page
+	uintptr_t hi = ((uintptr_t) fiber->sp - pageSize) & ~((uintptr_t) pageSize - 1); // cushion below sp
+	if (hi > lo && (hi - lo) >= FIBER_STACK_RELEASE_THRESHOLD) {
+		madvise((void *) lo, hi - lo, MADV_DONTNEED);
+	}
+}
+
+
 void fiberTrampoline(void)
 {
 	// Runs on the new fiber's own stack the first time it is scheduled.

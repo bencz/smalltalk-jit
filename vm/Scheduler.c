@@ -67,6 +67,57 @@ static PER_ISOLATE size_t gFreeCap = 0;
 #define WORKER_STACK_SIZE (512 * 1024)
 
 
+// ---- GC dirty-fiber list --------------------------------------------------
+// Fibers that may hold a young pointer directly on their roots. The scavenger
+// walks ONLY these (a fiber whose direct roots are all old is covered by the
+// remembered set and skipped). A fiber becomes dirty when registered or run, and
+// is cleaned by the scavenger once its walk finds no young direct root. Doubly
+// linked so the scavenger can unlink a cleaned fiber in O(1).
+
+static PER_ISOLATE Fiber *gDirtyHead = NULL;
+
+static void schedulerMarkFiberDirty(Fiber *fiber)
+{
+	if (fiber->dirty) {
+		return;
+	}
+	fiber->dirty = 1;
+	fiber->dirtyPrev = NULL;
+	fiber->dirtyNext = gDirtyHead;
+	if (gDirtyHead != NULL) {
+		gDirtyHead->dirtyPrev = fiber;
+	}
+	gDirtyHead = fiber;
+}
+
+void schedulerMarkFiberClean(Fiber *fiber)
+{
+	if (!fiber->dirty) {
+		return;
+	}
+	fiber->dirty = 0;
+	if (fiber->dirtyPrev != NULL) {
+		fiber->dirtyPrev->dirtyNext = fiber->dirtyNext;
+	} else {
+		gDirtyHead = fiber->dirtyNext;
+	}
+	if (fiber->dirtyNext != NULL) {
+		fiber->dirtyNext->dirtyPrev = fiber->dirtyPrev;
+	}
+	fiber->dirtyNext = fiber->dirtyPrev = NULL;
+}
+
+Fiber *schedulerDirtyHead(void)
+{
+	return gDirtyHead;
+}
+
+Fiber *schedulerCurrentFiber(void)
+{
+	return gCurrent;
+}
+
+
 // ---- registry -------------------------------------------------------------
 
 static size_t registerFiber(Fiber *fiber)
@@ -85,12 +136,16 @@ static size_t registerFiber(Fiber *fiber)
 	}
 	gFibers[slot] = fiber;
 	fiber->id = (gSlotGeneration[slot] << ID_SLOT_BITS) | slot;
+	// Dirty from birth — before initFiberContext (which allocates and can
+	// scavenge) could otherwise skip this fiber and drop its young entryBlock.
+	schedulerMarkFiberDirty(fiber);
 	return fiber->id;
 }
 
 
 static void unregisterFiber(Fiber *fiber)
 {
+	schedulerMarkFiberClean(fiber); // unlink before the struct is freed
 	size_t slot = idSlot(fiber->id);
 	gFibers[slot] = NULL;
 	gSlotGeneration[slot]++;
@@ -282,6 +337,7 @@ static void runFiber(Fiber *fiber)
 {
 	gCurrent = fiber;
 	fiber->state = FIBER_RUNNING;
+	schedulerMarkFiberDirty(fiber); // running code may create new young roots
 	loadRoots(fiber);
 	fiberSwitchAsm(&gScheduler.sp, fiber->sp);
 	gCurrent = NULL;
@@ -520,6 +576,9 @@ Value schedulerRun(void)
 		if (fiber->state == FIBER_DONE) {
 			unregisterFiber(fiber);
 			fiberDestroy(fiber);
+		} else if (fiber->state == FIBER_SUSPENDED) {
+			// Parked: hand the dead pages below its stack pointer back to the OS.
+			fiberReleaseIdleStack(fiber);
 		}
 	}
 	return gExitResult;

@@ -45,6 +45,13 @@ typedef struct Fiber {
 	size_t id;              // stable id, index into the scheduler fiber registry
 	int waitFd;             // fd this fiber is EPOLLONESHOT-armed on, or -1
 	struct Fiber *queueNext; // intrusive link for the ready queue / wait queues
+	// GC: a fiber is "dirty" (may hold a young root directly on its stack/handles)
+	// from when it is registered/run until a scavenge finds all its direct roots
+	// old. Only dirty fibers are walked by the scavenger; clean ones are covered
+	// by the remembered set. Linked into the scheduler's dirty list.
+	_Bool dirty;
+	struct Fiber *dirtyNext;
+	struct Fiber *dirtyPrev;
 } Fiber;
 
 // Low-level context switch (defined in Fiber.c via inline asm).
@@ -55,6 +62,7 @@ void fiberSwitchAsm(void **saveSp, void *newSp);
 // begins executing fiberTrampoline (which calls fiberMain). Does not schedule it.
 Fiber *fiberCreate(size_t stackSize);
 void fiberDestroy(Fiber *fiber);
+void fiberReleaseIdleStack(Fiber *fiber); // madvise the dead stack region on park
 
 // The trampoline the freshly-created stack "returns" into on first switch.
 void fiberTrampoline(void);

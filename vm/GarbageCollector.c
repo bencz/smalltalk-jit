@@ -367,6 +367,7 @@ void gcSweep(PageSpace *space)
 			if (space->pagesTail == page) {
 				space->pagesTail = prev;
 			}
+			pageSpaceIndexRemove(space, page);
 			unmapHeapPage(page);
 		}
 		page = nextPage;

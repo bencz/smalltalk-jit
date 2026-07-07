@@ -15,6 +15,7 @@ typedef struct Heap {
 	PageSpace oldSpace;
 	PageSpace execSpace;
 	RememberedSet rememberedSet;
+	size_t oldGcThreshold; // run a full GC only once old space grows past this
 } Heap;
 
 void initHeap(Heap *heap, struct Thread *thread);
