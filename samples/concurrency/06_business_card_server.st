@@ -199,16 +199,9 @@ BusinessCardApi := Object [
 		aServer get: '/__stats' do: [:req |
 			(HttpResponse ok) json: GarbageCollector lastStats ].
 
-		"Force a full GC and report the resulting live/scanned counts — used to tell
-		 a genuine leak (marked stays huge) from floating garbage (marked small)."
+		"Force a full GC and report the resulting live/scanned counts."
 		aServer get: '/__gc' do: [:req |
 			GarbageCollector collectGarbage.
-			(HttpResponse ok) json: GarbageCollector lastStats ].
-
-		"Force a full GC then print a live-object-by-class census to stderr."
-		aServer get: '/__histo' do: [:req |
-			GarbageCollector collectGarbage.
-			GarbageCollector printHistogram.
 			(HttpResponse ok) json: GarbageCollector lastStats ].
 
 		^aServer

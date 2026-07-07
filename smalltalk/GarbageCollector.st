@@ -14,9 +14,4 @@ GarbageCollector := Object [
 		<primitive: LastGCStatsPrimitive>
 	]
 
-
-	class printHistogram [
-		<primitive: HeapHistogramPrimitive>
-	]
-
 ]

@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.5)
 project(smalltalk-jit)
 
-set(CMAKE_C_FLAGS "-std=gnu11 -pedantic -Wno-flexible-array-extensions -Wno-c11-extensions -Wno-gnu -fcommon -fno-omit-frame-pointer")
+set(CMAKE_C_FLAGS "-std=gnu11 -pedantic -Werror -Wno-flexible-array-extensions -Wno-c11-extensions -Wno-gnu -fcommon -fno-omit-frame-pointer")
 
 # Default to an optimized build with debug info and assertions kept on (the VM's
 # ASSERTs are valuable while the GC/JIT are still maturing). Pass

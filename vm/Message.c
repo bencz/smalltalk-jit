@@ -97,14 +97,14 @@ typedef struct { MsgBuf buf; IdMap map; uint32_t nextId; } Writer;
 static _Bool isClassObject(RawObject *o)
 {
 	// `o` is a class iff its class (metaclass) is an instance of Metaclass.
-	return (RawObject *) ((RawClass *) o->class)->class == Handles.MetaClass->raw;
+	return (RawObject *) ((RawClass *) o->class)->class == (RawObject *) Handles.MetaClass->raw;
 }
 
 static _Bool isRejectedClass(RawObject *cls)
 {
-	return cls == Handles.Block->raw || cls == Handles.BlockContext->raw
-		|| cls == Handles.MethodContext->raw || cls == Handles.CompiledMethod->raw
-		|| cls == Handles.CompiledBlock->raw || cls == Handles.ExceptionHandler->raw;
+	return cls == (RawObject *) Handles.Block->raw || cls == (RawObject *) Handles.BlockContext->raw
+		|| cls == (RawObject *) Handles.MethodContext->raw || cls == (RawObject *) Handles.CompiledMethod->raw
+		|| cls == (RawObject *) Handles.CompiledBlock->raw || cls == (RawObject *) Handles.ExceptionHandler->raw;
 }
 
 static void writeName(Writer *w, RawObject *stringOrSymbol)
@@ -132,7 +132,7 @@ static void writeObjectRef(Writer *w, RawObject *o)
 	w->nextId++; // consumed the id we just handed out
 
 	RawObject *cls = (RawObject *) o->class;
-	if (cls == Handles.Symbol->raw) {
+	if (cls == (RawObject *) Handles.Symbol->raw) {
 		bufU8(&w->buf, MSG_SYMBOL);
 		writeName(w, o);
 		return;
