@@ -116,9 +116,26 @@ OrderedCollection := SequenceableCollection [
 
 
 	addLast: anObject [
-		lastIndex = contents size ifTrue: [self growBy: 8 shiftBy: 0].
+		lastIndex = contents size ifTrue: [self makeRoomAtLast].
 		lastIndex := lastIndex + 1.
 		^contents at: lastIndex put: anObject
+	]
+
+
+	makeRoomAtLast [
+		"contents is full at the back. If removeFirst has left dead space at the
+		 front, slide the live elements down to reuse it (this is what keeps a
+		 queue — addLast + removeFirst — from growing its backing array without
+		 bound); only grow when there is genuinely no room."
+		firstIndex > 1
+			ifTrue: [
+				| n |
+				n := lastIndex - firstIndex + 1.
+				contents replaceFrom: 1 to: n with: contents startingAt: firstIndex.
+				n + 1 to: contents size do: [:i | contents at: i put: nil].
+				firstIndex := 1.
+				lastIndex := n]
+			ifFalse: [self growBy: 8 shiftBy: 0]
 	]
 
 
@@ -163,10 +180,10 @@ OrderedCollection := SequenceableCollection [
 		self emptyCheck.
 		object := contents at: firstIndex.
 		contents at: firstIndex put: nil.
-		"firstIndex = lastIndex
-			ifTrue: [self initialize]
-			ifFalse: ["firstIndex := firstIndex + 1"]".
-		"self size < self shrinkSize ifTrue: [self shrink]."
+		firstIndex := firstIndex + 1.
+		"emptied: rewind indices so the backing array is reused from the start
+		 instead of the window sliding off the end and forcing unbounded growth."
+		firstIndex > lastIndex ifTrue: [firstIndex := 1. lastIndex := 0].
 		^object
 	]
 
@@ -177,10 +194,8 @@ OrderedCollection := SequenceableCollection [
 		self emptyCheck.
 		object := contents at: lastIndex.
 		contents at: lastIndex put: nil.
-		"firstIndex = lastIndex
-			ifTrue: [self initialize]
-			ifFalse: ["lastIndex := lastIndex - 1"]".
-		"self size < self shrinkSize ifTrue: [self shrink]."
+		lastIndex := lastIndex - 1.
+		lastIndex < firstIndex ifTrue: [firstIndex := 1. lastIndex := 0].
 		^object
 	]
 

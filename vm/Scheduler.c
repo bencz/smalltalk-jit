@@ -682,6 +682,18 @@ size_t schedulerFiberSlots(void)
 }
 
 
+size_t schedulerLiveFibers(void)
+{
+	return gFiberSlots - gFreeCount;
+}
+
+
+size_t schedulerArmedWaiters(void)
+{
+	return gArmedWaiters;
+}
+
+
 Fiber *schedulerFiberAt(size_t slot)
 {
 	return slot < gFiberSlots ? gFibers[slot] : NULL;

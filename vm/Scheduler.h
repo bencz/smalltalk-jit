@@ -60,6 +60,8 @@ void schedulerFiberMain(void);
 
 _Bool schedulerActive(void);
 size_t schedulerFiberSlots(void);         // upper bound for iteration (full GC)
+size_t schedulerLiveFibers(void);         // currently-registered (non-freed) fibers
+size_t schedulerArmedWaiters(void);       // fibers parked on an fd in epoll
 Fiber *schedulerFiberAt(size_t slot);     // may be NULL (freed slot)
 
 // Scavenger-only: walk just the "dirty" fibers (those that may hold a young root

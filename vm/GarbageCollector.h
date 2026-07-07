@@ -19,6 +19,7 @@ typedef struct {
 	// (the never-pruned-remembered-set symptom).
 	size_t scavengeCount;
 	int64_t scavengeTimeUs;
+	int64_t youngSurvivorBytes;   // bytes copied within young by the last scavenge
 } GCStats;
 
 extern PER_ISOLATE GCStats LastGCStats;

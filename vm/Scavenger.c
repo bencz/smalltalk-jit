@@ -102,6 +102,8 @@ void scavengerScavenge(Scavenger *scavenger)
 	iterateNativeCode(scavenger);
 	schedulerRestoreCurrentRoots();
 	scavenger->survivorEnd = scavenger->top;
+	LastGCStats.youngSurvivorBytes =
+		scavenger->top - (uint8_t *) ((uintptr_t) scavenger->fromSpace | NEW_SPACE_TAG);
 	memset(scavenger->toSpace, scavenger->size, 0);
 
 	LastGCStats.scavengeCount++;

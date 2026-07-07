@@ -939,7 +939,9 @@ static void histoPrintLine(size_t count, RawClass *cls)
 {
 	const char *name = "?";
 	int len = 1;
-	if (cls != NULL && ((uintptr_t) cls & SPACE_TAG) == OLD_SPACE_TAG) {
+	if (cls != NULL
+	    && (pageSpaceIncludes(&CurrentThread.heap.oldSpace, (uint8_t *) cls)
+	        || scavengerIncludes(&CurrentThread.heap.newSpace, (uint8_t *) cls))) {
 		Value nameVal = cls->name;
 		if (valueTypeOf(nameVal, VALUE_POINTER)) {
 			RawIndexedObject *s = (RawIndexedObject *) asObject(nameVal);
@@ -954,6 +956,42 @@ static PrimitiveResult heapHistogramPrimitive(Value receiver)
 {
 	static HistoEntry entries[HISTO_MAX_CLASSES];
 	size_t used = 0, overflow = 0;
+
+	// Young-space census: what survives in young after a scavenge (the survivor set
+	// whose growth drives scavenge cost)?
+	{
+		static HistoEntry yentries[HISTO_MAX_CLASSES];
+		size_t yused = 0, youngBytes = 0;
+		Scavenger *sc = &CurrentThread.heap.newSpace;
+		uint8_t *p = (uint8_t *) ((uintptr_t) sc->fromSpace | NEW_SPACE_TAG);
+		while (p < sc->top) {
+			RawObject *o = (RawObject *) p;
+			RawClass *ocls = o->class;
+			// defensive: class must live in old space or (rarely) young
+			if (!(pageSpaceIncludes(&CurrentThread.heap.oldSpace, (uint8_t *) ocls)
+			      || scavengerIncludes(sc, (uint8_t *) ocls))) {
+				break;
+			}
+			size_t osz = align(computeRawObjectSize(o), HEAP_OBJECT_ALIGN);
+			if (osz < HEAP_OBJECT_ALIGN || p + osz > sc->top) break;
+			youngBytes += osz;
+			RawClass *cls = o->class;
+			size_t i;
+			for (i = 0; i < yused; i++) {
+				if (yentries[i].cls == cls) { yentries[i].count += osz; break; } // count = BYTES here
+			}
+			if (i == yused && yused < HISTO_MAX_CLASSES) {
+				yentries[yused].cls = cls; yentries[yused].count = osz; yused++;
+			}
+			p += osz;
+		}
+		qsort(yentries, yused, sizeof(HistoEntry), histoCompare);
+		fprintf(stderr, "=== YOUNG survivors: %zu KB, %zu classes (count column = BYTES) ===\n", youngBytes / 1024, yused);
+		size_t ytop = yused < 20 ? yused : 20;
+		for (size_t i = 0; i < ytop; i++) {
+			histoPrintLine(yentries[i].count, yentries[i].cls);
+		}
+	}
 
 	PageSpaceIterator iterator;
 	pageSpaceIteratorInit(&iterator, &CurrentThread.heap.oldSpace);
@@ -1314,6 +1352,10 @@ static PrimitiveResult lastGcStatsPrimitive(Value receiver)
 	stringDictAtPut(stats, asString("scavengeTimeUs"), tagInt(LastGCStats.scavengeTimeUs));
 	stringDictAtPut(stats, asString("oldBytes"), tagInt(CurrentThread.heap.oldSpace.totalBytes));
 	stringDictAtPut(stats, asString("remembered"), tagInt(rememberedSetCount(&CurrentThread.heap.rememberedSet)));
+	stringDictAtPut(stats, asString("youngSurvivorBytes"), tagInt(LastGCStats.youngSurvivorBytes));
+	stringDictAtPut(stats, asString("liveFibers"), tagInt(schedulerLiveFibers()));
+	stringDictAtPut(stats, asString("fiberSlots"), tagInt(schedulerFiberSlots()));
+	stringDictAtPut(stats, asString("armedWaiters"), tagInt(schedulerArmedWaiters()));
 	Value result = getTaggedPtr(stats);
 	closeHandleScope(&scope, NULL);
 	return primSuccess(result);
