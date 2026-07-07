@@ -66,6 +66,12 @@ static PER_ISOLATE size_t gFreeCap = 0;
 #define MAIN_STACK_SIZE   (8 * 1024 * 1024)
 #define WORKER_STACK_SIZE (512 * 1024)
 
+// Per-worker-fiber stack size, tunable via ST_FIBER_STACK_KB (default 512 KB).
+// Smaller stacks let many more fibers fit in virtual address space; overflow
+// still faults on the guard page (a clean crash, not corruption) until a
+// recoverable stack-limit check lands.
+static PER_ISOLATE size_t gWorkerStackSize = WORKER_STACK_SIZE;
+
 
 // ---- GC dirty-fiber list --------------------------------------------------
 // Fibers that may hold a young pointer directly on their roots. The scavenger
@@ -387,6 +393,14 @@ void schedulerInit(void)
 	// Writing to a peer that has closed its end must return EPIPE, not kill us.
 	signal(SIGPIPE, SIG_IGN);
 	gActive = 1;
+
+	char *stackEnv = getenv("ST_FIBER_STACK_KB");
+	if (stackEnv != NULL) {
+		long kb = atol(stackEnv);
+		if (kb >= 16) { // floor: keep room for at least a frame + the guard page
+			gWorkerStackSize = (size_t) kb * 1024;
+		}
+	}
 }
 
 
@@ -410,7 +424,7 @@ size_t schedulerSpawnBlock(Value block)
 	openHandleScope(&scope);
 	Object *blockHandle = scopeHandle(asObject(block));
 
-	Fiber *fiber = fiberCreate(WORKER_STACK_SIZE);
+	Fiber *fiber = fiberCreate(gWorkerStackSize);
 	fiber->cEntry = NULL;
 	fiber->entryBlock = getTaggedPtr(blockHandle);
 	registerFiber(fiber);          // entryBlock is a GC root from here on
