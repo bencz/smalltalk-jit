@@ -114,6 +114,33 @@ Float := Number [
 	]
 
 
+	tan [
+		<primitive: FloatTanPrimitive>
+	]
+
+
+	arcSin [
+		<primitive: FloatArcSinPrimitive>
+	]
+
+
+	arcCos [
+		<primitive: FloatArcCosPrimitive>
+	]
+
+
+	arcTan [
+		<primitive: FloatArcTanPrimitive>
+	]
+
+
+	arcTan: aNumber [
+		"Two-argument arctangent: self arcTan: aNumber == atan2(self, aNumber)."
+		<primitive: FloatArcTan2Primitive>
+		^self arcTan: aNumber asFloat
+	]
+
+
 	exp [
 		<primitive: FloatExpPrimitive>
 	]

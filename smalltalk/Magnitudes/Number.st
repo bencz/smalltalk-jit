@@ -191,6 +191,31 @@ Number := Magnitude [
 	]
 
 
+	tan [
+		^self asFloat tan
+	]
+
+
+	arcSin [
+		^self asFloat arcSin
+	]
+
+
+	arcCos [
+		^self asFloat arcCos
+	]
+
+
+	arcTan [
+		^self asFloat arcTan
+	]
+
+
+	arcTan: aNumber [
+		^self asFloat arcTan: aNumber asFloat
+	]
+
+
 	log: aNumber [
 		^self ln / aNumber ln
 	]
@@ -287,7 +312,7 @@ Number := Magnitude [
 
 
 	truncateTo: aNumber [
-
+		^(self / aNumber) truncated * aNumber
 	]
 
 
@@ -297,19 +322,19 @@ Number := Magnitude [
 
 
 	roundTo: aNumber [
-
+		^(self / aNumber) rounded * aNumber
 	]
 
 
 	"converting"
 
 	degreesToRadians [
-
+		^self asFloat * Float pi / 180.0
 	]
 
 
 	radiansToDegrees [
-
+		^self asFloat * 180.0 / Float pi
 	]
 
 

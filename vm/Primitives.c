@@ -109,6 +109,11 @@ static PrimitiveResult floatSinPrimitive(Value self);
 static PrimitiveResult floatCosPrimitive(Value self);
 static PrimitiveResult floatExpPrimitive(Value self);
 static PrimitiveResult floatLnPrimitive(Value self);
+static PrimitiveResult floatTanPrimitive(Value self);
+static PrimitiveResult floatArcSinPrimitive(Value self);
+static PrimitiveResult floatArcCosPrimitive(Value self);
+static PrimitiveResult floatArcTanPrimitive(Value self);
+static PrimitiveResult floatArcTan2Primitive(Value self, Value arg);
 static PrimitiveResult floatAsStringPrimitive(Value self);
 static PrimitiveResult intAsFloatPrimitive(Value self);
 
@@ -182,6 +187,11 @@ Primitive Primitives[] = {
 	{"FloatCosPrimitive", CCALL, .cFunction = floatCosPrimitive, 1},
 	{"FloatExpPrimitive", CCALL, .cFunction = floatExpPrimitive, 1},
 	{"FloatLnPrimitive", CCALL, .cFunction = floatLnPrimitive, 1},
+	{"FloatTanPrimitive", CCALL, .cFunction = floatTanPrimitive, 1},
+	{"FloatArcSinPrimitive", CCALL, .cFunction = floatArcSinPrimitive, 1},
+	{"FloatArcCosPrimitive", CCALL, .cFunction = floatArcCosPrimitive, 1},
+	{"FloatArcTanPrimitive", CCALL, .cFunction = floatArcTanPrimitive, 1},
+	{"FloatArcTan2Primitive", CCALL, .cFunction = floatArcTan2Primitive, 2},
 	{"FloatAsStringPrimitive", CCALL, .cFunction = floatAsStringPrimitive, 1},
 	{"IntAsFloatPrimitive", CCALL, .cFunction = intAsFloatPrimitive, 1},
 
@@ -1070,6 +1080,40 @@ static PrimitiveResult floatExpPrimitive(Value self)
 static PrimitiveResult floatLnPrimitive(Value self)
 {
 	return primSuccess(floatResult(newFloat(log(rawFloatValue(asObject(self))))));
+}
+
+
+static PrimitiveResult floatTanPrimitive(Value self)
+{
+	return primSuccess(floatResult(newFloat(tan(rawFloatValue(asObject(self))))));
+}
+
+
+static PrimitiveResult floatArcSinPrimitive(Value self)
+{
+	return primSuccess(floatResult(newFloat(asin(rawFloatValue(asObject(self))))));
+}
+
+
+static PrimitiveResult floatArcCosPrimitive(Value self)
+{
+	return primSuccess(floatResult(newFloat(acos(rawFloatValue(asObject(self))))));
+}
+
+
+static PrimitiveResult floatArcTanPrimitive(Value self)
+{
+	return primSuccess(floatResult(newFloat(atan(rawFloatValue(asObject(self))))));
+}
+
+
+static PrimitiveResult floatArcTan2Primitive(Value self, Value arg)
+{
+	// self arcTan: arg  ==  atan2(self, arg); fall back to coerce a non-Float arg.
+	if (!isFloatValue(arg)) {
+		return primFailed();
+	}
+	return primSuccess(floatResult(newFloat(atan2(rawFloatValue(asObject(self)), rawFloatValue(asObject(arg))))));
 }
 
 
