@@ -54,7 +54,7 @@ Association *dictAtPut(Dictionary *dict, DictComparator cmp, Object *key, Value 
 
 		arrayAtPutObject(contents, index, (Object *) assoc);
 		dict->raw->tally += tagInt(1);
-		if (dictSize(dict) == contents->raw->size) {
+		if (dictSize(dict) * 4 >= contents->raw->size * 3) {   // grow at 75% load
 			growDictionary(dict);
 		}
 	} else {
@@ -76,7 +76,7 @@ Association *dictAtPutObject(Dictionary *dict, DictComparator cmp, Object *key, 
 		assoc = createAssoc(key, value);
 		arrayAtPutObject(contents, index, (Object *) assoc);
 		dict->raw->tally += tagInt(1);
-		if (dictSize(dict) == contents->raw->size) {
+		if (dictSize(dict) * 4 >= contents->raw->size * 3) {   // grow at 75% load
 			growDictionary(dict);
 		}
 	} else {

@@ -122,7 +122,7 @@ SequenceableCollection := Collection [
 			result := true.
 			(self at: i) = first ifTrue: [
 				1 to: aCollection size do: [ :j |
-					result := (self at: i + j - 1) = (aCollection at: j)].
+					(self at: i + j - 1) = (aCollection at: j) ifFalse: [result := false]].
 			result ifTrue: [^i]]].
 
 		^aBlock value

@@ -759,9 +759,11 @@ void generateMethodLookup(CodeGenerator *generator)
 
 	asmDecq(buffer, RDI);
 
-	// hash class and selector
+	// hash class and selector (must match lookupHash() in Lookup.h: shift out the
+	// always-zero low 4 bits of the 16-byte-aligned addresses before masking).
 	asmMovq(buffer, RDI, RDX);
 	asmXorq(buffer, RSI, RDX);
+	asmShrqImm(buffer, RDX, 4);
 	asmAndqImm(buffer, RDX, LOOKUP_CACHE_SIZE - 1);
 
 	// check class

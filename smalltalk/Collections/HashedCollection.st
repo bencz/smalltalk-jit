@@ -58,7 +58,7 @@ HashedCollection := Collection [
 	atNewIndex: anInteger put: anObject [
 		contents at: anInteger put: anObject.
 		tally := tally + 1.
-		tally = contents size ifTrue: [self grow].
+		(tally * 4 >= (contents size * 3)) ifTrue: [self grow].
 	]
 
 
@@ -69,7 +69,7 @@ HashedCollection := Collection [
 
 		oldContents := contents.
 		self initialize: oldContents size * 2.
-		oldContents do: [ :item | self add: item].
+		oldContents do: [ :item | item isNil ifFalse: [self add: item]].
 	]
 
 

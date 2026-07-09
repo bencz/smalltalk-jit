@@ -30,7 +30,11 @@ NativeCode *getNativeCode(Class *class, CompiledMethod *method);
 
 static intptr_t lookupHash(intptr_t classHash, intptr_t selectorHash)
 {
-	return (classHash ^ selectorHash) & LOOKUP_CACHE_SIZE - 1;
+	// class/selector are 16-byte-aligned heap addresses, so bits 0-3 of the XOR
+	// are always zero. Shift them out before masking, otherwise only 1/16th of
+	// the 4096 buckets are reachable (an effective 256-entry cache). The JIT
+	// probe in generateMethodLookup() must apply the identical shift+mask.
+	return ((classHash ^ selectorHash) >> 4) & (LOOKUP_CACHE_SIZE - 1);
 }
 
 

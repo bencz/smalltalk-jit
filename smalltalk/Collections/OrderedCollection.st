@@ -109,7 +109,7 @@ OrderedCollection := SequenceableCollection [
 
 
 	addFirst: anObject [
-		firstIndex = 1 ifTrue: [self growBy: 8 shiftBy: 8].
+		firstIndex = 1 ifTrue: [| g | g := contents size max: 8. self growBy: g shiftBy: g].
 		firstIndex := firstIndex - 1.
 		^contents at: firstIndex put: anObject
 	]
@@ -135,7 +135,7 @@ OrderedCollection := SequenceableCollection [
 				n + 1 to: contents size do: [:i | contents at: i put: nil].
 				firstIndex := 1.
 				lastIndex := n]
-			ifFalse: [self growBy: 8 shiftBy: 0]
+			ifFalse: [self growBy: (contents size max: 8) shiftBy: 0]
 	]
 
 
@@ -242,7 +242,7 @@ OrderedCollection := SequenceableCollection [
 		 room at the back: grow when lastIndex has reached the end of
 		 contents (not merely when the collection is completely full,
 		 since free slots may sit at the front)."
-		lastIndex = contents size ifTrue: [self growBy: 8 shiftBy: 0].
+		lastIndex = contents size ifTrue: [self growBy: (contents size max: 8) shiftBy: 0].
 		lastIndex := lastIndex + 1.
 		lastIndex to: anInteger + firstIndex by: -1 do: [ :i |
 			contents at: i put: (contents at: i - 1)].
