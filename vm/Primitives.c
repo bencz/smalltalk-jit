@@ -262,8 +262,17 @@ void registerPrimitives(void)
 }
 
 
+uint16_t primitiveCount(void)
+{
+	return sizeof(Primitives) / sizeof(Primitive);
+}
+
+
 void generatePrimitive(CodeGenerator *generator, uint16_t primitive)
 {
+	// Defense in depth: an out-of-range number is rejected at compile time
+	// (processPrimitivePragma), so reaching here with one means a corrupt method.
+	ASSERT(primitive >= 1 && primitive <= primitiveCount());
 	Primitive *prim = Primitives + primitive - 1;
 	if (prim->type == GEN) {
 		prim->generate(generator);
@@ -476,8 +485,29 @@ static PrimitiveResult streamAvailablePrimitive(Value receiver, Value descriptor
 }
 
 
+// True when vAddr is a heap object big enough to be an InternetAddress whose `address`
+// field is a tagged int — i.e. reading addr->address is safe. Without this a wrong-typed
+// argument (a String, a bare Object, an InternetAddress whose address ivar is still nil)
+// makes asObject/asCInt read out of bounds or assert-abort the whole VM. Fail the
+// primitive instead so the Smalltalk fallback raises a catchable IoError.
+static _Bool validInternetAddress(Value vAddr)
+{
+	if (!valueTypeOf(vAddr, VALUE_POINTER)) {
+		return 0;
+	}
+	RawObject *obj = asObject(vAddr);
+	if (computeRawObjectSize(obj) < sizeof(RawInternetAddress)) {
+		return 0;
+	}
+	return valueTypeOf(((RawInternetAddress *) obj)->address, VALUE_INT);
+}
+
+
 static PrimitiveResult socketConnectPrimitive(Value socket, Value vAddr, Value port)
 {
+	if (!validInternetAddress(vAddr) || !valueTypeOf(port, VALUE_INT)) {
+		return primFailed();
+	}
 	RawInternetAddress *addr = (RawInternetAddress *) asObject(vAddr);
 	int descriptor = socketConnect(asCInt(addr->address), asCInt(port));
 	return descriptor < 0 ? primFailed() : primSuccess(tagInt(descriptor));
@@ -486,6 +516,9 @@ static PrimitiveResult socketConnectPrimitive(Value socket, Value vAddr, Value p
 
 static PrimitiveResult socketBindPrimitive(Value socket, Value vAddr, Value port, Value queueSize)
 {
+	if (!validInternetAddress(vAddr) || !valueTypeOf(port, VALUE_INT) || !valueTypeOf(queueSize, VALUE_INT)) {
+		return primFailed();
+	}
 	RawInternetAddress *addr = (RawInternetAddress *) asObject(vAddr);
 	int descriptor = socketBind(asCInt(addr->address), asCInt(port), asCInt(queueSize));
 	return descriptor < 0 ? primFailed() : primSuccess(tagInt(descriptor));

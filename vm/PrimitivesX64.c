@@ -672,11 +672,15 @@ static void generateIntQuoPrimitive(CodeGenerator *generator)
 {
 	AssemblerBuffer *buffer = &generator->buffer;
 	AssemblerLabel notInt;
+	AssemblerLabel divZero;
 	asmInitLabel(&notInt);
+	asmInitLabel(&divZero);
 
 	movArg(buffer, 1, RSI);
 	testInt(generator, SIL);
 	asmJ(buffer, COND_NOT_ZERO, &notInt);
+	asmTestq(buffer, RSI, RSI);                 // divide-by-zero would SIGFPE: fail the
+	asmJ(buffer, COND_ZERO, &divZero);          // primitive so the Smalltalk fallback raises
 
 	movArg(buffer, 0, RAX);
 	asmCqo(buffer);
@@ -685,6 +689,7 @@ static void generateIntQuoPrimitive(CodeGenerator *generator)
 	asmRet(buffer);
 
 	asmLabelBind(buffer, &notInt, asmOffset(buffer));
+	asmLabelBind(buffer, &divZero, asmOffset(buffer));
 }
 
 
@@ -694,13 +699,17 @@ static void generateIntModPrimitive(CodeGenerator *generator)
 	AssemblerLabel notInt;
 	AssemblerLabel negativeResult;
 	AssemblerLabel negativeDivisor;
+	AssemblerLabel divZero;
 	asmInitLabel(&notInt);
 	asmInitLabel(&negativeResult);
 	asmInitLabel(&negativeDivisor);
+	asmInitLabel(&divZero);
 
 	movArg(buffer, 1, RDI);
 	testInt(generator, DIL);
 	asmJ(buffer, COND_NOT_ZERO, &notInt);
+	asmTestq(buffer, RDI, RDI);                 // divide-by-zero would SIGFPE: fail the
+	asmJ(buffer, COND_ZERO, &divZero);          // primitive so the Smalltalk fallback raises
 
 	movArg(buffer, 0, RAX);
 	asmCqo(buffer);
@@ -719,6 +728,7 @@ static void generateIntModPrimitive(CodeGenerator *generator)
 	asmRet(buffer);
 
 	asmLabelBind(buffer, &notInt, asmOffset(buffer));
+	asmLabelBind(buffer, &divZero, asmOffset(buffer));
 }
 
 
@@ -726,11 +736,15 @@ static void generateIntRemPrimitive(CodeGenerator *generator)
 {
 	AssemblerBuffer *buffer = &generator->buffer;
 	AssemblerLabel notInt;
+	AssemblerLabel divZero;
 	asmInitLabel(&notInt);
+	asmInitLabel(&divZero);
 
 	movArg(buffer, 1, RDI);
 	testInt(generator, DIL);
 	asmJ(buffer, COND_NOT_ZERO, &notInt);
+	asmTestq(buffer, RDI, RDI);                 // divide-by-zero would SIGFPE: fail the
+	asmJ(buffer, COND_ZERO, &divZero);          // primitive so the Smalltalk fallback raises
 
 	movArg(buffer, 0, RAX);
 	asmCqo(buffer);
@@ -739,6 +753,7 @@ static void generateIntRemPrimitive(CodeGenerator *generator)
 	asmRet(buffer);
 
 	asmLabelBind(buffer, &notInt, asmOffset(buffer));
+	asmLabelBind(buffer, &divZero, asmOffset(buffer));
 }
 
 

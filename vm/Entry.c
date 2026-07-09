@@ -193,14 +193,23 @@ _Bool parseFileAndInitialize(char *filename, Value *lastBlockResult)
 	// scavenge — a raw-pointer Iterator would dangle when the backing array moves,
 	// leaving the NEXT element a stale pointer. ordCollObjectAt re-reads the live
 	// collection and returns a fresh scope handle, so it survives GC mid-loop.
+	// Nested scope per item: each iteration allocates handles (ordCollObjectAt plus the
+	// initialize/block evaluation), which would otherwise pile up in this outer scope and
+	// overflow it once a file defines enough classes.
 	size_t classesSize = ordCollSize(classes);
 	for (size_t i = 0; i < classesSize; i++) {
+		HandleScope inner;
+		openHandleScope(&inner);
 		invokeInititalize(ordCollObjectAt(classes, i));
+		closeHandleScope(&inner, NULL);
 	}
 
 	size_t blocksSize = ordCollSize(blocks);
 	for (size_t i = 0; i < blocksSize; i++) {
+		HandleScope inner;
+		openHandleScope(&inner);
 		*lastBlockResult = evalBlockNode((BlockNode *) ordCollObjectAt(blocks, i));
+		closeHandleScope(&inner, NULL);
 	}
 
 	closeHandleScope(&scope, NULL);
@@ -224,10 +233,17 @@ _Bool parseFile(char *filename, OrderedCollection *classes, OrderedCollection *b
 	initFileParser(&parser, file, asString(filename));
 
 	while (!parserAtEnd(&parser)) {
+		// A nested scope PER top-level item: each parsed node/class survives via the
+		// outer-rooted classes/blocks collection, so releasing the item's transient
+		// parse/compile handles here keeps the file-wide scope from overflowing (~3
+		// handles/class would otherwise abort scopeHandle at 256, i.e. ~85 classes).
+		HandleScope inner;
+		openHandleScope(&inner);
 		if (blocks != NULL && currentToken(&parser.tokenizer)->type == TOKEN_OPEN_SQUARE_BRACKET) {
 			BlockNode *node = parseBlock(&parser);
 			if (node == NULL) {
 				printParseError(&parser, filename);
+				closeHandleScope(&inner, NULL);
 				closeHandleScope(&scope, NULL);
 				return 0;
 			}
@@ -236,6 +252,7 @@ _Bool parseFile(char *filename, OrderedCollection *classes, OrderedCollection *b
 			ClassNode *node = parseClass(&parser);
 			if (node == NULL) {
 				printParseError(&parser, filename);
+				closeHandleScope(&inner, NULL);
 				closeHandleScope(&scope, NULL);
 				return 0;
 			}
@@ -243,6 +260,7 @@ _Bool parseFile(char *filename, OrderedCollection *classes, OrderedCollection *b
 			Object *class = buildClass(node);
 			if (isCompileError(class)) {
 				printCompileError((CompileError *) class);
+				closeHandleScope(&inner, NULL);
 				closeHandleScope(&scope, NULL);
 				return 0;
 			}
@@ -251,6 +269,7 @@ _Bool parseFile(char *filename, OrderedCollection *classes, OrderedCollection *b
 				ordCollAddObject(classes, class);
 			}
 		}
+		closeHandleScope(&inner, NULL);
 	}
 
 	freeParser(&parser);
@@ -273,10 +292,15 @@ _Bool parseSource(char *source, OrderedCollection *classes, OrderedCollection *b
 	initParser(&parser, asString(source));
 
 	while (!parserAtEnd(&parser)) {
+		// Nested scope per top-level item (see parseFile) so the whole-source scope
+		// does not overflow on a source string that defines many classes.
+		HandleScope inner;
+		openHandleScope(&inner);
 		if (blocks != NULL && currentToken(&parser.tokenizer)->type == TOKEN_OPEN_SQUARE_BRACKET) {
 			BlockNode *node = parseBlock(&parser);
 			if (node == NULL) {
 				printParseError(&parser, source);
+				closeHandleScope(&inner, NULL);
 				closeHandleScope(&scope, NULL);
 				return 0;
 			}
@@ -285,12 +309,14 @@ _Bool parseSource(char *source, OrderedCollection *classes, OrderedCollection *b
 			ClassNode *node = parseClass(&parser);
 			if (node == NULL) {
 				printParseError(&parser, source);
+				closeHandleScope(&inner, NULL);
 				closeHandleScope(&scope, NULL);
 				return 0;
 			}
 			Object *class = buildClass(node);
 			if (isCompileError(class)) {
 				printCompileError((CompileError *) class);
+				closeHandleScope(&inner, NULL);
 				closeHandleScope(&scope, NULL);
 				return 0;
 			}
@@ -298,6 +324,7 @@ _Bool parseSource(char *source, OrderedCollection *classes, OrderedCollection *b
 				ordCollAddObject(classes, class);
 			}
 		}
+		closeHandleScope(&inner, NULL);
 	}
 
 	freeParser(&parser);
@@ -320,12 +347,18 @@ _Bool parseSourceAndInitialize(char *source, Value *lastBlockResult)
 
 	size_t classesSize = ordCollSize(classes);
 	for (size_t i = 0; i < classesSize; i++) {
+		HandleScope inner;
+		openHandleScope(&inner);
 		invokeInititalize(ordCollObjectAt(classes, i));
+		closeHandleScope(&inner, NULL);
 	}
 
 	size_t blocksSize = ordCollSize(blocks);
 	for (size_t i = 0; i < blocksSize; i++) {
+		HandleScope inner;
+		openHandleScope(&inner);
 		*lastBlockResult = evalBlockNode((BlockNode *) ordCollObjectAt(blocks, i));
+		closeHandleScope(&inner, NULL);
 	}
 
 	closeHandleScope(&scope, NULL);

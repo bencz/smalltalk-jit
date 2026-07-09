@@ -14,6 +14,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+// From Primitives.c. Declared here (not via Primitives.h) because that header pulls in
+// CodeGenerator.h/RegisterAllocator.h, whose `Variable` type clashes with Variable.h's.
+uint16_t primitiveCount(void);
+
 typedef struct Compiler {
 	struct Compiler *parent;
 	AssemblerBuffer buffer;
@@ -130,7 +134,14 @@ static void processPrimitivePragma(Compiler *compiler, MessageExpressionNode *pr
 		goto error;
 	}
 
-	if (!valueTypeOf(primitive, VALUE_INT) || (primitive = asCInt(primitive)) > UINT16_MAX) {
+	if (!valueTypeOf(primitive, VALUE_INT)) {
+		goto error;
+	}
+	primitive = asCInt(primitive);
+	// Reject out-of-range primitive numbers at compile time: generatePrimitive() indexes
+	// Primitives[primitive-1] with no bounds check, so a bad number would read/call past
+	// the table. Valid numbers are 1..primitiveCount().
+	if (primitive < 1 || primitive > primitiveCount()) {
 		goto error;
 	}
 

@@ -135,8 +135,9 @@ CollectionStream := PositionableStream [
 
 
 	reset [
+		"Reposition to the start only; `end` is the read limit and must NOT be
+		 clobbered (that would make a read stream created via `on:` instantly atEnd)."
 		position := 1.
-		end := 1.
 	]
 
 

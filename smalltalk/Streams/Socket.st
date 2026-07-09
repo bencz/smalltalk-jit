@@ -9,6 +9,7 @@ Socket := ExternalStream [
 
 	class connect: address port: port [
 		<primitive: SocketConnectPrimitive>
+		IoError last signal.
 	]
 
 

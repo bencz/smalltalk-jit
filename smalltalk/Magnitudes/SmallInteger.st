@@ -180,7 +180,9 @@ SmallInteger := Integer [
 
 
 	asObject [
-		<primitive: IntAsObjectPrimitive>
+		"The IntAsObjectPrimitive is unimplemented and its stub hard-exits the VM, so
+		 raise a catchable error instead of reaching it."
+		^self shouldNotImplement
 	]
 
 

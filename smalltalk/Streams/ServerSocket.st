@@ -30,6 +30,7 @@ ServerSocket := Object [
 
 	basicAccept [
 		<primitive: SocketAcceptPrimitive>
+		IoError last signal.
 	]
 
 

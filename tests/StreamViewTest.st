@@ -22,11 +22,11 @@
 	view position: 3.
 	Assert do: [view position: 4] expect: Error.
 
-	"stream := CollectionStream on: 'abcdef'.
+	stream := CollectionStream on: 'abcdef'.
 	view := StreamView on: stream limit: 3.
 	view next: 2.
 	view reset.
-	Assert true: view next = $a."
+	Assert true: view next = $a.
 
 	stream := CollectionStream on: 'abcdef'.
 	view := StreamView on: stream limit: 3.
