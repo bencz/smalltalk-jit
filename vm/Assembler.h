@@ -198,7 +198,10 @@ static void asmBindFixup(AssemblerBuffer *buffer, AssemblerFixup *fixup, int64_t
 
 static void asmAddPointerOffset(AssemblerBuffer *buffer, ptrdiff_t offset)
 {
-	ASSERT(INT16_MIN <= offset && offset <= INT16_MAX);
+	// The offset is a positive position within the method's machine code, stored and
+	// read back as an unsigned uint16 (see the GC in Scavenger.c/GarbageCollector.c),
+	// so the real per-method code-size limit is UINT16_MAX, not INT16_MAX.
+	ASSERT(0 <= offset && offset <= UINT16_MAX);
 	ASSERT(buffer->pointersOffsetsSize < 1024);
 	buffer->pointersOffsets[buffer->pointersOffsetsSize++] = offset;
 }

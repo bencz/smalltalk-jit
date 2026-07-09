@@ -213,13 +213,73 @@ static void generateBody(CodeGenerator *generator)
 	BytecodeLabel *labels = malloc(sizeof(BytecodeLabel) * (generator->code.bytecodesSize + 1));
 	BytecodeLabel *currentLabel = labels;
 
+	// A backward JUMP (loop back-edge) targets a bytecode the main loop already passed, so
+	// its machine jump cannot be resolved forward: record the machine offset at every
+	// bytecode start, and mark backward-jump targets (loop headers) so we (a) bind the
+	// backward jump to the target's known machine offset and (b) drop register caches
+	// there (control merges from the back-edge, so no fill can be assumed live).
+	size_t bcSize = generator->code.bytecodesSize;
+	ptrdiff_t *machineOffsetAt = malloc(sizeof(ptrdiff_t) * (bcSize + 1));
+	_Bool *isBackwardTarget = calloc(bcSize + 1, sizeof(_Bool));
+	{
+		BytecodesIterator pre;
+		bytecodeInitIterator(&pre, generator->code.bytecodes, bcSize);
+		while (bytecodeHasNext(&pre)) {
+			Bytecode bc = bytecodeNext(&pre);
+			switch (bc) {
+			case BYTECODE_COPY:
+				bytecodeNextOperand(&pre);
+				bytecodeNextOperand(&pre);
+				break;
+			case BYTECODE_SEND:
+			case BYTECODE_SEND_WITH_STORE: {
+				bytecodeNextByte(&pre);
+				uint8_t a = bytecodeNextByte(&pre);
+				bytecodeNextOperand(&pre);
+				for (uint8_t k = 0; k < a; k++) {
+					bytecodeNextOperand(&pre);
+				}
+				if (bc == BYTECODE_SEND_WITH_STORE) {
+					bytecodeNextOperand(&pre);
+				}
+				break;
+			}
+			case BYTECODE_RETURN:
+			case BYTECODE_OUTER_RETURN:
+				bytecodeNextOperand(&pre);
+				break;
+			case BYTECODE_JUMP: {
+				int32_t d = bytecodeNextInt32(&pre);
+				ptrdiff_t t = bytecodeOffset(&pre) + d;
+				if (d < 0 && t >= 0 && t <= (ptrdiff_t) bcSize) {
+					isBackwardTarget[t] = 1;
+				}
+				break;
+			}
+			case BYTECODE_JUMP_NOT_MEMBER_OF: {
+				bytecodeNextByte(&pre);
+				bytecodeNextOperand(&pre);
+				int32_t d = bytecodeNextInt32(&pre);
+				ptrdiff_t t = bytecodeOffset(&pre) + d;
+				if (d < 0 && t >= 0 && t <= (ptrdiff_t) bcSize) {
+					isBackwardTarget[t] = 1;
+				}
+				break;
+			}
+			default:
+				FAIL();
+			}
+		}
+	}
+
 	bytecodeInitIterator(&iterator, generator->code.bytecodes, generator->code.bytecodesSize);
 	while (bytecodeHasNext(&iterator)) {
 		HandleScope scope;
 		openHandleScope(&scope);
 
 		ptrdiff_t offset = bytecodeOffset(&iterator);
-		_Bool isJumpTarget = 0;
+		machineOffsetAt[offset] = asmOffset(&generator->buffer);
+		_Bool isJumpTarget = isBackwardTarget[offset];
 		BytecodeLabel *label = labels;
 		while (label < currentLabel) {
 			if (label->offset == offset) {
@@ -285,8 +345,16 @@ static void generateBody(CodeGenerator *generator)
 			// The IR stores a relative displacement (target - here - 4); recover the
 			// absolute target-bytecode offset by adding the post-read position.
 			int32_t disp = bytecodeNextInt32(&iterator);
-			currentLabel->offset = bytecodeOffset(&iterator) + disp;
+			ptrdiff_t target = bytecodeOffset(&iterator) + disp;
 			asmInitLabel(&currentLabel->label);
+			if (disp < 0) {
+				// Backward (loop back-edge): the target's machine offset is known; bind
+				// the label to it so asmJmpLabel emits the backward displacement.
+				asmLabelBind(&generator->buffer, &currentLabel->label, machineOffsetAt[target]);
+				currentLabel->offset = -2;   // already bound; the post-loop binders skip it
+			} else {
+				currentLabel->offset = target;
+			}
 			asmJmpLabel(&generator->buffer, &currentLabel->label);
 			currentLabel++;
 			break;
@@ -296,9 +364,15 @@ static void generateBody(CodeGenerator *generator)
 			RawObject *class = compiledCodeLiteralAt(&generator->code, bytecodeNextByte(&iterator));
 			Operand receiver = bytecodeNextOperand(&iterator);
 			int32_t disp = bytecodeNextInt32(&iterator);
+			ptrdiff_t target = bytecodeOffset(&iterator) + disp;
 
-			currentLabel->offset = bytecodeOffset(&iterator) + disp;
 			asmInitLabel(&currentLabel->label);
+			if (disp < 0) {
+				asmLabelBind(&generator->buffer, &currentLabel->label, machineOffsetAt[target]);
+				currentLabel->offset = -2;
+			} else {
+				currentLabel->offset = target;
+			}
 			generateClassCheck(generator, receiver, (RawClass *) class, &currentLabel->label);
 			currentLabel++;
 			break;
@@ -332,6 +406,8 @@ static void generateBody(CodeGenerator *generator)
 		}
 	}
 
+	free(machineOffsetAt);
+	free(isBackwardTarget);
 	free(labels);
 }
 

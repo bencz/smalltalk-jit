@@ -279,10 +279,145 @@ static void analyzeInlinedBlock(BlockScope *blockScope, BlockNode *node)
 }
 
 
+// `to: stop do: [:i | ...]` with a literal one-arg, temp-free block is inlined into
+// the enclosing frame (no closure, no BlockContext, no per-iteration send): the loop
+// variable becomes an enclosing temp. Purely syntactic — kept in sync with Compiler.c's
+// compileLoopKind, which additionally verifies Scope.c inlined the block (scope marker).
+static _Bool messageIsInlinableLoop(MessageExpressionNode *node)
+{
+	static int enabled = -1;
+	if (enabled < 0) {
+		enabled = getenv("ST_NO_INLINE_CF") == NULL;
+	}
+	if (!enabled) {
+		return 0;
+	}
+	if (!stringEqualsC(messageExpressionNodeGetSelector(node), "to:do:")) {
+		return 0;
+	}
+	OrderedCollection *args = messageExpressionNodeGetArgs(node);
+	if (ordCollSize(args) != 2) {
+		return 0;
+	}
+	Object *blockObj = ordCollObjectAt(args, 1);
+	if (blockObj->raw->class != Handles.BlockNode->raw) {
+		return 0;
+	}
+	BlockNode *block = (BlockNode *) blockObj;
+	return ordCollSize(blockNodeGetArgs(block)) == 1
+		&& ordCollSize(blockNodeGetTempVars(block)) == 0;
+}
+
+
+static _Bool exprHasRealBlock(ExpressionNode *e);
+
+// A block LITERAL passed to a non-inlined selector becomes a real closure that captures
+// its free variables by reference. If the loop body contains such a block, inlining the
+// loop (which flattens the loop variable into a single enclosing slot) would give every
+// closure the loop variable's FINAL value instead of a per-iteration binding. Detect any
+// such real block so the loop falls back to a normal send (real block => correct capture).
+// Block args to inlined control-flow / to:do: selectors are spliced, not captured, so we
+// recurse into them rather than flag them.
+// The walk allocates scope handles (ordCollObjectAt / iteratorNextObject) but does no GC,
+// so each call brackets its handles in its own HandleScope to keep the recursion from
+// overflowing the fixed handle scope.
+static _Bool nodeHasRealBlock(Object *node)
+{
+	if (node->raw->class == Handles.ExpressionNode->raw) {
+		return exprHasRealBlock((ExpressionNode *) node);
+	}
+	if (node->raw->class != Handles.BlockNode->raw) {
+		return 0;
+	}
+	HandleScope scope;
+	openHandleScope(&scope);
+	_Bool found = 0;
+	Iterator it;
+	initOrdCollIterator(&it, blockNodeGetExpressions((BlockNode *) node), 0, 0);
+	while (!found && iteratorHasNext(&it)) {
+		found = exprHasRealBlock((ExpressionNode *) iteratorNextObject(&it));
+	}
+	closeHandleScope(&scope, NULL);
+	return found;
+}
+
+static _Bool exprHasRealBlock(ExpressionNode *e)
+{
+	HandleScope scope;
+	openHandleScope(&scope);
+	_Bool found = nodeHasRealBlock((Object *) expressionNodeGetReceiver(e));
+	Iterator it;
+	initOrdCollIterator(&it, expressionNodeGetMessageExpressions(e), 0, 0);
+	while (!found && iteratorHasNext(&it)) {
+		MessageExpressionNode *m = (MessageExpressionNode *) iteratorNextObject(&it);
+		_Bool inlined = messageIsInlinableControlFlow(m) || messageIsInlinableLoop(m);
+		Iterator ai;
+		initOrdCollIterator(&ai, messageExpressionNodeGetArgs(m), 0, 0);
+		while (!found && iteratorHasNext(&ai)) {
+			Object *arg = iteratorNextObject(&ai);
+			found = (!inlined && arg->raw->class == Handles.BlockNode->raw) || nodeHasRealBlock(arg);
+		}
+	}
+	closeHandleScope(&scope, NULL);
+	return found;
+}
+
+static _Bool loopBodyIsCaptureFree(MessageExpressionNode *node)
+{
+	HandleScope scope;
+	openHandleScope(&scope);
+	BlockNode *block = (BlockNode *) ordCollObjectAt(messageExpressionNodeGetArgs(node), 1);
+	_Bool found = 0;
+	Iterator it;
+	initOrdCollIterator(&it, blockNodeGetExpressions(block), 0, 0);
+	while (!found && iteratorHasNext(&it)) {
+		found = exprHasRealBlock((ExpressionNode *) iteratorNextObject(&it));
+	}
+	closeHandleScope(&scope, NULL);
+	return !found;
+}
+
+
+// The loop variable is flattened into the enclosing scope, so inline only when its name
+// is completely unbound here — otherwise it would clobber a temp/arg/inst var/self of the
+// same name. Any collision falls back to a normal send (a real block).
+static _Bool inlinedLoopVarIsFresh(BlockScope *blockScope, MessageExpressionNode *node)
+{
+	BlockNode *block = (BlockNode *) ordCollObjectAt(messageExpressionNodeGetArgs(node), 1);
+	LiteralNode *loopArg = (LiteralNode *) ordCollObjectAt(blockNodeGetArgs(block), 0);
+	return isTaggedNil(stringDictAt(blockScopeGetVars(blockScope), literalNodeGetStringValue(loopArg)));
+}
+
+
+// Analyze an inlined `to:do:`: the stop expression and the block body live in the
+// enclosing scope, and the block's single argument (the loop variable) is declared as an
+// enclosing temp so its references resolve at this level. processVariables() renumbers it.
+static void analyzeInlinedLoop(BlockScope *blockScope, MessageExpressionNode *node)
+{
+	OrderedCollection *args = messageExpressionNodeGetArgs(node);
+	analyzeLiteral(blockScope, ordCollObjectAt(args, 0));   // stop expression
+	if (blockScopeHasError(blockScope)) {
+		return;
+	}
+	BlockNode *block = (BlockNode *) ordCollObjectAt(args, 1);
+	LiteralNode *loopArg = (LiteralNode *) ordCollObjectAt(blockNodeGetArgs(block), 0);
+	String *name = literalNodeGetStringValue(loopArg);
+	stringDictAtPut(blockScopeGetVars(blockScope), name, defineVariable(OPERAND_TEMP_VAR, 0, 0));
+	analyzeInlinedBlock(blockScope, block);
+}
+
+
 static void analyzeMessageExpression(BlockScope *blockScope, MessageExpressionNode *node)
 {
 	HandleScope scope;
 	openHandleScope(&scope);
+
+	if (messageIsInlinableLoop(node) && inlinedLoopVarIsFresh(blockScope, node)
+	    && loopBodyIsCaptureFree(node)) {
+		analyzeInlinedLoop(blockScope, node);
+		closeHandleScope(&scope, NULL);
+		return;
+	}
 
 	Iterator iterator;
 	initOrdCollIterator(&iterator, messageExpressionNodeGetArgs(node), 0, 0);

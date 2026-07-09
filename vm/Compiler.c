@@ -517,11 +517,91 @@ static void compileInlinedControlFlow(Compiler *compiler, Operand *receiver, int
 }
 
 
+// True when this `to:do:` was inlined by Scope.c into the current frame (Scope.c marks
+// the block by pointing its scope at the enclosing scope). Mirrors messageIsInlinableLoop
+// plus that marker; on a mismatch we emit a normal send.
+static _Bool compileLoopKind(Compiler *compiler, MessageExpressionNode *node)
+{
+	if (!inlineControlFlowEnabled()) {
+		return 0;
+	}
+	if (!stringEqualsC(messageExpressionNodeGetSelector(node), "to:do:")) {
+		return 0;
+	}
+	OrderedCollection *args = messageExpressionNodeGetArgs(node);
+	if (ordCollSize(args) != 2) {
+		return 0;
+	}
+	Object *blockObj = ordCollObjectAt(args, 1);
+	if (blockObj->raw->class != Handles.BlockNode->raw) {
+		return 0;
+	}
+	BlockNode *block = (BlockNode *) blockObj;
+	if (ordCollSize(blockNodeGetArgs(block)) != 1 || ordCollSize(blockNodeGetTempVars(block)) != 0) {
+		return 0;
+	}
+	// Compare the RAW scope objects: blockNodeGetScope() and compiler->scope are
+	// handles that wrap the same object with distinct handle addresses.
+	return blockNodeGetScope(block)->raw == compiler->scope->raw;
+}
+
+
+// Emit `to: stop do: [:i | body]` as an inline counted loop (no block, no BlockContext,
+// no per-iteration #value: send):  i := self; limit := stop; [i <= limit] whileTrue:
+// [ body; i := i + 1 ]  answering self. The `<=`/`+` sends are inlined by the backend.
+static void compileInlinedLoop(Compiler *compiler, Operand *receiver, MessageExpressionNode *node, Operand *result)
+{
+	AssemblerBuffer *buffer = &compiler->buffer;
+	OrderedCollection *args = messageExpressionNodeGetArgs(node);
+	BlockNode *block = (BlockNode *) ordCollObjectAt(args, 1);
+	LiteralNode *loopArg = (LiteralNode *) ordCollObjectAt(blockNodeGetArgs(block), 0);
+
+	Operand i;
+	findVar(compiler, loopArg, &i);   // loop var (declared by Scope.c as an enclosing temp)
+
+	Operand stopOp;
+	compileLiteral(compiler, (LiteralNode *) ordCollObjectAt(args, 0), &stopOp);
+	Operand limit;
+	createTmpVar(compiler, &limit);
+	bytecodeCopy(buffer, &stopOp, &limit);          // limit := stop (evaluated once)
+	bytecodeCopy(buffer, receiver, &i);             // i := self
+
+	Operand cond;
+	createTmpVar(compiler, &cond);
+	Operand one = { .isValid = 1, .type = OPERAND_VALUE, .value = tagInt(1) };
+	uint8_t leIdx = ordCollAddObjectIfNotExists(compiler->literals, (Object *) asSymbol(asString("<=")));
+	uint8_t plusIdx = ordCollAddObjectIfNotExists(compiler->literals, (Object *) asSymbol(asString("+")));
+	uint8_t trueClassIdx = ordCollAddObjectIfNotExists(compiler->literals, (Object *) Handles.True);
+
+	AssemblerLabel loop, end;
+	asmInitLabel(&loop);
+	asmInitLabel(&end);
+
+	asmLabelBind(buffer, &loop, asmOffset(buffer));
+	bytecodeSendWithStore(buffer, leIdx, &i, &cond, &limit, 1);   // cond := i <= limit
+	bytecodeJumpNotMemberOf(buffer, &cond, trueClassIdx, &end);   // exit when not true
+	compileInlinedBlockBody(compiler, block, NULL);               // splice body
+	bytecodeSendWithStore(buffer, plusIdx, &i, &i, &one, 1);      // i := i + 1
+	bytecodeJump(buffer, &loop);
+	asmLabelBind(buffer, &end, asmOffset(buffer));
+
+	if (result != NULL) {
+		bytecodeCopy(buffer, receiver, result);                  // to:do: answers self
+	}
+}
+
+
 static void compileMessageExpression(Compiler *compiler, Operand *receiver, MessageExpressionNode *node, Operand *result)
 {
 	HandleScope scope;
 	openHandleScope(&scope);
 	AssemblerBuffer *buffer = &compiler->buffer;
+
+	if (compileLoopKind(compiler, node)) {
+		compileInlinedLoop(compiler, receiver, node, result);
+		closeHandleScope(&scope, NULL);
+		return;
+	}
 
 	int cfKind = compileControlFlowKind(node);
 	if (cfKind != CF_NONE) {
