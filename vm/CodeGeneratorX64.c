@@ -36,7 +36,8 @@ static void generateSend(CodeGenerator *generator, BytecodesIterator *iterator);
 static void generateOuterReturn(CodeGenerator *generator, BytecodesIterator *iterator);
 static void pushOperand(CodeGenerator *generator, Operand operand);
 static void movOperand(CodeGenerator *generator, Operand operand, Register reg);
-static void movToOperand(CodeGenerator *generator, Register reg, Operand operand);
+static void movToOperand(CodeGenerator *generator, Register reg, Operand operand, _Bool valueMayBePointer);
+static _Bool operandMayBePointer(Operand operand);
 static void generateClassCheck(CodeGenerator *generator, Operand operand, RawClass *class, AssemblerLabel *label);
 static void generateLoadBlock(CodeGenerator *generator, Operand operand);
 static void fillContext(CodeGenerator *generator, uint8_t level);
@@ -256,7 +257,7 @@ static void generateBody(CodeGenerator *generator)
 		case BYTECODE_SEND_WITH_STORE:
 			generateSend(generator, &iterator);
 			if (bytecode == BYTECODE_SEND_WITH_STORE) {
-				movToOperand(generator, RAX, bytecodeNextOperand(&iterator));
+				movToOperand(generator, RAX, bytecodeNextOperand(&iterator), 1);
 			}
 			break;
 
@@ -347,7 +348,7 @@ static void generateCopy(CodeGenerator *generator, BytecodesIterator *iterator)
 			generateLoadObject(&generator->buffer, Handles.nil->raw, srcVar->reg, 1);
 			srcVar->flags |= VAR_IN_REG;
 		}
-		movToOperand(generator, srcVar->reg, dst);
+		movToOperand(generator, srcVar->reg, dst, 1);
 	} else if (dst.type == OPERAND_TEMP_VAR) {
 		Variable *dstVar = variableAt(generator, dst.index);
 		if (dstVar->reg == SPILLED_REG) {
@@ -361,14 +362,22 @@ static void generateCopy(CodeGenerator *generator, BytecodesIterator *iterator)
 		}
 	} else {
 		movOperand(generator, src, RAX);
-		movToOperand(generator, RAX, dst);
+		movToOperand(generator, RAX, dst, operandMayBePointer(src));
 	}
 }
 
 
+static _Bool rawSelectorIs(RawObject *selector, const char *name, size_t len)
+{
+	return rawObjectSize(selector) == len
+		&& memcmp(getRawObjectIndexedVars(selector), name, len) == 0;
+}
+
 // SmallInteger selectors inlined at the call site (fast path in generateSend).
+// The bit-op kinds are int-only (never taken by the Float fast path).
 enum { ARITH_NONE = 0, ARITH_ADD, ARITH_SUB, ARITH_MUL, ARITH_DIV,
-       ARITH_LT, ARITH_LE, ARITH_GT, ARITH_GE, ARITH_EQ, ARITH_NE };
+       ARITH_LT, ARITH_LE, ARITH_GT, ARITH_GE, ARITH_EQ, ARITH_NE,
+       ARITH_BITAND, ARITH_BITOR, ARITH_BITXOR };
 
 static int classifyArith(RawObject *selector)
 {
@@ -390,11 +399,35 @@ static int classifyArith(RawObject *selector)
 		case '>': return ARITH_GE;
 		case '~': return ARITH_NE;
 		}
+	} else {
+		if (rawSelectorIs(selector, "bitAnd:", 7)) return ARITH_BITAND;
+		if (rawSelectorIs(selector, "bitOr:", 6)) return ARITH_BITOR;
+		if (rawSelectorIs(selector, "bitXor:", 7)) return ARITH_BITXOR;
 	}
 	return ARITH_NONE;
 }
 
-static _Bool arithIsCompare(int kind) { return kind >= ARITH_LT; }
+static _Bool arithIsCompare(int kind) { return kind >= ARITH_LT && kind <= ARITH_NE; }
+static _Bool arithIsBitOp(int kind) { return kind >= ARITH_BITAND; }
+
+
+// Identity / nil tests inlined at the call site. `==`/`~~` are non-overridable
+// identity; `isNil`/`notNil` compile to `== nil`/`~~ nil` (the only kernel
+// definitions are identity-to-nil). Unlike the arithmetic fast paths these
+// ALWAYS resolve, so no class guard and no dispatch fallback are emitted.
+enum { IDENT_NONE = 0, IDENT_EQ, IDENT_NE, IDENT_ISNIL, IDENT_NOTNIL };
+
+static int classifyIdentity(RawObject *selector, uint8_t argsSize)
+{
+	if (argsSize == 1) {
+		if (rawSelectorIs(selector, "==", 2)) return IDENT_EQ;
+		if (rawSelectorIs(selector, "~~", 2)) return IDENT_NE;
+	} else if (argsSize == 0) {
+		if (rawSelectorIs(selector, "isNil", 5)) return IDENT_ISNIL;
+		if (rawSelectorIs(selector, "notNil", 6)) return IDENT_NOTNIL;
+	}
+	return IDENT_NONE;
+}
 
 
 // Float call-site intrinsic gate: unset ST_NO_INLINE_FLOAT => enabled.
@@ -536,9 +569,11 @@ static void generateSend(CodeGenerator *generator, BytecodesIterator *iterator)
 	// only RAX/RSI/RDI(/RDX) as scratch and leave TMP (= receiver) untouched on
 	// the dispatch fall-through, so the class recompute below works.
 	int arithKind = argsSize == 1 ? classifyArith(selector) : ARITH_NONE;
+	int identKind = classifyIdentity(selector, argsSize);
+	_Bool identityInline = identKind != IDENT_NONE;
 	_Bool intInline = arithKind != ARITH_NONE && arithKind != ARITH_DIV;   // int has no inline '/'
-	_Bool floatInline = arithKind != ARITH_NONE && floatInlineEnabled();
-	_Bool anyInline = intInline || floatInline;
+	_Bool floatInline = arithKind != ARITH_NONE && !arithIsBitOp(arithKind) && floatInlineEnabled();
+	_Bool anyInline = intInline || floatInline || identityInline;
 	// Separate merge labels: each AssemblerLabel supports only one reference, so
 	// the int hit and the float hit cannot share one. Both bind to the same offset.
 	AssemblerLabel arithMerge, floatMerge;
@@ -574,6 +609,15 @@ static void generateSend(CodeGenerator *generator, BytecodesIterator *iterator)
 			asmImulq(buffer, RSI, RAX);                                                 // a * (b<<2) = (a*b)<<2
 			asmJ(buffer, COND_OVERFLOW, &overflowMiss);
 			break;
+		case ARITH_BITAND:                                                             // both tagged 00 => result
+			asmAndq(buffer, RSI, RAX);                                                  // (a<<2)&(b<<2) = (a&b)<<2, stays tagged
+			break;
+		case ARITH_BITOR:
+			asmOrq(buffer, RSI, RAX);
+			break;
+		case ARITH_BITXOR:
+			asmXorq(buffer, RSI, RAX);
+			break;
 		default: {   // comparisons: cmp then branch on FRESH flags (loads clobber flags)
 			AssemblerLabel cmpTrue, cmpDone;
 			uint8_t cond = arithKind == ARITH_LT ? COND_LESS
@@ -605,24 +649,48 @@ static void generateSend(CodeGenerator *generator, BytecodesIterator *iterator)
 		generateFloatFastPath(generator, arithKind, &floatMerge);
 	}
 
-	RawClass *class = compiledCodeResolveOperandClass(&generator->code, receiver);
-	if (class != NULL) {
-		asmMovqImm(buffer, (int64_t) lookupNativeCode(class, (RawString *) selector), R11);
+	if (identityInline) {
+		// Identity/nil test: always resolves, so emit no class guard and no
+		// dispatch. Operands are on the stack (receiver [rsp], arg [rsp+8]); leave
+		// the boolean in RAX and fall through to the shared merge/pop tail below.
+		AssemblerLabel identTrue, identDone;
+		asmInitLabel(&identTrue);
+		asmInitLabel(&identDone);
+		asmMovqMem(buffer, asmMem(RSP, NO_REGISTER, SS_1, 0), RAX);                       // receiver
+		if (argsSize == 1) {
+			asmMovqMem(buffer, asmMem(RSP, NO_REGISTER, SS_1, sizeof(intptr_t)), RSI);    // arg
+		} else {
+			generateLoadObject(buffer, Handles.nil->raw, RSI, 1);                        // compare vs nil
+		}
+		asmCmpq(buffer, RAX, RSI);
+		_Bool wantEqual = identKind == IDENT_EQ || identKind == IDENT_ISNIL;
+		asmJ(buffer, wantEqual ? COND_EQUAL : COND_NOT_EQUAL, &identTrue);
+		generateLoadObject(buffer, Handles.false->raw, RAX, 1);
+		asmJmpLabel(buffer, &identDone);
+		asmLabelBind(buffer, &identTrue, asmOffset(buffer));
+		generateLoadObject(buffer, Handles.true->raw, RAX, 1);
+		asmLabelBind(buffer, &identDone, asmOffset(buffer));
+		generator->frameSize -= argsSize + 1;
 	} else {
-		// Always recompute the receiver's class from TMP. The old VAR_CLASS spill
-		// cache (keyed by the receiver variable) is UNSAFE once inlined control flow
-		// exists: a send inside a conditional arm would spill the class on a path
-		// that is not always taken, and a later send would read the unpopulated slot
-		// as a garbage class. Recomputing per send is a few instructions and correct.
-		generateLoadClass(buffer, TMP, RDI);
-		generateLoadObject(buffer, selector, RSI, 0);
-		generateMethodLookup(generator);
-	}
+		RawClass *class = compiledCodeResolveOperandClass(&generator->code, receiver);
+		if (class != NULL) {
+			asmMovqImm(buffer, (int64_t) lookupNativeCode(class, (RawString *) selector), R11);
+		} else {
+			// Always recompute the receiver's class from TMP. The old VAR_CLASS spill
+			// cache (keyed by the receiver variable) is UNSAFE once inlined control flow
+			// exists: a send inside a conditional arm would spill the class on a path
+			// that is not always taken, and a later send would read the unpopulated slot
+			// as a garbage class. Recomputing per send is a few instructions and correct.
+			generateLoadClass(buffer, TMP, RDI);
+			generateLoadObject(buffer, selector, RSI, 0);
+			generateMethodLookup(generator);
+		}
 
-	generator->frameSize -= argsSize + 1;
-	asmCallq(buffer, R11);
-	generateStackmap(generator);
-	ordCollAdd(generator->descriptors, createBytecodeDescriptor(asmOffset(&generator->buffer), generator->bytecodeNumber));
+		generator->frameSize -= argsSize + 1;
+		asmCallq(buffer, R11);
+		generateStackmap(generator);
+		ordCollAdd(generator->descriptors, createBytecodeDescriptor(asmOffset(&generator->buffer), generator->bytecodeNumber));
+	}
 	// Both the inline fast paths and the dispatched call converge here (result in
 	// RAX) so they share the single arg-pop.
 	if (anyInline) {
@@ -1052,7 +1120,25 @@ static void movOperand(CodeGenerator *generator, Operand operand, Register reg)
 }
 
 
-static void movToOperand(CodeGenerator *generator, Register reg, Operand operand)
+// A stored value can only create an old->young pointer (and thus need the write
+// barrier) if it is itself a heap pointer. Compile-time non-pointers — SmallInteger
+// and Character immediates, and the nil/true/false singletons, which live in old
+// space and never move — can never do so, so their barrier is elided.
+static _Bool operandMayBePointer(Operand operand)
+{
+	switch (operand.type) {
+	case OPERAND_NIL:
+	case OPERAND_TRUE:
+	case OPERAND_FALSE:
+		return 0;
+	case OPERAND_VALUE:
+		return valueTypeOf(operand.value, VALUE_POINTER);
+	default:
+		return 1;
+	}
+}
+
+static void movToOperand(CodeGenerator *generator, Register reg, Operand operand, _Bool valueMayBePointer)
 {
 	AssemblerBuffer *buffer = &generator->buffer;
 
@@ -1073,7 +1159,9 @@ static void movToOperand(CodeGenerator *generator, Register reg, Operand operand
 		Variable *context = specialVariableAt(generator, VAR_CONTEXT, operand.level);
 		ptrdiff_t offset = varOffset(RawContext, vars) + operand.index * sizeof(Value);
 		fillContext(generator, operand.level);
-		generateStoreCheck(generator, context->reg, reg);
+		if (valueMayBePointer) {
+			generateStoreCheck(generator, context->reg, reg);
+		}
 		asmMovqToMem(buffer, reg, asmMem(context->reg, NO_REGISTER, SS_1, offset));
 		break;
 	}
@@ -1084,7 +1172,9 @@ static void movToOperand(CodeGenerator *generator, Register reg, Operand operand
 		ptrdiff_t offset = varOffset(RawObject, body) + (shape.payloadSize + operand.index + shape.isIndexed) * sizeof(Value);
 
 		fillVar(generator, self);
-		generateStoreCheck(generator, self->reg, reg);
+		if (valueMayBePointer) {
+			generateStoreCheck(generator, self->reg, reg);
+		}
 		asmMovqToMem(buffer, reg, asmMem(self->reg, NO_REGISTER, SS_1, offset));
 		break;
 	}
@@ -1093,7 +1183,9 @@ static void movToOperand(CodeGenerator *generator, Register reg, Operand operand
 		Variable *variable = specialVariableAt(generator, VAR_ASSOC, operand.index);
 		fillAssoc(generator, operand.index);
 		asmMovqToMem(buffer, reg, asmMem(variable->reg, NO_REGISTER, SS_1, varOffset(RawAssociation, value)));
-		generateStoreCheck(generator, variable->reg, reg);
+		if (valueMayBePointer) {
+			generateStoreCheck(generator, variable->reg, reg);
+		}
 		break;
 	}
 
