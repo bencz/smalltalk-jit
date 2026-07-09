@@ -84,6 +84,7 @@ scheduler, channels, an actor layer, and non-blocking sockets.
 | `04_webserver.st`           | Non-blocking **sockets** — a tiny concurrent HTTP server + clients |
 | `05_business_card_api.st`   | **HTTP + actors** — a business-card API (users and cards are actors, each card counts its views), driven by an in-VM client with a throughput burst |
 | `06_business_card_server.st`| The same API as a **standalone server** bound to `0.0.0.0:8080`, seeded with one card; hammer it with `curl`, `ab -k -n 50000 -c 200`, or `wrk` |
+| `07_mediator_cqrs.st`       | **Advanced Mediator (CQRS)** — commands/queries routed to one handler through a pipeline (`log → validate → time`); events published **fire-and-forget** to per-subscriber fibers; a saga reacts to a `StockLow` event by issuing a `Restock`; concurrent buyers fan out as fibers and fan in over a channel |
 
 The HTTP server, client and JSON codec used by 05/06 live in the kernel
 (`smalltalk/Streams/Http/*.st` and `smalltalk/Json.st`), so they are reusable

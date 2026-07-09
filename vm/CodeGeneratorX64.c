@@ -1079,11 +1079,34 @@ static void generateClassCheck(CodeGenerator *generator, Operand operand, RawCla
 		break;
 	}
 
-	case OPERAND_LITERAL:
-	case OPERAND_ASSOC: {
+	case OPERAND_LITERAL: {
 		RawObject *literal = compiledCodeLiteralAt(&generator->code, operand.index);
 		if (class != literal->class) {
 			asmJmpLabel(buffer, label);
+		}
+		break;
+	}
+
+	case OPERAND_ASSOC: {
+		// Load the association's *runtime* value and check ITS class dynamically.
+		// Do NOT constant-fold on the Association object's class (which is always
+		// Association, never True/False) — that used to funnel every global
+		// receiver of an inlined conditional straight to #mustBeBoolean. Mirrors
+		// the OPERAND_INST_VAR/OPERAND_CONTEXT_VAR paths; scratch is TMP (value)
+		// and RAX (tested class), and the VAR_CLASS cache is left untouched.
+		generateLoadObject(buffer, compiledCodeLiteralAt(&generator->code, operand.index), TMP, 1);
+		asmMovqMem(buffer, asmMem(TMP, NO_REGISTER, SS_1, varOffset(RawAssociation, value)), TMP);
+
+		if (class == Handles.SmallInteger->raw) {
+			asmTestqImm(buffer, TMP, 3);
+			asmJ(buffer, COND_NOT_ZERO, label);
+		} else if (class == Handles.Character->raw) {
+			asmTestqImm(buffer, TMP, VALUE_CHAR);
+			asmJ(buffer, COND_ZERO, label);
+		} else {
+			generateLoadObject(buffer, (RawObject *) class, RAX, 0);
+			asmCmpqMem(buffer, asmMem(TMP, NO_REGISTER, SS_1, varOffset(RawObject, class)), RAX);
+			asmJ(buffer, COND_NOT_EQUAL, label);
 		}
 		break;
 	}

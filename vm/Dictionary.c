@@ -10,6 +10,8 @@
 static void growDictionary(Dictionary *dict);
 static Association *createAssoc(Object *key, Object *value);
 static size_t findIndex(RawArray *contents, DictComparator cmp, Value key, Value hash);
+static _Bool identityCmp(Value a, Value b);
+static _Bool stringCmp(Value a, Value b);
 
 
 Dictionary *newDictionary(size_t size)
@@ -89,29 +91,40 @@ static void growDictionary(Dictionary *dict)
 {
 	Array *contents = scopeHandle((RawArray *) asObject(dict->raw->contents));
 	Array *newContents = newObject(Handles.Array, contents->raw->size * 2);
-	objectStorePtr((Object *) dict,  &dict->raw->contents, (Object *) newContents);
 
-	Iterator iterator;
-	initArrayIterator(&iterator, contents, 0, 0);
-
-	while (iteratorHasNext(&iterator)) {
+	// Relocate the EXISTING association objects into the resized contents,
+	// preserving their object identity. The JIT bakes a fixed Association
+	// pointer into compiled code (OPERAND_ASSOC); reinserting via dictAtPut
+	// would allocate fresh associations and orphan those baked pointers, so a
+	// mutable global written through the new association would read nil through
+	// the stale one. Iterate by index (re-reading contents->raw) and allocate
+	// nothing in the loop so no scavenge can move `contents` mid-walk.
+	for (size_t i = 0; i < contents->raw->size; i++) {
 		HandleScope scope;
 		openHandleScope(&scope);
 
-		Association *assoc = (Association *) iteratorNextObject(&iterator);
-		if (assoc->raw->class == Handles.Association->raw) {
-			RawClass *class = getClassOf(assoc->raw->key);
-			if (class == Handles.String->raw) {
-				stringDictAtPut(dict, scopeHandle(asObject(assoc->raw->key)), assoc->raw->value);
-			} else if (class == Handles.Symbol->raw) {
-				symbolDictAtPut(dict, scopeHandle(asObject(assoc->raw->key)), assoc->raw->value);
+		Association *assoc = scopeHandle(asObject(contents->raw->vars[i]));
+		if (!isNil(assoc) && assoc->raw->class == Handles.Association->raw) {
+			RawClass *keyClass = getClassOf(assoc->raw->key);
+			ptrdiff_t index;
+			if (keyClass == Handles.String->raw) {
+				index = findIndex(newContents->raw, &stringCmp, assoc->raw->key,
+					computeStringHash(scopeHandle(asObject(assoc->raw->key))));
+			} else if (keyClass == Handles.Symbol->raw) {
+				index = findIndex(newContents->raw, &identityCmp, assoc->raw->key,
+					objectGetHash(scopeHandle(asObject(assoc->raw->key))));
 			} else {
 				FAIL();
 			}
+			arrayAtPutObject(newContents, index, (Object *) assoc);
 		}
 
 		closeHandleScope(&scope, NULL);
 	}
+
+	// Swap in the resized contents. `tally` is unchanged: the same entries were
+	// relocated, not reinserted.
+	objectStorePtr((Object *) dict, &dict->raw->contents, (Object *) newContents);
 }
 
 
