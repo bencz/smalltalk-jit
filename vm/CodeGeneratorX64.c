@@ -367,7 +367,7 @@ static void generateCopy(CodeGenerator *generator, BytecodesIterator *iterator)
 
 
 // SmallInteger selectors inlined at the call site (fast path in generateSend).
-enum { ARITH_NONE = 0, ARITH_ADD, ARITH_SUB, ARITH_MUL,
+enum { ARITH_NONE = 0, ARITH_ADD, ARITH_SUB, ARITH_MUL, ARITH_DIV,
        ARITH_LT, ARITH_LE, ARITH_GT, ARITH_GE, ARITH_EQ, ARITH_NE };
 
 static int classifyArith(RawObject *selector)
@@ -379,6 +379,7 @@ static int classifyArith(RawObject *selector)
 		case '+': return ARITH_ADD;
 		case '-': return ARITH_SUB;
 		case '*': return ARITH_MUL;
+		case '/': return ARITH_DIV;   // Float only (single-instruction divsd); SmallInteger keeps dispatching
 		case '<': return ARITH_LT;
 		case '>': return ARITH_GT;
 		case '=': return ARITH_EQ;
@@ -394,6 +395,116 @@ static int classifyArith(RawObject *selector)
 }
 
 static _Bool arithIsCompare(int kind) { return kind >= ARITH_LT; }
+
+
+// Float call-site intrinsic gate: unset ST_NO_INLINE_FLOAT => enabled.
+static _Bool floatInlineEnabled(void)
+{
+	static int enabled = -1;
+	if (enabled < 0) {
+		enabled = getenv("ST_NO_INLINE_FLOAT") == NULL;
+	}
+	return enabled;
+}
+
+
+// Inline Float `+ - * /` and `< <= > >= = ~=` at the call site. Reached when the
+// SmallInteger fast path missed (or was skipped, for `/`); the operands are still
+// on the stack (receiver at [rsp], arg at [rsp+8]) and TMP still holds the
+// receiver. If BOTH operands are boxed Floats, do the SSE op inline and jump to
+// the shared merge; otherwise fall through to the normal dispatch (which coerces
+// mixed int/float via retry:coercing:). Scratch is RAX/RSI/RDI (all rebuilt by
+// dispatch) plus RDX + XMM0/XMM1 on the committed arithmetic path; TMP is left
+// untouched on every fall-through-to-dispatch path so the class recompute works.
+static void generateFloatFastPath(CodeGenerator *generator, int arithKind, AssemblerLabel *arithMerge)
+{
+	AssemblerBuffer *buffer = &generator->buffer;
+	AssemblerLabel tagMissR, tagMissA, classMissR, classMissA;
+	asmInitLabel(&tagMissR);
+	asmInitLabel(&tagMissA);
+	asmInitLabel(&classMissR);
+	asmInitLabel(&classMissA);
+
+	asmMovqMem(buffer, asmMem(RSP, NO_REGISTER, SS_1, 0), RAX);                     // receiver
+	asmMovqMem(buffer, asmMem(RSP, NO_REGISTER, SS_1, sizeof(intptr_t)), RSI);      // arg
+	// both must be heap pointers (only VALUE_POINTER has bit 0 set) of class Float
+	asmTestqImm(buffer, RAX, VALUE_POINTER);
+	asmJ(buffer, COND_ZERO, &tagMissR);
+	asmTestqImm(buffer, RSI, VALUE_POINTER);
+	asmJ(buffer, COND_ZERO, &tagMissA);
+	generateLoadObject(buffer, (RawObject *) Handles.Float->raw, RDI, 0);           // Float class (raw)
+	asmCmpqMem(buffer, asmMem(RAX, NO_REGISTER, SS_1, varOffset(RawObject, class)), RDI);
+	asmJ(buffer, COND_NOT_EQUAL, &classMissR);
+	asmCmpqMem(buffer, asmMem(RSI, NO_REGISTER, SS_1, varOffset(RawObject, class)), RDI);
+	asmJ(buffer, COND_NOT_EQUAL, &classMissA);
+
+	if (arithIsCompare(arithKind)) {
+		// No allocation: unbox both, ucomisd, load true/false. ucomisd sets CF/ZF/PF
+		// like an unsigned compare, with unordered (NaN) => CF=ZF=PF=1. Branch on
+		// FRESH flags (the true/false loads clobber flags). NaN follows C: unordered
+		// is false for < <= > >= = and true for ~=. Each label is referenced exactly
+		// once (asmEmitLabel32 allows only one reference): `jp` and the fall-through
+		// both reach firstBlock, the main condition reaches secondBlock.
+		asmMovsdMem(buffer, asmMem(RAX, NO_REGISTER, SS_1, varOffset(RawFloat, value)), XMM0);
+		asmMovsdMem(buffer, asmMem(RSI, NO_REGISTER, SS_1, varOffset(RawFloat, value)), XMM1);
+		asmUcomisd(buffer, XMM0, XMM1);
+		AssemblerLabel firstBlock, secondBlock, cmpDone;
+		asmInitLabel(&firstBlock);
+		asmInitLabel(&secondBlock);
+		asmInitLabel(&cmpDone);
+		uint8_t jMain;
+		RawObject *firstValue, *secondValue;
+		if (arithKind == ARITH_NE) {
+			// true unless ordered-and-equal: parity(NaN)->true, equal->false
+			jMain = COND_EQUAL;
+			firstValue = Handles.true->raw;
+			secondValue = Handles.false->raw;
+		} else {
+			// false on unordered: parity(NaN)->false, condition->true
+			jMain = arithKind == ARITH_LT ? COND_BELOW
+				: arithKind == ARITH_LE ? COND_BELOW_EQUAL
+				: arithKind == ARITH_GT ? COND_ABOVE
+				: arithKind == ARITH_GE ? COND_ABOVE_EQUAL
+				: COND_EQUAL;
+			firstValue = Handles.false->raw;
+			secondValue = Handles.true->raw;
+		}
+		asmJ(buffer, COND_PARITY_EVEN, &firstBlock);   // unordered (NaN) -> firstBlock
+		asmJ(buffer, jMain, &secondBlock);
+		asmLabelBind(buffer, &firstBlock, asmOffset(buffer));   // jp target + fall-through
+		generateLoadObject(buffer, firstValue, RAX, 1);
+		asmJmpLabel(buffer, &cmpDone);
+		asmLabelBind(buffer, &secondBlock, asmOffset(buffer));
+		generateLoadObject(buffer, secondValue, RAX, 1);
+		asmLabelBind(buffer, &cmpDone, asmOffset(buffer));
+	} else {
+		// Arithmetic: box the result. Allocate FIRST, then compute into the new
+		// Float. The operands stay live across the (possibly scavenging) allocation
+		// via the stub's stackmap, and the result never crosses a C call, so no XMM
+		// value has to survive the allocation.
+		generateLoadObject(buffer, (RawObject *) Handles.Float->raw, RSI, 0);       // class for AllocateStub
+		asmMovqImm(buffer, 0, RDX);                                                 // no indexed slots
+		generateStubCall(generator, &AllocateStub);                                // RAX = new tagged Float
+		asmMovqMem(buffer, asmMem(RSP, NO_REGISTER, SS_1, 0), RSI);                 // reload receiver (GC-updated)
+		asmMovqMem(buffer, asmMem(RSP, NO_REGISTER, SS_1, sizeof(intptr_t)), RDI);  // reload arg
+		asmMovsdMem(buffer, asmMem(RSI, NO_REGISTER, SS_1, varOffset(RawFloat, value)), XMM0);
+		asmMovsdMem(buffer, asmMem(RDI, NO_REGISTER, SS_1, varOffset(RawFloat, value)), XMM1);
+		switch (arithKind) {
+		case ARITH_ADD: asmAddsd(buffer, XMM1, XMM0); break;
+		case ARITH_SUB: asmSubsd(buffer, XMM1, XMM0); break;
+		case ARITH_MUL: asmMulsd(buffer, XMM1, XMM0); break;
+		default:        asmDivsd(buffer, XMM1, XMM0); break;   // ARITH_DIV
+		}
+		asmMovsdToMem(buffer, XMM0, asmMem(RAX, NO_REGISTER, SS_1, varOffset(RawFloat, value)));
+	}
+	asmJmpLabel(buffer, arithMerge);
+
+	// Any type mismatch falls through to the dispatch that follows in generateSend.
+	asmLabelBind(buffer, &tagMissR, asmOffset(buffer));
+	asmLabelBind(buffer, &tagMissA, asmOffset(buffer));
+	asmLabelBind(buffer, &classMissR, asmOffset(buffer));
+	asmLabelBind(buffer, &classMissA, asmOffset(buffer));
+}
 
 
 // TMP: receiver
@@ -417,17 +528,29 @@ static void generateSend(CodeGenerator *generator, BytecodesIterator *iterator)
 	asmPushq(buffer, TMP);
 	generator->frameSize++;
 
-	// --- inline SmallInteger arithmetic fast path ---------------------------
-	// Operands are on the stack (receiver at [rsp], arg at [rsp+8]); if both are
-	// SmallIntegers do the tagged op inline and skip the dispatch, otherwise fall
-	// through to the normal send (which handles overflow/coercion via retry:).
-	// Uses ONLY RAX/RSI as scratch — both are re-established by the dispatch path —
-	// and leaves TMP (= receiver) untouched, so the class computation below is
-	// unaffected. Two separate tag tests avoid needing a third scratch register.
+	// --- inline arithmetic/comparison fast paths ----------------------------
+	// Operands are on the stack (receiver at [rsp], arg at [rsp+8]). The int fast
+	// path does the tagged SmallInteger op; on a tag/overflow miss it falls into
+	// the Float fast path (SSE, if both are boxed Floats); a miss there falls
+	// through to the normal dispatch (coercion via retry:). Both fast paths use
+	// only RAX/RSI/RDI(/RDX) as scratch and leave TMP (= receiver) untouched on
+	// the dispatch fall-through, so the class recompute below works.
 	int arithKind = argsSize == 1 ? classifyArith(selector) : ARITH_NONE;
-	AssemblerLabel arithMerge, tagMissR, tagMissA, overflowMiss;
-	if (arithKind != ARITH_NONE) {
+	_Bool intInline = arithKind != ARITH_NONE && arithKind != ARITH_DIV;   // int has no inline '/'
+	_Bool floatInline = arithKind != ARITH_NONE && floatInlineEnabled();
+	_Bool anyInline = intInline || floatInline;
+	// Separate merge labels: each AssemblerLabel supports only one reference, so
+	// the int hit and the float hit cannot share one. Both bind to the same offset.
+	AssemblerLabel arithMerge, floatMerge;
+	if (intInline) {
 		asmInitLabel(&arithMerge);
+	}
+	if (floatInline) {
+		asmInitLabel(&floatMerge);
+	}
+
+	if (intInline) {
+		AssemblerLabel tagMissR, tagMissA, overflowMiss;
 		asmInitLabel(&tagMissR);
 		asmInitLabel(&tagMissA);
 		asmInitLabel(&overflowMiss);
@@ -472,9 +595,14 @@ static void generateSend(CodeGenerator *generator, BytecodesIterator *iterator)
 		}
 		}
 		asmJmpLabel(buffer, &arithMerge);
+		// tag/overflow misses fall through to the Float fast path (or dispatch)
 		asmLabelBind(buffer, &tagMissR, asmOffset(buffer));
 		asmLabelBind(buffer, &tagMissA, asmOffset(buffer));
 		asmLabelBind(buffer, &overflowMiss, asmOffset(buffer));
+	}
+
+	if (floatInline) {
+		generateFloatFastPath(generator, arithKind, &floatMerge);
 	}
 
 	RawClass *class = compiledCodeResolveOperandClass(&generator->code, receiver);
@@ -495,10 +623,16 @@ static void generateSend(CodeGenerator *generator, BytecodesIterator *iterator)
 	asmCallq(buffer, R11);
 	generateStackmap(generator);
 	ordCollAdd(generator->descriptors, createBytecodeDescriptor(asmOffset(&generator->buffer), generator->bytecodeNumber));
-	// Both the inline fast path and the dispatched call converge here (result in
+	// Both the inline fast paths and the dispatched call converge here (result in
 	// RAX) so they share the single arg-pop.
-	if (arithKind != ARITH_NONE) {
-		asmLabelBind(buffer, &arithMerge, asmOffset(buffer));
+	if (anyInline) {
+		ptrdiff_t mergeOffset = asmOffset(buffer);
+		if (intInline) {
+			asmLabelBind(buffer, &arithMerge, mergeOffset);
+		}
+		if (floatInline) {
+			asmLabelBind(buffer, &floatMerge, mergeOffset);
+		}
 	}
 	asmAddqImm(buffer, RSP, (argsSize + 1) * sizeof(intptr_t));
 	invalidateRegs(&generator->regsAlloc);
@@ -509,7 +643,7 @@ static void generateSend(CodeGenerator *generator, BytecodesIterator *iterator)
 	// the slot would be left unpopulated. Forget the cached/spilled class for this
 	// receiver so the next send recomputes it from the receiver instead of reading
 	// the stale slot.
-	if (arithKind != ARITH_NONE &&
+	if (anyInline &&
 	    (receiver.type == OPERAND_TEMP_VAR || receiver.type == OPERAND_ARG_VAR)) {
 		Variable *classVar = specialVariableAt(generator, VAR_CLASS, receiver.index);
 		classVar->flags &= ~(VAR_ON_STACK | VAR_IN_REG);

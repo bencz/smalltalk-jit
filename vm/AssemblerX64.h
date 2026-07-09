@@ -1123,4 +1123,62 @@ static void asmEmitOperands(AssemblerBuffer *buffer, Operands *operands)
 	}
 }
 
+
+// --- SSE scalar-double support (used by the inline Float intrinsic) ----------
+// XMM register numbers encode in the ModRM reg/rm fields exactly like GPRs, so
+// the existing Operands/REX/ModRM machinery is reused; only the mandatory
+// prefix (F2 for scalar-double, 66 for ucomisd) + the 0F escape are prepended.
+// Byte order is: legacy prefix -> REX -> 0F -> opcode -> ModRM/SIB/disp.
+
+typedef enum {
+	XMM0 = 0, XMM1 = 1, XMM2 = 2, XMM3 = 3,
+	XMM4 = 4, XMM5 = 5, XMM6 = 6, XMM7 = 7,
+} XmmRegister;
+
+// movsd xmm(dst), [mem]   (F2 0F 10 /r)
+static void asmMovsdMem(AssemblerBuffer *buffer, MemoryOperand operand, XmmRegister dst)
+{
+	Operands operands = {.reg = dst};
+	asmInitMemoryOperand(&operands, operand);
+	asmEnsureCapacity(buffer);
+	asmEmitUint8(buffer, 0xF2);
+	asmEmitRexOperands(buffer, 0, &operands);
+	asmEmitUint8(buffer, 0x0F);
+	asmEmitUint8(buffer, 0x10);
+	asmEmitOperands(buffer, &operands);
+}
+
+// movsd [mem], xmm(src)   (F2 0F 11 /r)
+static void asmMovsdToMem(AssemblerBuffer *buffer, XmmRegister src, MemoryOperand operand)
+{
+	Operands operands = {.reg = src};
+	asmInitMemoryOperand(&operands, operand);
+	asmEnsureCapacity(buffer);
+	asmEmitUint8(buffer, 0xF2);
+	asmEmitRexOperands(buffer, 0, &operands);
+	asmEmitUint8(buffer, 0x0F);
+	asmEmitUint8(buffer, 0x11);
+	asmEmitOperands(buffer, &operands);
+}
+
+// scalar-double reg,reg: <prefix> 0F <op> /r  with dst in ModRM.reg, src in ModRM.rm
+static void asmSseRegReg(AssemblerBuffer *buffer, uint8_t prefix, uint8_t op, uint8_t regField, uint8_t rmField)
+{
+	Operands operands = {.mod = MOD_REG, .reg = regField, .rm = rmField};
+	asmEnsureCapacity(buffer);
+	asmEmitUint8(buffer, prefix);
+	asmEmitRexOperands(buffer, 0, &operands);
+	asmEmitUint8(buffer, 0x0F);
+	asmEmitUint8(buffer, op);
+	asmEmitOperands(buffer, &operands);
+}
+
+// dst = dst OP src
+static void asmAddsd(AssemblerBuffer *buffer, XmmRegister src, XmmRegister dst) { asmSseRegReg(buffer, 0xF2, 0x58, dst, src); }
+static void asmSubsd(AssemblerBuffer *buffer, XmmRegister src, XmmRegister dst) { asmSseRegReg(buffer, 0xF2, 0x5C, dst, src); }
+static void asmMulsd(AssemblerBuffer *buffer, XmmRegister src, XmmRegister dst) { asmSseRegReg(buffer, 0xF2, 0x59, dst, src); }
+static void asmDivsd(AssemblerBuffer *buffer, XmmRegister src, XmmRegister dst) { asmSseRegReg(buffer, 0xF2, 0x5E, dst, src); }
+// ucomisd a, b : sets EFLAGS (CF/ZF/PF) from comparing a to b; unordered => CF=ZF=PF=1
+static void asmUcomisd(AssemblerBuffer *buffer, XmmRegister a, XmmRegister b) { asmSseRegReg(buffer, 0x66, 0x2E, a, b); }
+
 #endif
