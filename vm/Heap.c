@@ -41,6 +41,8 @@ void initHeap(Heap *heap, struct Thread *thread)
 	heap->oldGcThreshold = OLD_GC_MIN_THRESHOLD;
 	pthread_mutex_init(&heap->youngLock, NULL);
 	pthread_mutex_init(&heap->oldLock, NULL);
+	pthread_mutex_init(&heap->execLock, NULL);
+	pthread_mutex_init(&heap->codegenLock, NULL);
 	pthread_mutex_init(&heap->gcLock, NULL);
 	pthread_mutex_init(&heap->safepointLock, NULL);
 	pthread_cond_init(&heap->safepointCond, NULL);
@@ -49,14 +51,22 @@ void initHeap(Heap *heap, struct Thread *thread)
 }
 
 
-// Register `thread` as a mutator of `heap` so the GC scans its roots. Prepended
-// under youngLock (registration is rare; the GC reads the list at a safepoint).
+// Register `thread` as a mutator of `heap` so the GC scans its roots. Taken under
+// gcLock (which the collector holds for the whole collection) so a worker can NEVER
+// join heap->mutators while a scavenge is walking that list / moving objects: the
+// registering thread simply waits for any in-progress collection to finish. This
+// mirrors heapEndMutator and closes the registration race (a worker that joined
+// after the collector's heapGcBegin snapshot used to run concurrently with the
+// scavenge, corrupting value slots). Registration is rare, so the extra lock is
+// free in practice; youngLock still guards the actual list write.
 void heapAddMutator(Heap *heap, struct Thread *thread)
 {
+	pthread_mutex_lock(&heap->gcLock);
 	pthread_mutex_lock(&heap->youngLock);
 	thread->nextMutator = heap->mutators;
 	heap->mutators = thread;
 	pthread_mutex_unlock(&heap->youngLock);
+	pthread_mutex_unlock(&heap->gcLock);
 }
 
 
@@ -152,6 +162,31 @@ void heapGcLeaveBlocked(Heap *heap, Thread *self)
 }
 
 
+// ---- JIT code-generation lock (serializes codegen across worker threads) ----
+// Only ONE thread generates JIT code at a time. Held across a whole method/stub
+// generation, which allocates young objects and may scavenge — so acquisition uses
+// the "waiting counts as safe" pattern (enter the blocked state before blocking on
+// the lock) to avoid deadlocking a peer collector. A per-thread depth counter makes
+// it re-entrant (a stub is generated while a method is being compiled).
+static PER_ISOLATE int gCodegenDepth = 0;
+
+void heapCodegenLockEnter(Heap *heap)
+{
+	if (gCodegenDepth++ == 0) {
+		heapGcEnterBlocked(heap, &CurrentThread); // waiting on codegenLock counts as safe
+		pthread_mutex_lock(&heap->codegenLock);
+		heapGcLeaveBlocked(heap, &CurrentThread);
+	}
+}
+
+void heapCodegenLockLeave(Heap *heap)
+{
+	if (--gCodegenDepth == 0) {
+		pthread_mutex_unlock(&heap->codegenLock);
+	}
+}
+
+
 void freeHeap(Heap *heap)
 {
 	freeScavenger(&heap->newSpace);
@@ -218,7 +253,10 @@ void freeObject(PageSpace *space, RawObject *object)
 NativeCode *allocateNativeCode(Heap *heap, size_t size, size_t pointersOffsetsSize)
 {
 	size_t realSize = align(sizeof(NativeCode) + size + pointersOffsetsSize * sizeof(uint16_t), HEAP_OBJECT_ALIGN);
+	// Serialize concurrent exec-space carving across worker threads (see execLock).
+	pthread_mutex_lock(&heap->execLock);
 	NativeCode *code = (NativeCode *) pageSpaceAllocate(&heap->execSpace, realSize);
+	pthread_mutex_unlock(&heap->execLock);
 	code->size = size;
 	code->pointersOffsetsSize = pointersOffsetsSize;
 	code->tags = 0;
@@ -303,39 +341,43 @@ static _Bool tlabRefill(Heap *heap, size_t realSize)
 }
 
 
-// Reclaim young space. When the heap is shared by several mutators, coordinate a
-// stop-the-world safepoint (one collector via gcLock; every other mutator parked
-// at a poll) so a scavenge never moves objects under a running worker. A single-
-// mutator heap (main alone, or an isolate) collects directly — behaviourally
-// identical to before.
+// Run mark/sweep after a scavenge if old space grew past its (self-raising)
+// threshold. Factored out so both the single- and multi-mutator collection paths
+// share exactly one copy.
+static void maybeFullGc(Heap *heap)
+{
+	if (heap->newSpace.hasPromotionFailure && heap->oldSpace.totalBytes >= heap->oldGcThreshold) {
+		markAndSweep(&CurrentThread);
+		heap->oldGcThreshold = heap->oldSpace.totalBytes * OLD_GC_GROWTH;
+		if (heap->oldGcThreshold < OLD_GC_MIN_THRESHOLD) {
+			heap->oldGcThreshold = OLD_GC_MIN_THRESHOLD;
+		}
+	}
+}
+
+// Reclaim young space. Always taken under gcLock, so it is serialized with mutator
+// registration/deregistration (heapAddMutator/heapEndMutator also hold gcLock) and
+// with any peer collector. Deciding single- vs multi-mutator INSIDE the lock is
+// what makes it race-free: a worker cannot slip into heap->mutators between the
+// count check and the scavenge. Single mutator (main alone, or an isolate) collects
+// directly (no stop-the-world needed — it is the only mutator, and registration is
+// blocked on gcLock); several mutators coordinate a stop-the-world safepoint (park
+// every other mutator at a poll) so a scavenge never moves objects under a runner.
 static void heapCollectYoung(Heap *heap, size_t realSize)
 {
-	if (heap->mutators == NULL || heap->mutators->nextMutator == NULL) {
-		scavengerScavenge(&heap->newSpace);
-		if (heap->newSpace.hasPromotionFailure && heap->oldSpace.totalBytes >= heap->oldGcThreshold) {
-			markAndSweep(&CurrentThread);
-			heap->oldGcThreshold = heap->oldSpace.totalBytes * OLD_GC_GROWTH;
-			if (heap->oldGcThreshold < OLD_GC_MIN_THRESHOLD) {
-				heap->oldGcThreshold = OLD_GC_MIN_THRESHOLD;
-			}
-		}
-		return;
-	}
-
 	heapGcEnterBlocked(heap, &CurrentThread); // blocking on gcLock counts as safe
 	pthread_mutex_lock(&heap->gcLock);
 	heapGcLeaveBlocked(heap, &CurrentThread);
-	// A peer may have freed space while we waited for gcLock.
-	if ((size_t) (heap->newSpace.end - heap->newSpace.top) < realSize) {
+
+	if (heap->mutators == NULL || heap->mutators->nextMutator == NULL) {
+		scavengerScavenge(&heap->newSpace);
+		maybeFullGc(heap);
+	} else if ((size_t) (heap->newSpace.end - heap->newSpace.top) < realSize) {
+		// A peer may have freed space while we waited for gcLock; only collect if
+		// it is still needed.
 		heapGcBegin(heap, &CurrentThread); // park every other mutator
 		scavengerScavenge(&heap->newSpace);
-		if (heap->newSpace.hasPromotionFailure && heap->oldSpace.totalBytes >= heap->oldGcThreshold) {
-			markAndSweep(&CurrentThread);
-			heap->oldGcThreshold = heap->oldSpace.totalBytes * OLD_GC_GROWTH;
-			if (heap->oldGcThreshold < OLD_GC_MIN_THRESHOLD) {
-				heap->oldGcThreshold = OLD_GC_MIN_THRESHOLD;
-			}
-		}
+		maybeFullGc(heap);
 		heapGcEnd(heap);
 	}
 	pthread_mutex_unlock(&heap->gcLock);
@@ -396,13 +438,27 @@ void collectGarbage(Thread *thread)
 }
 
 
+// Self-test observability (ST_PARFULLGC_TEST): count of full GCs run on any heap
+// across all OS threads, so a test can confirm the multi-mutator markAndSweep path
+// actually fired. Relaxed atomic — a diagnostic counter, never a synchronising fence.
+unsigned long gFullGcRuns = 0;
+
 void markAndSweep(Thread *thread)
 {
 	resetGcStats();
 	LastGCStats.count++;
+	__atomic_add_fetch(&gFullGcRuns, 1, __ATOMIC_RELAXED);
 	int64_t startTime = osCurrentMicroTime();
 
-	rememberedSetReset(&thread->rememberedSet);
+	// Reset EVERY mutator's remembered set, not just the collector's: they are all
+	// parked at this stop-the-world safepoint, and marking rebuilds all surviving
+	// old->young edges into the collector's set (thread->rememberedSet), which the
+	// next scavenge reads via its per-mutator walk. Leaving a peer's set intact
+	// would keep stale (possibly swept) old objects in it -> next scavenge would
+	// walk freed memory.
+	for (Thread *m = thread->heap->mutators; m != NULL; m = m->nextMutator) {
+		rememberedSetReset(&m->rememberedSet);
+	}
 	gcMarkRoots(thread);
 	gcSweep(&thread->heap->oldSpace);
 

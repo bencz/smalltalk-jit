@@ -24,6 +24,19 @@ typedef struct Heap {
 	// (stop-the-world) GC is uncontended; this covers concurrent mutators
 	// allocating large/old objects, and future concurrent promotion.
 	pthread_mutex_t oldLock;
+	// Guards the executable space (JIT code). Several worker OS threads lazily
+	// generate methods AND per-thread stubs (StubCode is PER_ISOLATE, so each new
+	// thread regenerates its own on first use) into ONE shared exec space; without
+	// this lock their concurrent pageSpaceAllocate calls corrupt the exec freelist/
+	// page list/index. Exec allocation never triggers a young/old GC, so holding it
+	// cannot deadlock the safepoint handshake.
+	pthread_mutex_t execLock;
+	// Serializes JIT code generation across worker threads. Codegen allocates young
+	// heap objects (assembler scratch, stackmaps) and can trigger a scavenge, so a
+	// thread WAITING for this lock counts as safe (it enters the blocked state before
+	// locking) or a peer collector would wait for it forever. Recursive use (a stub
+	// generated while compiling a method) is handled by a per-thread depth counter.
+	pthread_mutex_t codegenLock;
 	// Every OS thread that mutates THIS heap links itself here (via Thread.nextMutator)
 	// so the GC can scan the roots of all of them, not just the collecting thread.
 	// One entry today (the owner); several once worker threads share the heap.
@@ -44,6 +57,8 @@ void heapEndMutator(Heap *heap, struct Thread *thread); // unregister an exiting
 void heapGcPoll(Heap *heap, struct Thread *self);
 void heapGcBegin(Heap *heap, struct Thread *self);
 void heapGcEnd(Heap *heap);
+void heapCodegenLockEnter(Heap *heap); // serialize JIT codegen across worker threads
+void heapCodegenLockLeave(Heap *heap);
 void heapGcEnterBlocked(Heap *heap, struct Thread *self);
 void heapGcLeaveBlocked(Heap *heap, struct Thread *self);
 

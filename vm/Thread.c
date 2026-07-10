@@ -17,6 +17,9 @@ void initThread(Thread *thread)
 	initHeap(thread->heap, thread);
 	initRememberedSet(&thread->rememberedSet);
 	thread->nextMutator = NULL;
+	thread->schedFibers = NULL; // set by schedulerInit if this thread runs a scheduler
+	thread->schedFiberSlots = NULL;
+	thread->schedCurrent = NULL;
 	heapAddMutator(thread->heap, thread); // this thread now mutates (and roots) its heap
 	// Start with an empty TLAB (top == end) pointing at the fresh nursery top, so
 	// the first allocation takes the refill path and carves a real chunk.

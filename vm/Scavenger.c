@@ -9,6 +9,7 @@
 #include "GarbageCollector.h"
 #include "Os.h"
 #include <string.h>
+#include <stdlib.h>
 
 #define SCAVENGER_ALIGN 8
 
@@ -277,15 +278,31 @@ static void iterateFiberRoots(Scavenger *scavenger, Fiber *fiber)
 // Non-scheduler (bootstrap) path: the single thread's roots, walked directly.
 static void iterateThreadRoots(Scavenger *scavenger)
 {
-	// The collector's own exception-handler chain (per-OS-thread TLS). Other
-	// mutators parked at a safepoint don't use exceptions across the boundary yet.
+	// The collector's own exception-handler chain (per-OS-thread TLS).
 	iterateExceptionHandlerSlot(scavenger, &CurrentExceptionHandler);
-	// Every OS thread mutating this heap: its stack, handle scopes and root context.
 	for (Thread *thread = scavenger->heap->mutators; thread != NULL; thread = thread->nextMutator) {
+		// The mutator's CURRENTLY-RUNNING fiber keeps its roots live in these fields.
 		iterateStackFrames(scavenger, thread->stackFramesTail);
 		iterateHandleScopes(scavenger, thread->handleScopes);
 		if (thread->context != 0) {
 			processTaggedPointer(scavenger, &thread->context);
+		}
+		// A mutator that runs a fiber scheduler also has PARKED fibers whose roots
+		// are SAVED in their (heap-allocated) Fiber structs — scan them too, so a GC
+		// triggered by a worker preserves the caller's parked fibers' objects. The
+		// RUNNING fiber is skipped: its live roots are the ones scanned just above
+		// (thread->stackFramesTail/handleScopes/context); its saved roots are stale.
+		if (thread->schedFibers != NULL) {
+			Fiber **fibers = *thread->schedFibers;
+			size_t slots = *thread->schedFiberSlots;
+			Fiber *current = *thread->schedCurrent;
+			for (size_t i = 0; i < slots; i++) {
+				Fiber *fiber = fibers[i];
+				if (fiber == NULL || fiber == current) {
+					continue;
+				}
+				iterateFiberRoots(scavenger, fiber);
+			}
 		}
 	}
 }
@@ -361,23 +378,48 @@ static void iterateRememberedSet(Scavenger *scavenger)
 	// actor/message workload it grew without bound and every scavenge re-scanned
 	// an ever-larger set (O(scavenges × set)), collapsing req/s and, because a
 	// dead old entry keeps resurrecting its young referents, exploding old space.
-	// Detach and re-scan EVERY mutator's remembered set. iterateObject's tail
-	// re-adds a still-live old->young root into the collecting thread's fresh set
-	// (CurrentThread), which the next scavenge will scan again via this same loop.
-	for (Thread *thread = scavenger->heap->mutators; thread != NULL; thread = thread->nextMutator) {
-		RememberedSet detached;
-		detached.blocks = thread->rememberedSet.blocks;
-		thread->rememberedSet.blocks = createRememberedSetBlock(NULL);
+	//
+	// iterateObject's tail re-adds a still-live old->young root into the COLLECTING
+	// thread's set (CurrentThread.rememberedSet). CurrentThread is itself one of the
+	// mutators, so we must DETACH every mutator's set (giving each a fresh empty one)
+	// BEFORE re-scanning ANY of them: otherwise, in the multi-mutator case, roots
+	// re-added into the collector's still-live set while earlier mutators are scanned
+	// would be detached and scanned a SECOND time when the loop reaches the collector
+	// — and on that second scan their young fields already point into the destination
+	// semispace, so forwardObject would try to evacuate an already-moved survivor and
+	// crash. Detaching all up front makes the collector's FRESH set (the re-add
+	// target) sit outside the set of chains being iterated, so each root is scanned
+	// exactly once. The next scavenge re-scans the re-added roots via this same loop.
+	size_t mutatorCount = 0;
+	for (Thread *t = scavenger->heap->mutators; t != NULL; t = t->nextMutator) {
+		mutatorCount++;
+	}
+	// Common case (main alone / one worker) fits the stack buffer with no malloc in
+	// the hot GC path; the heap fallback only kicks in with many worker threads.
+	RememberedSetBlock *inlineBuf[16];
+	RememberedSetBlock **detached = mutatorCount <= 16 ? inlineBuf : malloc(mutatorCount * sizeof(RememberedSetBlock *));
+	if (detached == NULL) {
+		FAIL(); // real guard: ASSERT is a no-op under NDEBUG (release builds)
+	}
+	size_t i = 0;
+	for (Thread *t = scavenger->heap->mutators; t != NULL; t = t->nextMutator) {
+		detached[i++] = t->rememberedSet.blocks;
+		t->rememberedSet.blocks = createRememberedSetBlock(NULL);
+	}
 
+	for (i = 0; i < mutatorCount; i++) {
+		RememberedSet detachedSet = { .blocks = detached[i] };
 		RememberedSetIterator iterator;
-		initRememberedSetIterator(&iterator, &detached);
+		initRememberedSetIterator(&iterator, &detachedSet);
 		while (rememberedSetIteratorHasNext(&iterator)) {
 			RawObject *root = rememberedSetIteratorNext(&iterator);
 			root->tags &= ~TAG_REMEMBERED;
 			iterateObject(scavenger, root);
 		}
-
-		rememberedSetFreeBlocks(detached.blocks);
+		rememberedSetFreeBlocks(detached[i]);
+	}
+	if (detached != inlineBuf) {
+		free(detached);
 	}
 }
 

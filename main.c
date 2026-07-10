@@ -89,6 +89,7 @@ static void *workerRunBlock(void *arg)
 	entryArgsAdd(&args, getTaggedPtr(blockH));        // re-read (a GC may have moved it)
 	gWorkerResult = sendMessage(getSymbol("value"), &args);
 	closeHandleScope(&scope, NULL);
+	heapEndMutator(gWorkerHeap, &CurrentThread); // leave heap->mutators before this thread dies
 	return NULL;
 }
 
@@ -139,9 +140,13 @@ static void *parWorker(void *arg)
 	openHandleScope(&scope);
 	Object *blockH = handle(asObject(gWorkerBlock));
 	EntryArgs args = { .size = 0 };
-	entryArgsAdd(&args, getTaggedPtr(blockH));
+	// Pass the receiver as a HANDLE (GC-updated), never a raw value: sendMessage can
+	// allocate (per-thread stub gen) before it reads args[0], so a raw value could be
+	// left stale by a peer-pressured scavenge.
+	entryArgsAddObject(&args, blockH);
 	gParResults[id] = sendMessage(getSymbol("value"), &args);
 	closeHandleScope(&scope, NULL);
+	heapEndMutator(gWorkerHeap, &CurrentThread); // leave heap->mutators before this thread dies
 	return NULL;
 }
 
@@ -245,6 +250,67 @@ static int parallelGcSelfTest(void)
 }
 
 
+// ---- parallel Smalltalk WITH promotion + multi-thread FULL GC --------------
+// N workers each build a LARGE, long-lived structure (an OrderedCollection of
+// 100k two-element Arrays) held in a live local, then re-read every element to a
+// checksum. The structures survive scavenges and promote to old space; across 8
+// workers that pushes old space past its full-GC threshold, so a scavenge with a
+// promotion failure escalates to markAndSweep — under a stop-the-world safepoint
+// while the OTHER workers sit parked at an allocation poll with their partial
+// structures live on their stacks. The full GC therefore MUST scan every
+// mutator's roots (not just the collector's): if it didn't, a peer's live Arrays
+// would be swept, its backing memory recycled, and its checksum would come out
+// wrong (or it would crash dereferencing a reclaimed object). gFullGcRuns proves
+// the multi-thread full-GC path actually fired.
+extern unsigned long gFullGcRuns;
+
+static int parallelFullGcSelfTest(void)
+{
+	HandleScope scope;
+	openHandleScope(&scope);
+	gWorkerHeap = CurrentThread.heap;
+	gMainHandles = Handles;
+	// Build then verify: acc stays live the whole time (a root on the worker's
+	// stack), so its 100k Arrays must survive every peer's full GC.
+	gWorkerBlock = evalObject(
+		"[ | acc sum | "
+		"  acc := OrderedCollection new. "
+		"  1 to: 100000 do: [:i | acc add: (Array with: i with: i * 2) ]. "
+		"  sum := 0. "
+		"  acc do: [:a | sum := sum + (a at: 1) + (a at: 2) ]. "
+		"  sum ]");
+	handle(asObject(gWorkerBlock));
+	long expected = 15000150000L; // sum over i=1..100000 of (i + 2i) = 3 * 100000*100001/2
+	unsigned long fullGcBefore = __atomic_load_n(&gFullGcRuns, __ATOMIC_RELAXED);
+	runBlockOnce(gWorkerBlock); // warm up JIT compilation so workers only READ cached code
+
+	heapGcEnterBlocked(gWorkerHeap, &CurrentThread); // main idle while the workers run
+	int64_t t0 = osCurrentMicroTime();
+	pthread_t th[PAR_WORKERS];
+	for (long w = 0; w < PAR_WORKERS; w++) {
+		pthread_create(&th[w], NULL, parWorker, (void *) w);
+	}
+	for (int w = 0; w < PAR_WORKERS; w++) {
+		pthread_join(th[w], NULL);
+	}
+	int64_t us = osCurrentMicroTime() - t0;
+	heapGcLeaveBlocked(gWorkerHeap, &CurrentThread);
+
+	int ok = 1;
+	for (int w = 0; w < PAR_WORKERS; w++) {
+		long r = valueTypeOf(gParResults[w], VALUE_INT) ? (long) asCInt(gParResults[w]) : -1;
+		if (r != expected) {
+			ok = 0;
+		}
+	}
+	unsigned long fullGcs = __atomic_load_n(&gFullGcRuns, __ATOMIC_RELAXED) - fullGcBefore;
+	closeHandleScope(&scope, NULL);
+	fprintf(stderr, "parallel-full-GC self-test: %d workers each built+verified a 100k-Array structure CONCURRENTLY on the shared heap in %ldms | full GCs (markAndSweep) observed=%lu | all-correct=%d -> %s\n",
+		PAR_WORKERS, (long) (us / 1000), fullGcs, ok, (ok && fullGcs > 0) ? "PASS" : "FAIL");
+	return (ok && fullGcs > 0) ? 0 : 1;
+}
+
+
 int main(int argc, char **args)
 {
 	CliArgs cliArgs;
@@ -299,6 +365,13 @@ int main(int argc, char **args)
 		initThread(&CurrentThread);
 		bootstrapSmalltalk(cliArgs.snapshotFileName, cliArgs.bootstrapDir);
 		return parallelGcSelfTest();
+	}
+
+	// Parallel Smalltalk WITH promotion + multi-thread FULL GC: ST_PARFULLGC_TEST=1 -s snap
+	if (getenv("ST_PARFULLGC_TEST") != NULL) {
+		initThread(&CurrentThread);
+		bootstrapSmalltalk(cliArgs.snapshotFileName, cliArgs.bootstrapDir);
+		return parallelFullGcSelfTest();
 	}
 
 	initThread(&CurrentThread);

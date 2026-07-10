@@ -452,6 +452,12 @@ void schedulerInit(void)
 	signal(SIGPIPE, SIG_IGN);
 	gActive = 1;
 
+	// Publish this scheduler's fiber registry so a GC collector on ANOTHER OS
+	// thread can reach this mutator's fibers (their structs are heap-allocated).
+	CurrentThread.schedFibers = &gFibers;
+	CurrentThread.schedFiberSlots = &gFiberSlots;
+	CurrentThread.schedCurrent = &gCurrent;
+
 	char *stackEnv = getenv("ST_FIBER_STACK_KB"); // reservation ceiling
 	if (stackEnv != NULL) {
 		long kb = atol(stackEnv);

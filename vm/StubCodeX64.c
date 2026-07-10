@@ -16,19 +16,23 @@ static CompiledMethod *createDoesNotUnderstandCode(void);
 NativeCode *getStubNativeCode(StubCode *stub)
 {
 	if (stub->nativeCode == NULL) {
-		HandleScope scope;
-		openHandleScope(&scope);
+		heapCodegenLockEnter(CurrentThread.heap); // serialize codegen across workers
+		if (stub->nativeCode == NULL) { // re-check: a peer may have generated it
+			HandleScope scope;
+			openHandleScope(&scope);
 
-		CodeGenerator generator;
-		initCodeGenerator(&generator);
-		stub->generator(&generator);
-		stub->nativeCode = buildNativeCode(&generator);
-		if (generator.code.methodOrBlock != NULL) {
-			compiledMethodSetNativeCode((CompiledMethod *) generator.code.methodOrBlock, stub->nativeCode);
+			CodeGenerator generator;
+			initCodeGenerator(&generator);
+			stub->generator(&generator);
+			stub->nativeCode = buildNativeCode(&generator);
+			if (generator.code.methodOrBlock != NULL) {
+				compiledMethodSetNativeCode((CompiledMethod *) generator.code.methodOrBlock, stub->nativeCode);
+			}
+			asmFreeBuffer(&generator.buffer);
+
+			closeHandleScope(&scope, NULL);
 		}
-		asmFreeBuffer(&generator.buffer);
-
-		closeHandleScope(&scope, NULL);
+		heapCodegenLockLeave(CurrentThread.heap);
 	}
 	return stub->nativeCode;
 }

@@ -52,6 +52,7 @@ static Variable *specialVariableAt(CodeGenerator *generator, uint8_t type, ptrdi
 
 NativeCode *generateMethodCode(CompiledMethod *method)
 {
+	heapCodegenLockEnter(CurrentThread.heap); // serialize codegen across worker threads
 	HandleScope scope;
 	openHandleScope(&scope);
 
@@ -63,6 +64,7 @@ NativeCode *generateMethodCode(CompiledMethod *method)
 	NativeCode *code = buildNativeCode(&generator);
 	closeHandleScope(&scope, NULL);
 	freeCodeGenerator(&generator);
+	heapCodegenLockLeave(CurrentThread.heap);
 	return code;
 }
 
@@ -1736,6 +1738,7 @@ void generatePushDummyContext(AssemblerBuffer *buffer)
 
 NativeCode *generateDoesNotUnderstand(String *selector)
 {
+	heapCodegenLockEnter(CurrentThread.heap); // serialize codegen across worker threads
 	size_t argsSize = computeArguments(selector);
 	AssemblerBuffer buffer;
 	asmInitBuffer(&buffer, 64);
@@ -1747,7 +1750,9 @@ NativeCode *generateDoesNotUnderstand(String *selector)
 	asmMovqImm(&buffer, (uint64_t) getStubNativeCode(&DoesNotUnderstandStub)->insts, R11);
 	asmJmpq(&buffer, R11);
 
-	return buildNativeCodeFromAssembler(&buffer);
+	NativeCode *code = buildNativeCodeFromAssembler(&buffer);
+	heapCodegenLockLeave(CurrentThread.heap);
+	return code;
 }
 
 

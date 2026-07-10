@@ -6,6 +6,7 @@
 struct HandleScope;
 struct StackFrame;
 struct EntryStackFrame;
+struct Fiber;
 
 // Per-mutator thread-local allocation buffer: a chunk carved from the shared
 // young space that this OS thread bump-allocates into WITHOUT locking (Go's
@@ -27,6 +28,12 @@ typedef struct Thread {
 	struct Thread *nextMutator; // intrusive link in heap->mutators (GC root-scans every mutator)
 	int spBlocked;              // mutator is in a blocking native wait (counts as safe for GC)
 	int spAtSafepoint;          // mutator parked at a safepoint poll
+	// Published by schedulerInit so a cross-thread GC collector can reach THIS
+	// mutator's fibers (the Fiber structs are heap-allocated; only the registry
+	// array + count + current are per-OS-thread TLS, so we expose their addresses).
+	struct Fiber ***schedFibers;
+	size_t *schedFiberSlots;
+	struct Fiber **schedCurrent;
 } Thread;
 
 extern __thread Thread CurrentThread;

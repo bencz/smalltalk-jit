@@ -423,7 +423,11 @@ static void *parallelPrimWorker(void *arg)
 	RawArray *blocks = (RawArray *) ((Object *) w->arrayHandle)->raw;
 	Object *blockH = scopeHandle(asObject(blocks->vars[w->index]));
 	EntryArgs args = { .size = 0 };
-	entryArgsAdd(&args, getTaggedPtr(blockH));
+	// Pass the receiver as a HANDLE (GC-updated), never a raw value: sendMessage
+	// generates this worker's per-thread SmalltalkEntry stub on first use (allocating,
+	// so a peer-pressured scavenge can move the block) BEFORE it reads args[0]. A raw
+	// value would then be stale.
+	entryArgsAddObject(&args, blockH);
 	Value result = sendMessage(getSymbol("value"), &args);
 	if (valueTypeOf(result, VALUE_POINTER)) {
 		Object box;
