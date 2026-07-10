@@ -10,6 +10,7 @@
 #include "vm/Handle.h"
 #include "vm/Smalltalk.h"
 #include "vm/Heap.h"
+#include "vm/Exception.h"
 #include "vm/Os.h"
 #include "vm/Cli.h"
 #include <unistd.h>
@@ -84,6 +85,7 @@ static void *workerRunBlock(void *arg)
 	initRememberedSet(&CurrentThread.rememberedSet);
 	CurrentThread.nextMutator = NULL;
 	heapAddMutator(gWorkerHeap, &CurrentThread);
+	CurrentThread.schedExceptionHandler = &CurrentExceptionHandler; // this worker's own TLS slot
 	Handles = gMainHandles; // well-known handles point at shared (old-space) objects
 	initThreadContext(&CurrentThread);               // root context on the worker's TLAB
 	HandleScope scope;
@@ -137,6 +139,7 @@ static void *parWorker(void *arg)
 	initRememberedSet(&CurrentThread.rememberedSet);
 	CurrentThread.nextMutator = NULL;
 	heapAddMutator(gWorkerHeap, &CurrentThread);
+	CurrentThread.schedExceptionHandler = &CurrentExceptionHandler; // this worker's own TLS slot
 	Handles = gMainHandles;
 	initThreadContext(&CurrentThread);
 	HandleScope scope;
@@ -311,6 +314,167 @@ static int parallelFullGcSelfTest(void)
 }
 
 
+// ---- scheduler-active collector must scan EVERY mutator (B0) ---------------
+// Forces the scenario the pre-B0 GC got wrong: a collector whose OWN scheduler
+// is active (gActive==1) used to scan only ITS OWN fibers and skip heap->mutators
+// entirely (Scavenger.c schedulerActive() branch / GarbageCollector.c early
+// returns). Here the MAIN thread runs its scheduler and an allocation-heavy fiber
+// (so main becomes the multi-mutator collector WITH gActive==1), while N peer OS
+// threads each hold a YOUNG structure reachable ONLY through their own handle
+// scope — precisely the root the buggy branch skips for peers. If the collector
+// skips them, the peers' structures are stranded in the abandoned semispace, its
+// memory reused by later evacuation, and the peers' checksums come out wrong (or
+// they crash dereferencing reclaimed objects). Pre-B0: FAIL/crash. Post-B0: PASS.
+#define SCHEDGC_PEERS 6
+extern unsigned long gFullGcRuns;
+static Object *gSchedBuildBlockH;
+static Object *gSchedVerifyBlockH;
+static Object *gSchedCollectorBlockH;
+static int gSchedResults[SCHEDGC_PEERS];
+static int gSchedReady = 0;
+static int gSchedDone = 0;
+static long gSchedExpected;
+
+static void *schedGcPeer(void *arg)
+{
+	long id = (long) arg;
+	memset(&CurrentThread, 0, sizeof(Thread));
+	CurrentThread.heap = gWorkerHeap;
+	initRememberedSet(&CurrentThread.rememberedSet);
+	CurrentThread.nextMutator = NULL;
+	heapAddMutator(gWorkerHeap, &CurrentThread);
+	CurrentThread.schedExceptionHandler = &CurrentExceptionHandler; // this peer's own TLS slot
+	Handles = gMainHandles;
+	initThreadContext(&CurrentThread);
+	HandleScope scope;
+	openHandleScope(&scope);
+	Object *buildH = handle(gSchedBuildBlockH->raw); // persistent handle to the (old) block
+	EntryArgs bargs = { .size = 0 };
+	entryArgsAddObject(&bargs, buildH);
+	Value structure = sendMessage(getSymbol("value"), &bargs);
+	// Hold the YOUNG structure ONLY in this handle SCOPE (thread->handleScopes) —
+	// the exact root a gActive==1 collector skips for peer mutators. A persistent
+	// handle() would be scanned by iteratePersistentHandles regardless of the branch
+	// and could not discriminate the bug; no old->young edge either.
+	Object *structH = scopeHandle(asObject(structure));
+
+	__atomic_add_fetch(&gSchedReady, 1, __ATOMIC_RELEASE);
+	// Park (counts as safe for the collector) until main has finished collecting.
+	heapGcEnterBlocked(gWorkerHeap, &CurrentThread);
+	while (!__atomic_load_n(&gSchedDone, __ATOMIC_ACQUIRE)) {
+		usleep(200);
+	}
+	heapGcLeaveBlocked(gWorkerHeap, &CurrentThread);
+
+	// Re-read the structure via its (possibly-forwarded) handle and re-checksum.
+	Object *verifyH = handle(gSchedVerifyBlockH->raw);
+	EntryArgs vargs = { .size = 0 };
+	entryArgsAddObject(&vargs, verifyH);  // receiver: the [:a| ...] block
+	entryArgsAddObject(&vargs, structH);  // arg: the structure
+	Value sum = sendMessage(getSymbol("value:"), &vargs);
+	long got = valueTypeOf(sum, VALUE_INT) ? (long) asCInt(sum) : -1;
+	gSchedResults[id] = (got == gSchedExpected) ? 1 : 0;
+
+	closeHandleScope(&scope, NULL);
+	heapEndMutator(gWorkerHeap, &CurrentThread);
+	return NULL;
+}
+
+static void schedGcCollectorFiber(void *arg)
+{
+	(void) arg;
+	// Runs as fiber #0 under main's scheduler (gActive==1, gCurrent!=NULL). Its
+	// allocation-heavy block holds every survivor live, so the shared young space
+	// cycles through several scavenges that evacuate INTO the abandoned semispace
+	// where the parked peers' stranded structures sit — guaranteeing reuse.
+	runBlockOnce(getTaggedPtr(gSchedCollectorBlockH));
+}
+
+static int schedGcSelfTest(void)
+{
+	gWorkerHeap = CurrentThread.heap;
+	gMainHandles = Handles;
+	gSchedExpected = 1501500; // sum over i=1..1000 of (i + 2*i) = 3*1000*1001/2
+
+	// Compile + warm up the blocks on MAIN while gActive==0 (correct single-mutator
+	// scanning), so peers and the collector fiber only READ cached native code and
+	// never compile/allocate under the buggy branch during the concurrent phase. The
+	// block handles are PERSISTENT (thread->handles), so they survive without holding
+	// a HandleScope across schedulerRun (which swaps thread->handleScopes per fiber).
+	{
+		HandleScope warm;
+		openHandleScope(&warm);
+		gSchedBuildBlockH = handle(asObject(evalObject(
+			"[ | a | a := Array new: 1000. 1 to: 1000 do: [:i | a at: i put: (Array with: i with: i * 2)]. a ]")));
+		gSchedVerifyBlockH = handle(asObject(evalObject(
+			"[:a | | s | s := 0. a do: [:e | s := s + (e at: 1) + (e at: 2)]. s ]")));
+		gSchedCollectorBlockH = handle(asObject(evalObject(
+			"[ | acc | acc := OrderedCollection new. 1 to: 500000 do: [:i | acc add: (Array with: i with: i * 2)]. acc size ]")));
+		// warm-up + sanity check of the expected checksum
+		Value s = runBlockOnce(getTaggedPtr(gSchedBuildBlockH));
+		Object *sH = scopeHandle(asObject(s));
+		Object *vH = handle(gSchedVerifyBlockH->raw);
+		EntryArgs wargs = { .size = 0 };
+		entryArgsAddObject(&wargs, vH);
+		entryArgsAddObject(&wargs, sH);
+		Value w = sendMessage(getSymbol("value:"), &wargs);
+		if (!valueTypeOf(w, VALUE_INT) || (long) asCInt(w) != gSchedExpected) {
+			fprintf(stderr, "sched-active-GC self-test: warm-up checksum mismatch -> FAIL\n");
+			closeHandleScope(&warm, NULL);
+			return 1;
+		}
+		runBlockOnce(getTaggedPtr(gSchedCollectorBlockH)); // warm up JIT of the collector block
+		closeHandleScope(&warm, NULL);
+	}
+
+	// Activate main's scheduler: from here main is gActive==1.
+	schedulerInit();
+
+	// Force the full-GC path too: main's scavenges promote the peers' held structures
+	// to OLD space, and a low threshold makes the collector fiber's heavy allocation
+	// trip markAndSweep — which (with gActive==1) must ALSO mark every peer's roots or
+	// their promoted structures get swept. Covers both collectors in one run.
+	gWorkerHeap->oldGcThreshold = 1 * 1024 * 1024;
+	unsigned long fullGcBefore = __atomic_load_n(&gFullGcRuns, __ATOMIC_RELAXED);
+
+	__atomic_store_n(&gSchedReady, 0, __ATOMIC_RELEASE);
+	__atomic_store_n(&gSchedDone, 0, __ATOMIC_RELEASE);
+
+	heapGcEnterBlocked(gWorkerHeap, &CurrentThread); // main safe while peers build+park
+	pthread_t th[SCHEDGC_PEERS];
+	for (long w = 0; w < SCHEDGC_PEERS; w++) {
+		pthread_create(&th[w], NULL, schedGcPeer, (void *) w);
+	}
+	while (__atomic_load_n(&gSchedReady, __ATOMIC_ACQUIRE) < SCHEDGC_PEERS) {
+		usleep(200);
+	}
+	heapGcLeaveBlocked(gWorkerHeap, &CurrentThread);
+
+	// main becomes the multi-mutator collector WITH gActive==1: run the allocating
+	// fiber under the scheduler so its scavenges take the schedulerActive() branch.
+	schedulerSpawnC(schedGcCollectorFiber, NULL, 0);
+	schedulerRun();
+
+	__atomic_store_n(&gSchedDone, 1, __ATOMIC_RELEASE);
+	heapGcEnterBlocked(gWorkerHeap, &CurrentThread); // main safe while peers verify+exit
+	for (int w = 0; w < SCHEDGC_PEERS; w++) {
+		pthread_join(th[w], NULL);
+	}
+	heapGcLeaveBlocked(gWorkerHeap, &CurrentThread);
+
+	int ok = 1;
+	for (int w = 0; w < SCHEDGC_PEERS; w++) {
+		if (!gSchedResults[w]) {
+			ok = 0;
+		}
+	}
+	unsigned long fullGcs = __atomic_load_n(&gFullGcRuns, __ATOMIC_RELAXED) - fullGcBefore;
+	fprintf(stderr, "sched-active-GC self-test: main ran a scheduler+alloc fiber (gActive==1) while %d peers held structures parked | scavenges+full GCs (markAndSweep)=%lu | all-survived=%d -> %s\n",
+		SCHEDGC_PEERS, fullGcs, ok, (ok && fullGcs > 0) ? "PASS" : "FAIL");
+	return (ok && fullGcs > 0) ? 0 : 1;
+}
+
+
 int main(int argc, char **args)
 {
 	CliArgs cliArgs;
@@ -372,6 +536,13 @@ int main(int argc, char **args)
 		initThread(&CurrentThread);
 		bootstrapSmalltalk(cliArgs.snapshotFileName, cliArgs.bootstrapDir);
 		return parallelFullGcSelfTest();
+	}
+
+	// Scheduler-active collector must scan every mutator (B0): ST_SCHEDGC_TEST=1 -s snap
+	if (getenv("ST_SCHEDGC_TEST") != NULL) {
+		initThread(&CurrentThread);
+		bootstrapSmalltalk(cliArgs.snapshotFileName, cliArgs.bootstrapDir);
+		return schedGcSelfTest();
 	}
 
 	initThread(&CurrentThread);

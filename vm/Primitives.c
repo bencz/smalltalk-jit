@@ -415,6 +415,7 @@ static void *parallelPrimWorker(void *arg)
 	CurrentThread.heap = w->heap;
 	initRememberedSet(&CurrentThread.rememberedSet);
 	heapAddMutator(w->heap, &CurrentThread);
+	CurrentThread.schedExceptionHandler = &CurrentExceptionHandler; // this worker's own TLS slot
 	Handles = w->handles;
 	initThreadContext(&CurrentThread);
 

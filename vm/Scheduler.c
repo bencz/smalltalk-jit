@@ -457,6 +457,7 @@ void schedulerInit(void)
 	CurrentThread.schedFibers = &gFibers;
 	CurrentThread.schedFiberSlots = &gFiberSlots;
 	CurrentThread.schedCurrent = &gCurrent;
+	CurrentThread.schedExceptionHandler = &CurrentExceptionHandler; // this thread's own TLS slot
 
 	char *stackEnv = getenv("ST_FIBER_STACK_KB"); // reservation ceiling
 	if (stackEnv != NULL) {

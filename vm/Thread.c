@@ -2,6 +2,7 @@
 #include "StackFrame.h"
 #include "Heap.h"
 #include "Handle.h"
+#include "Exception.h"
 #include "Assert.h"
 #include <stdlib.h>
 
@@ -20,6 +21,7 @@ void initThread(Thread *thread)
 	thread->schedFibers = NULL; // set by schedulerInit if this thread runs a scheduler
 	thread->schedFiberSlots = NULL;
 	thread->schedCurrent = NULL;
+	thread->schedExceptionHandler = &CurrentExceptionHandler; // this OS thread's own TLS slot
 	heapAddMutator(thread->heap, thread); // this thread now mutates (and roots) its heap
 	// Start with an empty TLAB (top == end) pointing at the fresh nursery top, so
 	// the first allocation takes the refill path and carves a real chunk.

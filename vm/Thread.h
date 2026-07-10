@@ -34,6 +34,12 @@ typedef struct Thread {
 	struct Fiber ***schedFibers;
 	size_t *schedFiberSlots;
 	struct Fiber **schedCurrent;
+	// Address of this mutator's TLS CurrentExceptionHandler (a Value holding the head
+	// of its running fiber's on:do: chain), so a cross-thread GC collector can scan a
+	// peer's live handler chain — it is a root reachable ONLY through this slot, not
+	// the Smalltalk stack. NULL until published (initThread / schedulerInit / worker
+	// registration). Stale for a scheduler mutator parked in the scheduler context.
+	Value *schedExceptionHandler;
 } Thread;
 
 extern __thread Thread CurrentThread;

@@ -26,8 +26,10 @@ typedef struct {
 
 static void iterateStack(MarkingQueue *queue, Thread *thread);
 static void iterateFiberStack(MarkingQueue *queue, Thread *thread, Fiber *fiber);
+static void iterateOneMutatorStack(MarkingQueue *queue, Thread *thread, Thread *m);
 static void iterateHandles(MarkingQueue *queue, Thread *thread);
 static void iterateFiberHandles(MarkingQueue *queue, Thread *thread, Fiber *fiber);
+static void iterateOneMutatorHandles(MarkingQueue *queue, Thread *thread, Thread *m);
 static void iterateNativeCode(MarkingQueue *queue, Thread *thread);
 static void iterateObject(MarkingQueue *queue, Thread *thread, RawObject *root);
 static void markObject(MarkingQueue *queue, Thread *thread, RawObject *object);
@@ -126,12 +128,48 @@ static void iterateFiberStack(MarkingQueue *queue, Thread *thread, Fiber *fiber)
 }
 
 
+// Mark ONE mutator's stack-side roots (its running fiber's live stack + its parked
+// fibers' stacks), gating on the mutator's scheduler state exactly like the
+// scavenger's iterateOneMutatorRoots so a cross-thread collector never reads a
+// peer's STALE thread-TLS (a scheduler mutator parked in the scheduler context, no
+// current fiber, may have a freed last-run stack in its TLS).
+static void iterateOneMutatorStack(MarkingQueue *queue, Thread *thread, Thread *m)
+{
+	// The collector's OWN exception-handler chain is marked separately (via
+	// CurrentExceptionHandler); mark a PEER's current-fiber handler chain here (a
+	// root reachable only through its published TLS slot, valid while a fiber is
+	// live in that TLS).
+	if (m->schedFibers == NULL) {
+		iterateStackFrames(queue, thread, m->stackFramesTail);
+		if (m != thread && m->schedExceptionHandler != NULL) {
+			iterateExceptionHandlerChain(queue, thread, *m->schedExceptionHandler);
+		}
+		return;
+	}
+	Fiber **fibers = *m->schedFibers;
+	size_t slots = *m->schedFiberSlots;
+	Fiber *current = *m->schedCurrent;
+	if (current != NULL) {
+		iterateStackFrames(queue, thread, m->stackFramesTail);
+		if (m != thread && m->schedExceptionHandler != NULL) {
+			iterateExceptionHandlerChain(queue, thread, *m->schedExceptionHandler);
+		}
+	}
+	for (size_t i = 0; i < slots; i++) {
+		Fiber *fiber = fibers[i];
+		if (fiber != NULL && fiber != current) {
+			iterateFiberStack(queue, thread, fiber);
+		}
+	}
+}
+
+
 static void iterateStack(MarkingQueue *queue, Thread *thread)
 {
 	if (schedulerActive()) {
-		// The collector runs its OWN fiber scheduler (the single-mutator case, e.g.
-		// the main thread of a server): walk every fiber it holds. gcMarkRoots has
-		// already synced the running fiber's live roots into its record.
+		// The collector runs its OWN fiber scheduler: walk every fiber it holds.
+		// gcMarkRoots has already synced the running fiber's live roots into its
+		// record.
 		size_t slots = schedulerFiberSlots();
 		for (size_t i = 0; i < slots; i++) {
 			Fiber *fiber = schedulerFiberAt(i);
@@ -139,34 +177,34 @@ static void iterateStack(MarkingQueue *queue, Thread *thread)
 				iterateFiberStack(queue, thread, fiber);
 			}
 		}
+		// B0: schedulerFiberAt only sees the COLLECTOR's own fibers. In the multicore
+		// model peer OS threads run their own schedulers over this shared heap, so a
+		// full GC here MUST also mark every peer mutator's stack roots — otherwise it
+		// would sweep objects still live on a peer's stack.
+		for (Thread *m = thread->heap->mutators; m != NULL; m = m->nextMutator) {
+			if (m == thread) {
+				// Own roots are covered by schedulerFiberAt above (all own fibers,
+				// current synced). The only miss: collecting from the scheduler
+				// context (no current fiber) leaves live roots in TLS, not a fiber.
+				// (Mark is idempotent, so unlike the scavenger this is double-safe
+				// even if TLS aliased a fiber's roots.)
+				if (schedulerCurrentFiber() == NULL) {
+					iterateStackFrames(queue, thread, m->stackFramesTail);
+					iterateExceptionHandlerChain(queue, thread, CurrentExceptionHandler);
+				}
+				continue;
+			}
+			iterateOneMutatorStack(queue, thread, m);
+		}
 		return;
 	}
-	// No scheduler on the collector (e.g. a worker OS thread triggered this full
-	// GC): scan EVERY mutator of the shared heap, mirroring the scavenger's
-	// iterateThreadRoots. Each mutator's currently-running fiber keeps its live
-	// roots in stackFramesTail; a mutator that runs a scheduler also has PARKED
-	// fibers whose roots are saved in their heap-allocated structs (skip the
-	// running one — its live roots are the stackFramesTail already walked). Without
-	// this, a full GC on one worker would sweep objects still live on a peer
-	// worker's (or the main thread's) stack.
-	//
-	// The collector's own exception-handler chain (per-OS-thread TLS) — mirror the
-	// scavenger's iterateThreadRoots (Scavenger.c) so a full GC on the non-scheduler
-	// path never sweeps a live handler reachable only through it.
+	// No scheduler on the collector (e.g. a worker OS thread triggered this full GC):
+	// scan EVERY mutator of the shared heap. The collector's own exception-handler
+	// chain (per-OS-thread TLS) is marked here; per-mutator handler chains are marked
+	// via their fibers' saved records (and, for the running fiber, via B0b).
 	iterateExceptionHandlerChain(queue, thread, CurrentExceptionHandler);
 	for (Thread *m = thread->heap->mutators; m != NULL; m = m->nextMutator) {
-		iterateStackFrames(queue, thread, m->stackFramesTail);
-		if (m->schedFibers != NULL) {
-			Fiber **fibers = *m->schedFibers;
-			size_t slots = *m->schedFiberSlots;
-			Fiber *current = *m->schedCurrent;
-			for (size_t i = 0; i < slots; i++) {
-				Fiber *fiber = fibers[i];
-				if (fiber != NULL && fiber != current) {
-					iterateFiberStack(queue, thread, fiber);
-				}
-			}
-		}
+		iterateOneMutatorStack(queue, thread, m);
 	}
 }
 
@@ -194,6 +232,36 @@ static void iterateFiberHandles(MarkingQueue *queue, Thread *thread, Fiber *fibe
 }
 
 
+// Mark ONE mutator's handle-side roots (its running fiber's live handle scopes +
+// context, plus its parked fibers' handle roots), gating on scheduler state exactly
+// like iterateOneMutatorStack / the scavenger's iterateOneMutatorRoots.
+static void iterateOneMutatorHandles(MarkingQueue *queue, Thread *thread, Thread *m)
+{
+	if (m->schedFibers == NULL) {
+		iterateHandleScopes(queue, thread, m->handleScopes);
+		if (m->context != 0) {
+			markObject(queue, thread, asObject(m->context));
+		}
+		return;
+	}
+	Fiber **fibers = *m->schedFibers;
+	size_t slots = *m->schedFiberSlots;
+	Fiber *current = *m->schedCurrent;
+	if (current != NULL) {
+		iterateHandleScopes(queue, thread, m->handleScopes);
+		if (m->context != 0) {
+			markObject(queue, thread, asObject(m->context));
+		}
+	}
+	for (size_t i = 0; i < slots; i++) {
+		Fiber *fiber = fibers[i];
+		if (fiber != NULL && fiber != current) {
+			iterateFiberHandles(queue, thread, fiber);
+		}
+	}
+}
+
+
 static void iterateHandles(MarkingQueue *queue, Thread *thread)
 {
 	// Persistent handles are per-mutator: every OS thread sharing this heap owns
@@ -215,27 +283,27 @@ static void iterateHandles(MarkingQueue *queue, Thread *thread)
 				iterateFiberHandles(queue, thread, fiber);
 			}
 		}
+		// B0: schedulerFiberAt only sees the COLLECTOR's own fibers — also mark every
+		// PEER mutator's handle-scope/context roots and parked fibers.
+		for (Thread *m = thread->heap->mutators; m != NULL; m = m->nextMutator) {
+			if (m == thread) {
+				if (schedulerCurrentFiber() == NULL) {
+					iterateHandleScopes(queue, thread, m->handleScopes);
+					if (m->context != 0) {
+						markObject(queue, thread, asObject(m->context));
+					}
+				}
+				continue;
+			}
+			iterateOneMutatorHandles(queue, thread, m);
+		}
 		return;
 	}
 
-	// Non-scheduler collector: each mutator's live handle scopes + context, plus
+	// Non-scheduler collector: every mutator's live handle scopes + context, plus
 	// the parked fibers of any mutator that runs a scheduler.
 	for (Thread *m = thread->heap->mutators; m != NULL; m = m->nextMutator) {
-		iterateHandleScopes(queue, thread, m->handleScopes);
-		if (m->context != 0) {
-			markObject(queue, thread, asObject(m->context));
-		}
-		if (m->schedFibers != NULL) {
-			Fiber **fibers = *m->schedFibers;
-			size_t slots = *m->schedFiberSlots;
-			Fiber *current = *m->schedCurrent;
-			for (size_t i = 0; i < slots; i++) {
-				Fiber *fiber = fibers[i];
-				if (fiber != NULL && fiber != current) {
-					iterateFiberHandles(queue, thread, fiber);
-				}
-			}
-		}
+		iterateOneMutatorHandles(queue, thread, m);
 	}
 }
 

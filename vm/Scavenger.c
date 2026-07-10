@@ -16,6 +16,8 @@
 static void iterateFiberRoots(Scavenger *scavenger, Fiber *fiber);
 static void iteratePersistentHandles(Scavenger *scavenger);
 static void iterateThreadRoots(Scavenger *scavenger);
+static void iterateOneMutatorRoots(Scavenger *scavenger, Thread *m);
+static void iterateStackFrames(Scavenger *scavenger, EntryStackFrame *entryFrame);
 static void iterateExceptionHandlerSlot(Scavenger *scavenger, Value *slot);
 static void iterateHandleScopes(Scavenger *scavenger, HandleScope *scopes);
 static void iterateRememberedSet(Scavenger *scavenger);
@@ -85,7 +87,8 @@ void scavengerScavenge(Scavenger *scavenger)
 		// Walk ONLY dirty fibers; clean any (non-current) whose direct roots are
 		// all old — their reachable young objects are already covered by the
 		// remembered set. This is what turns O(fibers × scavenges) into
-		// O(dirty × scavenges).
+		// O(dirty × scavenges). NB: this covers only THIS collector's own fibers
+		// (the dirty list is per-OS-thread TLS).
 		Fiber *current = schedulerCurrentFiber();
 		Fiber *fiber = schedulerDirtyHead();
 		while (fiber != NULL) {
@@ -96,6 +99,36 @@ void scavengerScavenge(Scavenger *scavenger)
 				schedulerMarkFiberClean(fiber);
 			}
 			fiber = next;
+		}
+		// B0: the dirty walk above covered only the COLLECTOR's own fibers. In the
+		// multicore model every OS thread may run its own scheduler, so any peer
+		// mutator sharing this heap has live roots (its running fiber's TLS + its
+		// parked fibers) that this collection MUST scan too — their dirty lists are
+		// their own TLS, unreachable from here. Walk every OTHER mutator's roots.
+		for (Thread *m = scavenger->heap->mutators; m != NULL; m = m->nextMutator) {
+			if (m == &CurrentThread) {
+				// Our own roots are covered by the dirty walk above. The one case it
+				// misses: collecting from the scheduler context itself (no current
+				// fiber), where our live roots sit in TLS, not in any fiber — scan
+				// them here. (When a fiber IS current, syncCurrentRoots already put
+				// them in its record, walked above.)
+				// SAFETY: this reads TLS in place, so it must not alias a parked
+				// fiber's saved roots (that would double-forward). It can't: the TLS
+				// aliases a fiber's roots only inside the scheduler loop right after
+				// saveRoots, and that loop never allocates — so a scavenge is never
+				// triggered in that window. Here (real C work in scheduler context)
+				// the TLS holds our own, un-aliased roots.
+				if (current == NULL) {
+					iterateStackFrames(scavenger, m->stackFramesTail);
+					iterateHandleScopes(scavenger, m->handleScopes);
+					if (m->context != 0) {
+						processTaggedPointer(scavenger, &m->context);
+					}
+					iterateExceptionHandlerSlot(scavenger, &CurrentExceptionHandler);
+				}
+				continue;
+			}
+			iterateOneMutatorRoots(scavenger, m);
 		}
 	} else {
 		iterateThreadRoots(scavenger); // bootstrap: no scheduler yet
@@ -275,35 +308,64 @@ static void iterateFiberRoots(Scavenger *scavenger, Fiber *fiber)
 }
 
 
-// Non-scheduler (bootstrap) path: the single thread's roots, walked directly.
+// Scan ONE mutator's roots (everything except its persistent handles, which are
+// walked separately for every mutator). Gates on the mutator's scheduler state so
+// a collector running on another OS thread never reads a peer's STALE thread-TLS:
+//   - no scheduler (schedFibers == NULL): the running code's live roots ARE the
+//     thread's TLS fields (stack/handleScopes/context).
+//   - scheduler with a current fiber: the TLS fields hold the running fiber's live
+//     roots; the PARKED fibers' roots are saved in their structs (skip the running
+//     one — its saved roots are stale).
+//   - scheduler with NO current fiber (parked in the scheduler context itself): the
+//     TLS fields still point at the LAST-run fiber's stack, which may already be
+//     freed/unmapped — do NOT touch them; every fiber's roots live in its struct.
+static void iterateOneMutatorRoots(Scavenger *scavenger, Thread *m)
+{
+	// The collector's OWN exception-handler chain is scanned separately (via
+	// &CurrentExceptionHandler); scan a PEER's current-fiber handler chain here — it
+	// is a root reachable only through its (published) TLS slot, valid only while a
+	// fiber is live in that TLS (bare mutator, or a scheduler mutator mid-fiber).
+	if (m->schedFibers == NULL) {
+		iterateStackFrames(scavenger, m->stackFramesTail);
+		iterateHandleScopes(scavenger, m->handleScopes);
+		if (m->context != 0) {
+			processTaggedPointer(scavenger, &m->context);
+		}
+		if (m != &CurrentThread && m->schedExceptionHandler != NULL) {
+			iterateExceptionHandlerSlot(scavenger, m->schedExceptionHandler);
+		}
+		return;
+	}
+	Fiber **fibers = *m->schedFibers;
+	size_t slots = *m->schedFiberSlots;
+	Fiber *current = *m->schedCurrent;
+	if (current != NULL) {
+		iterateStackFrames(scavenger, m->stackFramesTail);
+		iterateHandleScopes(scavenger, m->handleScopes);
+		if (m->context != 0) {
+			processTaggedPointer(scavenger, &m->context);
+		}
+		if (m != &CurrentThread && m->schedExceptionHandler != NULL) {
+			iterateExceptionHandlerSlot(scavenger, m->schedExceptionHandler);
+		}
+	}
+	for (size_t i = 0; i < slots; i++) {
+		Fiber *fiber = fibers[i];
+		if (fiber == NULL || fiber == current) {
+			continue; // the running fiber's live roots are the TLS scanned above
+		}
+		iterateFiberRoots(scavenger, fiber);
+	}
+}
+
+
+// Non-scheduler (bootstrap) path: walk every mutator's roots directly.
 static void iterateThreadRoots(Scavenger *scavenger)
 {
 	// The collector's own exception-handler chain (per-OS-thread TLS).
 	iterateExceptionHandlerSlot(scavenger, &CurrentExceptionHandler);
 	for (Thread *thread = scavenger->heap->mutators; thread != NULL; thread = thread->nextMutator) {
-		// The mutator's CURRENTLY-RUNNING fiber keeps its roots live in these fields.
-		iterateStackFrames(scavenger, thread->stackFramesTail);
-		iterateHandleScopes(scavenger, thread->handleScopes);
-		if (thread->context != 0) {
-			processTaggedPointer(scavenger, &thread->context);
-		}
-		// A mutator that runs a fiber scheduler also has PARKED fibers whose roots
-		// are SAVED in their (heap-allocated) Fiber structs — scan them too, so a GC
-		// triggered by a worker preserves the caller's parked fibers' objects. The
-		// RUNNING fiber is skipped: its live roots are the ones scanned just above
-		// (thread->stackFramesTail/handleScopes/context); its saved roots are stale.
-		if (thread->schedFibers != NULL) {
-			Fiber **fibers = *thread->schedFibers;
-			size_t slots = *thread->schedFiberSlots;
-			Fiber *current = *thread->schedCurrent;
-			for (size_t i = 0; i < slots; i++) {
-				Fiber *fiber = fibers[i];
-				if (fiber == NULL || fiber == current) {
-					continue;
-				}
-				iterateFiberRoots(scavenger, fiber);
-			}
-		}
+		iterateOneMutatorRoots(scavenger, thread);
 	}
 }
 
