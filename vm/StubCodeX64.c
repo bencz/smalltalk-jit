@@ -13,28 +13,37 @@ static void initCodeGenerator(CodeGenerator *generator);
 static CompiledMethod *createDoesNotUnderstandCode(void);
 
 
+// Stubs are cached per-HEAP (Heap.stubCode[id]), generated once and reused by every
+// mutator of that heap. Double-checked locking with acquire/release so the common
+// (already-generated) path is lock-free and race-free: the slot is published with a
+// release store only after the NativeCode is fully built.
 NativeCode *getStubNativeCode(StubCode *stub)
 {
-	if (stub->nativeCode == NULL) {
-		heapCodegenLockEnter(CurrentThread.heap); // serialize codegen across workers
-		if (stub->nativeCode == NULL) { // re-check: a peer may have generated it
-			HandleScope scope;
-			openHandleScope(&scope);
-
-			CodeGenerator generator;
-			initCodeGenerator(&generator);
-			stub->generator(&generator);
-			stub->nativeCode = buildNativeCode(&generator);
-			if (generator.code.methodOrBlock != NULL) {
-				compiledMethodSetNativeCode((CompiledMethod *) generator.code.methodOrBlock, stub->nativeCode);
-			}
-			asmFreeBuffer(&generator.buffer);
-
-			closeHandleScope(&scope, NULL);
-		}
-		heapCodegenLockLeave(CurrentThread.heap);
+	Heap *heap = CurrentThread.heap;
+	NativeCode *code = __atomic_load_n(&heap->stubCode[stub->id], __ATOMIC_ACQUIRE);
+	if (code != NULL) {
+		return code;
 	}
-	return stub->nativeCode;
+	heapCodegenLockEnter(heap); // serialize codegen across this heap's workers
+	code = __atomic_load_n(&heap->stubCode[stub->id], __ATOMIC_ACQUIRE); // re-check under lock
+	if (code == NULL) {
+		HandleScope scope;
+		openHandleScope(&scope);
+
+		CodeGenerator generator;
+		initCodeGenerator(&generator);
+		stub->generator(&generator);
+		code = buildNativeCode(&generator);
+		if (generator.code.methodOrBlock != NULL) {
+			compiledMethodSetNativeCode((CompiledMethod *) generator.code.methodOrBlock, code);
+		}
+		asmFreeBuffer(&generator.buffer);
+		__atomic_store_n(&heap->stubCode[stub->id], code, __ATOMIC_RELEASE); // publish last
+
+		closeHandleScope(&scope, NULL);
+	}
+	heapCodegenLockLeave(heap);
+	return code;
 }
 
 
@@ -141,7 +150,7 @@ static void generateSmalltalkEntry(CodeGenerator *generator)
 	asmPopq(buffer, RBP);
 	asmRet(buffer);
 }
-PER_ISOLATE StubCode SmalltalkEntry = { .generator = generateSmalltalkEntry, .nativeCode = NULL };
+StubCode SmalltalkEntry = { .generator = generateSmalltalkEntry, .id = STUB_SMALLTALK_ENTRY };
 
 
 static void generateAllocate(CodeGenerator *generator)
@@ -285,7 +294,7 @@ static void generateAllocate(CodeGenerator *generator)
 	asmIncq(buffer, RAX);
 	asmRet(buffer);
 }
-PER_ISOLATE StubCode AllocateStub = { .generator = generateAllocate, .nativeCode = NULL };
+StubCode AllocateStub = { .generator = generateAllocate, .id = STUB_ALLOCATE };
 
 
 static void generateLookup(CodeGenerator *generator)
@@ -295,7 +304,7 @@ static void generateLookup(CodeGenerator *generator)
 	asmMovq(buffer, RAX, R11);
 	asmRet(buffer);
 }
-PER_ISOLATE StubCode LookupStub = { .generator = generateLookup, .nativeCode = NULL };
+StubCode LookupStub = { .generator = generateLookup, .id = STUB_LOOKUP };
 
 
 static void generateDoesNotUnderstandStub(CodeGenerator *generator)
@@ -367,7 +376,7 @@ static void generateDoesNotUnderstandStub(CodeGenerator *generator)
 	asmPopq(buffer, RBP);
 	asmRet(buffer);
 }
-PER_ISOLATE StubCode DoesNotUnderstandStub = { .generator = generateDoesNotUnderstandStub, .nativeCode = NULL };
+StubCode DoesNotUnderstandStub = { .generator = generateDoesNotUnderstandStub, .id = STUB_DNU };
 
 
 static CompiledMethod *createDoesNotUnderstandCode(void)

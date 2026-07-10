@@ -48,6 +48,9 @@ void initHeap(Heap *heap, struct Thread *thread)
 	pthread_cond_init(&heap->safepointCond, NULL);
 	heap->safepointRequested = 0;
 	heap->mutators = NULL;
+	for (int i = 0; i < STUB_COUNT; i++) {
+		heap->stubCode[i] = NULL; // JIT stubs generated lazily, once per heap
+	}
 }
 
 
@@ -372,13 +375,20 @@ static void heapCollectYoung(Heap *heap, size_t realSize)
 	if (heap->mutators == NULL || heap->mutators->nextMutator == NULL) {
 		scavengerScavenge(&heap->newSpace);
 		maybeFullGc(heap);
-	} else if ((size_t) (heap->newSpace.end - heap->newSpace.top) < realSize) {
+	} else {
 		// A peer may have freed space while we waited for gcLock; only collect if
-		// it is still needed.
-		heapGcBegin(heap, &CurrentThread); // park every other mutator
-		scavengerScavenge(&heap->newSpace);
-		maybeFullGc(heap);
-		heapGcEnd(heap);
+		// still needed. Read newSpace.top under youngLock — the lock that guards the
+		// bump cursor a peer's tlabRefill advances — so this re-check does not race
+		// the carve (a plain read here is a benign but real data race, per TSan).
+		pthread_mutex_lock(&heap->youngLock);
+		_Bool needed = (size_t) (heap->newSpace.end - heap->newSpace.top) < realSize;
+		pthread_mutex_unlock(&heap->youngLock);
+		if (needed) {
+			heapGcBegin(heap, &CurrentThread); // park every other mutator
+			scavengerScavenge(&heap->newSpace);
+			maybeFullGc(heap);
+			heapGcEnd(heap);
+		}
 	}
 	pthread_mutex_unlock(&heap->gcLock);
 }

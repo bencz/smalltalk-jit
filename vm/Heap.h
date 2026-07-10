@@ -10,11 +10,19 @@
 struct Thread;
 struct NativeCode;
 
+// JIT stubs are shared per-HEAP, not per-OS-thread: all worker threads of one heap
+// reuse the same generated stub bodies (they reach per-thread state via CTX->thread),
+// so a stub is generated once per heap instead of once per worker. Kept in sync with
+// the StubId enum in StubCode.h. Per-heap (not global) keeps isolates independent —
+// each heap's stub `insts` live in that heap's execSpace.
+#define STUB_COUNT 4
+
 typedef struct Heap {
 	struct Thread *thread;
 	Scavenger newSpace;
 	PageSpace oldSpace;
 	PageSpace execSpace;
+	struct NativeCode *stubCode[STUB_COUNT]; // generated JIT stubs, shared by this heap's mutators
 	size_t oldGcThreshold; // run a full GC only once old space grows past this
 	// Guards carving TLAB chunks out of the shared young space: the per-mutator
 	// bump inside a TLAB stays lock-free; only the (rare) refill takes this lock,
@@ -25,11 +33,11 @@ typedef struct Heap {
 	// allocating large/old objects, and future concurrent promotion.
 	pthread_mutex_t oldLock;
 	// Guards the executable space (JIT code). Several worker OS threads lazily
-	// generate methods AND per-thread stubs (StubCode is PER_ISOLATE, so each new
-	// thread regenerates its own on first use) into ONE shared exec space; without
-	// this lock their concurrent pageSpaceAllocate calls corrupt the exec freelist/
-	// page list/index. Exec allocation never triggers a young/old GC, so holding it
-	// cannot deadlock the safepoint handshake.
+	// generate methods into ONE shared exec space; without this lock their concurrent
+	// pageSpaceAllocate calls corrupt the exec freelist/page list/index. (Stubs are
+	// now generated once per heap — stubCode[] above — so only method compilation
+	// still contends here.) Exec allocation never triggers a young/old GC, so holding
+	// it cannot deadlock the safepoint handshake.
 	pthread_mutex_t execLock;
 	// Serializes JIT code generation across worker threads. Codegen allocates young
 	// heap objects (assembler scratch, stackmaps) and can trigger a scavenge, so a

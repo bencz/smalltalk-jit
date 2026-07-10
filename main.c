@@ -69,7 +69,11 @@ static void runMessageTest(void *arg)
 // compiled methods and JIT stubs (which reach per-thread state via CTX->thread).
 static SmalltalkHandles gMainHandles;
 static Heap *gWorkerHeap;
-static Value gWorkerBlock;
+// The block to run, held as a PERSISTENT HANDLE on main (not a raw Value global):
+// the block promotes/moves during warm-up, and only a handle's `raw` is kept current
+// by the GC. Workers read `gWorkerBlockH->raw` (fresh) — a raw global would go stale
+// and point a worker at a reclaimed location.
+static Object *gWorkerBlockH;
 static Value gWorkerResult;
 
 static void *workerRunBlock(void *arg)
@@ -84,9 +88,9 @@ static void *workerRunBlock(void *arg)
 	initThreadContext(&CurrentThread);               // root context on the worker's TLAB
 	HandleScope scope;
 	openHandleScope(&scope);                         // entry points below re-handle into a parent
-	Object *blockH = handle(asObject(gWorkerBlock)); // root the block before we allocate
+	Object *blockH = handle(gWorkerBlockH->raw);     // fresh block from main's live handle
 	EntryArgs args = { .size = 0 };
-	entryArgsAdd(&args, getTaggedPtr(blockH));        // re-read (a GC may have moved it)
+	entryArgsAddObject(&args, blockH);                // handle arg (GC-updated across stub gen)
 	gWorkerResult = sendMessage(getSymbol("value"), &args);
 	closeHandleScope(&scope, NULL);
 	heapEndMutator(gWorkerHeap, &CurrentThread); // leave heap->mutators before this thread dies
@@ -101,8 +105,7 @@ static int workerSelfTest(void)
 	gMainHandles = Handles;
 	// A clean, allocation-heavy block: 200k Array allocations => many scavenges on
 	// the worker; returns 2*200000 = 400000.
-	gWorkerBlock = evalObject("[ | n | n := 0. 1 to: 200000 do: [:i | n := n + (Array new: 2) size]. n ]");
-	handle(asObject(gWorkerBlock)); // keep it alive on the main mutator across the spawn
+	gWorkerBlockH = handle(asObject(evalObject("[ | n | n := 0. 1 to: 200000 do: [:i | n := n + (Array new: 2) size]. n ]")));
 
 	pthread_t worker;
 	heapGcEnterBlocked(gWorkerHeap, &CurrentThread); // main is idle: safe for the worker's GC
@@ -138,7 +141,7 @@ static void *parWorker(void *arg)
 	initThreadContext(&CurrentThread);
 	HandleScope scope;
 	openHandleScope(&scope);
-	Object *blockH = handle(asObject(gWorkerBlock));
+	Object *blockH = handle(gWorkerBlockH->raw); // fresh block from main's live handle
 	EntryArgs args = { .size = 0 };
 	// Pass the receiver as a HANDLE (GC-updated), never a raw value: sendMessage can
 	// allocate (per-thread stub gen) before it reads args[0], so a raw value could be
@@ -156,7 +159,7 @@ static Value runBlockOnce(Value block)
 	openHandleScope(&scope);
 	Object *h = handle(asObject(block));
 	EntryArgs args = { .size = 0 };
-	entryArgsAdd(&args, getTaggedPtr(h));
+	entryArgsAddObject(&args, h); // handle arg (GC-updated across sendMessage's stub gen)
 	Value r = sendMessage(getSymbol("value"), &args);
 	closeHandleScope(&scope, NULL);
 	return r;
@@ -169,13 +172,12 @@ static int parallelSelfTest(void)
 	gWorkerHeap = CurrentThread.heap;
 	gMainHandles = Handles;
 	// Pure-compute block: sum 1..30,000,000 (fits SmallInteger, so NO allocation).
-	gWorkerBlock = evalObject("[ | s | s := 0. 1 to: 30000000 do: [:i | s := s + i]. s ]");
-	handle(asObject(gWorkerBlock));
+	gWorkerBlockH = handle(asObject(evalObject("[ | s | s := 0. 1 to: 30000000 do: [:i | s := s + i]. s ]")));
 	long expected = 450000015000000L; // 30000000 * 30000001 / 2
 
-	runBlockOnce(gWorkerBlock); // warm up JIT compilation so workers only READ cached code
+	runBlockOnce(getTaggedPtr(gWorkerBlockH)); // warm up JIT compilation so workers only READ cached code
 	int64_t s0 = osCurrentMicroTime();
-	runBlockOnce(gWorkerBlock);  // serial baseline: one run
+	runBlockOnce(getTaggedPtr(gWorkerBlockH));  // serial baseline: one run
 	int64_t serialUs = osCurrentMicroTime() - s0;
 
 	heapGcEnterBlocked(gWorkerHeap, &CurrentThread); // main idle while the workers run
@@ -219,10 +221,9 @@ static int parallelGcSelfTest(void)
 	openHandleScope(&scope);
 	gWorkerHeap = CurrentThread.heap;
 	gMainHandles = Handles;
-	gWorkerBlock = evalObject("[ | n | n := 0. 1 to: 400000 do: [:i | n := n + (Array new: 2) size]. n ]");
-	handle(asObject(gWorkerBlock));
+	gWorkerBlockH = handle(asObject(evalObject("[ | n | n := 0. 1 to: 400000 do: [:i | n := n + (Array new: 2) size]. n ]")));
 	long expected = 800000; // 2 * 400000
-	runBlockOnce(gWorkerBlock); // warm up JIT compilation
+	runBlockOnce(getTaggedPtr(gWorkerBlockH)); // warm up JIT compilation
 
 	heapGcEnterBlocked(gWorkerHeap, &CurrentThread);
 	int64_t t0 = osCurrentMicroTime();
@@ -272,17 +273,16 @@ static int parallelFullGcSelfTest(void)
 	gMainHandles = Handles;
 	// Build then verify: acc stays live the whole time (a root on the worker's
 	// stack), so its 100k Arrays must survive every peer's full GC.
-	gWorkerBlock = evalObject(
+	gWorkerBlockH = handle(asObject(evalObject(
 		"[ | acc sum | "
 		"  acc := OrderedCollection new. "
 		"  1 to: 100000 do: [:i | acc add: (Array with: i with: i * 2) ]. "
 		"  sum := 0. "
 		"  acc do: [:a | sum := sum + (a at: 1) + (a at: 2) ]. "
-		"  sum ]");
-	handle(asObject(gWorkerBlock));
+		"  sum ]")));
 	long expected = 15000150000L; // sum over i=1..100000 of (i + 2i) = 3 * 100000*100001/2
 	unsigned long fullGcBefore = __atomic_load_n(&gFullGcRuns, __ATOMIC_RELAXED);
-	runBlockOnce(gWorkerBlock); // warm up JIT compilation so workers only READ cached code
+	runBlockOnce(getTaggedPtr(gWorkerBlockH)); // warm up JIT compilation so workers only READ cached code
 
 	heapGcEnterBlocked(gWorkerHeap, &CurrentThread); // main idle while the workers run
 	int64_t t0 = osCurrentMicroTime();
