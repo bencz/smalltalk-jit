@@ -40,6 +40,18 @@ void initHeap(Heap *heap, struct Thread *thread)
 	initPageSpace(&heap->execSpace, 256 * KB, 1);
 	heap->oldGcThreshold = OLD_GC_MIN_THRESHOLD;
 	pthread_mutex_init(&heap->youngLock, NULL);
+	heap->mutators = NULL;
+}
+
+
+// Register `thread` as a mutator of `heap` so the GC scans its roots. Prepended
+// under youngLock (registration is rare; the GC reads the list at a safepoint).
+void heapAddMutator(Heap *heap, struct Thread *thread)
+{
+	pthread_mutex_lock(&heap->youngLock);
+	thread->nextMutator = heap->mutators;
+	heap->mutators = thread;
+	pthread_mutex_unlock(&heap->youngLock);
 }
 
 

@@ -16,6 +16,8 @@ void initThread(Thread *thread)
 	thread->heap = malloc(sizeof(Heap));
 	initHeap(thread->heap, thread);
 	initRememberedSet(&thread->rememberedSet);
+	thread->nextMutator = NULL;
+	heapAddMutator(thread->heap, thread); // this thread now mutates (and roots) its heap
 	// Start with an empty TLAB (top == end) pointing at the fresh nursery top, so
 	// the first allocation takes the refill path and carves a real chunk.
 	thread->tlab.top = thread->heap->newSpace.top;

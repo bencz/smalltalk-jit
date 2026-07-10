@@ -330,11 +330,13 @@ static void iterateHandleScopes(Scavenger *scavenger, HandleScope *scopes)
 // and context are walked in iterateFiberRoots.)
 static void iteratePersistentHandles(Scavenger *scavenger)
 {
-	Thread *thread = scavenger->heap->thread;
-	HandlesIterator handlesIterator;
-	initHandlesIterator(&handlesIterator, thread->handles);
-	while (handlesIteratorHasNext(&handlesIterator)) {
-		processPointer(scavenger, &handlesIteratorNext(&handlesIterator)->raw);
+	// Every OS thread that mutates this heap has its own persistent-handle list.
+	for (Thread *thread = scavenger->heap->mutators; thread != NULL; thread = thread->nextMutator) {
+		HandlesIterator handlesIterator;
+		initHandlesIterator(&handlesIterator, thread->handles);
+		while (handlesIteratorHasNext(&handlesIterator)) {
+			processPointer(scavenger, &handlesIteratorNext(&handlesIterator)->raw);
+		}
 	}
 }
 
@@ -353,20 +355,24 @@ static void iterateRememberedSet(Scavenger *scavenger)
 	// actor/message workload it grew without bound and every scavenge re-scanned
 	// an ever-larger set (O(scavenges × set)), collapsing req/s and, because a
 	// dead old entry keeps resurrecting its young referents, exploding old space.
-	RememberedSet *rememberedSet = &CurrentThread.rememberedSet;
-	RememberedSet detached;
-	detached.blocks = rememberedSet->blocks;
-	rememberedSet->blocks = createRememberedSetBlock(NULL);
+	// Detach and re-scan EVERY mutator's remembered set. iterateObject's tail
+	// re-adds a still-live old->young root into the collecting thread's fresh set
+	// (CurrentThread), which the next scavenge will scan again via this same loop.
+	for (Thread *thread = scavenger->heap->mutators; thread != NULL; thread = thread->nextMutator) {
+		RememberedSet detached;
+		detached.blocks = thread->rememberedSet.blocks;
+		thread->rememberedSet.blocks = createRememberedSetBlock(NULL);
 
-	RememberedSetIterator iterator;
-	initRememberedSetIterator(&iterator, &detached);
-	while (rememberedSetIteratorHasNext(&iterator)) {
-		RawObject *root = rememberedSetIteratorNext(&iterator);
-		root->tags &= ~TAG_REMEMBERED;
-		iterateObject(scavenger, root);
+		RememberedSetIterator iterator;
+		initRememberedSetIterator(&iterator, &detached);
+		while (rememberedSetIteratorHasNext(&iterator)) {
+			RawObject *root = rememberedSetIteratorNext(&iterator);
+			root->tags &= ~TAG_REMEMBERED;
+			iterateObject(scavenger, root);
+		}
+
+		rememberedSetFreeBlocks(detached.blocks);
 	}
-
-	rememberedSetFreeBlocks(detached.blocks);
 }
 
 

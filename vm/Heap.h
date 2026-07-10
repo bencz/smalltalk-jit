@@ -20,7 +20,13 @@ typedef struct Heap {
 	// bump inside a TLAB stays lock-free; only the (rare) refill takes this lock,
 	// so several worker OS threads can share one nursery.
 	pthread_mutex_t youngLock;
+	// Every OS thread that mutates THIS heap links itself here (via Thread.nextMutator)
+	// so the GC can scan the roots of all of them, not just the collecting thread.
+	// One entry today (the owner); several once worker threads share the heap.
+	struct Thread *mutators;
 } Heap;
+
+void heapAddMutator(Heap *heap, struct Thread *thread);
 
 void initHeap(Heap *heap, struct Thread *thread);
 void freeHeap(Heap *heap);

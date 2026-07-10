@@ -24,6 +24,7 @@ typedef struct Thread {
 	struct EntryStackFrame *stackFramesTail;
 	TLAB tlab; // per-OS-thread young allocation buffer (stays embedded, per-mutator)
 	RememberedSet rememberedSet; // per-mutator old->young log (merged at GC in the multicore model)
+	struct Thread *nextMutator; // intrusive link in heap->mutators (GC root-scans every mutator)
 } Thread;
 
 extern __thread Thread CurrentThread;
