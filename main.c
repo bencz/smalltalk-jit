@@ -475,6 +475,231 @@ static int schedGcSelfTest(void)
 }
 
 
+// ---- JIT back-edge safepoint poll: CPU-bound loops must yield to a peer GC (B1) ----
+// N peer OS threads each run a PURE, NON-allocating Smalltalk loop (count to 8e8,
+// SmallInteger => no allocation). The only way a peer running this reaches a
+// safepoint is the new JIT back-edge poll — it never hits the allocate() poll.
+// While they loop, main (a registered mutator) requests several stop-the-world
+// rounds via heapGcBegin. WITHOUT the poll a peer never becomes safe, so
+// heapGcBegin blocks until the peer FINISHES its ~2-3s loop and deregisters ->
+// each round takes ~loop-time. WITH the poll, peers park within one iteration ->
+// each round returns in microseconds. The pre/post gap is ~4 orders of magnitude,
+// so a 200ms threshold makes the pass/fail deterministic and non-flaky.
+#define SPJIT_PEERS 4
+static int gSpjitReady = 0;
+static int gSpjitResults[SPJIT_PEERS];
+static Value gSpjitExpected;
+
+static void *spjitPeer(void *arg)
+{
+	long id = (long) arg;
+	memset(&CurrentThread, 0, sizeof(Thread));
+	CurrentThread.heap = gWorkerHeap;
+	initRememberedSet(&CurrentThread.rememberedSet);
+	CurrentThread.nextMutator = NULL;
+	heapAddMutator(gWorkerHeap, &CurrentThread);
+	CurrentThread.schedExceptionHandler = &CurrentExceptionHandler;
+	Handles = gMainHandles;
+	initThreadContext(&CurrentThread);
+	HandleScope scope;
+	openHandleScope(&scope);
+	Object *blockH = handle(gWorkerBlockH->raw);
+	EntryArgs args = { .size = 0 };
+	entryArgsAddObject(&args, blockH);
+	__atomic_add_fetch(&gSpjitReady, 1, __ATOMIC_RELEASE); // ready just before the pure loop
+	Value r = sendMessage(getSymbol("value"), &args);      // long non-allocating loop
+	gSpjitResults[id] = (valueTypeOf(r, VALUE_INT) && asCInt(r) == asCInt(gSpjitExpected)) ? 1 : 0;
+	closeHandleScope(&scope, NULL);
+	heapEndMutator(gWorkerHeap, &CurrentThread);
+	return NULL;
+}
+
+static int safepointJitSelfTest(void)
+{
+	HandleScope scope;
+	openHandleScope(&scope);
+	gWorkerHeap = CurrentThread.heap;
+	gMainHandles = Handles;
+	// Pure-compute, NON-allocating loop on the JIT's inlined to:do: machine loop:
+	// s counts to 8e8 (fits SmallInteger, so no LargeInteger allocation). Long
+	// enough (~2-3s) that a pre-fix blocked heapGcBegin dwarfs the threshold.
+	gWorkerBlockH = handle(asObject(evalObject("[ | s | s := 0. 1 to: 800000000 do: [:i | s := s + 1]. s ]")));
+	gSpjitExpected = tagInt(800000000L);
+	runBlockOnce(getTaggedPtr(gWorkerBlockH)); // warm up JIT so peers only READ cached code
+
+	__atomic_store_n(&gSpjitReady, 0, __ATOMIC_RELEASE);
+	pthread_t th[SPJIT_PEERS];
+	for (long w = 0; w < SPJIT_PEERS; w++) {
+		pthread_create(&th[w], NULL, spjitPeer, (void *) w);
+	}
+	while (__atomic_load_n(&gSpjitReady, __ATOMIC_ACQUIRE) < SPJIT_PEERS) {
+		usleep(200);
+	}
+	usleep(50 * 1000); // settle: let peers pass sendMessage's entry allocation (which hits
+	                   // the allocate() poll) and get into the pure steady loop.
+
+	const int rounds = 4;
+	int64_t worstUs = 0;
+	for (int r = 0; r < rounds; r++) {
+		int64_t t0 = osCurrentMicroTime();
+		heapGcBegin(gWorkerHeap, &CurrentThread); // requires every peer at a safepoint
+		int64_t us = osCurrentMicroTime() - t0;
+		heapGcEnd(gWorkerHeap);
+		if (us > worstUs) {
+			worstUs = us;
+		}
+	}
+
+	heapGcEnterBlocked(gWorkerHeap, &CurrentThread); // main safe while peers finish + exit
+	for (int w = 0; w < SPJIT_PEERS; w++) {
+		pthread_join(th[w], NULL);
+	}
+	heapGcLeaveBlocked(gWorkerHeap, &CurrentThread);
+
+	int ok = 1;
+	for (int w = 0; w < SPJIT_PEERS; w++) {
+		if (!gSpjitResults[w]) {
+			ok = 0;
+		}
+	}
+	closeHandleScope(&scope, NULL);
+	int64_t thresholdUs = 200 * 1000; // pre-fix a blocked heapGcBegin waits ~loop-time (>1s)
+	int fast = worstUs < thresholdUs;
+	fprintf(stderr, "safepoint-JIT self-test: %d peers ran a NON-allocating loop; %d STW rounds mid-loop, worst heapGcBegin=%ldms (threshold %ldms) | all-correct=%d -> %s\n",
+		SPJIT_PEERS, rounds, (long) (worstUs / 1000), (long) (thresholdUs / 1000), ok, (ok && fast) ? "PASS" : "FAIL");
+	return (ok && fast) ? 0 : 1;
+}
+
+
+// ---- JIT back-edge stackmap correctness: loop-carried body-only root (B1 Q4) ----
+// The linear-scan allocator's [start,end] liveness is control-flow-unaware, so a
+// young pointer that is loop-carried but whose last TEXTUAL use precedes the
+// back-edge is omitted from the poll's stackmap unless we over-approximate. Here
+// each peer builds a young Array `box`, anchors it in a shared array slot (a
+// SECOND, independently-scanned root) and then runs a NON-allocating loop that
+// writes into box WITHOUT referencing it after the loop (so box's frame slot is
+// body-only). Main drives a real scavenge while every peer is parked at the
+// back-edge poll: it relocates box (found via the shared slot) and, WITH the fix,
+// also updates the peer's frame slot so the peer keeps writing into the relocated
+// box; WITHOUT the fix the frame slot is stale, the peer's post-scavenge writes go
+// to the abandoned copy, and the shared slot's box freezes at the scavenge-time
+// value != BIG. Pre-fix: FAIL (or crash). Post-fix: PASS.
+#define SPROOTS_PEERS 4
+#define SPROOTS_BIG 200000000L
+static int gRootsReady = 0;
+static Object *gRootsPeerBlockH;
+static Object *gRootsReadBlockH;
+static Object *gRootsSharedH;
+
+static void *rootsPeer(void *arg)
+{
+	long id = (long) arg;
+	memset(&CurrentThread, 0, sizeof(Thread));
+	CurrentThread.heap = gWorkerHeap;
+	initRememberedSet(&CurrentThread.rememberedSet);
+	CurrentThread.nextMutator = NULL;
+	heapAddMutator(gWorkerHeap, &CurrentThread);
+	CurrentThread.schedExceptionHandler = &CurrentExceptionHandler;
+	Handles = gMainHandles;
+	initThreadContext(&CurrentThread);
+	HandleScope scope;
+	openHandleScope(&scope);
+	EntryArgs args = { .size = 0 };
+	entryArgsAddObject(&args, handle(gRootsPeerBlockH->raw)); // receiver: [:shared :idx | ...]
+	entryArgsAddObject(&args, handle(gRootsSharedH->raw));    // arg1: shared array
+	entryArgsAdd(&args, tagInt(id + 1));                      // arg2: 1-based slot index
+	__atomic_add_fetch(&gRootsReady, 1, __ATOMIC_RELEASE);   // ready just before the write-loop
+	sendMessage(getSymbol("value:value:"), &args);
+	closeHandleScope(&scope, NULL);
+	heapEndMutator(gWorkerHeap, &CurrentThread);
+	return NULL;
+}
+
+static int safepointRootsSelfTest(void)
+{
+	HandleScope scope;
+	openHandleScope(&scope);
+	gWorkerHeap = CurrentThread.heap;
+	gMainHandles = Handles;
+
+	// box is loop-carried but body-only: written inside the loop, NOT referenced
+	// after it (returns nil), so its frame slot is omitted from the back-edge
+	// stackmap unless generateSafepointPoll over-approximates. The loop bound is a
+	// LITERAL: only then does the compiler emit the inlined to:do: machine loop with
+	// a back-edge (a variable bound degenerates into real sends with no back-edge).
+	char blockSrc[256];
+	snprintf(blockSrc, sizeof(blockSrc),
+		"[:shared :idx | | box | box := Array new: 1. box at: 1 put: 0. "
+		"shared at: idx put: box. 1 to: %ld do: [:k | box at: 1 put: k]. nil ]", SPROOTS_BIG);
+	gRootsPeerBlockH = handle(asObject(evalObject(blockSrc)));
+	gRootsReadBlockH = handle(asObject(evalObject("[:shared :idx | (shared at: idx) at: 1 ]")));
+	char arrSrc[64];
+	snprintf(arrSrc, sizeof(arrSrc), "Array new: %d", SPROOTS_PEERS);
+	gRootsSharedH = handle(asObject(evalObject(arrSrc)));
+
+	// Warm up (compile) the peer block on MAIN with a full run, so peers only READ
+	// cached native code + inline caches during the concurrent phase and never
+	// compile/allocate/lookup (which would let them reach a safepoint without the
+	// back-edge poll). It writes a throwaway box into shared[1]; peers overwrite it.
+	{
+		EntryArgs wargs = { .size = 0 };
+		entryArgsAddObject(&wargs, handle(gRootsPeerBlockH->raw));
+		entryArgsAddObject(&wargs, handle(gRootsSharedH->raw));
+		entryArgsAdd(&wargs, tagInt(1));
+		sendMessage(getSymbol("value:value:"), &wargs);
+	}
+
+	__atomic_store_n(&gRootsReady, 0, __ATOMIC_RELEASE);
+	heapGcEnterBlocked(gWorkerHeap, &CurrentThread); // main safe while peers build + start looping
+	pthread_t th[SPROOTS_PEERS];
+	for (long w = 0; w < SPROOTS_PEERS; w++) {
+		pthread_create(&th[w], NULL, rootsPeer, (void *) w);
+	}
+	while (__atomic_load_n(&gRootsReady, __ATOMIC_ACQUIRE) < SPROOTS_PEERS) {
+		usleep(200);
+	}
+	heapGcLeaveBlocked(gWorkerHeap, &CurrentThread);
+	usleep(50 * 1000); // settle: peers past the setup allocation and into the pure write-loop
+
+	// Drive a REAL stop-the-world scavenge while peers are parked at the back-edge
+	// poll (mirrors heapCollectYoung's multi-mutator branch). It relocates each
+	// peer's young box; the frame slot must move with it (the Q4 fix) or later
+	// writes are lost.
+	heapGcEnterBlocked(gWorkerHeap, &CurrentThread);
+	pthread_mutex_lock(&gWorkerHeap->gcLock);
+	heapGcLeaveBlocked(gWorkerHeap, &CurrentThread);
+	heapGcBegin(gWorkerHeap, &CurrentThread);      // park every peer at its back-edge poll
+	scavengerScavenge(&gWorkerHeap->newSpace);     // move box; update shared[idx] + (with fix) frame slot
+	heapGcEnd(gWorkerHeap);
+	pthread_mutex_unlock(&gWorkerHeap->gcLock);
+
+	heapGcEnterBlocked(gWorkerHeap, &CurrentThread); // main safe while peers run to BIG + exit
+	for (int w = 0; w < SPROOTS_PEERS; w++) {
+		pthread_join(th[w], NULL);
+	}
+	heapGcLeaveBlocked(gWorkerHeap, &CurrentThread);
+
+	// Verify: shared[idx] at:1 must equal BIG (the last k written). With the bug the
+	// post-scavenge writes went to a stale slot and this is frozen earlier.
+	int ok = 1;
+	for (long w = 0; w < SPROOTS_PEERS; w++) {
+		EntryArgs rargs = { .size = 0 };
+		entryArgsAddObject(&rargs, handle(gRootsReadBlockH->raw));
+		entryArgsAddObject(&rargs, handle(gRootsSharedH->raw));
+		entryArgsAdd(&rargs, tagInt(w + 1));
+		Value v = sendMessage(getSymbol("value:value:"), &rargs);
+		long got = valueTypeOf(v, VALUE_INT) ? (long) asCInt(v) : -1;
+		if (got != SPROOTS_BIG) {
+			ok = 0;
+		}
+	}
+	closeHandleScope(&scope, NULL);
+	fprintf(stderr, "safepoint-roots self-test: %d peers held a loop-carried body-only young Array across a NON-allocating loop; a scavenge relocated it while they were parked at the back-edge poll | all-slots-tracked=%d -> %s\n",
+		SPROOTS_PEERS, ok, ok ? "PASS" : "FAIL");
+	return ok ? 0 : 1;
+}
+
+
 int main(int argc, char **args)
 {
 	CliArgs cliArgs;
@@ -543,6 +768,20 @@ int main(int argc, char **args)
 		initThread(&CurrentThread);
 		bootstrapSmalltalk(cliArgs.snapshotFileName, cliArgs.bootstrapDir);
 		return schedGcSelfTest();
+	}
+
+	// JIT back-edge safepoint poll: CPU-bound loops must yield (B1): ST_SAFEPOINT_JIT_TEST=1 -s snap
+	if (getenv("ST_SAFEPOINT_JIT_TEST") != NULL) {
+		initThread(&CurrentThread);
+		bootstrapSmalltalk(cliArgs.snapshotFileName, cliArgs.bootstrapDir);
+		return safepointJitSelfTest();
+	}
+
+	// JIT back-edge stackmap correctness / loop-carried root (B1 Q4): ST_SAFEPOINT_ROOTS_TEST=1 -s snap
+	if (getenv("ST_SAFEPOINT_ROOTS_TEST") != NULL) {
+		initThread(&CurrentThread);
+		bootstrapSmalltalk(cliArgs.snapshotFileName, cliArgs.bootstrapDir);
+		return safepointRootsSelfTest();
 	}
 
 	initThread(&CurrentThread);

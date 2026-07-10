@@ -19,6 +19,12 @@ typedef struct {
 	ptrdiff_t bytecodeNumber;
 	OrderedCollection *stackmaps;
 	OrderedCollection *descriptors;
+	// When set, generateStackmap over-approximates liveness (marks every spilled
+	// temp whose range starts at/before the current bytecode, ignoring its end).
+	// Used only for a loop back-edge safepoint poll, where the control-flow-unaware
+	// linear-scan liveness would otherwise omit a loop-carried, body-only pointer
+	// that is live into the next iteration — see generateSafepointPoll.
+	_Bool overapproxStackmap;
 } CodeGenerator;
 
 NativeCode *generateMethodCode(CompiledMethod *method);

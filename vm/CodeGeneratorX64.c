@@ -23,6 +23,7 @@ typedef struct {
 } BytecodeLabel;
 
 static NativeCode *generateBlockCode(CompiledBlock *block, CodeGenerator *parentGenerator);
+static void generateSafepointPoll(CodeGenerator *generator, _Bool atBackEdge);
 static void generateCode(CodeGenerator *generator);
 static void initCodeGenerator(CodeGenerator *generator);
 static void freeCodeGenerator(CodeGenerator *generator);
@@ -102,6 +103,17 @@ static void generateCode(CodeGenerator *generator)
 	if (!generator->regsAlloc.frameLess) {
 		generatePrologue(generator, generator->regsAlloc.frameSize);
 		generateContextDefinition(generator);
+		// Entry safepoint poll (framed methods only): bounds stop-the-world latency
+		// and covers long non-allocating recursion / repeated non-looping calls that
+		// the back-edge poll can't reach. Not a back-edge, so no stackmap
+		// over-approximation is needed — at bytecode 0 no temp is live-past-end, args
+		// are scanned unconditionally, and every frame slot is nil (generatePrologue).
+		// Restricted to methods: CTX is established here (SmalltalkEntry, callee-saved),
+		// whereas a block's activations already reach a safepoint via BlockContext
+		// allocation and its context setup differs.
+		if (!generator->code.isBlock) {
+			generateSafepointPoll(generator, 0);
+		}
 	} else if (generator->code.isBlock) {
 		variableAt(generator, CONTEXT_INDEX)->flags |= VAR_IN_REG;
 	}
@@ -121,6 +133,7 @@ static void initCodeGenerator(CodeGenerator *generator)
 	generator->frameRawAreaSize = 0;
 	generator->tmpVar = 0;
 	generator->bytecodeNumber = 0;
+	generator->overapproxStackmap = 0;
 	generator->stackmaps = newOrdColl(32);
 	generator->descriptors = newOrdColl(32);
 }
@@ -202,6 +215,70 @@ static void generateContextRestore(CodeGenerator *generator)
 		fillVar(generator, context);
 		asmMovqMem(&generator->buffer, asmMem(context->reg, NO_REGISTER, SS_1, varOffset(RawContext, parent)), context->reg);
 	}
+}
+
+
+// Safepoint poll for JIT-compiled code. A CPU-bound fiber in a non-allocating
+// loop never reaches the allocate() poll (Heap.c), so a peer collector's
+// heapGcBegin would wait for it forever. Emit an inline check at every loop
+// back-edge (and, for framed methods, at entry): load the current heap's
+// `safepointRequested` flag and, when a peer wants to stop the world, park in
+// heapGcPoll until it finishes. Structurally identical to generateStoreCheck:
+// a cheap inline test, and a rare C call with the live caller-saved set spilled
+// around it (the fast path clobbers only TMP).
+//
+// storeIp=1 is REQUIRED: heapGcPoll parks this thread and a peer collector then
+// scans this fiber's frame, so the callsite needs a stackmap describing our live
+// roots (the write barrier can use storeIp=0 because rememberedSetGrow never
+// parks). `atBackEdge` additionally over-approximates that stackmap: the
+// linear-scan allocator's [start,end] liveness is control-flow-unaware and omits
+// a loop-carried pointer whose last textual use precedes the back-edge though it
+// is live into the next iteration. A non-allocating loop never self-scavenges, so
+// such a pointer stays young/movable; a peer scavenge running while we park here
+// would relocate it but leave the omitted frame slot dangling -> heap corruption.
+// Marking every VAR_ON_STACK temp is safe (the scavenger tolerates stale/
+// over-marked slots via scavengeStackSlot) and closes the hole.
+static void generateSafepointPoll(CodeGenerator *generator, _Bool atBackEdge)
+{
+	AssemblerBuffer *buffer = &generator->buffer;
+	AssemblerLabel noGc;
+	asmInitLabel(&noGc);
+
+	// TMP = CTX->thread->heap
+	asmMovqMem(buffer, asmMem(CTX, NO_REGISTER, SS_1, varOffset(RawContext, thread)), TMP);
+	asmMovqMem(buffer, asmMem(TMP, NO_REGISTER, SS_1, offsetof(Thread, heap)), TMP);
+	// Fast path: one byte test of the 0/1 flag (little-endian low byte of the int,
+	// re-loaded every iteration so the mutator observes a set flag within ~1 pass).
+	asmCmpbMemImm(buffer, asmMem(TMP, NO_REGISTER, SS_1, offsetof(Heap, safepointRequested)), 0);
+	asmJ(buffer, COND_EQUAL, &noGc);
+
+	// Slow path (a peer is collecting): spill the caller-saved allocatable set +
+	// scratch, park in heapGcPoll(heap, thread), restore. Callee-saved RBX/R13-R15
+	// and CTX(R12) are preserved by the C ABI. Mirrors generateStoreCheck's grow path.
+	asmPushq(buffer, RAX);
+	asmPushq(buffer, RCX);
+	asmPushq(buffer, RDX);
+	asmPushq(buffer, RSI);
+	asmPushq(buffer, RDI);
+	asmPushq(buffer, R8);
+	asmPushq(buffer, R9);
+	asmPushq(buffer, R11);
+	// RSI = thread, RDI = thread->heap   (heapGcPoll(Heap *heap, Thread *self))
+	asmMovqMem(buffer, asmMem(CTX, NO_REGISTER, SS_1, varOffset(RawContext, thread)), RSI);
+	asmMovqMem(buffer, asmMem(RSI, NO_REGISTER, SS_1, offsetof(Thread, heap)), RDI);
+	generator->overapproxStackmap = atBackEdge;
+	generateCCall(generator, (intptr_t) heapGcPoll, 2, 1);
+	generator->overapproxStackmap = 0;
+	asmPopq(buffer, R11);
+	asmPopq(buffer, R9);
+	asmPopq(buffer, R8);
+	asmPopq(buffer, RDI);
+	asmPopq(buffer, RSI);
+	asmPopq(buffer, RDX);
+	asmPopq(buffer, RCX);
+	asmPopq(buffer, RAX);
+
+	asmLabelBind(buffer, &noGc, asmOffset(buffer));
 }
 
 
@@ -354,6 +431,12 @@ static void generateBody(CodeGenerator *generator)
 				// the label to it so asmJmpLabel emits the backward displacement.
 				asmLabelBind(&generator->buffer, &currentLabel->label, machineOffsetAt[target]);
 				currentLabel->offset = -2;   // already bound; the post-loop binders skip it
+				// Safepoint poll so a CPU-bound (possibly non-allocating) loop yields to
+				// a peer GC. Emitted after the bind and before the jump: the backward
+				// displacement is computed at emit time, so the poll's bytes are absorbed.
+				// Every inlined loop is framed today (to:do: emits the <=/+1 sends).
+				ASSERT(!generator->regsAlloc.frameLess);
+				generateSafepointPoll(generator, 1);
 			} else {
 				currentLabel->offset = target;
 			}
@@ -1596,7 +1679,10 @@ void generateStackmap(CodeGenerator *generator)
 	size_t varsSize = generator->regsAlloc.varsSize;
 	for (size_t i = 0; i < varsSize; i++) {
 		Variable *var = variableAt(generator, i);
-		if (i == CONTEXT_INDEX || (var->frameOffset < 0 && (var->flags & VAR_ON_STACK) && var->start <= generator->bytecodeNumber && generator->bytecodeNumber <= var->end)) {
+		// A back-edge poll (overapproxStackmap) drops the `bytecodeNumber <= end`
+		// upper bound: a loop-carried temp whose last textual use precedes the
+		// back-edge is still live into the next iteration and must be marked.
+		if (i == CONTEXT_INDEX || (var->frameOffset < 0 && (var->flags & VAR_ON_STACK) && var->start <= generator->bytecodeNumber && (generator->overapproxStackmap || generator->bytecodeNumber <= var->end))) {
 			ASSERT(var->frameOffset < -1);
 			size_t index = -var->frameOffset - 1;
 			if (index > 1) {
