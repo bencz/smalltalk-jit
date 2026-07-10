@@ -102,10 +102,12 @@ void scavengerScavenge(Scavenger *scavenger)
 	iterateNativeCode(scavenger);
 	schedulerRestoreCurrentRoots();
 	scavenger->survivorEnd = scavenger->top;
-	// The mutator's TLAB pointed into the semispace we just abandoned; reset it
-	// empty at the fresh nursery top so the next allocation re-carves a chunk.
-	CurrentThread.tlab.top = scavenger->top;
-	CurrentThread.tlab.end = scavenger->top;
+	// EVERY mutator's TLAB pointed into the semispace we just abandoned; reset them
+	// all empty at the fresh nursery top so each re-carves on its next allocation.
+	for (Thread *m = scavenger->heap->mutators; m != NULL; m = m->nextMutator) {
+		m->tlab.top = scavenger->top;
+		m->tlab.end = scavenger->top;
+	}
 	LastGCStats.youngSurvivorBytes =
 		scavenger->top - (uint8_t *) ((uintptr_t) scavenger->fromSpace | NEW_SPACE_TAG);
 	memset(scavenger->toSpace, scavenger->size, 0);

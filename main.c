@@ -7,11 +7,16 @@
 #include "vm/Isolate.h"
 #include "vm/Message.h"
 #include "vm/Safepoint.h"
+#include "vm/Handle.h"
+#include "vm/Smalltalk.h"
+#include "vm/Heap.h"
+#include "vm/Os.h"
 #include "vm/Cli.h"
 #include <unistd.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <pthread.h>
 
 static void bootstrapSmalltalk(char *snapshotFileName, char *bootstrapDir);
 
@@ -56,6 +61,142 @@ static void runMessageTest(void *arg)
 }
 
 
+// ---- worker-thread Smalltalk execution self-test (ST_WORKER_TEST=1) --------
+// Proves a SECOND OS thread can run JIT-compiled Smalltalk on the SAME heap:
+// the worker points its Thread at the shared heap, replicates the well-known
+// Handles (they reference shared objects), and runs a block that allocates
+// heavily (forcing scavenges on the worker) — all sharing one heap, one set of
+// compiled methods and JIT stubs (which reach per-thread state via CTX->thread).
+static SmalltalkHandles gMainHandles;
+static Heap *gWorkerHeap;
+static Value gWorkerBlock;
+static Value gWorkerResult;
+
+static void *workerRunBlock(void *arg)
+{
+	(void) arg;
+	memset(&CurrentThread, 0, sizeof(Thread));
+	CurrentThread.heap = gWorkerHeap;
+	initRememberedSet(&CurrentThread.rememberedSet);
+	CurrentThread.nextMutator = NULL;
+	heapAddMutator(gWorkerHeap, &CurrentThread);
+	Handles = gMainHandles; // well-known handles point at shared (old-space) objects
+	initThreadContext(&CurrentThread);               // root context on the worker's TLAB
+	HandleScope scope;
+	openHandleScope(&scope);                         // entry points below re-handle into a parent
+	Object *blockH = handle(asObject(gWorkerBlock)); // root the block before we allocate
+	EntryArgs args = { .size = 0 };
+	entryArgsAdd(&args, getTaggedPtr(blockH));        // re-read (a GC may have moved it)
+	gWorkerResult = sendMessage(getSymbol("value"), &args);
+	closeHandleScope(&scope, NULL);
+	return NULL;
+}
+
+static int workerSelfTest(void)
+{
+	HandleScope scope;
+	openHandleScope(&scope);
+	gWorkerHeap = CurrentThread.heap;
+	gMainHandles = Handles;
+	// A clean, allocation-heavy block: 200k Array allocations => many scavenges on
+	// the worker; returns 2*200000 = 400000.
+	gWorkerBlock = evalObject("[ | n | n := 0. 1 to: 200000 do: [:i | n := n + (Array new: 2) size]. n ]");
+	handle(asObject(gWorkerBlock)); // keep it alive on the main mutator across the spawn
+
+	pthread_t worker;
+	pthread_create(&worker, NULL, workerRunBlock, NULL);
+	pthread_join(worker, NULL);
+
+	closeHandleScope(&scope, NULL);
+	long result = valueTypeOf(gWorkerResult, VALUE_INT) ? (long) asCInt(gWorkerResult) : -1;
+	fprintf(stderr, "worker self-test: a Smalltalk block ran on a WORKER OS thread sharing the heap -> result=%ld (expected 400000) -> %s\n",
+		result, result == 400000 ? "PASS" : "FAIL");
+	return result == 400000 ? 0 : 1;
+}
+
+
+// ---- parallel Smalltalk execution self-test (ST_PARALLEL_TEST=1) -----------
+// N worker OS threads run the SAME compiled block CONCURRENTLY on the shared
+// heap. The block is pure integer compute (no allocation => no GC => no need for
+// the safepoint-coordinated collector yet), so this isolates and proves REAL
+// parallel Smalltalk execution across cores. Reports the speedup vs one thread.
+#define PAR_WORKERS 8
+static Value gParResults[PAR_WORKERS];
+
+static void *parWorker(void *arg)
+{
+	long id = (long) arg;
+	memset(&CurrentThread, 0, sizeof(Thread));
+	CurrentThread.heap = gWorkerHeap;
+	initRememberedSet(&CurrentThread.rememberedSet);
+	CurrentThread.nextMutator = NULL;
+	heapAddMutator(gWorkerHeap, &CurrentThread);
+	Handles = gMainHandles;
+	initThreadContext(&CurrentThread);
+	HandleScope scope;
+	openHandleScope(&scope);
+	Object *blockH = handle(asObject(gWorkerBlock));
+	EntryArgs args = { .size = 0 };
+	entryArgsAdd(&args, getTaggedPtr(blockH));
+	gParResults[id] = sendMessage(getSymbol("value"), &args);
+	closeHandleScope(&scope, NULL);
+	return NULL;
+}
+
+static Value runBlockOnce(Value block)
+{
+	HandleScope scope;
+	openHandleScope(&scope);
+	Object *h = handle(asObject(block));
+	EntryArgs args = { .size = 0 };
+	entryArgsAdd(&args, getTaggedPtr(h));
+	Value r = sendMessage(getSymbol("value"), &args);
+	closeHandleScope(&scope, NULL);
+	return r;
+}
+
+static int parallelSelfTest(void)
+{
+	HandleScope scope;
+	openHandleScope(&scope);
+	gWorkerHeap = CurrentThread.heap;
+	gMainHandles = Handles;
+	// Pure-compute block: sum 1..30,000,000 (fits SmallInteger, so NO allocation).
+	gWorkerBlock = evalObject("[ | s | s := 0. 1 to: 30000000 do: [:i | s := s + i]. s ]");
+	handle(asObject(gWorkerBlock));
+	long expected = 450000015000000L; // 30000000 * 30000001 / 2
+
+	runBlockOnce(gWorkerBlock); // warm up JIT compilation so workers only READ cached code
+	int64_t s0 = osCurrentMicroTime();
+	runBlockOnce(gWorkerBlock);  // serial baseline: one run
+	int64_t serialUs = osCurrentMicroTime() - s0;
+
+	int64_t p0 = osCurrentMicroTime();
+	pthread_t th[PAR_WORKERS];
+	for (long w = 0; w < PAR_WORKERS; w++) {
+		pthread_create(&th[w], NULL, parWorker, (void *) w);
+	}
+	for (int w = 0; w < PAR_WORKERS; w++) {
+		pthread_join(th[w], NULL);
+	}
+	int64_t parUs = osCurrentMicroTime() - p0;
+
+	int ok = 1;
+	for (int w = 0; w < PAR_WORKERS; w++) {
+		long r = valueTypeOf(gParResults[w], VALUE_INT) ? (long) asCInt(gParResults[w]) : -1;
+		if (r != expected) {
+			ok = 0;
+		}
+	}
+	closeHandleScope(&scope, NULL);
+
+	double speedup = parUs > 0 ? (double) PAR_WORKERS * (double) serialUs / (double) parUs : 0.0;
+	fprintf(stderr, "parallel self-test: %d workers ran Smalltalk sum(1..30M) CONCURRENTLY on the shared heap | serial=%ldms parallel(%dx work)=%ldms speedup=%.1fx | all-correct=%d -> %s\n",
+		PAR_WORKERS, (long) (serialUs / 1000), PAR_WORKERS, (long) (parUs / 1000), speedup, ok, ok ? "PASS" : "FAIL");
+	return ok ? 0 : 1;
+}
+
+
 int main(int argc, char **args)
 {
 	CliArgs cliArgs;
@@ -89,6 +230,20 @@ int main(int argc, char **args)
 		freeHandles();
 		freeThread(&CurrentThread);
 		return msgResult;
+	}
+
+	// Worker-thread Smalltalk execution self-test (needs the image): ST_WORKER_TEST=1 -s snap
+	if (getenv("ST_WORKER_TEST") != NULL) {
+		initThread(&CurrentThread);
+		bootstrapSmalltalk(cliArgs.snapshotFileName, cliArgs.bootstrapDir);
+		return workerSelfTest();
+	}
+
+	// Parallel Smalltalk execution across cores: ST_PARALLEL_TEST=1 -s snap
+	if (getenv("ST_PARALLEL_TEST") != NULL) {
+		initThread(&CurrentThread);
+		bootstrapSmalltalk(cliArgs.snapshotFileName, cliArgs.bootstrapDir);
+		return parallelSelfTest();
 	}
 
 	initThread(&CurrentThread);
