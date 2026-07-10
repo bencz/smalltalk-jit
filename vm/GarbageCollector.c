@@ -179,7 +179,7 @@ static void iterateHandles(MarkingQueue *queue, Thread *thread)
 static void iterateNativeCode(MarkingQueue *queue, Thread *thread)
 {
 	PageSpaceIterator iterator;
-	pageSpaceIteratorInit(&iterator, &thread->heap.execSpace);
+	pageSpaceIteratorInit(&iterator, &thread->heap->execSpace);
 	NativeCode *code = (NativeCode *) pageSpaceIteratorNext(&iterator);
 
 	while (code != NULL) {
@@ -232,14 +232,14 @@ static void iterateObject(MarkingQueue *queue, Thread *thread, RawObject *root)
 
 	root->tags = root->tags & ~TAG_REMEMBERED;
 	if (remember && isOldObject(root)) {
-		rememberedSetAdd(&thread->heap.rememberedSet, root);
+		rememberedSetAdd(&thread->rememberedSet, root);
 	}
 }
 
 
 static void markObject(MarkingQueue *queue, Thread *thread, RawObject *object)
 {
-	ASSERT(isOldObject(object) || (thread->heap.newSpace.fromSpace <= (uint8_t *) object && (uint8_t *) object <= (thread->heap.newSpace.fromSpace + thread->heap.newSpace.size)));
+	ASSERT(isOldObject(object) || (thread->heap->newSpace.fromSpace <= (uint8_t *) object && (uint8_t *) object <= (thread->heap->newSpace.fromSpace + thread->heap->newSpace.size)));
 	if (object->tags & TAG_MARKED) {
 		return;
 	}

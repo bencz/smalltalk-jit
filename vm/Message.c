@@ -260,7 +260,7 @@ static Value readValue(Cursor *c, Registry *reg)
 		int64_t hash = curI64(c);
 		uint32_t indexed = curU32(c);
 
-		RawObject *obj = allocateObject(&CurrentThread.heap, cls->raw, indexed);
+		RawObject *obj = allocateObject(CurrentThread.heap, cls->raw, indexed);
 		obj->hash = (Value) hash;
 		size_t myId = reg->count;
 		regNew(reg, obj); // record BEFORE reading fields, so cycles resolve

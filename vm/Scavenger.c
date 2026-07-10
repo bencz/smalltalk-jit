@@ -353,7 +353,7 @@ static void iterateRememberedSet(Scavenger *scavenger)
 	// actor/message workload it grew without bound and every scavenge re-scanned
 	// an ever-larger set (O(scavenges × set)), collapsing req/s and, because a
 	// dead old entry keeps resurrecting its young referents, exploding old space.
-	RememberedSet *rememberedSet = &scavenger->heap->rememberedSet;
+	RememberedSet *rememberedSet = &CurrentThread.rememberedSet;
 	RememberedSet detached;
 	detached.blocks = rememberedSet->blocks;
 	rememberedSet->blocks = createRememberedSetBlock(NULL);
@@ -494,6 +494,6 @@ static void iterateObject(Scavenger *scavenger, RawObject *root)
 	}
 
 	if (remember && isOldObject(root) && (root->tags & TAG_REMEMBERED) == 0) {
-		rememberedSetAdd(&scavenger->heap->rememberedSet, root);
+		rememberedSetAdd(&CurrentThread.rememberedSet, root);
 	}
 }

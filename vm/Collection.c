@@ -51,7 +51,7 @@ OrderedCollection *arrayAsOrdColl(Array *array)
 OrderedCollection *newOrdColl(size_t size)
 {
 	OrderedCollection *collection = newObject(Handles.OrderedCollection, 0);
-	RawObject *contents = allocateObject(&CurrentThread.heap, Handles.Array->raw, size);
+	RawObject *contents = allocateObject(CurrentThread.heap, Handles.Array->raw, size);
 	rawObjectStorePtr((RawObject *) collection->raw, &collection->raw->contents, contents);
 	collection->raw->firstIndex = tagInt(1);
 	collection->raw->lastIndex = 0;

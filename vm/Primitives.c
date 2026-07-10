@@ -957,7 +957,7 @@ static PrimitiveResult collectGarbagePrimitive(Value receiver)
 
 static PrimitiveResult printHeapPrimitive(Value receiver)
 {
-	printHeap(&CurrentThread.heap);
+	printHeap(CurrentThread.heap);
 	return primSuccess(receiver);
 }
 
@@ -1218,8 +1218,8 @@ static PrimitiveResult lastGcStatsPrimitive(Value receiver)
 	stringDictAtPut(stats, asString("fullTimeUs"), tagInt(LastGCStats.totalTime));
 	stringDictAtPut(stats, asString("scavengeCount"), tagInt(LastGCStats.scavengeCount));
 	stringDictAtPut(stats, asString("scavengeTimeUs"), tagInt(LastGCStats.scavengeTimeUs));
-	stringDictAtPut(stats, asString("oldBytes"), tagInt(CurrentThread.heap.oldSpace.totalBytes));
-	stringDictAtPut(stats, asString("remembered"), tagInt(rememberedSetCount(&CurrentThread.heap.rememberedSet)));
+	stringDictAtPut(stats, asString("oldBytes"), tagInt(CurrentThread.heap->oldSpace.totalBytes));
+	stringDictAtPut(stats, asString("remembered"), tagInt(rememberedSetCount(&CurrentThread.rememberedSet)));
 	stringDictAtPut(stats, asString("youngSurvivorBytes"), tagInt(LastGCStats.youngSurvivorBytes));
 	stringDictAtPut(stats, asString("liveFibers"), tagInt(schedulerLiveFibers()));
 	stringDictAtPut(stats, asString("fiberSlots"), tagInt(schedulerFiberSlots()));

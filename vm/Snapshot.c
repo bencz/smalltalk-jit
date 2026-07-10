@@ -253,7 +253,7 @@ static Value readObject(int64_t field, Snapshot *snapshot)
 	size_t size = shape.varsSize;
 	size_t indexedSize = shape.isIndexed ? readInt64(snapshot) : 0;
 
-	RawObject *object = (RawObject *) allocate(&CurrentThread.heap, computeInstanceSize(shape, indexedSize));
+	RawObject *object = (RawObject *) allocate(CurrentThread.heap, computeInstanceSize(shape, indexedSize));
 	snapshotDictAtPut(&snapshot->dict, id, tagPtr(object));
 
 	if (shape.isIndexed) {

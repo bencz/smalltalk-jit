@@ -36,13 +36,13 @@ void freeHandles(void)
 
 void *newObject(Class *class, size_t size)
 {
-	return scopeHandle(allocateObject(&CurrentThread.heap, class->raw, size));
+	return scopeHandle(allocateObject(CurrentThread.heap, class->raw, size));
 }
 
 
 Float *newFloat(double value)
 {
-	Float *object = (Float *) scopeHandle(allocateObject(&CurrentThread.heap, Handles.Float->raw, 0));
+	Float *object = (Float *) scopeHandle(allocateObject(CurrentThread.heap, Handles.Float->raw, 0));
 	object->raw->value = value;
 	return object;
 }
@@ -50,7 +50,7 @@ Float *newFloat(double value)
 
 Object *copyResizedObject(Object *object, size_t newSize)
 {
-	Object *newObject = scopeHandle(allocateObject(&CurrentThread.heap, object->raw->class, newSize));
+	Object *newObject = scopeHandle(allocateObject(CurrentThread.heap, object->raw->class, newSize));
 	size_t size = objectSize(object);
 	size = computeInstanceSize(object->raw->class->instanceShape, newSize > size ? size : newSize);
 	size_t offset = HEADER_SIZE + object->raw->class->instanceShape.isIndexed * sizeof(Value);

@@ -275,7 +275,8 @@ static void generateAllocate(CodeGenerator *generator)
 	asmRet(buffer);
 
 	asmLabelBind(buffer, &noFreeSpace, asmOffset(buffer));
-	asmLeaq(buffer, asmMem(RBX, NO_REGISTER, SS_1, offsetof(Thread, heap)), RDI);
+	// heap is now a pointer field: LOAD thread->heap (not thread->heap).
+	asmMovqMem(buffer, asmMem(RBX, NO_REGISTER, SS_1, offsetof(Thread, heap)), RDI);
 	generateCCall(generator, (intptr_t) allocateObject, 3, 0);
 	asmIncq(buffer, RAX);
 	asmRet(buffer);
@@ -368,7 +369,7 @@ PER_ISOLATE StubCode DoesNotUnderstandStub = { .generator = generateDoesNotUnder
 static CompiledMethod *createDoesNotUnderstandCode(void)
 {
 	CompiledCodeHeader header = { 0 };
-	CompiledMethod *method = handle(allocateObject(&CurrentThread.heap, Handles.CompiledMethod->raw, 0));
+	CompiledMethod *method = handle(allocateObject(CurrentThread.heap, Handles.CompiledMethod->raw, 0));
 	SourceCode *source = newObject(Handles.SourceCode, 0);
 	sourceCodeSetSourceOrFileName(source, asString("_doesNotUnderstand []"));
 	sourceCodeSetPosition(source, 0);

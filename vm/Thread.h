@@ -17,12 +17,13 @@ typedef struct TLAB {
 } TLAB;
 
 typedef struct Thread {
-	Heap heap;
+	Heap *heap; // heap-allocated; ONE heap per isolate, shared by its worker threads
 	struct Handle *handles;
 	struct HandleScope *handleScopes;
 	Value context;
 	struct EntryStackFrame *stackFramesTail;
-	TLAB tlab; // appended last so existing field offsets (used by the JIT) don't shift
+	TLAB tlab; // per-OS-thread young allocation buffer (stays embedded, per-mutator)
+	RememberedSet rememberedSet; // per-mutator old->young log (merged at GC in the multicore model)
 } Thread;
 
 extern __thread Thread CurrentThread;
@@ -45,7 +46,7 @@ void threadSetExitFrame(struct StackFrame *stackFrame);
 static inline void rawObjectStorePtr(RawObject *object, Value *field, RawObject *value)
 {
 	if (isOldObject(object) && isNewObject(value) && (object->tags & TAG_REMEMBERED) == 0) {
-		rememberedSetAdd(&CurrentThread.heap.rememberedSet, object);
+		rememberedSetAdd(&CurrentThread.rememberedSet, object);
 	}
 	*field = tagPtr(value);
 }

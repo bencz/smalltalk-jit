@@ -18,8 +18,8 @@ Dictionary *newDictionary(size_t size)
 {
 	Dictionary *dict = newObject(Handles.Dictionary, 0);
 	// XXX: code bellow causes optimization bug in GCC:
-	// dict->raw->contents = tagPtr(allocateObject(&CurrentThread.heap, Handles.Array->raw, size));
-	RawObject *contents = allocateObject(&CurrentThread.heap, Handles.Array->raw, size);
+	// dict->raw->contents = tagPtr(allocateObject(CurrentThread.heap, Handles.Array->raw, size));
+	RawObject *contents = allocateObject(CurrentThread.heap, Handles.Array->raw, size);
 	rawObjectStorePtr((RawObject *) dict->raw, &dict->raw->contents, contents);
 	dict->raw->tally = 0;
 	return dict;

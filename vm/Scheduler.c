@@ -318,7 +318,7 @@ static void loadRoots(Fiber *fiber)
 static void initFiberContext(Fiber *fiber)
 {
 	RawContext *context = (RawContext *) allocateObject(
-		&CurrentThread.heap, Handles.MethodContext->raw, 0);
+		CurrentThread.heap, Handles.MethodContext->raw, 0);
 	context->thread = &CurrentThread;
 	fiber->roots.stackFramesTail = NULL;
 	fiber->roots.handleScopes = NULL;

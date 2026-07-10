@@ -14,7 +14,6 @@ typedef struct Heap {
 	Scavenger newSpace;
 	PageSpace oldSpace;
 	PageSpace execSpace;
-	RememberedSet rememberedSet;
 	size_t oldGcThreshold; // run a full GC only once old space grows past this
 } Heap;
 

@@ -36,7 +36,6 @@ void initHeap(Heap *heap, struct Thread *thread)
 	initScavenger(&heap->newSpace, heap, 64 * MB);
 	initPageSpace(&heap->oldSpace, 256 * KB, 0);
 	initPageSpace(&heap->execSpace, 256 * KB, 1);
-	initRememberedSet(&heap->rememberedSet);
 	heap->oldGcThreshold = OLD_GC_MIN_THRESHOLD;
 }
 
@@ -215,7 +214,7 @@ uint8_t *tryAllocateOld(Heap *heap, size_t size, _Bool grow)
 
 void collectGarbage(Thread *thread)
 {
-	scavengerScavenge(&thread->heap.newSpace);
+	scavengerScavenge(&thread->heap->newSpace);
 	markAndSweep(thread);
 }
 
@@ -226,15 +225,15 @@ void markAndSweep(Thread *thread)
 	LastGCStats.count++;
 	int64_t startTime = osCurrentMicroTime();
 
-	rememberedSetReset(&thread->heap.rememberedSet);
+	rememberedSetReset(&thread->rememberedSet);
 	gcMarkRoots(thread);
-	gcSweep(&thread->heap.oldSpace);
+	gcSweep(&thread->heap->oldSpace);
 
 	LastGCStats.time = osCurrentMicroTime() - startTime;
 	LastGCStats.totalTime += LastGCStats.time;
 
 #if VERIFY_HEAP_AFTER_GC
-	verifyHeap(&thread->heap);
+	verifyHeap(thread->heap);
 #endif
 }
 

@@ -13,7 +13,7 @@ NativeCode *findNativeCodeAtIc(uint8_t *ic)
 {
 	PageSpaceIterator iterator;
 	NativeCode *obj;
-	pageSpaceIteratorInit(&iterator, &CurrentThread.heap.execSpace);
+	pageSpaceIteratorInit(&iterator, &CurrentThread.heap->execSpace);
 	obj = (NativeCode *) pageSpaceIteratorNext(&iterator);
 	while (obj != NULL) {
 		if ((obj->tags & TAG_FREESPACE) == 0 && obj->insts <= ic && ic < obj->insts + obj->size) {
@@ -28,7 +28,7 @@ NativeCode *findNativeCodeAtIc(uint8_t *ic)
 void printMethodsUsage(void)
 {
 	PageSpaceIterator iterator;
-	pageSpaceIteratorInit(&iterator, &CurrentThread.heap.execSpace);
+	pageSpaceIteratorInit(&iterator, &CurrentThread.heap->execSpace);
 	NativeCode *code = (NativeCode *) pageSpaceIteratorNext(&iterator);
 
 	while (code != NULL) {

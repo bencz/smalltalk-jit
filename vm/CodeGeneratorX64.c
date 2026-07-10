@@ -814,7 +814,7 @@ void generateStoreCheck(CodeGenerator *generator, Register object, Register valu
 	asmInitLabel(&alreadyInSet);
 	asmInitLabel(&notFull);
 
-	ptrdiff_t rememberedSetOffset = offsetof(Thread, heap) + offsetof(Heap, rememberedSet);
+	ptrdiff_t rememberedSetOffset = offsetof(Thread, rememberedSet);
 	ptrdiff_t blocksOffset = rememberedSetOffset + offsetof(RememberedSet, blocks);
 	MemoryOperand blockCurrent = asmMem(TMP, NO_REGISTER, SS_1, offsetof(RememberedSetBlock, current));
 	MemoryOperand blockEnd = asmMem(TMP, NO_REGISTER, SS_1, offsetof(RememberedSetBlock, end));
@@ -1771,7 +1771,7 @@ NativeCode *buildNativeCode(CodeGenerator *generator)
 NativeCode *buildNativeCodeFromAssembler(AssemblerBuffer *buffer)
 {
 	size_t size = asmOffset(buffer);
-	NativeCode *code = allocateNativeCode(&CurrentThread.heap, size, buffer->pointersOffsetsSize);
+	NativeCode *code = allocateNativeCode(CurrentThread.heap, size, buffer->pointersOffsetsSize);
 	code->compiledCode = NULL;
 	code->argsSize = 0;
 	code->descriptors = NULL;
