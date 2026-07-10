@@ -6,6 +6,7 @@
 #include "vm/Scheduler.h"
 #include "vm/Isolate.h"
 #include "vm/Message.h"
+#include "vm/Safepoint.h"
 #include "vm/Cli.h"
 #include <unistd.h>
 #include <string.h>
@@ -65,6 +66,11 @@ int main(int argc, char **args)
 	// Phase 2 transport self-test (C-level): ST_TRANSPORT_TEST=1 ./st
 	if (getenv("ST_TRANSPORT_TEST") != NULL) {
 		return isolateTransportSelfTest();
+	}
+
+	// Multicore safepoint handshake self-test (C-level): ST_SAFEPOINT_TEST=1 ./st
+	if (getenv("ST_SAFEPOINT_TEST") != NULL) {
+		return safepointSelfTest();
 	}
 
 	// Phase 2 message-serializer self-test (needs the image): ST_MESSAGE_TEST=1 -s snap

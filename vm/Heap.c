@@ -140,28 +140,62 @@ static uint8_t *pageSpaceAllocate(PageSpace *pageSpace, size_t size)
 }
 
 
+// Carve a fresh TLAB from the nursery for this heap's mutator. Single-mutator
+// for now: hand the whole remaining nursery to the TLAB (so there are no gaps).
+// Returns 0 if the nursery lacks room for `realSize` (caller scavenges + retries).
+static _Bool tlabRefill(Heap *heap, size_t realSize)
+{
+	Scavenger *s = &heap->newSpace;
+	if ((size_t) (s->end - s->top) < realSize) {
+		return 0;
+	}
+	heap->thread->tlab.top = s->top;
+	heap->thread->tlab.end = s->end;
+	s->top = s->end; // the whole remaining nursery now belongs to the TLAB
+	return 1;
+}
+
+
 uint8_t *allocate(Heap *heap, size_t size)
 {
 	size_t realSize = align(size, HEAP_OBJECT_ALIGN);
-	uint8_t *p = scavengerTryAllocate(&heap->newSpace, realSize);
-	if (p == NULL) {
-		scavengerScavenge(&heap->newSpace);
-		// A scavenge that had to grow old space signals promotion pressure. Only
-		// escalate to a full GC once old-space capacity has grown past the moving
-		// threshold — growing to hold live promotions must NOT force a full GC.
-		if (heap->newSpace.hasPromotionFailure && heap->oldSpace.totalBytes >= heap->oldGcThreshold) {
-			markAndSweep(&CurrentThread);
-			heap->oldGcThreshold = heap->oldSpace.totalBytes * OLD_GC_GROWTH;
-			if (heap->oldGcThreshold < OLD_GC_MIN_THRESHOLD) {
-				heap->oldGcThreshold = OLD_GC_MIN_THRESHOLD;
-			}
+	TLAB *tlab = &heap->thread->tlab;
+
+	// Fast path: bump the TLAB. This is exactly what the JIT AllocateStub inlines,
+	// and (once TLABs are per-worker) it needs no lock.
+	if ((size_t) (tlab->end - tlab->top) >= realSize) {
+		uint8_t *p = tlab->top;
+		tlab->top += realSize;
+		return p;
+	}
+
+	// TLAB exhausted: refill from the nursery.
+	if (tlabRefill(heap, realSize)) {
+		uint8_t *p = tlab->top;
+		tlab->top += realSize;
+		return p;
+	}
+
+	// Nursery exhausted: scavenge (which invalidates the TLAB), then refill. A
+	// scavenge that had to grow old space signals promotion pressure; escalate to
+	// a full GC only once old-space capacity has grown past the moving threshold —
+	// growing to hold live promotions must NOT force a full GC.
+	scavengerScavenge(&heap->newSpace);
+	if (heap->newSpace.hasPromotionFailure && heap->oldSpace.totalBytes >= heap->oldGcThreshold) {
+		markAndSweep(heap->thread);
+		heap->oldGcThreshold = heap->oldSpace.totalBytes * OLD_GC_GROWTH;
+		if (heap->oldGcThreshold < OLD_GC_MIN_THRESHOLD) {
+			heap->oldGcThreshold = OLD_GC_MIN_THRESHOLD;
 		}
-		p = scavengerTryAllocate(&heap->newSpace, realSize);
 	}
-	if (p == NULL) {
-		p = tryAllocateOld(heap, realSize, 1);
+	if (tlabRefill(heap, realSize)) {
+		uint8_t *p = tlab->top;
+		tlab->top += realSize;
+		return p;
 	}
-	return p;
+
+	// Still no young room: fall back to old space.
+	return tryAllocateOld(heap, realSize, 1);
 }
 
 
@@ -207,7 +241,9 @@ void verifyHeap(Heap *heap)
 {
 	RawObject *object = (RawObject *) ((uintptr_t) heap->newSpace.fromSpace | NEW_SPACE_TAG);
 
-	while ((uint8_t *) object < heap->newSpace.top) {
+	// The young high-water is the TLAB cursor (newSpace.top was advanced when the
+	// TLAB carved its chunk, so it no longer marks the last live object).
+	while ((uint8_t *) object < heap->thread->tlab.top) {
 		verifyObject(heap, object);
 		object = (RawObject *) ((uint8_t *) object + align(computeRawObjectSize(object), HEAP_OBJECT_ALIGN));
 	}
@@ -259,7 +295,7 @@ void printHeap(Heap *heap)
 {
 	printf("Scavenger\n\t");
 	printHeapPage(heap->newSpace.page);
-	printf("\tfree space: %zi\n", heap->newSpace.top - heap->newSpace.fromSpace);
+	printf("\tfree space: %zi\n", heap->thread->tlab.top - heap->newSpace.fromSpace);
 
 	printf("Old space\n");
 	printPageSpace(&heap->oldSpace);

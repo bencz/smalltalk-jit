@@ -211,7 +211,9 @@ static void swapObjectInNewSpace(Object *old, Object *new)
 	size_t objects = 0;
 	RawObject *object = (RawObject *) ((uintptr_t) CurrentThread.heap.newSpace.fromSpace | NEW_SPACE_TAG);
 	RawObject *prev = NULL;
-	RawObject *end = (RawObject *) CurrentThread.heap.newSpace.top;
+	// The young allocation high-water now lives in the mutator's TLAB, not
+	// newSpace.top (which was advanced when the TLAB carved its chunk).
+	RawObject *end = (RawObject *) CurrentThread.tlab.top;
 	while (object < end) {
 		objects++;
 		iterateObject(object, old, new);

@@ -158,7 +158,7 @@ static void generateAllocate(CodeGenerator *generator)
 	ptrdiff_t sizeOffset = offsetof(RawClass, instanceShape) + offsetof(InstanceShape, size);
 	ptrdiff_t varsOffset = offsetof(RawClass, instanceShape) + offsetof(InstanceShape, varsSize);
 	ptrdiff_t isBytesOffset = offsetof(RawClass, instanceShape) + offsetof(InstanceShape, isBytes);
-	ptrdiff_t scavengerOffset = offsetof(Thread, heap) + offsetof(Heap, newSpace);
+	ptrdiff_t tlabOffset = offsetof(Thread, tlab);
 	ptrdiff_t payloadOffset = offsetof(RawClass, instanceShape) + offsetof(InstanceShape, payloadSize);
 	ptrdiff_t isIndexedOffset = offsetof(RawClass, instanceShape) + offsetof(InstanceShape, isIndexed);
 
@@ -201,14 +201,14 @@ static void generateAllocate(CodeGenerator *generator)
 
 	// check free space
 	asmMovqMem(buffer, asmMem(CTX, NO_REGISTER, SS_1, varOffset(RawContext, thread)), RBX); // RBX: thread
-	asmMovqMem(buffer, asmMem(RBX, NO_REGISTER, SS_1, scavengerOffset + offsetof(Scavenger, end)), TMP); // TMP: scavenger end
-	asmMovqMem(buffer, asmMem(RBX, NO_REGISTER, SS_1, scavengerOffset + offsetof(Scavenger, top)), RAX); // RAX: new object
-	asmSubq(buffer, RAX, TMP); // TMP: scavenger free space
+	asmMovqMem(buffer, asmMem(RBX, NO_REGISTER, SS_1, tlabOffset + offsetof(TLAB, end)), TMP); // TMP: TLAB end
+	asmMovqMem(buffer, asmMem(RBX, NO_REGISTER, SS_1, tlabOffset + offsetof(TLAB, top)), RAX); // RAX: new object
+	asmSubq(buffer, RAX, TMP); // TMP: TLAB free space
 	asmCmpq(buffer, RCX, TMP);
 	asmJ(buffer, COND_ABOVE, &noFreeSpace);
 
 	// move top cursor
-	asmAddqToMem(buffer, RCX, asmMem(RBX, NO_REGISTER, SS_1, scavengerOffset + offsetof(Scavenger, top)));
+	asmAddqToMem(buffer, RCX, asmMem(RBX, NO_REGISTER, SS_1, tlabOffset + offsetof(TLAB, top)));
 
 	// class
 	asmMovqToMem(buffer, RSI, asmMem(RAX, NO_REGISTER, SS_1, offsetof(RawObject, class)));

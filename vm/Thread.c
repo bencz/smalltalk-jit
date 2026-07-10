@@ -10,6 +10,10 @@ __thread Thread CurrentThread = { 0 };
 void initThread(Thread *thread)
 {
 	initHeap(&thread->heap, thread);
+	// Start with an empty TLAB (top == end) pointing at the fresh nursery top, so
+	// the first allocation takes the refill path and carves a real chunk.
+	thread->tlab.top = thread->heap.newSpace.top;
+	thread->tlab.end = thread->heap.newSpace.top;
 	thread->stackFramesTail = NULL;
 }
 

@@ -46,6 +46,7 @@ set(vmSources
 	vm/Primitives.c
 	vm/RegisterAllocator.c
 	vm/Repl.c
+	vm/Safepoint.c
 	vm/Scavenger.c
 	vm/Scheduler.c
 	vm/Scope.c

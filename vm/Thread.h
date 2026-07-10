@@ -7,12 +7,22 @@ struct HandleScope;
 struct StackFrame;
 struct EntryStackFrame;
 
+// Per-mutator thread-local allocation buffer: a chunk carved from the shared
+// young space that this OS thread bump-allocates into WITHOUT locking (Go's
+// mcache idea). `top` carries NEW_SPACE_TAG like Scavenger.top; `end` is
+// untagged; free bytes = end - top. Refilled from the nursery when exhausted.
+typedef struct TLAB {
+	uint8_t *top;
+	uint8_t *end;
+} TLAB;
+
 typedef struct Thread {
 	Heap heap;
 	struct Handle *handles;
 	struct HandleScope *handleScopes;
 	Value context;
 	struct EntryStackFrame *stackFramesTail;
+	TLAB tlab; // appended last so existing field offsets (used by the JIT) don't shift
 } Thread;
 
 extern __thread Thread CurrentThread;
