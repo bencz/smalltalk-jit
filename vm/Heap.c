@@ -149,8 +149,10 @@ static _Bool tlabRefill(Heap *heap, size_t realSize)
 	if ((size_t) (s->end - s->top) < realSize) {
 		return 0;
 	}
-	heap->thread->tlab.top = s->top;
-	heap->thread->tlab.end = s->end;
+	// The TLAB belongs to the OS thread doing the allocation, not to whoever
+	// created the (soon shared) heap — reach it through the thread-local mutator.
+	CurrentThread.tlab.top = s->top;
+	CurrentThread.tlab.end = s->end;
 	s->top = s->end; // the whole remaining nursery now belongs to the TLAB
 	return 1;
 }
@@ -159,7 +161,7 @@ static _Bool tlabRefill(Heap *heap, size_t realSize)
 uint8_t *allocate(Heap *heap, size_t size)
 {
 	size_t realSize = align(size, HEAP_OBJECT_ALIGN);
-	TLAB *tlab = &heap->thread->tlab;
+	TLAB *tlab = &CurrentThread.tlab;
 
 	// Fast path: bump the TLAB. This is exactly what the JIT AllocateStub inlines,
 	// and (once TLABs are per-worker) it needs no lock.
@@ -243,7 +245,7 @@ void verifyHeap(Heap *heap)
 
 	// The young high-water is the TLAB cursor (newSpace.top was advanced when the
 	// TLAB carved its chunk, so it no longer marks the last live object).
-	while ((uint8_t *) object < heap->thread->tlab.top) {
+	while ((uint8_t *) object < CurrentThread.tlab.top) {
 		verifyObject(heap, object);
 		object = (RawObject *) ((uint8_t *) object + align(computeRawObjectSize(object), HEAP_OBJECT_ALIGN));
 	}
@@ -295,7 +297,7 @@ void printHeap(Heap *heap)
 {
 	printf("Scavenger\n\t");
 	printHeapPage(heap->newSpace.page);
-	printf("\tfree space: %zi\n", heap->thread->tlab.top - heap->newSpace.fromSpace);
+	printf("\tfree space: %zi\n", CurrentThread.tlab.top - heap->newSpace.fromSpace);
 
 	printf("Old space\n");
 	printPageSpace(&heap->oldSpace);
