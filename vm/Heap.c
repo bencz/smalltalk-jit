@@ -40,6 +40,7 @@ void initHeap(Heap *heap, struct Thread *thread)
 	initPageSpace(&heap->execSpace, 256 * KB, 1);
 	heap->oldGcThreshold = OLD_GC_MIN_THRESHOLD;
 	pthread_mutex_init(&heap->youngLock, NULL);
+	pthread_mutex_init(&heap->oldLock, NULL);
 	heap->mutators = NULL;
 }
 
@@ -252,10 +253,12 @@ uint8_t *allocate(Heap *heap, size_t size)
 uint8_t *tryAllocateOld(Heap *heap, size_t size, _Bool grow)
 {
 	size_t realSize = align(size, HEAP_OBJECT_ALIGN);
+	pthread_mutex_lock(&heap->oldLock);
 	uint8_t *p = pageSpaceTryAllocate(&heap->oldSpace, realSize);
 	if (p == NULL && grow) {
 		p = pageSpaceAllocate(&heap->oldSpace, realSize);
 	}
+	pthread_mutex_unlock(&heap->oldLock);
 	ASSERT(p == NULL || isOldObject((RawObject *) p));
 	return p;
 }
@@ -408,7 +411,11 @@ static void *tlabTestWorker(void *arg)
 	memset(&CurrentThread, 0, sizeof(Thread));
 	CurrentThread.heap = &gTlabTestHeap;
 	for (int i = 0; i < TLAB_TEST_ALLOCS; i++) {
-		uint8_t *p = allocate(&gTlabTestHeap, TLAB_TEST_OBJSIZE);
+		// Alternate young (TLAB carve under youngLock) and old (free list under
+		// oldLock) so both shared allocators are hammered concurrently.
+		uint8_t *p = (i & 1)
+			? tryAllocateOld(&gTlabTestHeap, TLAB_TEST_OBJSIZE, 1)
+			: allocate(&gTlabTestHeap, TLAB_TEST_OBJSIZE);
 		*(uint64_t *) p = ((uint64_t) ta->id << 32) | (uint64_t) i; // stamp
 		ta->ptrs[i] = p;
 	}
@@ -444,7 +451,7 @@ int tlabConcurrencySelfTest(void)
 	}
 
 	long total = (long) TLAB_TEST_WORKERS * TLAB_TEST_ALLOCS;
-	fprintf(stderr, "tlab concurrency self-test: %d threads x %d allocs = %ld objects on ONE shared heap, clobbered=%ld -> %s\n",
+	fprintf(stderr, "shared-heap alloc self-test: %d threads x %d allocs = %ld objects (young+old) on ONE shared heap, clobbered=%ld -> %s\n",
 		TLAB_TEST_WORKERS, TLAB_TEST_ALLOCS, total, clobbered, clobbered == 0 ? "PASS" : "FAIL");
 	return clobbered == 0 ? 0 : 1;
 }
