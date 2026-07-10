@@ -277,12 +277,16 @@ static void iterateFiberRoots(Scavenger *scavenger, Fiber *fiber)
 // Non-scheduler (bootstrap) path: the single thread's roots, walked directly.
 static void iterateThreadRoots(Scavenger *scavenger)
 {
-	Thread *thread = scavenger->heap->thread;
-	iterateStackFrames(scavenger, thread->stackFramesTail);
+	// The collector's own exception-handler chain (per-OS-thread TLS). Other
+	// mutators parked at a safepoint don't use exceptions across the boundary yet.
 	iterateExceptionHandlerSlot(scavenger, &CurrentExceptionHandler);
-	iterateHandleScopes(scavenger, thread->handleScopes);
-	if (thread->context != 0) {
-		processTaggedPointer(scavenger, &thread->context);
+	// Every OS thread mutating this heap: its stack, handle scopes and root context.
+	for (Thread *thread = scavenger->heap->mutators; thread != NULL; thread = thread->nextMutator) {
+		iterateStackFrames(scavenger, thread->stackFramesTail);
+		iterateHandleScopes(scavenger, thread->handleScopes);
+		if (thread->context != 0) {
+			processTaggedPointer(scavenger, &thread->context);
+		}
 	}
 }
 

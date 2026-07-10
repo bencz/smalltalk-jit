@@ -41,6 +41,10 @@ void initHeap(Heap *heap, struct Thread *thread)
 	heap->oldGcThreshold = OLD_GC_MIN_THRESHOLD;
 	pthread_mutex_init(&heap->youngLock, NULL);
 	pthread_mutex_init(&heap->oldLock, NULL);
+	pthread_mutex_init(&heap->gcLock, NULL);
+	pthread_mutex_init(&heap->safepointLock, NULL);
+	pthread_cond_init(&heap->safepointCond, NULL);
+	heap->safepointRequested = 0;
 	heap->mutators = NULL;
 }
 
@@ -53,6 +57,77 @@ void heapAddMutator(Heap *heap, struct Thread *thread)
 	thread->nextMutator = heap->mutators;
 	heap->mutators = thread;
 	pthread_mutex_unlock(&heap->youngLock);
+}
+
+
+// ---- stop-the-world safepoint handshake (per shared heap) ------------------
+// Mirrors vm/Safepoint.c but scoped to ONE heap's mutators (heap->mutators), so
+// a collection on the shared heap never stops threads of a different isolate.
+
+void heapGcPoll(Heap *heap, Thread *self)
+{
+	if (!__atomic_load_n(&heap->safepointRequested, __ATOMIC_ACQUIRE)) {
+		return; // hot path: one acquire load
+	}
+	pthread_mutex_lock(&heap->safepointLock);
+	if (__atomic_load_n(&heap->safepointRequested, __ATOMIC_ACQUIRE)) {
+		self->spAtSafepoint = 1;
+		pthread_cond_broadcast(&heap->safepointCond); // wake a waiting collector
+		while (__atomic_load_n(&heap->safepointRequested, __ATOMIC_ACQUIRE)) {
+			pthread_cond_wait(&heap->safepointCond, &heap->safepointLock);
+		}
+		self->spAtSafepoint = 0;
+	}
+	pthread_mutex_unlock(&heap->safepointLock);
+}
+
+static int heapAllSafe(Heap *heap, Thread *exclude)
+{
+	for (Thread *t = heap->mutators; t != NULL; t = t->nextMutator) {
+		if (t == exclude) {
+			continue;
+		}
+		if (!t->spAtSafepoint && !t->spBlocked) {
+			return 0;
+		}
+	}
+	return 1;
+}
+
+void heapGcBegin(Heap *heap, Thread *self)
+{
+	pthread_mutex_lock(&heap->safepointLock);
+	__atomic_store_n(&heap->safepointRequested, 1, __ATOMIC_RELEASE);
+	while (!heapAllSafe(heap, self)) {
+		pthread_cond_wait(&heap->safepointCond, &heap->safepointLock);
+	}
+	pthread_mutex_unlock(&heap->safepointLock);
+}
+
+void heapGcEnd(Heap *heap)
+{
+	pthread_mutex_lock(&heap->safepointLock);
+	__atomic_store_n(&heap->safepointRequested, 0, __ATOMIC_RELEASE);
+	pthread_cond_broadcast(&heap->safepointCond);
+	pthread_mutex_unlock(&heap->safepointLock);
+}
+
+void heapGcEnterBlocked(Heap *heap, Thread *self)
+{
+	pthread_mutex_lock(&heap->safepointLock);
+	self->spBlocked = 1;
+	pthread_cond_broadcast(&heap->safepointCond);
+	pthread_mutex_unlock(&heap->safepointLock);
+}
+
+void heapGcLeaveBlocked(Heap *heap, Thread *self)
+{
+	pthread_mutex_lock(&heap->safepointLock);
+	while (__atomic_load_n(&heap->safepointRequested, __ATOMIC_ACQUIRE)) {
+		pthread_cond_wait(&heap->safepointCond, &heap->safepointLock);
+	}
+	self->spBlocked = 0;
+	pthread_mutex_unlock(&heap->safepointLock);
 }
 
 
@@ -207,45 +282,74 @@ static _Bool tlabRefill(Heap *heap, size_t realSize)
 }
 
 
+// Reclaim young space. When the heap is shared by several mutators, coordinate a
+// stop-the-world safepoint (one collector via gcLock; every other mutator parked
+// at a poll) so a scavenge never moves objects under a running worker. A single-
+// mutator heap (main alone, or an isolate) collects directly — behaviourally
+// identical to before.
+static void heapCollectYoung(Heap *heap, size_t realSize)
+{
+	if (heap->mutators == NULL || heap->mutators->nextMutator == NULL) {
+		scavengerScavenge(&heap->newSpace);
+		if (heap->newSpace.hasPromotionFailure && heap->oldSpace.totalBytes >= heap->oldGcThreshold) {
+			markAndSweep(&CurrentThread);
+			heap->oldGcThreshold = heap->oldSpace.totalBytes * OLD_GC_GROWTH;
+			if (heap->oldGcThreshold < OLD_GC_MIN_THRESHOLD) {
+				heap->oldGcThreshold = OLD_GC_MIN_THRESHOLD;
+			}
+		}
+		return;
+	}
+
+	heapGcEnterBlocked(heap, &CurrentThread); // blocking on gcLock counts as safe
+	pthread_mutex_lock(&heap->gcLock);
+	heapGcLeaveBlocked(heap, &CurrentThread);
+	// A peer may have freed space while we waited for gcLock.
+	if ((size_t) (heap->newSpace.end - heap->newSpace.top) < realSize) {
+		heapGcBegin(heap, &CurrentThread); // park every other mutator
+		scavengerScavenge(&heap->newSpace);
+		if (heap->newSpace.hasPromotionFailure && heap->oldSpace.totalBytes >= heap->oldGcThreshold) {
+			markAndSweep(&CurrentThread);
+			heap->oldGcThreshold = heap->oldSpace.totalBytes * OLD_GC_GROWTH;
+			if (heap->oldGcThreshold < OLD_GC_MIN_THRESHOLD) {
+				heap->oldGcThreshold = OLD_GC_MIN_THRESHOLD;
+			}
+		}
+		heapGcEnd(heap);
+	}
+	pthread_mutex_unlock(&heap->gcLock);
+}
+
+
 uint8_t *allocate(Heap *heap, size_t size)
 {
 	size_t realSize = align(size, HEAP_OBJECT_ALIGN);
 	TLAB *tlab = &CurrentThread.tlab;
 
-	// Fast path: bump the TLAB. This is exactly what the JIT AllocateStub inlines,
-	// and (once TLABs are per-worker) it needs no lock.
+	// Fast path: bump the TLAB (also inlined by the JIT AllocateStub).
 	if ((size_t) (tlab->end - tlab->top) >= realSize) {
 		uint8_t *p = tlab->top;
 		tlab->top += realSize;
 		return p;
 	}
 
-	// TLAB exhausted: refill from the nursery.
+	// Slow path = a GC safepoint poll point: if a peer mutator is collecting this
+	// shared heap, park here until it finishes (our TLAB is reset by its scavenge).
+	heapGcPoll(heap, &CurrentThread);
+
 	if (tlabRefill(heap, realSize)) {
 		uint8_t *p = tlab->top;
 		tlab->top += realSize;
 		return p;
 	}
 
-	// Nursery exhausted: scavenge (which invalidates the TLAB), then refill. A
-	// scavenge that had to grow old space signals promotion pressure; escalate to
-	// a full GC only once old-space capacity has grown past the moving threshold —
-	// growing to hold live promotions must NOT force a full GC.
-	scavengerScavenge(&heap->newSpace);
-	if (heap->newSpace.hasPromotionFailure && heap->oldSpace.totalBytes >= heap->oldGcThreshold) {
-		markAndSweep(heap->thread);
-		heap->oldGcThreshold = heap->oldSpace.totalBytes * OLD_GC_GROWTH;
-		if (heap->oldGcThreshold < OLD_GC_MIN_THRESHOLD) {
-			heap->oldGcThreshold = OLD_GC_MIN_THRESHOLD;
-		}
-	}
+	heapCollectYoung(heap, realSize);
+
 	if (tlabRefill(heap, realSize)) {
 		uint8_t *p = tlab->top;
 		tlab->top += realSize;
 		return p;
 	}
-
-	// Still no young room: fall back to old space.
 	return tryAllocateOld(heap, realSize, 1);
 }
 

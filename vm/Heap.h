@@ -28,9 +28,23 @@ typedef struct Heap {
 	// so the GC can scan the roots of all of them, not just the collecting thread.
 	// One entry today (the owner); several once worker threads share the heap.
 	struct Thread *mutators;
+	// --- stop-the-world GC coordination for a shared heap ---
+	// gcLock: at most one collector at a time. safepoint{Lock,Cond,Requested}: the
+	// handshake — a collector parks every other mutator (they poll at allocation
+	// slow paths) before touching the object graph. Unused while single-mutator.
+	pthread_mutex_t gcLock;
+	pthread_mutex_t safepointLock;
+	pthread_cond_t safepointCond;
+	int safepointRequested;
 } Heap;
 
 void heapAddMutator(Heap *heap, struct Thread *thread);
+// Stop-the-world coordination (shared heap). `self` is excluded from the wait.
+void heapGcPoll(Heap *heap, struct Thread *self);
+void heapGcBegin(Heap *heap, struct Thread *self);
+void heapGcEnd(Heap *heap);
+void heapGcEnterBlocked(Heap *heap, struct Thread *self);
+void heapGcLeaveBlocked(Heap *heap, struct Thread *self);
 
 void initHeap(Heap *heap, struct Thread *thread);
 void freeHeap(Heap *heap);

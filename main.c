@@ -104,8 +104,10 @@ static int workerSelfTest(void)
 	handle(asObject(gWorkerBlock)); // keep it alive on the main mutator across the spawn
 
 	pthread_t worker;
+	heapGcEnterBlocked(gWorkerHeap, &CurrentThread); // main is idle: safe for the worker's GC
 	pthread_create(&worker, NULL, workerRunBlock, NULL);
 	pthread_join(worker, NULL);
+	heapGcLeaveBlocked(gWorkerHeap, &CurrentThread);
 
 	closeHandleScope(&scope, NULL);
 	long result = valueTypeOf(gWorkerResult, VALUE_INT) ? (long) asCInt(gWorkerResult) : -1;
@@ -171,6 +173,7 @@ static int parallelSelfTest(void)
 	runBlockOnce(gWorkerBlock);  // serial baseline: one run
 	int64_t serialUs = osCurrentMicroTime() - s0;
 
+	heapGcEnterBlocked(gWorkerHeap, &CurrentThread); // main idle while the workers run
 	int64_t p0 = osCurrentMicroTime();
 	pthread_t th[PAR_WORKERS];
 	for (long w = 0; w < PAR_WORKERS; w++) {
@@ -180,6 +183,7 @@ static int parallelSelfTest(void)
 		pthread_join(th[w], NULL);
 	}
 	int64_t parUs = osCurrentMicroTime() - p0;
+	heapGcLeaveBlocked(gWorkerHeap, &CurrentThread);
 
 	int ok = 1;
 	for (int w = 0; w < PAR_WORKERS; w++) {
@@ -193,6 +197,50 @@ static int parallelSelfTest(void)
 	double speedup = parUs > 0 ? (double) PAR_WORKERS * (double) serialUs / (double) parUs : 0.0;
 	fprintf(stderr, "parallel self-test: %d workers ran Smalltalk sum(1..30M) CONCURRENTLY on the shared heap | serial=%ldms parallel(%dx work)=%ldms speedup=%.1fx | all-correct=%d -> %s\n",
 		PAR_WORKERS, (long) (serialUs / 1000), PAR_WORKERS, (long) (parUs / 1000), speedup, ok, ok ? "PASS" : "FAIL");
+	return ok ? 0 : 1;
+}
+
+
+// ---- parallel Smalltalk WITH allocation + safepoint-coordinated GC ---------
+// N workers each run an allocation-heavy block CONCURRENTLY: 400k short-lived
+// Arrays => many young scavenges. When one worker's nursery fills it becomes the
+// collector (heapGcBegin parks the others at their allocation polls), scavenges
+// the shared heap scanning EVERY mutator's roots, then resumes them. If the
+// safepoint/root-scan were wrong, a worker's live objects would be moved out from
+// under it and the result would be corrupt.
+static int parallelGcSelfTest(void)
+{
+	HandleScope scope;
+	openHandleScope(&scope);
+	gWorkerHeap = CurrentThread.heap;
+	gMainHandles = Handles;
+	gWorkerBlock = evalObject("[ | n | n := 0. 1 to: 400000 do: [:i | n := n + (Array new: 2) size]. n ]");
+	handle(asObject(gWorkerBlock));
+	long expected = 800000; // 2 * 400000
+	runBlockOnce(gWorkerBlock); // warm up JIT compilation
+
+	heapGcEnterBlocked(gWorkerHeap, &CurrentThread);
+	int64_t t0 = osCurrentMicroTime();
+	pthread_t th[PAR_WORKERS];
+	for (long w = 0; w < PAR_WORKERS; w++) {
+		pthread_create(&th[w], NULL, parWorker, (void *) w);
+	}
+	for (int w = 0; w < PAR_WORKERS; w++) {
+		pthread_join(th[w], NULL);
+	}
+	int64_t us = osCurrentMicroTime() - t0;
+	heapGcLeaveBlocked(gWorkerHeap, &CurrentThread);
+
+	int ok = 1;
+	for (int w = 0; w < PAR_WORKERS; w++) {
+		long r = valueTypeOf(gParResults[w], VALUE_INT) ? (long) asCInt(gParResults[w]) : -1;
+		if (r != expected) {
+			ok = 0;
+		}
+	}
+	closeHandleScope(&scope, NULL);
+	fprintf(stderr, "parallel-GC self-test: %d workers each allocated 400k Arrays CONCURRENTLY on the shared heap in %ldms (safepoint-coordinated scavenges) | all-correct=%d -> %s\n",
+		PAR_WORKERS, (long) (us / 1000), ok, ok ? "PASS" : "FAIL");
 	return ok ? 0 : 1;
 }
 
@@ -244,6 +292,13 @@ int main(int argc, char **args)
 		initThread(&CurrentThread);
 		bootstrapSmalltalk(cliArgs.snapshotFileName, cliArgs.bootstrapDir);
 		return parallelSelfTest();
+	}
+
+	// Parallel Smalltalk WITH allocation + safepoint-coordinated GC: ST_PARGC_TEST=1 -s snap
+	if (getenv("ST_PARGC_TEST") != NULL) {
+		initThread(&CurrentThread);
+		bootstrapSmalltalk(cliArgs.snapshotFileName, cliArgs.bootstrapDir);
+		return parallelGcSelfTest();
 	}
 
 	initThread(&CurrentThread);
