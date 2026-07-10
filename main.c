@@ -73,6 +73,11 @@ int main(int argc, char **args)
 		return safepointSelfTest();
 	}
 
+	// Concurrent shared-heap allocation self-test (C-level): ST_TLAB_TEST=1 ./st
+	if (getenv("ST_TLAB_TEST") != NULL) {
+		return tlabConcurrencySelfTest();
+	}
+
 	// Phase 2 message-serializer self-test (needs the image): ST_MESSAGE_TEST=1 -s snap
 	if (getenv("ST_MESSAGE_TEST") != NULL) {
 		initThread(&CurrentThread);

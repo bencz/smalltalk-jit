@@ -215,6 +215,10 @@ static void swapObjectInNewSpace(Object *old, Object *new)
 	// newSpace.top (which was advanced when the TLAB carved its chunk).
 	RawObject *end = (RawObject *) CurrentThread.tlab.top;
 	while (object < end) {
+		if ((object->tags & TAG_FREESPACE) != 0) { // retired TLAB tail: skip
+			object = (RawObject *) ((uint8_t *) object + ((FreeSpace *) object)->size);
+			continue;
+		}
 		objects++;
 		iterateObject(object, old, new);
 		prev = object;

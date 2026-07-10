@@ -6,6 +6,8 @@
 #include "CompiledCode.h"
 #include "String.h"
 #include <string.h>
+#include <stdlib.h>
+#include <pthread.h>
 
 #define KB 1024
 #define MB (1024 * 1024)
@@ -37,6 +39,7 @@ void initHeap(Heap *heap, struct Thread *thread)
 	initPageSpace(&heap->oldSpace, 256 * KB, 0);
 	initPageSpace(&heap->execSpace, 256 * KB, 1);
 	heap->oldGcThreshold = OLD_GC_MIN_THRESHOLD;
+	pthread_mutex_init(&heap->youngLock, NULL);
 }
 
 
@@ -139,20 +142,54 @@ static uint8_t *pageSpaceAllocate(PageSpace *pageSpace, size_t size)
 }
 
 
-// Carve a fresh TLAB from the nursery for this heap's mutator. Single-mutator
-// for now: hand the whole remaining nursery to the TLAB (so there are no gaps).
-// Returns 0 if the nursery lacks room for `realSize` (caller scavenges + retries).
+// How much young space a single TLAB refill carves. Small enough that several
+// worker OS threads share one nursery; large enough to amortise the lock.
+#define TLAB_CHUNK_BYTES (256 * KB)
+
+// Write a filler over an abandoned TLAB tail so the nursery stays linearly
+// parseable across the gap. Young addresses carry NEW_SPACE_TAG (so `p` is not
+// 16-aligned) — write the FreeSpace header inline rather than via createFreeSpace
+// (whose assert would reject the tagged pointer). Layout matches FreeSpace, so
+// linear walkers detect TAG_FREESPACE (offset 15) and skip `size` bytes.
+static void youngFill(uint8_t *p, size_t size)
+{
+	FreeSpace *filler = (FreeSpace *) p;
+	filler->next = NULL;
+	filler->size = size;
+	filler->tags = TAG_FREESPACE;
+}
+
+// Carve a fresh TLAB chunk from the shared young space for the CALLING OS thread.
+// The per-mutator bump (fast path, in allocate()/the JIT) is lock-free; only this
+// refill takes youngLock, so multiple workers can share one nursery. Returns 0 if
+// the nursery lacks room for `realSize` (caller scavenges + retries).
 static _Bool tlabRefill(Heap *heap, size_t realSize)
 {
+	pthread_mutex_lock(&heap->youngLock);
 	Scavenger *s = &heap->newSpace;
-	if ((size_t) (s->end - s->top) < realSize) {
+	size_t available = (size_t) (s->end - s->top);
+	if (available < realSize) {
+		pthread_mutex_unlock(&heap->youngLock);
 		return 0;
 	}
-	// The TLAB belongs to the OS thread doing the allocation, not to whoever
-	// created the (soon shared) heap — reach it through the thread-local mutator.
+
+	// Retire the tail of the current TLAB into a filler (only now, when we are
+	// actually replacing it) so the abandoned bytes remain walkable.
+	size_t tail = (size_t) (CurrentThread.tlab.end - CurrentThread.tlab.top);
+	if (tail >= HEAP_OBJECT_ALIGN) {
+		youngFill(CurrentThread.tlab.top, tail);
+	}
+
+	size_t chunk = TLAB_CHUNK_BYTES < realSize ? realSize : TLAB_CHUNK_BYTES;
+	chunk = align(chunk, HEAP_OBJECT_ALIGN);
+	if (chunk > available) {
+		chunk = available;
+	}
+	// tlab.top carries NEW_SPACE_TAG (inherited from s->top); free = end - top.
 	CurrentThread.tlab.top = s->top;
-	CurrentThread.tlab.end = s->end;
-	s->top = s->end; // the whole remaining nursery now belongs to the TLAB
+	CurrentThread.tlab.end = s->top + chunk;
+	s->top += chunk;
+	pthread_mutex_unlock(&heap->youngLock);
 	return 1;
 }
 
@@ -245,6 +282,10 @@ void verifyHeap(Heap *heap)
 	// The young high-water is the TLAB cursor (newSpace.top was advanced when the
 	// TLAB carved its chunk, so it no longer marks the last live object).
 	while ((uint8_t *) object < CurrentThread.tlab.top) {
+		if ((object->tags & TAG_FREESPACE) != 0) { // retired TLAB tail
+			object = (RawObject *) ((uint8_t *) object + ((FreeSpace *) object)->size);
+			continue;
+		}
 		verifyObject(heap, object);
 		object = (RawObject *) ((uint8_t *) object + align(computeRawObjectSize(object), HEAP_OBJECT_ALIGN));
 	}
@@ -327,4 +368,71 @@ static void printPageSpace(PageSpace *space)
 		printf("\t");
 		printFreeSpace(freeSpace);
 	}*/
+}
+
+
+// ---- concurrent shared-heap allocation self-test (ST_TLAB_TEST=1) ----------
+// N OS threads allocate from ONE shared young space at the same time, each via
+// the real allocate() path (lock-free TLAB bump + youngLock-guarded refill), and
+// stamp a unique 64-bit value into every object they are handed. If the locked
+// carve ever handed two threads overlapping memory, a stamp would be clobbered.
+// Sized to stay within the nursery so no scavenge/old-space fallback is hit.
+
+#define TLAB_TEST_WORKERS 8
+#define TLAB_TEST_ALLOCS  20000
+#define TLAB_TEST_OBJSIZE 48
+
+static Heap gTlabTestHeap;
+
+typedef struct {
+	long id;
+	uint8_t **ptrs;
+} TlabTestArg;
+
+static void *tlabTestWorker(void *arg)
+{
+	TlabTestArg *ta = arg;
+	// A fresh thread-local mutator that SHARES the one test heap.
+	memset(&CurrentThread, 0, sizeof(Thread));
+	CurrentThread.heap = &gTlabTestHeap;
+	for (int i = 0; i < TLAB_TEST_ALLOCS; i++) {
+		uint8_t *p = allocate(&gTlabTestHeap, TLAB_TEST_OBJSIZE);
+		*(uint64_t *) p = ((uint64_t) ta->id << 32) | (uint64_t) i; // stamp
+		ta->ptrs[i] = p;
+	}
+	return NULL;
+}
+
+int tlabConcurrencySelfTest(void)
+{
+	memset(&CurrentThread, 0, sizeof(Thread));
+	CurrentThread.heap = &gTlabTestHeap;
+	initHeap(&gTlabTestHeap, &CurrentThread);
+
+	pthread_t threads[TLAB_TEST_WORKERS];
+	TlabTestArg args[TLAB_TEST_WORKERS];
+	for (long w = 0; w < TLAB_TEST_WORKERS; w++) {
+		args[w].id = w;
+		args[w].ptrs = malloc(TLAB_TEST_ALLOCS * sizeof(uint8_t *));
+		pthread_create(&threads[w], NULL, tlabTestWorker, &args[w]);
+	}
+	for (int w = 0; w < TLAB_TEST_WORKERS; w++) {
+		pthread_join(threads[w], NULL);
+	}
+
+	long clobbered = 0;
+	for (long w = 0; w < TLAB_TEST_WORKERS; w++) {
+		for (int i = 0; i < TLAB_TEST_ALLOCS; i++) {
+			uint64_t expect = ((uint64_t) w << 32) | (uint64_t) i;
+			if (*(uint64_t *) args[w].ptrs[i] != expect) {
+				clobbered++;
+			}
+		}
+		free(args[w].ptrs);
+	}
+
+	long total = (long) TLAB_TEST_WORKERS * TLAB_TEST_ALLOCS;
+	fprintf(stderr, "tlab concurrency self-test: %d threads x %d allocs = %ld objects on ONE shared heap, clobbered=%ld -> %s\n",
+		TLAB_TEST_WORKERS, TLAB_TEST_ALLOCS, total, clobbered, clobbered == 0 ? "PASS" : "FAIL");
+	return clobbered == 0 ? 0 : 1;
 }

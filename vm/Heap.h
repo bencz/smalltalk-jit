@@ -5,6 +5,7 @@
 #include "HeapPage.h"
 #include "Scavenger.h"
 #include "RememberedSet.h"
+#include <pthread.h>
 
 struct Thread;
 struct NativeCode;
@@ -15,6 +16,10 @@ typedef struct Heap {
 	PageSpace oldSpace;
 	PageSpace execSpace;
 	size_t oldGcThreshold; // run a full GC only once old space grows past this
+	// Guards carving TLAB chunks out of the shared young space: the per-mutator
+	// bump inside a TLAB stays lock-free; only the (rare) refill takes this lock,
+	// so several worker OS threads can share one nursery.
+	pthread_mutex_t youngLock;
 } Heap;
 
 void initHeap(Heap *heap, struct Thread *thread);
@@ -28,5 +33,6 @@ void collectGarbage(struct Thread *thread);
 void markAndSweep(struct Thread *thread);
 void verifyHeap(Heap *heap);
 void printHeap(Heap *heap);
+int tlabConcurrencySelfTest(void); // ST_TLAB_TEST=1 ./st
 
 #endif
