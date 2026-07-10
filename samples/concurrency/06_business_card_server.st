@@ -24,35 +24,8 @@
      GET  /health                               -> {status:ok}
   ============================================================"
 
-"---- Command messages -------------------------------------------------------"
-RegisterUser := Object [
-	| name email |
-	class name: aName email: anEmail [ ^self new setName: aName email: anEmail ]
-	setName: aName email: anEmail [ name := aName. email := anEmail. ^self ]
-	name [ ^name ]  email [ ^email ]
-]
-
-CreateCard := Object [
-	| owner fields |
-	class owner: anOwner fields: aDict [ ^self new setOwner: anOwner fields: aDict ]
-	setOwner: anOwner fields: aDict [ owner := anOwner. fields := aDict. ^self ]
-	owner [ ^owner ]  fields [ ^fields ]
-]
-
-LookupUser := Object [
-	| id |
-	class id: anId [ ^self new setId: anId ]
-	setId: anId [ id := anId. ^self ]
-	id [ ^id ]
-]
-
-LookupCard := Object [
-	| id |
-	class id: anId [ ^self new setId: anId ]
-	setId: anId [ id := anId. ^self ]
-	id [ ^id ]
-]
-
+"---- The only command message still sent to an actor: tell a UserActor it now
+     owns a card. Resolution/registration are plain method calls on CardDirectory. --"
 AddCard := Object [
 	| cardId |
 	class id: anId [ ^self new setId: anId ]
@@ -111,31 +84,38 @@ BusinessCardActor := Actor [
 	]
 ]
 
-Directory := Actor [
+"A plain id->Pid registry -- NOT an actor. Reads are direct O(1) dictionary hits on
+ the caller's own fiber (no mailbox, no round-trip); writes are synchronous and thus
+ atomic under the cooperative single-OS-thread scheduler (no await/I/O/yield between the
+ counter bump and the store, and spawn/tell don't yield the caller). Only mutation of
+ owned state stays an actor round-trip: BusinessCardActor>>#view."
+CardDirectory := Object [
 	| users cards userSeq cardSeq |
-	started: ctx [ users := Dictionary new. cards := Dictionary new. userSeq := 0. cardSeq := 0 ]
-	receiveMessage: ctx [
-		| m |
-		m := ctx message.
-		m == #ping ifTrue: [ ^ctx respond: ((Dictionary new: 8) at: 'status' put: 'ok'; yourself) ].
-		(m isKindOf: RegisterUser) ifTrue: [
-			| uid pid |
-			userSeq := userSeq + 1. uid := userSeq.
-			pid := ctx spawn: (Props fromProducer: [ UserActor id: uid name: m name email: m email ]).
-			users at: uid put: pid.
-			^ctx respond: uid ].
-		(m isKindOf: CreateCard) ifTrue: [
-			| ownerPid cid cardPid |
-			ownerPid := users at: m owner ifAbsent: [ nil ].
-			ownerPid isNil ifTrue: [ ^ctx respond: nil ].
-			cardSeq := cardSeq + 1. cid := cardSeq.
-			cardPid := ctx spawn: (Props fromProducer: [ BusinessCardActor id: cid owner: m owner fields: m fields ]).
-			cards at: cid put: cardPid.
-			ownerPid tell: (AddCard id: cid).
-			^ctx respond: cid ].
-		(m isKindOf: LookupUser) ifTrue: [ ^ctx respond: (users at: m id ifAbsent: [ nil ]) ].
-		(m isKindOf: LookupCard) ifTrue: [ ^ctx respond: (cards at: m id ifAbsent: [ nil ]) ].
-	]
+
+	class new [ ^super new init ]
+	init [ users := Dictionary new. cards := Dictionary new. userSeq := 0. cardSeq := 0. ^self ]
+
+	"reads -- direct, no actor hop"
+	lookupUser: anId [ ^users at: anId ifAbsent: [ nil ] ]
+	lookupCard: anId [ ^cards at: anId ifAbsent: [ nil ] ]
+
+	"writes -- synchronous, atomic under the cooperative scheduler"
+	registerUserName: aName email: anEmail [
+		| uid pid |
+		userSeq := userSeq + 1. uid := userSeq.
+		pid := Actors spawn: (Props fromProducer: [ UserActor id: uid name: aName email: anEmail ]).
+		users at: uid put: pid.
+		^uid ]
+
+	createCardOwner: ownerId fields: aDict [
+		| ownerPid cid cardPid |
+		ownerPid := users at: ownerId ifAbsent: [ nil ].
+		ownerPid isNil ifTrue: [ ^nil ].
+		cardSeq := cardSeq + 1. cid := cardSeq.
+		cardPid := Actors spawn: (Props fromProducer: [ BusinessCardActor id: cid owner: ownerId fields: aDict ]).
+		cards at: cid put: cardPid.
+		ownerPid tell: (AddCard id: cid).
+		^cid ]
 ]
 
 
@@ -149,31 +129,32 @@ BusinessCardApi := Object [
 				ifTrue: [ HttpResponse badRequest: 'name is required' ]
 				ifFalse: [
 					name := payload at: 'name'.
-					uid := (directory request: (RegisterUser name: name email: (payload at: 'email' ifAbsent: [ '' ]))) await.
+					uid := directory registerUserName: name email: (payload at: 'email' ifAbsent: [ '' ]).
 					HttpResponse created: (Dictionary new at: 'id' put: uid; yourself) ] ].
 
 		aServer get: '/users/:id' do: [:req |
 			| pid |
-			pid := (directory request: (LookupUser id: (req param: 'id') asNumber)) await.
+			pid := directory lookupUser: (req param: 'id') asNumber.
 			pid isNil ifTrue: [ HttpResponse notFound ]
 				ifFalse: [ (HttpResponse ok) json: ((pid request: #profile) await) ] ].
 
 		aServer post: '/users/:id/cards' do: [:req |
 			| payload cid |
 			payload := req jsonBody. payload isNil ifTrue: [ payload := Dictionary new ].
-			cid := (directory request: (CreateCard owner: (req param: 'id') asNumber fields: payload)) await.
+			cid := directory createCardOwner: (req param: 'id') asNumber fields: payload.
 			cid isNil ifTrue: [ HttpResponse notFound ]
 				ifFalse: [ HttpResponse created: (Dictionary new at: 'id' put: cid; yourself) ] ].
 
+		"Direct id->Pid lookup, then ONE round-trip to the card actor for #view."
 		aServer get: '/cards/:id' do: [:req |
 			| pid |
-			pid := (directory request: (LookupCard id: (req param: 'id') asNumber)) await.
+			pid := directory lookupCard: (req param: 'id') asNumber.
 			pid isNil ifTrue: [ HttpResponse notFound ]
 				ifFalse: [ (HttpResponse ok) json: ((pid request: #view) await) ] ].
 
 		aServer get: '/cards/:id/views' do: [:req |
 			| pid |
-			pid := (directory request: (LookupCard id: (req param: 'id') asNumber)) await.
+			pid := directory lookupCard: (req param: 'id') asNumber.
 			pid isNil ifTrue: [ HttpResponse notFound ]
 				ifFalse: [ (HttpResponse ok) json: ((pid request: #stats) await) ] ].
 
@@ -181,9 +162,10 @@ BusinessCardApi := Object [
 			(HttpResponse ok) json: (Dictionary new at: 'status' put: 'ok'; yourself) ].
 
 		"---- diagnostic endpoints (layer bisection for the req/s investigation) ----"
-		"HTTP + exactly ONE actor round-trip + a tiny JSON payload."
+		"HTTP + exactly ONE actor round-trip + a tiny JSON payload.
+		 Pings the seeded card actor via #stats (which does NOT count a view)."
 		aServer get: '/actor-ping' do: [:req |
-			(HttpResponse ok) json: ((directory request: #ping) await) ].
+			(HttpResponse ok) json: (((directory lookupCard: 1) request: #stats) await) ].
 
 		"HTTP + a card-shaped Dictionary build + JSON encode, but NO actor round-trip.
 		 Isolates the JSON/Dictionary allocation cost from the actor-message cost."
@@ -215,18 +197,18 @@ BusinessCardApi := Object [
 	addr := InternetAddress lookup: '0.0.0.0'.
 	port := 8080.
 
-	directory := Actors spawn: (Props fromActorClass: Directory).
+	directory := CardDirectory new.
 	server := HttpServer on: addr port: port.
 	BusinessCardApi on: server directory: directory.
 	server start.
 
 	"seed: user 1 owns card 1"
-	(directory request: (RegisterUser name: 'Alice' email: 'alice@example.com')) await.
-	(directory request: (CreateCard owner: 1 fields: (Dictionary new
+	directory registerUserName: 'Alice' email: 'alice@example.com'.
+	directory createCardOwner: 1 fields: (Dictionary new
 		at: 'title' put: 'Founder';
 		at: 'company' put: 'Smalltalk Works';
 		at: 'phone' put: '+1-555-0100';
-		yourself))) await.
+		yourself).
 
 	Transcript nextPutAll: 'business-card API on http://0.0.0.0:'; nextPutAll: port printString; lf.
 	Transcript nextPutAll: 'seeded: GET /cards/1 is ready. Ctrl-C to stop.'; lf.
