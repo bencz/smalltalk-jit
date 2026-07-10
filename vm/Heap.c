@@ -60,6 +60,27 @@ void heapAddMutator(Heap *heap, struct Thread *thread)
 }
 
 
+// Unregister an exiting worker thread from `heap->mutators` so a later GC never
+// scans the roots of a dead OS thread. Done under gcLock (which the collector
+// holds while iterating the list), so it never races a scavenge.
+void heapEndMutator(Heap *heap, Thread *thread)
+{
+	heapGcEnterBlocked(heap, thread); // waiting on gcLock counts as safe
+	pthread_mutex_lock(&heap->gcLock);
+	heapGcLeaveBlocked(heap, thread);
+	pthread_mutex_lock(&heap->youngLock);
+	Thread **link = &heap->mutators;
+	while (*link != NULL && *link != thread) {
+		link = &(*link)->nextMutator;
+	}
+	if (*link == thread) {
+		*link = thread->nextMutator;
+	}
+	pthread_mutex_unlock(&heap->youngLock);
+	pthread_mutex_unlock(&heap->gcLock);
+}
+
+
 // ---- stop-the-world safepoint handshake (per shared heap) ------------------
 // Mirrors vm/Safepoint.c but scoped to ONE heap's mutators (heap->mutators), so
 // a collection on the shared heap never stops threads of a different isolate.

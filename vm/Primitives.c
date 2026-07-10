@@ -19,7 +19,9 @@
 #include "Scheduler.h"
 #include "Isolate.h"
 #include "Message.h"
+#include "Collection.h"
 #include "Assert.h"
+#include <pthread.h>
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -49,6 +51,7 @@ static PrimitiveResult arrayEqualsPrimitive(Value receiver, Value operand);
 static PrimitiveResult replaceBytesPrimitive(Value self, Value start, Value stop, Value replacement, Value replacementStart);
 static PrimitiveResult indexOfBytePrimitive(Value self, Value byte, Value start);
 static PrimitiveResult becomePrimitive(Value object, Value other);
+static PrimitiveResult workerParallelPrimitive(Value self, Value blocks);
 static PrimitiveResult contextPositionDescriptorPrimitive(Value vContext);
 static PrimitiveResult stringAsSymbolPrimitive(Value receiver);
 static PrimitiveResult streamOpenPrimitive(Value fileStream, Value fileName, Value mode);
@@ -235,6 +238,8 @@ Primitive Primitives[] = {
 	{"IsolateSendPrimitive", CCALL, .cFunction = isolateSendPrimitive, 3},
 	{"IsolateReceivePrimitive", CCALL, .cFunction = isolateReceivePrimitive, 1},
 
+	{"WorkerParallelPrimitive", CCALL, .cFunction = workerParallelPrimitive, 2},
+
 	{"ParseClassPrimitive", CCALL, .cFunction = parseClassPrimitive, 1},
 	{"ParseMethodPrimitive", CCALL, .cFunction = parseMethodPrimitive, 1},
 	{"ParseMethodOrBlockPrimitive", CCALL, .cFunction = parseMethodOrBlockPrimitive, 1},
@@ -385,6 +390,92 @@ static PrimitiveResult becomePrimitive(Value object, Value other)
 	objectBecome(scopeHandle(asObject(object)), scopeHandle(asObject(other)));
 	closeHandleScope(&scope, NULL);
 	return primSuccess(other);
+}
+
+
+// ---- Worker parallel: run N blocks on N worker OS threads, one shared heap ----
+// Each worker points its Thread at the caller's heap, replicates the well-known
+// Handles (they reference shared objects), runs its block, and writes the result
+// into a shared results Array. GC across the workers is safepoint-coordinated
+// (see allocate()/heapGc* in Heap.c). Best for CPU-bound blocks: the caller's
+// OTHER fibers' roots aren't scanned during a worker GC yet, so allocation-heavy
+// parallelism is safe only when the caller has no live parked fibers.
+typedef struct {
+	Object *arrayHandle;   // persistent handle to the blocks array (GC-updated)
+	Object *resultsHandle; // persistent handle to the results array
+	size_t index;
+	SmalltalkHandles handles;
+	Heap *heap;
+} ParWorkerArg;
+
+static void *parallelPrimWorker(void *arg)
+{
+	ParWorkerArg *w = arg;
+	memset(&CurrentThread, 0, sizeof(Thread));
+	CurrentThread.heap = w->heap;
+	initRememberedSet(&CurrentThread.rememberedSet);
+	heapAddMutator(w->heap, &CurrentThread);
+	Handles = w->handles;
+	initThreadContext(&CurrentThread);
+
+	HandleScope scope;
+	openHandleScope(&scope);
+	RawArray *blocks = (RawArray *) ((Object *) w->arrayHandle)->raw;
+	Object *blockH = scopeHandle(asObject(blocks->vars[w->index]));
+	EntryArgs args = { .size = 0 };
+	entryArgsAdd(&args, getTaggedPtr(blockH));
+	Value result = sendMessage(getSymbol("value"), &args);
+	if (valueTypeOf(result, VALUE_POINTER)) {
+		Object box;
+		box.raw = asObject(result);
+		arrayAtPutObject((Array *) w->resultsHandle, (ptrdiff_t) w->index, &box);
+	} else {
+		((RawArray *) ((Object *) w->resultsHandle)->raw)->vars[w->index] = result;
+	}
+	closeHandleScope(&scope, NULL);
+
+	heapEndMutator(w->heap, &CurrentThread); // leave the mutator set before the thread dies
+	return NULL;
+}
+
+static PrimitiveResult workerParallelPrimitive(Value self, Value blocksArray)
+{
+	(void) self;
+	HandleScope scope;
+	openHandleScope(&scope);
+	Array *arr = (Array *) scopeHandle(asObject(blocksArray));
+	size_t n = ((RawArray *) arr->raw)->size;
+	Array *results = newArray(n);
+	Object *arrPH = persistHandle(arr);
+	Object *resultsPH = persistHandle(results);
+	SmalltalkHandles mainHandles = Handles;
+	Heap *heap = CurrentThread.heap;
+
+	ParWorkerArg *works = malloc(n * sizeof(ParWorkerArg));
+	pthread_t *threads = malloc(n * sizeof(pthread_t));
+	for (size_t i = 0; i < n; i++) {
+		works[i].arrayHandle = arrPH;
+		works[i].resultsHandle = resultsPH;
+		works[i].index = i;
+		works[i].handles = mainHandles;
+		works[i].heap = heap;
+	}
+	heapGcEnterBlocked(heap, &CurrentThread); // caller is idle (blocked) during the join
+	for (size_t i = 0; i < n; i++) {
+		pthread_create(&threads[i], NULL, parallelPrimWorker, &works[i]);
+	}
+	for (size_t i = 0; i < n; i++) {
+		pthread_join(threads[i], NULL);
+	}
+	heapGcLeaveBlocked(heap, &CurrentThread);
+	free(works);
+	free(threads);
+
+	Value r = getTaggedPtr(resultsPH);
+	freeHandle(arrPH);
+	freeHandle(resultsPH);
+	closeHandleScope(&scope, NULL);
+	return primSuccess(r);
 }
 
 

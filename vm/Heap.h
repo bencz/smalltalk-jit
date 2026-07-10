@@ -39,6 +39,7 @@ typedef struct Heap {
 } Heap;
 
 void heapAddMutator(Heap *heap, struct Thread *thread);
+void heapEndMutator(Heap *heap, struct Thread *thread); // unregister an exiting worker
 // Stop-the-world coordination (shared heap). `self` is excluded from the wait.
 void heapGcPoll(Heap *heap, struct Thread *self);
 void heapGcBegin(Heap *heap, struct Thread *self);
