@@ -909,6 +909,70 @@ static int schedStwSelfTest(void)
 	return ok ? 0 : 1;
 }
 
+// 5. ST_SCHED_MIGRATE_TEST — a fiber that PARKS mid-Smalltalk (holding a live reified block
+//    context) and RESUMES on ANOTHER worker must allocate into the NEW worker's TLAB (B2.5).
+//    Each fiber runs a block that allocates, yields (a real send -> parks with its context
+//    live), allocates more, then checksums. With many fibers on many workers they migrate on
+//    every yield. WITHOUT the context rebind, the migrated fiber allocates via the parking
+//    worker's TLAB while that worker allocates too -> overlapping objects -> wrong checksum /
+//    crash. WITH it -> every checksum is exact.
+#define SMIG_FIBERS 8
+#define SMIG_EXPECTED 320800   // sum i=1..400 of (i + 3i) = 4 * 400*401/2
+static _Atomic int gSmigOk;
+static Object *gSmigBlockH;
+static void smigFiber(void *arg)
+{
+	(void) arg;
+	// Use a SCOPE handle (lives in the fiber's handleScopes, which migrate with it), NOT a
+	// persistent handle() — the persistent list is per-worker TLS and would be left on the
+	// parking worker when this fiber yields and resumes elsewhere. (runBlockOnce uses a
+	// persistent handle, which is fine for non-migrating tests but not here.)
+	HandleScope scope;
+	openHandleScope(&scope);
+	Object *h = scopeHandle(gSmigBlockH->raw);
+	EntryArgs args = { .size = 0 };
+	entryArgsAddObject(&args, h);
+	Value r = sendMessage(getSymbol("value"), &args);
+	if (!(valueTypeOf(r, VALUE_INT) && (long) asCInt(r) == SMIG_EXPECTED)) {
+		__atomic_store_n(&gSmigOk, 0, __ATOMIC_RELAXED);
+	}
+	closeHandleScope(&scope, NULL);
+}
+
+static int schedMigrateSelfTest(void)
+{
+	int workers = schedWorkerCount();
+	__atomic_store_n(&gSmigOk, 1, __ATOMIC_RELAXED);
+	{
+		HandleScope setup;
+		openHandleScope(&setup);
+		// hasContext block (contains inner blocks) that yields mid-iteration.
+		gSmigBlockH = handle(asObject(evalObject(
+			"[ | acc sum | acc := OrderedCollection new. "
+			"  1 to: 400 do: [:i | acc add: (Array with: i with: i * 3). "
+			"    (i \\\\ 40) = 0 ifTrue: [ Processor yield ] ]. "
+			"  sum := 0. acc do: [:e | sum := sum + (e at: 1) + (e at: 2) ]. sum ]")));
+		runBlockOnce(getTaggedPtr(gSmigBlockH)); // warm up JIT on main before the pool runs
+		closeHandleScope(&setup, NULL);
+	}
+
+	schedulerInit();
+	for (long i = 0; i < SMIG_FIBERS; i++) {
+		schedulerSpawnC(smigFiber, (void *) i, 0);
+	}
+	__atomic_store_n(&gWatchdogDone, 0, __ATOMIC_RELEASE);
+	pthread_t wd;
+	pthread_create(&wd, NULL, schedWatchdog, (void *) 120000L);
+	schedulerRun();
+	__atomic_store_n(&gWatchdogDone, 1, __ATOMIC_RELEASE);
+	pthread_join(wd, NULL);
+
+	int ok = __atomic_load_n(&gSmigOk, __ATOMIC_RELAXED);
+	fprintf(stderr, "sched-migrate self-test: %d fibers yielded mid-Smalltalk across %d workers (context rebind) | all-correct=%d -> %s\n",
+		SMIG_FIBERS, workers, ok, ok ? "PASS" : "FAIL");
+	return ok ? 0 : 1;
+}
+
 
 int main(int argc, char **args)
 {
@@ -1015,6 +1079,11 @@ int main(int argc, char **args)
 		initThread(&CurrentThread);
 		bootstrapSmalltalk(cliArgs.snapshotFileName, cliArgs.bootstrapDir);
 		return schedStwSelfTest();
+	}
+	if (getenv("ST_SCHED_MIGRATE_TEST") != NULL) {
+		initThread(&CurrentThread);
+		bootstrapSmalltalk(cliArgs.snapshotFileName, cliArgs.bootstrapDir);
+		return schedMigrateSelfTest();
 	}
 
 	initThread(&CurrentThread);

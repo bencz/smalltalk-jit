@@ -362,22 +362,46 @@ static void saveRoots(Fiber *fiber)
 }
 
 
+// Re-point EVERY live reified context of `fiber` at the current worker's Thread. The JIT
+// reads `CTX->thread` to reach per-mutator state (TLAB bump, remembered-set log,
+// stackFramesTail, the dummy context), and each reified context caches `thread` (copied
+// from its parent when it was created). With a worker pool a fiber can resume on a
+// DIFFERENT worker than the one it parked on, so those cached pointers must be rebound or
+// it allocates into / logs into another worker's per-mutator state and corrupts the heap.
+// Every live context sits in some stack frame's CONTEXT_SLOT (plus the fiber's root
+// context, shared by all non-reified methods), so walk the frames exactly like the GC.
+static void fiberRebindContexts(Fiber *fiber)
+{
+	Thread *me = &CurrentThread;
+	// Root context (used directly by every method compiled without hasContext).
+	((RawContext *) asObject(fiber->roots.context))->thread = me;
+	for (EntryStackFrame *entryFrame = fiber->roots.stackFramesTail;
+	     entryFrame != NULL; entryFrame = entryFrame->prev) {
+		for (StackFrame *frame = entryFrame->exit; frame != NULL;
+		     frame = stackFrameGetParent(frame, entryFrame)) {
+			Value ctx = stackFrameGetSlot(frame, CONTEXT_SLOT);
+			if (valueTypeOf(ctx, VALUE_POINTER)) {
+				((RawContext *) asObject(ctx))->thread = me;
+			}
+		}
+	}
+}
+
+
 static void loadRoots(Fiber *fiber)
 {
 	CurrentThread.stackFramesTail = fiber->roots.stackFramesTail;
 	CurrentThread.handleScopes = fiber->roots.handleScopes;
 	CurrentThread.context = fiber->roots.context;
 	CurrentExceptionHandler = fiber->roots.exceptionHandler;
-	// The JIT allocation stub bumps CTX->thread->tlab, and the entry stub sets CTX from
-	// CurrentThread.context (this fiber's root context). With a pool, a fiber can run on
-	// a DIFFERENT worker each time it is scheduled, so re-point its root context at the
-	// worker about to run it — otherwise it allocates into another worker's TLAB and
-	// corrupts the shared nursery. (NOTE: a fiber that PARKS mid-Smalltalk and RESUMES on
-	// another worker still holds reified nested contexts pinned to the old worker; the
-	// B2.3 fibers run to completion or park only in C, so this root fix suffices. The
-	// general migration case is handled before the default flips to multi-worker.)
-	if (fiber->roots.context != 0) {
-		((RawContext *) asObject(fiber->roots.context))->thread = &CurrentThread;
+	// Rebind this fiber's contexts to the worker about to run it — but ONLY when it
+	// actually migrated. If its root context already points at us, this fiber last ran on
+	// this worker, so every context it holds already points here (nothing else rewrites
+	// them). That makes the common same-worker resume O(1) and pays the frame walk only on
+	// a real migration.
+	if (fiber->roots.context != 0
+	    && ((RawContext *) asObject(fiber->roots.context))->thread != &CurrentThread) {
+		fiberRebindContexts(fiber);
 	}
 }
 
