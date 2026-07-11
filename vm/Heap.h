@@ -9,6 +9,7 @@
 
 struct Thread;
 struct NativeCode;
+struct Scheduler;
 
 // JIT stubs are shared per-HEAP, not per-OS-thread: all worker threads of one heap
 // reuse the same generated stub bodies (they reach per-thread state via CTX->thread),
@@ -49,6 +50,12 @@ typedef struct Heap {
 	// so the GC can scan the roots of all of them, not just the collecting thread.
 	// One entry today (the owner); several once worker threads share the heap.
 	struct Thread *mutators;
+	// The fiber scheduler shared by all OS-thread workers of this heap (ready queue,
+	// fiber registry, timer heap, epoll). Per-heap (not per-OS-thread TLS) so a pool
+	// of workers can pull fibers from ONE queue over this one heap. NULL until
+	// schedulerInit runs (bootstrap allocates before any fiber exists). Isolates keep
+	// separate schedulers because they have separate heaps.
+	struct Scheduler *sched;
 	// --- stop-the-world GC coordination for a shared heap ---
 	// gcLock: at most one collector at a time. safepoint{Lock,Cond,Requested}: the
 	// handshake — a collector parks every other mutator (they poll at allocation

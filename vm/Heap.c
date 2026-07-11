@@ -48,6 +48,7 @@ void initHeap(Heap *heap, struct Thread *thread)
 	pthread_cond_init(&heap->safepointCond, NULL);
 	heap->safepointRequested = 0;
 	heap->mutators = NULL;
+	heap->sched = NULL; // allocated by schedulerInit, once per heap
 	for (int i = 0; i < STUB_COUNT; i++) {
 		heap->stubCode[i] = NULL; // JIT stubs generated lazily, once per heap
 	}

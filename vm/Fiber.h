@@ -4,16 +4,45 @@
 #include "Object.h"
 #include <stddef.h>
 
+// ThreadSanitizer cannot follow user-level fiber context switches on its own: a fiber's
+// stack migrates across OS threads (park on one worker, resume on another), which
+// confuses TSan's per-OS-thread shadow stack and crashes it. TSan's fiber API annotates
+// each switch so it tracks the running stack correctly. Zero-cost in a normal build.
+#ifdef __SANITIZE_THREAD__
+#include <sanitizer/tsan_interface.h>
+#define TSAN_CREATE_FIBER()      __tsan_create_fiber(0)
+#define TSAN_DESTROY_FIBER(f)    __tsan_destroy_fiber(f)
+#define TSAN_SWITCH_TO_FIBER(f)  __tsan_switch_to_fiber((f), 0)
+#define TSAN_CURRENT_FIBER()     __tsan_get_current_fiber()
+#else
+#define TSAN_CREATE_FIBER()      NULL
+#define TSAN_DESTROY_FIBER(f)    ((void) (f))
+#define TSAN_SWITCH_TO_FIBER(f)  ((void) (f))
+#define TSAN_CURRENT_FIBER()     NULL
+#endif
+
 struct EntryStackFrame;
 struct Handle;
 struct HandleScope;
 
 typedef enum {
 	FIBER_READY,      // in the ready queue, waiting to run
-	FIBER_RUNNING,    // currently executing
+	FIBER_RUNNING,    // currently executing on some worker
+	FIBER_PARKING,    // transient: chose to yield/suspend, not yet switched off its
+	                  // worker's stack. NEVER observed at a GC safepoint (the park
+	                  // path is allocation-free), so it is not a scan state.
 	FIBER_SUSPENDED,  // parked (semaphore/timer/io), not in ready queue
 	FIBER_DONE        // finished, awaiting destruction
 } FiberState;
+
+// What the scheduler run loop must do once a FIBER_PARKING fiber has fully switched
+// off its worker's stack (the "commit" happens on the scheduler stack, after the
+// context switch, so a peer worker can never pop-and-run the same stack mid-switch).
+typedef enum {
+	PARK_NONE = 0,
+	PARK_YIELD,    // re-queue at the back of the ready queue
+	PARK_SUSPEND   // park off the ready queue (unless a resume raced in: parkPending)
+} ParkIntent;
 
 // The subset of VM execution state that is private to each fiber. The shared
 // isolate state (heap, persistent handle list) lives in CurrentThread and is
@@ -41,6 +70,12 @@ typedef struct Fiber {
 	void *reserveFloor;
 
 	FiberState state;
+	// Park-handoff (multi-worker): set by the fiber under the scheduler lock before it
+	// switches off; read by the run loop's commit after the switch. `parkPending` is a
+	// wake that raced in while the fiber was still FIBER_PARKING — the commit re-queues
+	// instead of parking, so no wakeup is ever lost.
+	ParkIntent parkIntent;
+	_Bool parkPending;
 	FiberRoots roots;
 
 	Value entryBlock;       // Smalltalk block to run (nil for C-entry fibers), a GC root
@@ -58,6 +93,7 @@ typedef struct Fiber {
 	_Bool dirty;
 	struct Fiber *dirtyNext;
 	struct Fiber *dirtyPrev;
+	void *tsanFiber;        // TSan fiber handle (NULL in a normal build; see Fiber.h top)
 } Fiber;
 
 // Low-level context switch (defined in Fiber.c via inline asm).

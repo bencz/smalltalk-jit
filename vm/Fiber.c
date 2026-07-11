@@ -55,6 +55,16 @@ Fiber *fiberCreate(size_t stackSize)
 {
 	long pageSize = gPageSize;
 
+#if defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__)
+	// A sanitizer massively inflates C stack-frame sizes (shadow, redzones), and the
+	// growth handler is disabled under a sanitizer, so a deep C call chain (e.g. a full
+	// GC triggered from within JIT'd Smalltalk in a fiber) can overrun a normal stack.
+	// Give every fiber a generous fully-committed stack under a sanitizer.
+	if (stackSize < 64 * 1024 * 1024) {
+		stackSize = 64 * 1024 * 1024;
+	}
+#endif
+
 	// Reserve the whole region + a permanent floor page as PROT_NONE (address
 	// space only), then commit a small window at the high end. The stack grows
 	// DOWN; a fault in the reserved-but-uncommitted span triggers growth, and the
@@ -75,6 +85,12 @@ Fiber *fiberCreate(size_t stackSize)
 	if (commit == 0) {
 		commit = pageSize;
 	}
+#if defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__)
+	// A sanitizer intercepts SIGSEGV/sigaction/mprotect, which the SIGSEGV-driven stack
+	// growth relies on (and the growth handler is a no-op under a sanitizer). Commit the
+	// whole stack up front so no guard fault ever occurs during a sanitizer run.
+	commit = stackSize;
+#endif
 	uint8_t *top = base + mapSize;
 	uint8_t *committedLow = top - commit;
 	if (mprotect(committedLow, commit, PROT_READ | PROT_WRITE) != 0) {
@@ -89,6 +105,7 @@ Fiber *fiberCreate(size_t stackSize)
 	fiber->reserveFloor = base + pageSize; // never grow below this
 	fiber->state = FIBER_SUSPENDED;
 	fiber->waitFd = -1;
+	fiber->tsanFiber = TSAN_CREATE_FIBER(); // NULL in a normal build
 	// calloc zeroed entryBlock/process/cEntry/cArg/queueNext/dirty*.
 
 	// Prime the stack so the first fiberSwitchAsm into it pops six zeroed
@@ -141,6 +158,7 @@ int fiberGrowStack(Fiber *fiber, uintptr_t faultAddr)
 
 void fiberDestroy(Fiber *fiber)
 {
+	TSAN_DESTROY_FIBER(fiber->tsanFiber); // no-op in a normal build
 	if (fiber->stackBase != NULL) {
 		munmap(fiber->stackBase, fiber->stackSize);
 	}

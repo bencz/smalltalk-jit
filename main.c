@@ -700,6 +700,216 @@ static int safepointRootsSelfTest(void)
 }
 
 
+// ---- B2.3: multi-worker scheduler pool self-tests --------------------------
+// These drive the REAL scheduler pool (M workers over one shared heap via
+// schedulerRun with ST_SCHED_WORKERS>1) with fibers that coordinate ONLY through
+// scheduler primitives (yield / sleep / the pool itself), never Smalltalk sync
+// (which is not thread-safe until B3). A watchdog turns a hang into a hard FAIL.
+
+static _Atomic int gWatchdogDone;
+static void *schedWatchdog(void *arg)
+{
+	long ms = (long) arg;
+	long waited = 0;
+	while (!__atomic_load_n(&gWatchdogDone, __ATOMIC_ACQUIRE) && waited < ms) {
+		usleep(10000);
+		waited += 10;
+	}
+	if (!__atomic_load_n(&gWatchdogDone, __ATOMIC_ACQUIRE)) {
+		fprintf(stderr, "WATCHDOG: scheduler pool hung (lost wakeup / deadlock) -> FAIL\n");
+		_exit(99);
+	}
+	return NULL;
+}
+
+static int schedWorkerCount(void)
+{
+	char *w = getenv("ST_SCHED_WORKERS");
+	return w ? atoi(w) : 1;
+}
+
+// 1. ST_SCHED_PARALLEL_TEST — N CPU-bound fibers distributed across the pool. Pure C
+//    compute (no allocation, no yield): each pool worker runs one fiber to completion,
+//    so wall time drops ~1/workers. Correctness proves the pool runs every fiber.
+#define SCP_FIBERS 8
+static _Atomic long gScpResult[SCP_FIBERS];
+static void scpFiber(void *arg)
+{
+	long id = (long) arg;
+	volatile long sum = 0; // volatile so the optimizer can't fold the loop to a closed form
+	for (long i = 1; i <= 30000000L; i++) {
+		sum += i;
+	}
+	__atomic_store_n(&gScpResult[id], sum, __ATOMIC_RELAXED);
+}
+
+static int schedParallelSelfTest(void)
+{
+	long expected = 30000000L * 30000001L / 2; // 450000015000000
+	int workers = schedWorkerCount();
+	schedulerInit();
+	for (long i = 0; i < SCP_FIBERS; i++) {
+		schedulerSpawnC(scpFiber, (void *) i, 0);
+	}
+	int64_t t0 = osCurrentMicroTime();
+	schedulerRun();
+	int64_t us = osCurrentMicroTime() - t0;
+	int ok = 1;
+	for (int i = 0; i < SCP_FIBERS; i++) {
+		if (__atomic_load_n(&gScpResult[i], __ATOMIC_RELAXED) != expected) {
+			ok = 0;
+		}
+	}
+	fprintf(stderr, "sched-parallel self-test: %d CPU-bound fibers ran across %d pool worker(s) in %ldms | all-correct=%d -> %s\n",
+		SCP_FIBERS, workers, (long) (us / 1000), ok, ok ? "PASS" : "FAIL");
+	return ok ? 0 : 1;
+}
+
+// 2. ST_SCHED_DOUBLERUN_TEST — no fiber ever runs on two workers at once (M2 handoff).
+//    Each fiber claims a per-fiber flag (atomic exchange must see 0), does tiny work,
+//    releases, then yields — hammering the pop/commit-after-switch/re-pop handoff.
+#define SDR_FIBERS 12
+#define SDR_ROUNDS 1500
+static _Atomic int gSdrRunning[SDR_FIBERS];
+static _Atomic long gSdrRounds[SDR_FIBERS];
+static _Atomic int gSdrDouble;
+static void sdrFiber(void *arg)
+{
+	long id = (long) arg;
+	for (int r = 0; r < SDR_ROUNDS; r++) {
+		if (__atomic_exchange_n(&gSdrRunning[id], 1, __ATOMIC_ACQ_REL) != 0) {
+			__atomic_store_n(&gSdrDouble, 1, __ATOMIC_RELAXED); // same stack on two workers!
+		}
+		for (volatile int k = 0; k < 40; k++) { }
+		__atomic_store_n(&gSdrRunning[id], 0, __ATOMIC_RELEASE);
+		__atomic_add_fetch(&gSdrRounds[id], 1, __ATOMIC_RELAXED);
+		schedulerYield();
+	}
+}
+
+static int schedDoubleRunSelfTest(void)
+{
+	int workers = schedWorkerCount();
+	schedulerInit();
+	for (long i = 0; i < SDR_FIBERS; i++) {
+		schedulerSpawnC(sdrFiber, (void *) i, 0);
+	}
+	__atomic_store_n(&gWatchdogDone, 0, __ATOMIC_RELEASE);
+	pthread_t wd;
+	pthread_create(&wd, NULL, schedWatchdog, (void *) 120000L);
+	schedulerRun();
+	__atomic_store_n(&gWatchdogDone, 1, __ATOMIC_RELEASE);
+	pthread_join(wd, NULL);
+	long total = 0;
+	for (int i = 0; i < SDR_FIBERS; i++) {
+		total += __atomic_load_n(&gSdrRounds[i], __ATOMIC_RELAXED);
+	}
+	int dbl = __atomic_load_n(&gSdrDouble, __ATOMIC_RELAXED);
+	int ok = !dbl && (total == (long) SDR_FIBERS * SDR_ROUNDS);
+	fprintf(stderr, "sched-doublerun self-test: %d fibers x %d yield-rounds on %d workers | double-run=%d total=%ld/%d -> %s\n",
+		SDR_FIBERS, SDR_ROUNDS, workers, dbl, total, SDR_FIBERS * SDR_ROUNDS, ok ? "PASS" : "FAIL");
+	return ok ? 0 : 1;
+}
+
+// 3. ST_SCHED_LOSTWAKE_TEST — no wakeup is ever lost (M2 parkPending). Each fiber does
+//    R rounds of schedulerSleep(0): it parks on a timer while a poller (another worker)
+//    fires that timer and resumes it, maximizing the resume-races-PARKING interleaving.
+//    Without parkPending a raced resume is dropped -> that fiber never wakes -> the
+//    total falls short (or the pool hangs -> watchdog).
+#define SLW_FIBERS 8
+#define SLW_ROUNDS 1000
+static _Atomic long gSlwRounds[SLW_FIBERS];
+static void slwFiber(void *arg)
+{
+	long id = (long) arg;
+	for (int r = 0; r < SLW_ROUNDS; r++) {
+		schedulerSleep(0); // park on timer; the poller resumes us (parkPending stress)
+		__atomic_add_fetch(&gSlwRounds[id], 1, __ATOMIC_RELAXED);
+	}
+}
+
+static int schedLostWakeSelfTest(void)
+{
+	int workers = schedWorkerCount();
+	schedulerInit();
+	for (long i = 0; i < SLW_FIBERS; i++) {
+		schedulerSpawnC(slwFiber, (void *) i, 0);
+	}
+	__atomic_store_n(&gWatchdogDone, 0, __ATOMIC_RELEASE);
+	pthread_t wd;
+	pthread_create(&wd, NULL, schedWatchdog, (void *) 120000L);
+	schedulerRun();
+	__atomic_store_n(&gWatchdogDone, 1, __ATOMIC_RELEASE);
+	pthread_join(wd, NULL);
+	long total = 0;
+	for (int i = 0; i < SLW_FIBERS; i++) {
+		total += __atomic_load_n(&gSlwRounds[i], __ATOMIC_RELAXED);
+	}
+	int ok = (total == (long) SLW_FIBERS * SLW_ROUNDS);
+	fprintf(stderr, "sched-lostwake self-test: %d fibers x %d sleep(0) rounds on %d workers (timer/park race) | total=%ld/%d -> %s\n",
+		SLW_FIBERS, SLW_ROUNDS, workers, total, SLW_FIBERS * SLW_ROUNDS, ok ? "PASS" : "FAIL");
+	return ok ? 0 : 1;
+}
+
+// 4. ST_SCHED_STW_TEST — idle pool workers are GC-safe (M3). A couple of fibers allocate
+//    heavily (real Smalltalk) while the other workers idle-wait on the pool condvar. The
+//    allocating fibers' scavenges + full GCs must stop the world, which requires every
+//    idle worker to count as SAFE (heapGcEnterBlocked before the cond_wait). Without it,
+//    heapGcBegin waits forever for an idle worker -> the pool hangs -> watchdog FAIL. It
+//    also exercises the M4 shared-registry root scan under a real multi-worker pool.
+#define SSTW_FIBERS 4
+#define SSTW_EXPECTED 200000
+static _Atomic int gSstwOk;
+static Object *gSstwBlockH;
+static void sstwFiber(void *arg)
+{
+	(void) arg;
+	Value r = runBlockOnce(getTaggedPtr(gSstwBlockH)); // allocates 200k Arrays -> scavenges + full GC
+	if (!(valueTypeOf(r, VALUE_INT) && (long) asCInt(r) == SSTW_EXPECTED)) {
+		__atomic_store_n(&gSstwOk, 0, __ATOMIC_RELAXED);
+	}
+}
+
+static int schedStwSelfTest(void)
+{
+	int workers = schedWorkerCount();
+	__atomic_store_n(&gSstwOk, 1, __ATOMIC_RELAXED);
+	// Persistent handle (survives schedulerRun swapping handleScopes per fiber). Force
+	// promotion + full GC via a low threshold so BOTH collectors run under the pool.
+	{
+		HandleScope setup;
+		openHandleScope(&setup); // evalObject/compile needs an open scope
+		gSstwBlockH = handle(asObject(evalObject(
+			"[ | acc | acc := OrderedCollection new. 1 to: 200000 do: [:i | acc add: (Array with: i with: i)]. acc size ]")));
+		runBlockOnce(getTaggedPtr(gSstwBlockH)); // warm up JIT on main before the pool runs
+		closeHandleScope(&setup, NULL);
+	}
+	CurrentThread.heap->oldGcThreshold = 1 * 1024 * 1024;
+	unsigned long fullGcBefore = __atomic_load_n(&gFullGcRuns, __ATOMIC_RELAXED);
+
+	schedulerInit();
+	for (long i = 0; i < SSTW_FIBERS; i++) {
+		schedulerSpawnC(sstwFiber, (void *) i, 0);
+	}
+	__atomic_store_n(&gWatchdogDone, 0, __ATOMIC_RELEASE);
+	pthread_t wd;
+	pthread_create(&wd, NULL, schedWatchdog, (void *) 180000L);
+	schedulerRun();
+	__atomic_store_n(&gWatchdogDone, 1, __ATOMIC_RELEASE);
+	pthread_join(wd, NULL);
+
+	unsigned long fullGcs = __atomic_load_n(&gFullGcRuns, __ATOMIC_RELAXED) - fullGcBefore;
+	// The point of this test is idle-worker GC-safety, which only exists at workers>1;
+	// there the concurrent allocation pressure also reliably trips the full GC. At 1
+	// worker (no idle workers, sequential fibers) just require correctness.
+	int correct = __atomic_load_n(&gSstwOk, __ATOMIC_RELAXED);
+	int ok = correct && (workers > 1 ? fullGcs > 0 : 1);
+	fprintf(stderr, "sched-STW self-test: %d allocating fibers on %d workers (rest idle-parked) | full GCs=%lu | all-correct=%d -> %s\n",
+		SSTW_FIBERS, workers, fullGcs, correct, ok ? "PASS" : "FAIL");
+	return ok ? 0 : 1;
+}
+
+
 int main(int argc, char **args)
 {
 	CliArgs cliArgs;
@@ -782,6 +992,29 @@ int main(int argc, char **args)
 		initThread(&CurrentThread);
 		bootstrapSmalltalk(cliArgs.snapshotFileName, cliArgs.bootstrapDir);
 		return safepointRootsSelfTest();
+	}
+
+	// B2.3 multi-worker scheduler pool (set ST_SCHED_WORKERS>1): CPU-bound fibers run
+	// across the pool; no fiber double-runs; no wakeup is lost; idle workers are GC-safe.
+	if (getenv("ST_SCHED_PARALLEL_TEST") != NULL) {
+		initThread(&CurrentThread);
+		bootstrapSmalltalk(cliArgs.snapshotFileName, cliArgs.bootstrapDir);
+		return schedParallelSelfTest();
+	}
+	if (getenv("ST_SCHED_DOUBLERUN_TEST") != NULL) {
+		initThread(&CurrentThread);
+		bootstrapSmalltalk(cliArgs.snapshotFileName, cliArgs.bootstrapDir);
+		return schedDoubleRunSelfTest();
+	}
+	if (getenv("ST_SCHED_LOSTWAKE_TEST") != NULL) {
+		initThread(&CurrentThread);
+		bootstrapSmalltalk(cliArgs.snapshotFileName, cliArgs.bootstrapDir);
+		return schedLostWakeSelfTest();
+	}
+	if (getenv("ST_SCHED_STW_TEST") != NULL) {
+		initThread(&CurrentThread);
+		bootstrapSmalltalk(cliArgs.snapshotFileName, cliArgs.bootstrapDir);
+		return schedStwSelfTest();
 	}
 
 	initThread(&CurrentThread);
