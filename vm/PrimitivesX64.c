@@ -1158,11 +1158,13 @@ static void generateBlockOnExceptionPrimitive(CodeGenerator *generator)
 	asmPushq(buffer, RAX);
 	generator->frameSize++;
 
-	// install exception handler
-	asmMovqImm(buffer, (int64_t) &CurrentExceptionHandler, RDI);
-	asmMovqMem(buffer, asmMem(RDI, NO_REGISTER, SS_1, 0), TMP);
+	// install exception handler into the RUNNING worker's chain (CTX->thread->exceptionHandler),
+	// NOT a baked &CurrentExceptionHandler — that immediate would be the CODEGEN thread's slot in
+	// this shared JIT code, so on:do: on any other worker would corrupt the wrong chain.
+	asmLoadTls(buffer, RDI, gCurrentThreadTpoff); // RDI = &CurrentThread (running worker)
+	asmMovqMem(buffer, asmMem(RDI, NO_REGISTER, SS_1, offsetof(Thread, exceptionHandler)), TMP);
 	asmMovqToMem(buffer, TMP, asmMem(RAX, NO_REGISTER, SS_1, varOffset(RawExceptionHandler, parent)));
-	asmMovqToMem(buffer, RAX, asmMem(RDI, NO_REGISTER, SS_1, 0));
+	asmMovqToMem(buffer, RAX, asmMem(RDI, NO_REGISTER, SS_1, offsetof(Thread, exceptionHandler)));
 
 	// value block
 	generateLoadObject(buffer, (RawObject *) Handles.Block->raw, RDI, 1);
@@ -1174,11 +1176,11 @@ static void generateBlockOnExceptionPrimitive(CodeGenerator *generator)
 	asmCallq(buffer, R11);
 	generateStackmap(generator);
 
-	// unregister exception handler
+	// unregister exception handler (restore parent into the RUNNING worker's chain)
 	asmMovqMem(buffer, asmMem(RBP, NO_REGISTER, SS_1, -3 * sizeof(intptr_t)), TMP);
 	asmMovqMem(buffer, asmMem(TMP, NO_REGISTER, SS_1, varOffset(RawExceptionHandler, parent)), TMP);
-	asmMovqImm(buffer, (int64_t) &CurrentExceptionHandler, RDI);
-	asmMovqToMem(buffer, TMP, asmMem(RDI, NO_REGISTER, SS_1, 0));
+	asmLoadTls(buffer, RDI, gCurrentThreadTpoff); // RDI = &CurrentThread (running worker)
+	asmMovqToMem(buffer, TMP, asmMem(RDI, NO_REGISTER, SS_1, offsetof(Thread, exceptionHandler)));
 
 	// epilogue
 	asmMovqMem(&generator->buffer, asmMem(CTX, NO_REGISTER, SS_1, varOffset(RawContext, parent)), CTX);

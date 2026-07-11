@@ -362,47 +362,16 @@ static void saveRoots(Fiber *fiber)
 }
 
 
-// Re-point EVERY live reified context of `fiber` at the current worker's Thread. The JIT
-// reads `CTX->thread` to reach per-mutator state (TLAB bump, remembered-set log,
-// stackFramesTail, the dummy context), and each reified context caches `thread` (copied
-// from its parent when it was created). With a worker pool a fiber can resume on a
-// DIFFERENT worker than the one it parked on, so those cached pointers must be rebound or
-// it allocates into / logs into another worker's per-mutator state and corrupts the heap.
-// Every live context sits in some stack frame's CONTEXT_SLOT (plus the fiber's root
-// context, shared by all non-reified methods), so walk the frames exactly like the GC.
-static void fiberRebindContexts(Fiber *fiber)
-{
-	Thread *me = &CurrentThread;
-	// Root context (used directly by every method compiled without hasContext).
-	((RawContext *) asObject(fiber->roots.context))->thread = me;
-	for (EntryStackFrame *entryFrame = fiber->roots.stackFramesTail;
-	     entryFrame != NULL; entryFrame = entryFrame->prev) {
-		for (StackFrame *frame = entryFrame->exit; frame != NULL;
-		     frame = stackFrameGetParent(frame, entryFrame)) {
-			Value ctx = stackFrameGetSlot(frame, CONTEXT_SLOT);
-			if (valueTypeOf(ctx, VALUE_POINTER)) {
-				((RawContext *) asObject(ctx))->thread = me;
-			}
-		}
-	}
-}
-
-
 static void loadRoots(Fiber *fiber)
 {
 	CurrentThread.stackFramesTail = fiber->roots.stackFramesTail;
 	CurrentThread.handleScopes = fiber->roots.handleScopes;
 	CurrentThread.context = fiber->roots.context;
 	CurrentExceptionHandler = fiber->roots.exceptionHandler;
-	// Rebind this fiber's contexts to the worker about to run it — but ONLY when it
-	// actually migrated. If its root context already points at us, this fiber last ran on
-	// this worker, so every context it holds already points here (nothing else rewrites
-	// them). That makes the common same-worker resume O(1) and pays the frame walk only on
-	// a real migration.
-	if (fiber->roots.context != 0
-	    && ((RawContext *) asObject(fiber->roots.context))->thread != &CurrentThread) {
-		fiberRebindContexts(fiber);
-	}
+	// No context->thread rebind needed: JIT-generated code reaches per-mutator state
+	// (TLAB, remembered set, stackFramesTail, the dummy context, on:do: chain) via the
+	// running worker's TLS (%fs, see asmLoadTls), so a fiber that migrates OS threads
+	// automatically uses whichever worker is executing it now.
 }
 
 

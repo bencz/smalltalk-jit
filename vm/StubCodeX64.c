@@ -129,8 +129,9 @@ static void generateSmalltalkEntry(CodeGenerator *generator)
 	asmMovq(buffer, RSI, R11); // Smalltalk methods expects native code entry in R11
 	asmCallq(buffer, RSI);
 
-	// load thread
-	asmMovqMem(buffer, asmMem(CTX, NO_REGISTER, SS_1, varOffset(RawContext, thread)), RCX);
+	// load the CURRENT worker's thread from TLS (the fiber may have migrated OS threads
+	// during the Smalltalk call, so CTX->thread could be stale)
+	asmLoadTls(buffer, RCX, gCurrentThreadTpoff);
 	// load entry frame
 	asmMovqMem(buffer, asmMem(RCX, NO_REGISTER, SS_1, offsetof(Thread, stackFramesTail)), TMP);
 	// load previous entry frame
@@ -212,8 +213,10 @@ static void generateAllocate(CodeGenerator *generator)
 	asmAddqImm(buffer, RCX, HEAP_OBJECT_ALIGN - 1);
 	asmAndqImm(buffer, RCX, -HEAP_OBJECT_ALIGN); // RCX: aligned size
 
-	// check free space
-	asmMovqMem(buffer, asmMem(CTX, NO_REGISTER, SS_1, varOffset(RawContext, thread)), RBX); // RBX: thread
+	// check free space — bump the RUNNING worker's TLAB, read from TLS (%fs) so shared JIT
+	// code allocates into whichever worker is executing this fiber right now (not the worker
+	// that created the context, which may differ after a migration)
+	asmLoadTls(buffer, RBX, gCurrentThreadTpoff); // RBX: &CurrentThread
 	asmMovqMem(buffer, asmMem(RBX, NO_REGISTER, SS_1, tlabOffset + offsetof(TLAB, end)), TMP); // TMP: TLAB end
 	asmMovqMem(buffer, asmMem(RBX, NO_REGISTER, SS_1, tlabOffset + offsetof(TLAB, top)), RAX); // RAX: new object
 	asmSubq(buffer, RAX, TMP); // TMP: TLAB free space

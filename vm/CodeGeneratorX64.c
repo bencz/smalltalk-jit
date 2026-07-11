@@ -192,9 +192,8 @@ static void generateContextDefinition(CodeGenerator *generator)
 		if (generator->code.header.hasContext) {
 			generateMethodContextAllocation(generator, generator->code.header.contextSize);
 		} else {
-			// load thread
-			asmMovqMem(buffer, asmMem(CTX, NO_REGISTER, SS_1, varOffset(RawContext, thread)), TMP);
-			// load dummy context
+			// load the RUNNING worker's thread from TLS, then its dummy (root) context
+			asmLoadTls(buffer, TMP, gCurrentThreadTpoff);
 			asmMovqMem(buffer, asmMem(TMP, NO_REGISTER, SS_1, offsetof(Thread, context)), TMP);
 			// spill dummy context
 			asmMovqToMem(buffer, TMP, asmMem(RBP, NO_REGISTER, SS_1, context->frameOffset * sizeof(intptr_t)));
@@ -263,8 +262,10 @@ static void generateSafepointPoll(CodeGenerator *generator, _Bool atBackEdge)
 	asmPushq(buffer, R8);
 	asmPushq(buffer, R9);
 	asmPushq(buffer, R11);
-	// RSI = thread, RDI = thread->heap   (heapGcPoll(Heap *heap, Thread *self))
-	asmMovqMem(buffer, asmMem(CTX, NO_REGISTER, SS_1, varOffset(RawContext, thread)), RSI);
+	// RSI = thread, RDI = thread->heap   (heapGcPoll(Heap *heap, Thread *self)). `self` sets
+	// this mutator's spAtSafepoint, so it MUST be the RUNNING worker (TLS), not CTX->thread
+	// which may be stale after a migration.
+	asmLoadTls(buffer, RSI, gCurrentThreadTpoff);
 	asmMovqMem(buffer, asmMem(RSI, NO_REGISTER, SS_1, offsetof(Thread, heap)), RDI);
 	generator->overapproxStackmap = atBackEdge;
 	generateCCall(generator, (intptr_t) heapGcPoll, 2, 1);
@@ -918,8 +919,8 @@ void generateStoreCheck(CodeGenerator *generator, Register object, Register valu
 	// mark as remembered
 	asmOrbMemImm(buffer, tags, TAG_REMEMBERED);
 
-	// TMP = remembered set head block
-	asmMovqMem(buffer, asmMem(CTX, NO_REGISTER, SS_1, varOffset(RawContext, thread)), TMP);
+	// TMP = remembered set head block — the RUNNING worker's set (per-mutator), read from TLS
+	asmLoadTls(buffer, TMP, gCurrentThreadTpoff);
 	asmMovqMem(buffer, asmMem(TMP, NO_REGISTER, SS_1, blocksOffset), TMP);
 
 	// Grow BEFORE the store when the block is full (current >= end), so the store
@@ -943,7 +944,7 @@ void generateStoreCheck(CodeGenerator *generator, Register object, Register valu
 	asmPushq(buffer, R8);
 	asmPushq(buffer, R9);
 	asmPushq(buffer, R11);
-	asmMovqMem(buffer, asmMem(CTX, NO_REGISTER, SS_1, varOffset(RawContext, thread)), TMP);
+	asmLoadTls(buffer, TMP, gCurrentThreadTpoff);
 	asmLeaq(buffer, asmMem(TMP, NO_REGISTER, SS_1, rememberedSetOffset), RDI);
 	generateCCall(generator, (intptr_t) rememberedSetGrow, 1, 0);
 	asmPopq(buffer, R11);
@@ -954,7 +955,7 @@ void generateStoreCheck(CodeGenerator *generator, Register object, Register valu
 	asmPopq(buffer, RDX);
 	asmPopq(buffer, RCX);
 	asmPopq(buffer, RAX);
-	asmMovqMem(buffer, asmMem(CTX, NO_REGISTER, SS_1, varOffset(RawContext, thread)), TMP);
+	asmLoadTls(buffer, TMP, gCurrentThreadTpoff);
 	asmMovqMem(buffer, asmMem(TMP, NO_REGISTER, SS_1, blocksOffset), TMP);
 
 	asmLabelBind(buffer, &notFull, asmOffset(buffer));
@@ -1717,8 +1718,9 @@ void generateCCall(CodeGenerator *generator, intptr_t cFunction, size_t argsSize
 	asmPushq(buffer, CTX); // spill current context
 	asmAndqImm(buffer, RSP, ~(16 - 1)); // ensure 16 bytes stack aligment
 
-	// load thread
-	asmMovqMem(buffer, asmMem(CTX, NO_REGISTER, SS_1, varOffset(RawContext, thread)), TMP);
+	// load the RUNNING worker's thread from TLS (per-mutator stackFramesTail), then set the
+	// exit frame for the C call — CTX->thread may be stale after a migration
+	asmLoadTls(buffer, TMP, gCurrentThreadTpoff);
 	// load last entry frame
 	asmMovqMem(buffer, asmMem(TMP, NO_REGISTER, SS_1, offsetof(Thread, stackFramesTail)), TMP);
 	// set exit frame
@@ -1815,8 +1817,8 @@ void generateBlockContextAllocation(CodeGenerator *generator)
 
 void generatePushDummyContext(AssemblerBuffer *buffer)
 {
-	// load thread
-	asmMovqMem(buffer, asmMem(CTX, NO_REGISTER, SS_1, varOffset(RawContext, thread)), TMP);
+	// load the RUNNING worker's thread from TLS, then push its dummy (root) context
+	asmLoadTls(buffer, TMP, gCurrentThreadTpoff);
 	// push dummy context
 	asmPushqMem(buffer, asmMem(TMP, NO_REGISTER, SS_1, offsetof(Thread, context)));
 }

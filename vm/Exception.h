@@ -12,7 +12,11 @@ typedef struct {
 } RawExceptionHandler;
 OBJECT_HANDLE(ExceptionHandler);
 
-extern PER_ISOLATE Value CurrentExceptionHandler;
+// Head of the running fiber's on:do: handler chain. Now a per-mutator field (see Thread.h)
+// rather than a standalone TLS global, so JIT-generated code reaches it via CTX->thread and
+// every worker sees ITS OWN chain. All existing `CurrentExceptionHandler` / `&CurrentExceptionHandler`
+// uses keep working through this alias.
+#define CurrentExceptionHandler (CurrentThread.exceptionHandler)
 
 Value  unwindExceptionHandler(RawObject *exception);
 

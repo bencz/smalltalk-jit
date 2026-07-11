@@ -23,6 +23,12 @@ typedef struct Thread {
 	struct HandleScope *handleScopes;
 	Value context;
 	struct EntryStackFrame *stackFramesTail;
+	// Head of this mutator's on:do: handler chain (was a standalone TLS `CurrentExceptionHandler`).
+	// Per-mutator so the JIT reaches it via CTX->thread (like tlab/stackFramesTail) instead of a
+	// baked TLS address — a baked address in SHARED JIT code would be the CODEGEN thread's slot,
+	// breaking on:do: on every other worker. A fiber's saved handler is loaded here on resume; the
+	// B2.5 context rebind keeps CTX->thread pointing at the running worker.
+	Value exceptionHandler;
 	TLAB tlab; // per-OS-thread young allocation buffer (stays embedded, per-mutator)
 	RememberedSet rememberedSet; // per-mutator old->young log (merged at GC in the multicore model)
 	struct Thread *nextMutator; // intrusive link in heap->mutators (GC root-scans every mutator)
@@ -43,6 +49,13 @@ typedef struct Thread {
 } Thread;
 
 extern __thread Thread CurrentThread;
+
+// Offset of &CurrentThread from the OS thread pointer (%fs base) for the initial-exec
+// TLS model — a link-time constant, identical on every thread. Computed once in
+// initThread. JIT code bakes this to read EACH running worker's CurrentThread via
+// %fs:tpoff (see asmLoadTls), instead of a per-thread address that would be wrong in
+// shared code.
+extern ptrdiff_t gCurrentThreadTpoff;
 
 // Per-isolate VM globals (Handles, the scheduler, LookupCache, JIT stubs, ...)
 // are thread-local so every isolate OS-thread owns its own copy. They MUST use

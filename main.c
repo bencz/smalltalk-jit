@@ -973,6 +973,73 @@ static int schedMigrateSelfTest(void)
 	return ok ? 0 : 1;
 }
 
+// 6. ST_SCHED_EXC_TEST — on:do: works PER WORKER (the exception-handler chain must be the
+//    running worker's, not the codegen thread's). Each fiber loops installing an on:do:,
+//    signalling inside it, catching, and yielding (so it migrates). With the handler chain
+//    baked to one thread's TLS slot, workers clobber each other's chains -> exceptions go
+//    uncaught / find the wrong handler -> wrong count or crash. Per-worker chain -> exact.
+#define SEXC_FIBERS 24
+#define SEXC_EXPECTED 1000  // one caught per iteration, i in 1..1000
+static _Atomic int gSexcOk;
+static _Atomic int gSexcDone;   // fibers that RAN TO COMPLETION (an uncaught exception kills a fiber
+                                // mid-run, so it never gets here — that is how a broken handler chain shows)
+static Object *gSexcBlockH;
+static void sexcFiber(void *arg)
+{
+	(void) arg;
+	HandleScope scope;
+	openHandleScope(&scope);
+	Object *h = scopeHandle(gSexcBlockH->raw);
+	EntryArgs args = { .size = 0 };
+	entryArgsAddObject(&args, h);
+	Value r = sendMessage(getSymbol("value"), &args);
+	if (!(valueTypeOf(r, VALUE_INT) && (long) asCInt(r) == SEXC_EXPECTED)) {
+		__atomic_store_n(&gSexcOk, 0, __ATOMIC_RELAXED);
+	}
+	__atomic_add_fetch(&gSexcDone, 1, __ATOMIC_RELAXED);
+	closeHandleScope(&scope, NULL);
+}
+
+static int schedExcSelfTest(void)
+{
+	int workers = schedWorkerCount();
+	__atomic_store_n(&gSexcOk, 1, __ATOMIC_RELAXED);
+	__atomic_store_n(&gSexcDone, 0, __ATOMIC_RELAXED);
+	{
+		HandleScope setup;
+		openHandleScope(&setup);
+		// The yield is INSIDE the protected block, BEFORE the signal: the handler is
+		// installed on one worker and the exception is raised after a possible migration
+		// to another — so the on:do: chain must travel with the fiber and be the RUNNING
+		// worker's, not the codegen thread's.
+		gSexcBlockH = handle(asObject(evalObject(
+			"[ | caught | caught := 0. "
+			"  1 to: 1000 do: [:i | "
+			"    [ Processor yield. Array new: 8. Error signal ] "
+			"      on: Error do: [:e | caught := caught + 1 ] ]. "
+			"  caught ]")));
+		runBlockOnce(getTaggedPtr(gSexcBlockH)); // warm up JIT on main before the pool runs
+		closeHandleScope(&setup, NULL);
+	}
+
+	schedulerInit();
+	for (long i = 0; i < SEXC_FIBERS; i++) {
+		schedulerSpawnC(sexcFiber, (void *) i, 0);
+	}
+	__atomic_store_n(&gWatchdogDone, 0, __ATOMIC_RELEASE);
+	pthread_t wd;
+	pthread_create(&wd, NULL, schedWatchdog, (void *) 120000L);
+	schedulerRun();
+	__atomic_store_n(&gWatchdogDone, 1, __ATOMIC_RELEASE);
+	pthread_join(wd, NULL);
+
+	int done = __atomic_load_n(&gSexcDone, __ATOMIC_RELAXED);
+	int ok = __atomic_load_n(&gSexcOk, __ATOMIC_RELAXED) && done == SEXC_FIBERS;
+	fprintf(stderr, "sched-exception self-test: %d fibers ran on:do:+signal across %d workers (per-worker handler chain) | completed=%d/%d all-correct=%d -> %s\n",
+		SEXC_FIBERS, workers, done, SEXC_FIBERS, __atomic_load_n(&gSexcOk, __ATOMIC_RELAXED), ok ? "PASS" : "FAIL");
+	return ok ? 0 : 1;
+}
+
 
 int main(int argc, char **args)
 {
@@ -1084,6 +1151,11 @@ int main(int argc, char **args)
 		initThread(&CurrentThread);
 		bootstrapSmalltalk(cliArgs.snapshotFileName, cliArgs.bootstrapDir);
 		return schedMigrateSelfTest();
+	}
+	if (getenv("ST_SCHED_EXC_TEST") != NULL) {
+		initThread(&CurrentThread);
+		bootstrapSmalltalk(cliArgs.snapshotFileName, cliArgs.bootstrapDir);
+		return schedExcSelfTest();
 	}
 
 	initThread(&CurrentThread);

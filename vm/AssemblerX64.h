@@ -171,6 +171,8 @@ static void asmMovqImm(AssemblerBuffer *buffer, int64_t imm, Register dst);
 static void asmMovqToMem(AssemblerBuffer *buffer, Register src, MemoryOperand operand);
 static void asmMovqMem(AssemblerBuffer *buffer, MemoryOperand operand, Register dst);
 static void asmMovqMemImm(AssemblerBuffer *buffer, int64_t imm, MemoryOperand operand);
+static void asmMovqFsAbs(AssemblerBuffer *buffer, int32_t disp, Register dst);
+static void asmLoadTls(AssemblerBuffer *buffer, Register dst, ptrdiff_t tpoff);
 static void asmMovb(AssemblerBuffer *buffer, ByteRegister src, ByteRegister dst);
 static void asmMovbToMem(AssemblerBuffer *buffer, ByteRegister src, MemoryOperand operand);
 static void asmMovbMem(AssemblerBuffer *buffer, MemoryOperand operand, ByteRegister dst);
@@ -376,6 +378,34 @@ static void asmMovqMemImm(AssemblerBuffer *buffer, int64_t imm, MemoryOperand op
 	asmEmitUint8(buffer, 0xC7);
 	asmEmitOperands(buffer, &operands);
 	asmEmitInt32(buffer, imm);
+}
+
+
+// mov dst, %fs:[disp32] — a segment-prefixed absolute load from the %fs (thread-pointer)
+// segment. Used to read thread-local state directly (see asmLoadTls). Encoding:
+//   64 (FS prefix)  REX.W[.R]  8B  ModRM(mod=00,reg=dst,rm=100=SIB)  SIB(0x25)  disp32
+static void asmMovqFsAbs(AssemblerBuffer *buffer, int32_t disp, Register dst)
+{
+	asmEnsureCapacity(buffer);
+	asmEmitUint8(buffer, 0x64);                             // FS segment override prefix
+	asmEmitRex(buffer, REX_W | (uint8_t) ((dst & 8) >> 1)); // REX.W (+ REX.R for R8..R15 in reg field)
+	asmEmitUint8(buffer, 0x8B);                             // MOV r64, r/m64
+	asmEmitUint8(buffer, (uint8_t) (((dst & 7) << 3) | 4)); // mod=00, reg=dst, rm=100 (SIB follows)
+	asmEmitUint8(buffer, 0x25);                             // SIB: scale=0, index=none(100), base=disp32(101)
+	asmEmitInt32(buffer, disp);
+}
+
+
+// Load the address of the current OS thread's initial-exec TLS block variable
+// `CurrentThread` into `dst`: dst = threadPointer (%fs:0) + tpoff. `tpoff` is the
+// link-time-constant offset of &CurrentThread from the thread pointer, the SAME on
+// every thread — so JIT code compiled once and shared by every worker still reaches
+// EACH worker's own CurrentThread (unlike a baked &CurrentThread or a CTX->thread that
+// goes stale when a fiber migrates OS threads).
+static void asmLoadTls(AssemblerBuffer *buffer, Register dst, ptrdiff_t tpoff)
+{
+	asmMovqFsAbs(buffer, 0, dst);                                // dst = thread pointer (%fs:0 self-ref)
+	asmLeaq(buffer, asmMem(dst, NO_REGISTER, SS_1, tpoff), dst); // dst = &CurrentThread
 }
 
 

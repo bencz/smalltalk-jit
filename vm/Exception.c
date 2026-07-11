@@ -5,9 +5,6 @@
 #include "Handle.h"
 #include "StackFrame.h"
 
-PER_ISOLATE Value CurrentExceptionHandler = 0;
-
-
 Value unwindExceptionHandler(RawObject *rawException)
 {
 	if (CurrentExceptionHandler == 0) {
