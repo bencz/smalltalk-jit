@@ -41,6 +41,21 @@ static _Bool hasFinalizer(RawObject *object);
 PER_ISOLATE GCStats LastGCStats = { 0 };
 
 
+// DIAGNOSTIC (GC_FREELOG=1): a ring buffer of recently-swept OLD objects. The
+// concurrent-full-GC corruption frees a live object; its slot is reused, so the
+// crash is delayed (a dangling class pointer misread later, e.g. in lookup). After
+// a crash, take the fake-object address from the core and search gFreeLog for it:
+// the matching entry names the class that was freed there and in which GC — i.e.
+// the live object the sweep wrongly reclaimed. gcSweep runs under the STW gcLock
+// (one collector at a time), so plain (non-atomic) writes are race-free. Off by
+// default (one getenv, cached).
+#define FREELOG_SIZE 262144
+static struct FreeLogEntry { void *addr; void *klass; unsigned long gc; unsigned long size; } gFreeLog[FREELOG_SIZE];
+static unsigned long gFreeLogIdx = 0;
+static unsigned long gSweepCount = 0;
+static int gFreeLogOn = -1; // -1 = uninitialised; 0/1 after first gcSweep
+
+
 void gcMarkRoots(Thread *thread)
 {
 	MarkingQueue queue = {
@@ -349,6 +364,10 @@ static _Bool markingQueueIsEmpty(MarkingQueue *queue)
 
 void gcSweep(PageSpace *space)
 {
+	if (gFreeLogOn < 0) {
+		gFreeLogOn = getenv("GC_FREELOG") != NULL;
+	}
+	gSweepCount++;
 	// Objects with finalizers found dead this sweep, run after the sweep. Grows on
 	// demand — a fixed cap overflowed once full GCs became rare (grow-threshold
 	// policy) and a sweep reclaims a large batch (e.g. many dead server sockets).
@@ -424,6 +443,13 @@ void gcSweep(PageSpace *space)
 				}
 				LastGCStats.freed++;
 				LastGCStats.sweeped++;
+				if (gFreeLogOn) {
+					struct FreeLogEntry *e = &gFreeLog[gFreeLogIdx++ % FREELOG_SIZE];
+					e->addr = object;
+					e->klass = object->class;
+					e->gc = gSweepCount;
+					e->size = objSize;
+				}
 			}
 			// free region (existing free chunk, or an unmarked dead object): coalesce
 			if (runStart != NULL && (uint8_t *) object == runStart + runSize) {
