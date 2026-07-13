@@ -50,7 +50,9 @@ PER_ISOLATE GCStats LastGCStats = { 0 };
 // (one collector at a time), so plain (non-atomic) writes are race-free. Off by
 // default (one getenv, cached).
 #define FREELOG_SIZE 262144
-static struct FreeLogEntry { void *addr; void *klass; unsigned long gc; unsigned long size; } gFreeLog[FREELOG_SIZE];
+// `volatile` so -O2 does NOT dead-store-eliminate this write-only (read only via gdb)
+// array — without it the whole array is optimised away and unreadable in the core.
+static volatile struct FreeLogEntry { void *addr; void *klass; unsigned long gc; unsigned long size; } gFreeLog[FREELOG_SIZE];
 static unsigned long gFreeLogIdx = 0;
 static unsigned long gSweepCount = 0;
 static int gFreeLogOn = -1; // -1 = uninitialised; 0/1 after first gcSweep
@@ -444,7 +446,7 @@ void gcSweep(PageSpace *space)
 				LastGCStats.freed++;
 				LastGCStats.sweeped++;
 				if (gFreeLogOn) {
-					struct FreeLogEntry *e = &gFreeLog[gFreeLogIdx++ % FREELOG_SIZE];
+					volatile struct FreeLogEntry *e = &gFreeLog[gFreeLogIdx++ % FREELOG_SIZE];
 					e->addr = object;
 					e->klass = object->class;
 					e->gc = gSweepCount;

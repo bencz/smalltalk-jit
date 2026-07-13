@@ -10,6 +10,7 @@
 #include "Os.h"
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 #define SCAVENGER_ALIGN 8
 
@@ -506,6 +507,14 @@ static RawObject *processPointer(Scavenger *scavenger, RawObject **p)
 		return (RawObject *) object->class;
 	}
 
+	// Idempotent: a pointer already at a DESTINATION survivor (an object evacuated THIS
+	// cycle) must NOT be re-forwarded — forwardObject requires a source-space object.
+	// This arises when one old object is in several mutators' remembered sets
+	// (multi-mutator): the first visit forwards its young child and rewrites this slot
+	// to the copy; a later visit re-reads it. The slot is already correct — return it.
+	if (scavengerIncludes(scavenger, (uint8_t *) object)) {
+		return object;
+	}
 	forwardObject(scavenger, object);
 	ASSERT((object->class->tags & TAG_FORWARDED) == 0);
 	object = (RawObject *) object->class;
@@ -527,6 +536,12 @@ static RawObject *processTaggedPointer(Scavenger *scavenger, Value *p)
 		return (RawObject *) object->class;
 	}
 
+	// Idempotent: see processPointer. A pointer already at a DESTINATION survivor was
+	// evacuated this cycle (e.g. the same old object in several mutators' remembered
+	// sets, re-visited); the slot is already correct — return it without re-forwarding.
+	if (scavengerIncludes(scavenger, (uint8_t *) object)) {
+		return object;
+	}
 	forwardObject(scavenger, object);
 	object = (RawObject *) object->class;
 	*p = tagPtr(object);
