@@ -10,6 +10,7 @@
 struct Thread;
 struct NativeCode;
 struct Scheduler;
+struct SmalltalkHandles;
 
 // JIT stubs are shared per-HEAP, not per-OS-thread: all worker threads of one heap
 // reuse the same generated stub bodies (they reach per-thread state via CTX->thread),
@@ -20,6 +21,12 @@ struct Scheduler;
 
 typedef struct Heap {
 	struct Thread *thread;
+	// Well-known handles (kernel classes, Smalltalk global dict, symbol table), shared
+	// by every worker OS thread of this heap. Reached via the `Handles` macro
+	// (Handle.h) as `*CurrentThread.heap->handles`. Allocated in initHeap, populated at
+	// bootstrap. Per-heap (not TLS) so shared-memory workers see one set; separate
+	// isolates keep separate handles via their separate heaps.
+	struct SmalltalkHandles *handles;
 	Scavenger newSpace;
 	PageSpace oldSpace;
 	PageSpace execSpace;

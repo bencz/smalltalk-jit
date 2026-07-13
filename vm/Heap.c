@@ -1,4 +1,5 @@
 #include "Heap.h"
+#include "Handle.h"
 #include "Smalltalk.h"
 #include "GarbageCollector.h"
 #include "Assert.h"
@@ -35,6 +36,9 @@ static void printPageSpace(PageSpace *space);
 void initHeap(Heap *heap, struct Thread *thread)
 {
 	heap->thread = thread;
+	// Per-heap well-known handles (see Heap.h / the `Handles` macro). Zeroed; bootstrap
+	// (or an isolate's own bootstrap) populates the fields. Shared by this heap's workers.
+	heap->handles = calloc(1, sizeof(SmalltalkHandles));
 	initScavenger(&heap->newSpace, heap, 64 * MB);
 	initPageSpace(&heap->oldSpace, 256 * KB, 0);
 	initPageSpace(&heap->execSpace, 256 * KB, 1);
@@ -196,6 +200,8 @@ void freeHeap(Heap *heap)
 	freeScavenger(&heap->newSpace);
 	freePageSpace(&heap->oldSpace);
 	freePageSpace(&heap->execSpace);
+	free(heap->handles);
+	heap->handles = NULL;
 }
 
 

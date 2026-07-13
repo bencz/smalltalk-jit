@@ -32,7 +32,7 @@ typedef struct {
 	HandleScope *current;
 } HandleScopeIterator;
 
-typedef struct {
+typedef struct SmalltalkHandles {
 	Object *nil;
 	Object *false;
 	Object *true;
@@ -95,7 +95,13 @@ typedef struct {
 	String *generateBacktraceSymbol;
 } SmalltalkHandles;
 
-extern PER_ISOLATE SmalltalkHandles Handles;
+// The well-known handles are per-HEAP (shared by all worker OS threads of a heap),
+// NOT per-OS-thread TLS: they point at the shared old-space kernel objects, so every
+// thread mutating one heap must see the SAME set (removes the old `Handles = gMainHandles`
+// TLS-copy hack). Multiple isolates keep separate handles because they have separate
+// heaps. Storage lives in `struct Heap` (allocated in initHeap); this macro reaches it
+// through the current thread's heap.
+#define Handles (*CurrentThread.heap->handles)
 
 static void *scopeHandle(void *object);
 static void *closeHandleScope(HandleScope *scope, void *handle);

@@ -4,7 +4,8 @@
 #include "Assert.h"
 #include <stdlib.h>
 
-PER_ISOLATE SmalltalkHandles Handles = { NULL };
+// `Handles` is now the macro `*CurrentThread.heap->handles` (Handle.h) — per-heap
+// storage lives in struct Heap, allocated by initHeap. No TLS definition here.
 
 
 void freeHandle(void *handle)

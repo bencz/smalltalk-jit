@@ -423,9 +423,15 @@ static void runBlock(Fiber *fiber)
 	HandleScope scope;
 	openHandleScope(&scope);
 
+	// GC-safe: hold the block in a scope handle (which the GC updates), NOT a raw Value in
+	// EntryArgs. sendMessage allocates (entry frame / context, and any scavenge triggered by
+	// a peer at a safepoint) before consuming args[0]; a raw copy would go stale when the
+	// block moves, sending #value to a moved/reclaimed object. Under many workers a peer
+	// scavenge lands in that window on essentially every fiber, so this must be a handle.
+	Object *block = scopeHandle(asObject(fiber->entryBlock));
 	String *valueSelector = getSymbol("value");
 	EntryArgs args = { .size = 0 };
-	entryArgsAdd(&args, fiber->entryBlock); // read fresh (GC may have moved it)
+	entryArgsAddObject(&args, block);
 	sendMessage(valueSelector, &args);
 
 	closeHandleScope(&scope, NULL);
@@ -933,7 +939,8 @@ static void *schedulerHelperMain(void *arg)
 	CurrentThread.nextMutator = NULL;
 	heapAddMutator(heap, &CurrentThread);                      // register before any allocation
 	CurrentThread.schedExceptionHandler = &CurrentExceptionHandler;
-	Handles = s->handles;                                      // well-known symbols snapshot
+	// Handles are per-heap now (Handle.h): CurrentThread.heap == the shared heap, whose
+	// handles are already populated — no TLS copy needed.
 	gWorkerStackSize = s->workerStackSize;
 	initThreadContext(&CurrentThread);                         // allocates this worker's root context
 

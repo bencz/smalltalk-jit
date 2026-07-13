@@ -4,7 +4,6 @@
 #include "vm/Repl.h"
 #include "vm/Thread.h"
 #include "vm/Scheduler.h"
-#include "vm/Isolate.h"
 #include "vm/Message.h"
 #include "vm/Safepoint.h"
 #include "vm/Handle.h"
@@ -86,7 +85,8 @@ static void *workerRunBlock(void *arg)
 	CurrentThread.nextMutator = NULL;
 	heapAddMutator(gWorkerHeap, &CurrentThread);
 	CurrentThread.schedExceptionHandler = &CurrentExceptionHandler; // this worker's own TLS slot
-	Handles = gMainHandles; // well-known handles point at shared (old-space) objects
+	// Handles are per-heap now (Handle.h): CurrentThread.heap already points at the
+	// shared heap, whose handles are populated — no TLS copy needed.
 	initThreadContext(&CurrentThread);               // root context on the worker's TLAB
 	HandleScope scope;
 	openHandleScope(&scope);                         // entry points below re-handle into a parent
@@ -140,7 +140,7 @@ static void *parWorker(void *arg)
 	CurrentThread.nextMutator = NULL;
 	heapAddMutator(gWorkerHeap, &CurrentThread);
 	CurrentThread.schedExceptionHandler = &CurrentExceptionHandler; // this worker's own TLS slot
-	Handles = gMainHandles;
+	// Handles are per-heap now (shared via CurrentThread.heap) — no TLS copy needed.
 	initThreadContext(&CurrentThread);
 	HandleScope scope;
 	openHandleScope(&scope);
@@ -344,7 +344,7 @@ static void *schedGcPeer(void *arg)
 	CurrentThread.nextMutator = NULL;
 	heapAddMutator(gWorkerHeap, &CurrentThread);
 	CurrentThread.schedExceptionHandler = &CurrentExceptionHandler; // this peer's own TLS slot
-	Handles = gMainHandles;
+	// Handles are per-heap now (shared via CurrentThread.heap) — no TLS copy needed.
 	initThreadContext(&CurrentThread);
 	HandleScope scope;
 	openHandleScope(&scope);
@@ -499,7 +499,7 @@ static void *spjitPeer(void *arg)
 	CurrentThread.nextMutator = NULL;
 	heapAddMutator(gWorkerHeap, &CurrentThread);
 	CurrentThread.schedExceptionHandler = &CurrentExceptionHandler;
-	Handles = gMainHandles;
+	// Handles are per-heap now (shared via CurrentThread.heap) — no TLS copy needed.
 	initThreadContext(&CurrentThread);
 	HandleScope scope;
 	openHandleScope(&scope);
@@ -600,7 +600,7 @@ static void *rootsPeer(void *arg)
 	CurrentThread.nextMutator = NULL;
 	heapAddMutator(gWorkerHeap, &CurrentThread);
 	CurrentThread.schedExceptionHandler = &CurrentExceptionHandler;
-	Handles = gMainHandles;
+	// Handles are per-heap now (shared via CurrentThread.heap) — no TLS copy needed.
 	initThreadContext(&CurrentThread);
 	HandleScope scope;
 	openHandleScope(&scope);
@@ -1048,11 +1048,6 @@ int main(int argc, char **args)
 
 	parseCliArgs(&cliArgs, argc, args);
 
-	// Phase 2 transport self-test (C-level): ST_TRANSPORT_TEST=1 ./st
-	if (getenv("ST_TRANSPORT_TEST") != NULL) {
-		return isolateTransportSelfTest();
-	}
-
 	// Multicore safepoint handshake self-test (C-level): ST_SAFEPOINT_TEST=1 ./st
 	if (getenv("ST_SAFEPOINT_TEST") != NULL) {
 		return safepointSelfTest();
@@ -1161,21 +1156,13 @@ int main(int argc, char **args)
 	initThread(&CurrentThread);
 	bootstrapSmalltalk(cliArgs.snapshotFileName, cliArgs.bootstrapDir);
 
-	// The program runs on the MAIN isolate (id 0). It can spawn worker isolates
-	// at runtime (`Isolate spawn:`), each a fresh VM on another core that reloads
-	// this same image; the main isolate keeps running. Give it an inbox so
-	// workers can message it, and remember the image path so workers can reload.
-	isolateSetSnapshotPath(cliArgs.snapshotFileName);
 	schedulerInit();
-	isolateInboxInit(0);
 
 	// Hand execution over to the cooperative fiber scheduler: the program runs
 	// as the first fiber and the loop keeps running until it (and any processes
 	// it forked) are done.
 	schedulerSpawnC(runProgram, &ctx, 0);
 	schedulerRun();
-
-	isolateJoinWorkers(); // wait for any worker isolates the program spawned
 
 	freeHandles();
 	freeThread(&CurrentThread);

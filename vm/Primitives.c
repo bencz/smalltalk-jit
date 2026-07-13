@@ -17,7 +17,6 @@
 #include "Entry.h"
 #include "Os.h"
 #include "Scheduler.h"
-#include "Isolate.h"
 #include "Message.h"
 #include "Collection.h"
 #include "Assert.h"
@@ -93,10 +92,6 @@ static PrimitiveResult processTerminatePrimitive(Value self, Value id);
 static PrimitiveResult processCurrentIdPrimitive(Value self);
 static PrimitiveResult processSuspendPrimitive(Value self);
 static PrimitiveResult processSleepPrimitive(Value self, Value micros);
-static PrimitiveResult isolateCurrentIdPrimitive(Value self);
-static PrimitiveResult isolateSpawnPrimitive(Value self, Value source);
-static PrimitiveResult isolateSendPrimitive(Value self, Value object, Value targetId);
-static PrimitiveResult isolateReceivePrimitive(Value self);
 static PrimitiveResult floatAddPrimitive(Value self, Value arg);
 static PrimitiveResult floatSubPrimitive(Value self, Value arg);
 static PrimitiveResult floatMulPrimitive(Value self, Value arg);
@@ -232,11 +227,6 @@ Primitive Primitives[] = {
 	{"ProcessCurrentIdPrimitive", CCALL, .cFunction = processCurrentIdPrimitive, 1},
 	{"ProcessSuspendPrimitive", CCALL, .cFunction = processSuspendPrimitive, 1},
 	{"ProcessSleepPrimitive", CCALL, .cFunction = processSleepPrimitive, 2},
-
-	{"IsolateCurrentIdPrimitive", CCALL, .cFunction = isolateCurrentIdPrimitive, 1},
-	{"IsolateSpawnPrimitive", CCALL, .cFunction = isolateSpawnPrimitive, 2},
-	{"IsolateSendPrimitive", CCALL, .cFunction = isolateSendPrimitive, 3},
-	{"IsolateReceivePrimitive", CCALL, .cFunction = isolateReceivePrimitive, 1},
 
 	{"WorkerParallelPrimitive", CCALL, .cFunction = workerParallelPrimitive, 2},
 
@@ -416,7 +406,8 @@ static void *parallelPrimWorker(void *arg)
 	initRememberedSet(&CurrentThread.rememberedSet);
 	heapAddMutator(w->heap, &CurrentThread);
 	CurrentThread.schedExceptionHandler = &CurrentExceptionHandler; // this worker's own TLS slot
-	Handles = w->handles;
+	// Handles are per-heap now (Handle.h): CurrentThread.heap == the shared heap w->heap,
+	// whose handles are already populated — no TLS copy needed.
 	initThreadContext(&CurrentThread);
 
 	HandleScope scope;
@@ -815,83 +806,6 @@ static PrimitiveResult processSleepPrimitive(Value self, Value micros)
 {
 	schedulerSleep((int64_t) asCInt(micros));
 	return primSuccess(self);
-}
-
-
-// Id (0-based) of the isolate (independent VM / OS thread) running this code.
-// In single-isolate mode this is always 0.
-static PrimitiveResult isolateCurrentIdPrimitive(Value self)
-{
-	(void) self;
-	return primSuccess(tagInt((intptr_t) isolateCurrentId()));
-}
-
-
-// Spawn a worker isolate that runs `source` (a String program) on its own core,
-// from within the running program. Answers the new isolate's id, or -1. The
-// source is copied out; the worker reloads the shared image and runs it.
-static PrimitiveResult isolateSpawnPrimitive(Value self, Value source)
-{
-	(void) self;
-	if (!valueTypeOf(source, VALUE_POINTER) || asObject(source)->class != Handles.String->raw) {
-		return primFailed();
-	}
-	RawObject *s = asObject(source);
-	size_t len = rawObjectSize(s);
-	char *buf = malloc(len + 1);
-	if (buf == NULL) {
-		return primSuccess(tagInt(-1));
-	}
-	memcpy(buf, getRawObjectIndexedVars(s), len);
-	buf[len] = 0;
-	int id = isolateSpawn(buf); // copies the source itself
-	free(buf);
-	return primSuccess(tagInt(id));
-}
-
-
-// Copy `object` (any portable graph) into isolate `targetId`'s heap by value:
-// serialize it here, hand the bytes to the target's inbox. Answers true on
-// success, false if the graph isn't portable (contains a block/context) or the
-// target isn't ready. The VM is agnostic about what the object means.
-static PrimitiveResult isolateSendPrimitive(Value self, Value object, Value targetId)
-{
-	(void) self;
-	size_t size = 0;
-	uint8_t *bytes = messageSerialize(object, &size);
-	if (bytes == NULL) {
-		return primSuccess(getTaggedPtr(Handles.false));
-	}
-	int rc = isolatePostBytes((int) asCInt(targetId), bytes, size);
-	free(bytes);
-	return primSuccess(getTaggedPtr(rc == 0 ? Handles.true : Handles.false));
-}
-
-
-// Block the current fiber until a buffer arrives in this isolate's inbox, then
-// rebuild it in this heap and answer the object. A single receiver fiber per
-// isolate is assumed (the actor layer runs one "receptionist").
-static PrimitiveResult isolateReceivePrimitive(Value self)
-{
-	(void) self;
-	uint8_t *bytes = NULL;
-	size_t size = 0;
-	while (!isolateInboxPop(&bytes, &size)) {
-		schedulerWaitFd(isolateInboxFd(), 0); // park until the inbox eventfd fires
-		isolateInboxClearSignal();
-	}
-
-	HandleScope scope;
-	openHandleScope(&scope);
-	Value obj;
-	_Bool ok = messageDeserialize(bytes, size, &obj); // obj rooted in `scope` while alive
-	free(bytes);
-	// Drop the transient handle rather than promoting it to the parent scope: the
-	// caller receives `obj` in a register and roots it, and no GC runs in between.
-	// (Promoting would leak one handle per receive and overflow the 256 cap.)
-	closeHandleScope(&scope, NULL);
-	// NB: a valid received value can be 0 (tagInt(0)); success is out-of-band.
-	return primSuccess(ok ? obj : getTaggedPtr(Handles.nil));
 }
 
 
