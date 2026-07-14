@@ -305,7 +305,8 @@ static void iterateObject(MarkingQueue *queue, Thread *thread, RawObject *root)
 
 	root->tags = root->tags & ~TAG_REMEMBERED;
 	if (remember && isOldObject(root)) {
-		rememberedSetAdd(&thread->rememberedSet, root);
+		// Rebuild into the HEAP-level set (mirrors the scavenger): survives worker exit.
+		rememberedSetAdd(&thread->heap->rememberedSet, root);
 	}
 }
 

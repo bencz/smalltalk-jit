@@ -57,6 +57,13 @@ typedef struct Heap {
 	// so the GC can scan the roots of all of them, not just the collecting thread.
 	// One entry today (the owner); several once worker threads share the heap.
 	struct Thread *mutators;
+	// The CONSOLIDATED old->young remembered set for this heap. Each scavenge/full-GC
+	// re-adds every surviving old->young root here (not into the transient collector
+	// thread), so the set survives worker-thread exit — a departing worker's per-thread
+	// barrier delta is spliced in by heapEndMutator. Write barriers still append to the
+	// PER-THREAD Thread.rememberedSet (lock-free); this heap-level set is touched ONLY
+	// under gcLock / at a stop-the-world safepoint, never by a barrier.
+	RememberedSet rememberedSet;
 	// The fiber scheduler shared by all OS-thread workers of this heap (ready queue,
 	// fiber registry, timer heap, epoll). Per-heap (not per-OS-thread TLS) so a pool
 	// of workers can pull fibers from ONE queue over this one heap. NULL until

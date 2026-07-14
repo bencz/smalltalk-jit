@@ -10,7 +10,6 @@
 #include "Os.h"
 #include <string.h>
 #include <stdlib.h>
-#include <stdio.h>
 
 #define SCAVENGER_ALIGN 8
 
@@ -414,25 +413,25 @@ static void iterateRememberedSet(Scavenger *scavenger)
 	// an ever-larger set (O(scavenges × set)), collapsing req/s and, because a
 	// dead old entry keeps resurrecting its young referents, exploding old space.
 	//
-	// iterateObject's tail re-adds a still-live old->young root into the COLLECTING
-	// thread's set (CurrentThread.rememberedSet). CurrentThread is itself one of the
-	// mutators, so we must DETACH every mutator's set (giving each a fresh empty one)
-	// BEFORE re-scanning ANY of them: otherwise, in the multi-mutator case, roots
-	// re-added into the collector's still-live set while earlier mutators are scanned
-	// would be detached and scanned a SECOND time when the loop reaches the collector
-	// — and on that second scan their young fields already point into the destination
-	// semispace, so forwardObject would try to evacuate an already-moved survivor and
-	// crash. Detaching all up front makes the collector's FRESH set (the re-add
-	// target) sit outside the set of chains being iterated, so each root is scanned
-	// exactly once. The next scavenge re-scans the re-added roots via this same loop.
+	// iterateObject's tail re-adds a still-live old->young root into the HEAP-level set
+	// (scavenger->heap->rememberedSet). We must DETACH every source set (each mutator's
+	// per-thread barrier set AND the heap-level consolidated set) — giving each a fresh
+	// empty one — BEFORE re-scanning ANY of them: otherwise a root re-added into the
+	// heap set while earlier sets are scanned would be detached and scanned a SECOND time
+	// when the loop reaches it — and on that second scan its young fields already point
+	// into the destination semispace, so forwardObject would try to evacuate an
+	// already-moved survivor and crash. Detaching all up front makes the heap set's FRESH
+	// head (the re-add target) sit outside the chains being iterated, so each root is
+	// scanned exactly once. The next scavenge re-scans the re-added roots via this loop.
 	size_t mutatorCount = 0;
 	for (Thread *t = scavenger->heap->mutators; t != NULL; t = t->nextMutator) {
 		mutatorCount++;
 	}
-	// Common case (main alone / one worker) fits the stack buffer with no malloc in
-	// the hot GC path; the heap fallback only kicks in with many worker threads.
+	// +1 for the heap-level consolidated set (the extra "pseudo-mutator"). Common case
+	// (main alone / one worker) still fits the stack buffer with no malloc in the hot path.
+	size_t setCount = mutatorCount + 1;
 	RememberedSetBlock *inlineBuf[16];
-	RememberedSetBlock **detached = mutatorCount <= 16 ? inlineBuf : malloc(mutatorCount * sizeof(RememberedSetBlock *));
+	RememberedSetBlock **detached = setCount <= 16 ? inlineBuf : malloc(setCount * sizeof(RememberedSetBlock *));
 	if (detached == NULL) {
 		FAIL(); // real guard: ASSERT is a no-op under NDEBUG (release builds)
 	}
@@ -441,8 +440,12 @@ static void iterateRememberedSet(Scavenger *scavenger)
 		detached[i++] = t->rememberedSet.blocks;
 		t->rememberedSet.blocks = createRememberedSetBlock(NULL);
 	}
+	// The heap-level consolidated set, as the last pseudo-mutator. Its fresh head is the
+	// re-add target for iterateObject, so it must be detached here too.
+	detached[i++] = scavenger->heap->rememberedSet.blocks;
+	scavenger->heap->rememberedSet.blocks = createRememberedSetBlock(NULL);
 
-	for (i = 0; i < mutatorCount; i++) {
+	for (i = 0; i < setCount; i++) {
 		RememberedSet detachedSet = { .blocks = detached[i] };
 		RememberedSetIterator iterator;
 		initRememberedSetIterator(&iterator, &detachedSet);
@@ -597,6 +600,9 @@ static void iterateObject(Scavenger *scavenger, RawObject *root)
 	}
 
 	if (remember && isOldObject(root) && (root->tags & TAG_REMEMBERED) == 0) {
-		rememberedSetAdd(&CurrentThread.rememberedSet, root);
+		// Consolidate into the HEAP-level set, not the transient collector thread's:
+		// otherwise the whole live set lands on whichever worker collected, and is
+		// orphaned when that worker exits (heapEndMutator). Touched only under STW here.
+		rememberedSetAdd(&scavenger->heap->rememberedSet, root);
 	}
 }

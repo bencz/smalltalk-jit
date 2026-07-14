@@ -52,6 +52,7 @@ void initHeap(Heap *heap, struct Thread *thread)
 	pthread_cond_init(&heap->safepointCond, NULL);
 	heap->safepointRequested = 0;
 	heap->mutators = NULL;
+	initRememberedSet(&heap->rememberedSet); // consolidated old->young set (survives worker exit)
 	heap->sched = NULL; // allocated by schedulerInit, once per heap
 	for (int i = 0; i < STUB_COUNT; i++) {
 		heap->stubCode[i] = NULL; // JIT stubs generated lazily, once per heap
@@ -95,6 +96,28 @@ void heapEndMutator(Heap *heap, Thread *thread)
 		*link = thread->nextMutator;
 	}
 	pthread_mutex_unlock(&heap->youngLock);
+
+	// Splice this exiting worker's per-thread barrier delta (old->young edges recorded
+	// since the last GC) into the heap-level consolidated set, so they are NOT lost when
+	// the thread's TLS is reclaimed. Raw block-chain splice — NOT rememberedSetAdd: the
+	// entries keep TAG_REMEMBERED (rememberedSetAdd ASSERTs it is clear). Safe under
+	// gcLock (still held): the heap-level set is only ever touched under gcLock / STW.
+	RememberedSetBlock *front = thread->rememberedSet.blocks;
+	if (front != NULL) {
+		_Bool empty = (front->prev == NULL) && (front->current == front->objects);
+		if (empty) {
+			rememberedSetFreeBlocks(front); // lone empty head — nothing to transfer
+		} else {
+			RememberedSetBlock *tail = front; // oldest block has prev == NULL
+			while (tail->prev != NULL) {
+				tail = tail->prev;
+			}
+			tail->prev = heap->rememberedSet.blocks; // concatenate: thread chain -> heap chain
+			heap->rememberedSet.blocks = front;
+		}
+		thread->rememberedSet.blocks = NULL; // ownership transferred; thread is dying
+	}
+
 	pthread_mutex_unlock(&heap->gcLock);
 }
 
@@ -200,6 +223,8 @@ void freeHeap(Heap *heap)
 	freeScavenger(&heap->newSpace);
 	freePageSpace(&heap->oldSpace);
 	freePageSpace(&heap->execSpace);
+	rememberedSetFreeBlocks(heap->rememberedSet.blocks); // free the whole chain (incl. head)
+	heap->rememberedSet.blocks = NULL;
 	free(heap->handles);
 	heap->handles = NULL;
 }
@@ -467,15 +492,15 @@ void markAndSweep(Thread *thread)
 	__atomic_add_fetch(&gFullGcRuns, 1, __ATOMIC_RELAXED);
 	int64_t startTime = osCurrentMicroTime();
 
-	// Reset EVERY mutator's remembered set, not just the collector's: they are all
-	// parked at this stop-the-world safepoint, and marking rebuilds all surviving
-	// old->young edges into the collector's set (thread->rememberedSet), which the
-	// next scavenge reads via its per-mutator walk. Leaving a peer's set intact
-	// would keep stale (possibly swept) old objects in it -> next scavenge would
-	// walk freed memory.
+	// Reset EVERY mutator's remembered set AND the heap-level consolidated set: they are
+	// all parked at this stop-the-world safepoint, and marking rebuilds all surviving
+	// old->young edges into the heap-level set (heap->rememberedSet), which the next
+	// scavenge reads. Leaving any set intact would keep stale (possibly swept) old
+	// objects in it -> next scavenge would walk freed memory.
 	for (Thread *m = thread->heap->mutators; m != NULL; m = m->nextMutator) {
 		rememberedSetReset(&m->rememberedSet);
 	}
+	rememberedSetReset(&thread->heap->rememberedSet);
 	gcMarkRoots(thread);
 	gcSweep(&thread->heap->oldSpace);
 
