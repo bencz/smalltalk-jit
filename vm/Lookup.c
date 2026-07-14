@@ -70,11 +70,25 @@ static NativeCodeEntry doesNotUnderstand(Class *class, String *selector)
 
 NativeCode *getNativeCode(Class *class, CompiledMethod *method)
 {
+	(void) class;
+	// Lock-free fast path: already-compiled methods (the common case) just ACQUIRE-load.
 	NativeCode *code = compiledMethodGetNativeCode(method);
-	if (code == NULL) {
-		String *selector = compiledMethodGetSelector(method);
-		code = generateMethodCode(method);
-		compiledMethodSetNativeCode(method, code);
+	if (code != NULL) {
+		return code;
 	}
+	// Cold method: compile under codegenLock with double-checked locking, so concurrent
+	// workers first-calling the same method don't double-compile or race the publish
+	// (was: unlocked check + generate + non-atomic store → torn code pointer on a peer =
+	// jump into a half-published NativeCode). Mirrors getStubNativeCode (StubCodeX64.c).
+	// heapCodegenLockEnter is re-entrant (generateMethodCode takes it again) and counts
+	// waiting as GC-safe.
+	Heap *heap = CurrentThread.heap;
+	heapCodegenLockEnter(heap);
+	code = compiledMethodGetNativeCode(method); // re-check under the lock
+	if (code == NULL) {
+		code = generateMethodCode(method);
+		compiledMethodSetNativeCode(method, code); // atomic RELEASE publish, last
+	}
+	heapCodegenLockLeave(heap);
 	return code;
 }

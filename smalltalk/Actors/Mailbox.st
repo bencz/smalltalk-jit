@@ -38,15 +38,22 @@ Mailbox := Object [
 	"posting"
 
 	postUser: aMessage sender: aSenderPid [
+		"Enqueue + wake the runner atomically under the global sync monitor (posts come
+		 from any worker; the queue is a plain OrderedCollection and there are no concurrent
+		 collections yet, so the monitor serializes addLast against the runner's removeFirst)."
+		Processor monitorEnter.
 		userQueue addLast: (Envelope message: aMessage sender: aSenderPid).
 		self schedule.
+		Processor monitorExit.
 		^self
 	]
 
 
 	postSystem: aMessage [
+		Processor monitorEnter.
 		systemQueue addLast: aMessage.
 		self schedule.
+		Processor monitorExit.
 		^self
 	]
 
@@ -56,8 +63,10 @@ Mailbox := Object [
 	suspend [ suspended := true. ^self ]
 
 	resume [
+		Processor monitorEnter.
 		suspended := false.
 		self schedule.
+		Processor monitorExit.
 		^self
 	]
 
@@ -80,8 +89,9 @@ Mailbox := Object [
 	"scheduling (private)"
 
 	schedule [
-		"Wake the runner if it is parked. Cooperative scheduling makes the
-		 idle-check and resume atomic (no yield in between)."
+		"Wake the parked runner. CALLER HOLDS THE MONITOR. Lost-wakeup-safe: the runner
+		 publishes its parked state (parkOnMonitor) before releasing the monitor, so this
+		 resumeId, issued under the same monitor, is never lost."
 		idle ifTrue: [
 			idle := false.
 			Processor resumeId: runnerId ].
@@ -90,41 +100,61 @@ Mailbox := Object [
 
 
 	hasProcessable [
+		"Read under the monitor (called from run's monitored idle-check)."
 		^systemQueue isEmpty not
 			or: [ suspended not and: [ userQueue isEmpty not ] ]
 	]
 
 
+	takeSystem [
+		"Atomically dequeue the next system message (or nil) under the monitor, so it can't
+		 race a concurrent post; the invocation itself runs OUTSIDE the monitor."
+		| m |
+		Processor monitorEnter.
+		m := (running and: [ systemQueue isEmpty not ])
+			ifTrue: [ systemQueue removeFirst ] ifFalse: [ nil ].
+		Processor monitorExit.
+		^m
+	]
+
+
+	takeUser [
+		| m |
+		Processor monitorEnter.
+		m := (running and: [ suspended not and: [ userQueue isEmpty not ] ])
+			ifTrue: [ userQueue removeFirst ] ifFalse: [ nil ].
+		Processor monitorExit.
+		^m
+	]
+
+
 	run [
+		Processor monitorEnter.
 		runnerId := Processor currentId.
+		Processor monitorExit.
 		[ running ] whileTrue: [
 			self processBatch.
 			running ifTrue: [
+				Processor monitorEnter.
 				self hasProcessable
-					ifTrue: [ Processor yield ]
-					ifFalse: [
-						idle := true.
-						Processor suspendCurrent.
-						idle := false ] ] ].
+					ifTrue: [ Processor monitorExit. Processor yield ]
+					ifFalse: [ idle := true. Processor parkOnMonitor ] ] ].
 		^self
 	]
 
 
 	processBatch [
-		"System messages first (always), then a bounded run of user messages."
-		[ running and: [ systemQueue isEmpty not ] ] whileTrue: [
-			invoker invokeSystem: systemQueue removeFirst ].
-
-		(running and: [ suspended not ]) ifTrue: [
-			| count |
-			count := 0.
-			[ running and: [ suspended not
-				and: [ count < throughput and: [ userQueue isEmpty not ] ] ] ] whileTrue: [
-					invoker invokeUser: userQueue removeFirst.
-					"a user message may enqueue system messages (e.g. a failure); drain them"
-					[ running and: [ systemQueue isEmpty not ] ] whileTrue: [
-						invoker invokeSystem: systemQueue removeFirst ].
-					count := count + 1 ] ].
+		"System messages first (always), then a bounded run of user messages. Each message is
+		 dequeued under the monitor (take*) but INVOKED outside it — invoke* runs arbitrary
+		 actor code that posts/sends, re-entering the (non-recursive) monitor."
+		| m count |
+		[ (m := self takeSystem) notNil ] whileTrue: [ invoker invokeSystem: m ].
+		count := 0.
+		[ count < throughput and: [ (m := self takeUser) notNil ] ] whileTrue: [
+			invoker invokeUser: m.
+			"a user message may enqueue system messages (e.g. a failure); drain them"
+			[ (m := self takeSystem) notNil ] whileTrue: [ invoker invokeSystem: m ].
+			count := count + 1 ].
 		^self
 	]
 ]

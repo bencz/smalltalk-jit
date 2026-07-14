@@ -92,6 +92,9 @@ static PrimitiveResult processTerminatePrimitive(Value self, Value id);
 static PrimitiveResult processCurrentIdPrimitive(Value self);
 static PrimitiveResult processSuspendPrimitive(Value self);
 static PrimitiveResult processSleepPrimitive(Value self, Value micros);
+static PrimitiveResult monitorEnterPrimitive(Value self);
+static PrimitiveResult monitorExitPrimitive(Value self);
+static PrimitiveResult monitorParkPrimitive(Value self);
 static PrimitiveResult floatAddPrimitive(Value self, Value arg);
 static PrimitiveResult floatSubPrimitive(Value self, Value arg);
 static PrimitiveResult floatMulPrimitive(Value self, Value arg);
@@ -227,6 +230,9 @@ Primitive Primitives[] = {
 	{"ProcessCurrentIdPrimitive", CCALL, .cFunction = processCurrentIdPrimitive, 1},
 	{"ProcessSuspendPrimitive", CCALL, .cFunction = processSuspendPrimitive, 1},
 	{"ProcessSleepPrimitive", CCALL, .cFunction = processSleepPrimitive, 2},
+	{"MonitorEnterPrimitive", CCALL, .cFunction = monitorEnterPrimitive, 1},
+	{"MonitorExitPrimitive", CCALL, .cFunction = monitorExitPrimitive, 1},
+	{"MonitorParkPrimitive", CCALL, .cFunction = monitorParkPrimitive, 1},
 
 	{"WorkerParallelPrimitive", CCALL, .cFunction = workerParallelPrimitive, 2},
 
@@ -805,6 +811,32 @@ static PrimitiveResult processSuspendPrimitive(Value self)
 static PrimitiveResult processSleepPrimitive(Value self, Value micros)
 {
 	schedulerSleep((int64_t) asCInt(micros));
+	return primSuccess(self);
+}
+
+
+// ---- Sync monitor primitives (Semaphore/Channel/... thread-safety) ----
+// Acquire the one per-heap sync monitor (GC-safe: waiting counts as at-safepoint).
+static PrimitiveResult monitorEnterPrimitive(Value self)
+{
+	heapMonitorEnter(CurrentThread.heap);
+	return primSuccess(self);
+}
+
+
+// Release the sync monitor.
+static PrimitiveResult monitorExitPrimitive(Value self)
+{
+	heapMonitorExit(CurrentThread.heap);
+	return primSuccess(self);
+}
+
+
+// Park the current fiber, atomically dropping the monitor (lost-wakeup-safe). The
+// caller must hold the monitor; it does NOT re-acquire it on wake.
+static PrimitiveResult monitorParkPrimitive(Value self)
+{
+	schedulerParkAndUnlockMonitor();
 	return primSuccess(self);
 }
 

@@ -53,6 +53,23 @@ typedef struct Heap {
 	// locking) or a peer collector would wait for it forever. Recursive use (a stub
 	// generated while compiling a method) is handled by a per-thread depth counter.
 	pthread_mutex_t codegenLock;
+	// The ONE global synchronization monitor for the Smalltalk sync primitives
+	// (Semaphore/Channel/Future/Mailbox/ActorSystem). Under the multi-worker pool a
+	// fiber's "check a condition then park" is no longer atomic by virtue of cooperative
+	// scheduling, so those primitives run their (short, FLAT — never nested) critical
+	// sections under this monitor. A thread WAITING for it counts as GC-safe (same
+	// enter-blocked discipline as codegenLock), and it is only ever taken monitor→
+	// sched->lock (never the reverse), so it cannot deadlock the STW handshake. Coarse
+	// by design (correctness first); sharding it per sync-object is a perf follow-up.
+	pthread_mutex_t monitorLock;
+	// Serializes symbol interning (asSymbol + growSymbolTable) across worker threads: the
+	// symbol table is ONE shared open-addressed hash per heap, so concurrent probe/insert/
+	// grow would corrupt it. Re-entrant (growSymbolTable re-enters asSymbol via setGlobal),
+	// GC-safe acquisition (interning allocates the new Symbol / bigger table → may scavenge).
+	// The occupancy counter is per-heap too (was per-thread TLS, wrong for a shared table).
+	pthread_mutex_t symbolLock;
+	size_t symbolCount;      // live entries in the symbol table (guarded by symbolLock)
+	_Bool symbolCountValid;  // recomputed lazily on first intern (snapshot restores the table only)
 	// Every OS thread that mutates THIS heap links itself here (via Thread.nextMutator)
 	// so the GC can scan the roots of all of them, not just the collecting thread.
 	// One entry today (the owner); several once worker threads share the heap.
@@ -88,6 +105,11 @@ void heapGcBegin(Heap *heap, struct Thread *self);
 void heapGcEnd(Heap *heap);
 void heapCodegenLockEnter(Heap *heap); // serialize JIT codegen across worker threads
 void heapCodegenLockLeave(Heap *heap);
+void heapMonitorEnter(Heap *heap); // GC-safe acquire of the Smalltalk sync monitor
+void heapMonitorExit(Heap *heap);
+void heapSymbolLockEnter(Heap *heap); // re-entrant, GC-safe: serialize symbol interning
+void heapSymbolLockLeave(Heap *heap);
+void heapFillAllTlabTails(Heap *heap); // retire every mutator's TLAB tail (become: under STW)
 void heapGcEnterBlocked(Heap *heap, struct Thread *self);
 void heapGcLeaveBlocked(Heap *heap, struct Thread *self);
 

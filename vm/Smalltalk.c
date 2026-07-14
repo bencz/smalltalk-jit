@@ -5,6 +5,8 @@
 #include "StackFrame.h"
 #include "CodeDescriptors.h"
 #include "Thread.h"
+#include "Scheduler.h"
+#include "Fiber.h"
 #include "Assert.h"
 #include <string.h>
 #include <stdio.h>
@@ -19,10 +21,12 @@ static void iterateObject(RawObject *object, Object *old, Object *new);
 // The symbol table is an open-addressed (linear-probe) hash array with a
 // power-of-two size. A full table would make the probe loop below spin forever,
 // so we track occupancy and grow (rehash into a 2x table) at a 0.75 load factor.
-// The count is per-isolate (each isolate owns its own table) and is recomputed
-// lazily on first use — the snapshot restores the table but not this C counter.
-static PER_ISOLATE size_t gSymbolCount = 0;
-static PER_ISOLATE _Bool gSymbolCountValid = 0;
+// The count is PER-HEAP (the table is shared by all workers of a heap; a per-thread
+// counter would let workers disagree on the load factor and corrupt the shared table)
+// and is recomputed lazily on first use — the snapshot restores the table but not it.
+// All accesses below run under heapSymbolLockEnter (asSymbol), so no extra sync needed.
+#define gSymbolCount      (CurrentThread.heap->symbolCount)
+#define gSymbolCountValid (CurrentThread.heap->symbolCountValid)
 
 static void symbolTableRecount(void)
 {
@@ -83,6 +87,11 @@ String *asSymbol(String *string)
 	if (string->raw->class != Handles.String->raw) {
 		FAIL();
 	}
+	// Everything below touches the ONE shared symbol table + occupancy counter, so it runs
+	// under the per-heap symbol lock (re-entrant: growSymbolTable → setGlobal → asSymbol).
+	Heap *heap = CurrentThread.heap;
+	heapSymbolLockEnter(heap);
+
 	if (!gSymbolCountValid) {
 		symbolTableRecount();
 	}
@@ -99,6 +108,7 @@ String *asSymbol(String *string)
 			break; // empty slot: this is a brand-new symbol
 		}
 		if (stringEquals(string, symbol)) {
+			heapSymbolLockLeave(heap);
 			return closeHandleScope(&scope, symbol); // already interned
 		}
 		index = index == size - 1 ? 0 : index + 1;
@@ -121,6 +131,7 @@ String *asSymbol(String *string)
 	newSymbol->raw->hash = hash;
 	arrayAtPutObject(Handles.SymbolTable, index, (Object *) newSymbol);
 	gSymbolCount++;
+	heapSymbolLockLeave(heap);
 	return closeHandleScope(&scope, newSymbol);
 }
 
@@ -187,14 +198,36 @@ Class *getClass(char *key)
 
 void objectBecome(Object *old, Object *new)
 {
+	Heap *heap = CurrentThread.heap;
+	// become: walks the whole heap + every mutator/fiber stack and rewrites pointers, so
+	// it must run with a STABLE object graph: no peer allocating (which would extend the
+	// young space under our walk) or collecting (moving objects). Stop the world exactly
+	// like heapCollectYoung — take gcLock (waiting counts as GC-safe), then park every
+	// other mutator at a safepoint. Single-mutator (no peers): gcLock alone suffices, no
+	// safepoint handshake needed. become: allocates nothing, so holding gcLock is deadlock-free.
+	_Bool multi = (heap->mutators != NULL && heap->mutators->nextMutator != NULL);
+	heapGcEnterBlocked(heap, &CurrentThread);
+	pthread_mutex_lock(&heap->gcLock);
+	heapGcLeaveBlocked(heap, &CurrentThread);
+	if (multi) {
+		heapGcBegin(heap, &CurrentThread);
+	}
+	// Make the young space linearly walkable: retire every parked mutator's TLAB tail
+	// (the current thread's included) into a filler so swapObjectInNewSpace can skip them.
+	heapFillAllTlabTails(heap);
+
 	size_t oldSize = computeObjectSize(old);
 	size_t newSize = computeObjectSize(new);
-
 	if (oldSize == newSize) {
 		memcpy(old->raw, new->raw, newSize);
 	} else {
 		swapObjectPointers(old, new);
 	}
+
+	if (multi) {
+		heapGcEnd(heap);
+	}
+	pthread_mutex_unlock(&heap->gcLock);
 }
 
 
@@ -211,9 +244,11 @@ static void swapObjectInNewSpace(Object *old, Object *new)
 	size_t objects = 0;
 	RawObject *object = (RawObject *) ((uintptr_t) CurrentThread.heap->newSpace.fromSpace | NEW_SPACE_TAG);
 	RawObject *prev = NULL;
-	// The young allocation high-water now lives in the mutator's TLAB, not
-	// newSpace.top (which was advanced when the TLAB carved its chunk).
-	RawObject *end = (RawObject *) CurrentThread.tlab.top;
+	// Walk the WHOLE carved young space up to the shared high-water (newSpace.top), NOT
+	// this thread's tlab.top — under the multi-worker pool objects live in EVERY mutator's
+	// TLAB, whose tails objectBecome just retired to fillers (heapFillAllTlabTails), so the
+	// span [fromSpace, newSpace.top) is fully parseable and skips those retired tails.
+	RawObject *end = (RawObject *) CurrentThread.heap->newSpace.top;
 	while (object < end) {
 		if ((object->tags & TAG_FREESPACE) != 0) { // retired TLAB tail: skip
 			object = (RawObject *) ((uint8_t *) object + ((FreeSpace *) object)->size);
@@ -243,12 +278,11 @@ static void swapObjectInOldSpace(Object *old, Object *new)
 }
 
 
-static void swapObjectOnStack(Object *old, Object *new)
+// Rewrite every tOld reference to tNew in one entry-frame chain (args + JIT stack slots
+// via the frame's stackmap). Factored out of swapObjectOnStack so become: can apply it to
+// EVERY mutator's live stack AND every parked fiber's saved stack, not just the caller's.
+static void swapStackFrames(EntryStackFrame *entryFrame, Value tOld, Value tNew)
 {
-	Value tOld = getTaggedPtr(old);
-	Value tNew = getTaggedPtr(new);
-	EntryStackFrame *entryFrame = CurrentThread.stackFramesTail;
-
 	while (entryFrame != NULL) {
 		StackFrame *prev = entryFrame->exit;
 		StackFrame *frame = stackFrameGetParent(prev, entryFrame);
@@ -280,6 +314,37 @@ static void swapObjectOnStack(Object *old, Object *new)
 			frame = stackFrameGetParent(frame, entryFrame);
 		}
 		entryFrame = entryFrame->prev;
+	}
+}
+
+
+static void swapObjectOnStack(Object *old, Object *new)
+{
+	Value tOld = getTaggedPtr(old);
+	Value tNew = getTaggedPtr(new);
+
+	// Always scan the current thread's live stack (also covers bootstrap, before any
+	// scheduler / mutator registry exists).
+	swapStackFrames(CurrentThread.stackFramesTail, tOld, tNew);
+	if (!schedulerActive()) {
+		return;
+	}
+	// Under the multi-worker pool the old pointer can be live on ANY peer worker's stack or
+	// in ANY parked fiber's saved stack, so scan them all (STW point → every stack is
+	// quiescent). Peers via heap->mutators (skip self, already done above); parked fibers via
+	// their saved roots.stackFramesTail (a RUNNING fiber's live stack is its worker's TLS,
+	// already covered by the mutator loop, so skip it to avoid processing a chain twice).
+	for (struct Thread *m = CurrentThread.heap->mutators; m != NULL; m = m->nextMutator) {
+		if (m != &CurrentThread) {
+			swapStackFrames(m->stackFramesTail, tOld, tNew);
+		}
+	}
+	size_t slots = schedulerFiberSlots();
+	for (size_t i = 0; i < slots; i++) {
+		Fiber *f = schedulerFiberAt(i);
+		if (f != NULL && f->state != FIBER_RUNNING) {
+			swapStackFrames(f->roots.stackFramesTail, tOld, tNew);
+		}
 	}
 }
 

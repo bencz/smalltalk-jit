@@ -167,8 +167,28 @@ static _Bool ptrInHeap(Scavenger *scavenger, uint8_t *addr)
 // walk) — trusting the space tag alone segfaults on an unmapped garbage class.
 static _Bool plausibleObject(Scavenger *scavenger, RawObject *object)
 {
+	// A real heap object is HEAP_OBJECT_ALIGN-aligned; a stale/garbage stack value
+	// almost never is. This is the cheapest, strongest first filter. Mask the
+	// NEW_SPACE_TAG bit (bit 3, inside the alignment bits): a young object's address
+	// carries it, so the real object base is 16-aligned only after masking.
+	if ((((uintptr_t) object & ~(uintptr_t) SPACE_TAG) & (HEAP_OBJECT_ALIGN - 1)) != 0) {
+		return 0;
+	}
+	// Its class must be an aligned, mapped heap object (validate as mapped BEFORE
+	// dereferencing it — trusting the space tag alone segfaults on a garbage class).
 	uint8_t *class = (uint8_t *) ((uintptr_t) object->class & ~(uintptr_t) SPACE_TAG);
-	if (!ptrInHeap(scavenger, class)) {
+	if (((uintptr_t) class & (HEAP_OBJECT_ALIGN - 1)) != 0 || !ptrInHeap(scavenger, class)) {
+		return 0;
+	}
+	// Second level: a genuine class is itself an object whose OWN class (the
+	// metaclass) is a mapped heap object. Garbage that merely happens to land on a
+	// single plausible-looking header is rejected here — this is what stops a false
+	// root from reaching the unguarded transitive tracer (iterateObject) with a wild
+	// class-derived size and hanging the collector, or scribbling a forwarding word.
+	// Dereference object->class AS STORED (like computeRawObjectSize does) — it is
+	// the real mapped address; the SPACE_TAG-stripped form is only for range checks.
+	uint8_t *metaclass = (uint8_t *) ((uintptr_t) ((RawObject *) object->class)->class & ~(uintptr_t) SPACE_TAG);
+	if (((uintptr_t) metaclass & (HEAP_OBJECT_ALIGN - 1)) != 0 || !ptrInHeap(scavenger, metaclass)) {
 		return 0;
 	}
 	size_t size = computeRawObjectSize(object);
@@ -206,10 +226,24 @@ static void scavengeStackSlot(Scavenger *scavenger, Value *value)
 	// live object from that garbage by validating its header (real class pointer +
 	// a size bounded by a semispace); if implausible, the slot was never validly
 	// assigned on this path -> its logical value is nil.
-	if (((uintptr_t) object & SPACE_TAG) != OLD_SPACE_TAG
-		&& (object->tags & TAG_FORWARDED) == 0
-		&& !plausibleObject(scavenger, object)) {
-		*value = tagPtr(Handles.nil->raw);
+	if (((uintptr_t) object & SPACE_TAG) != OLD_SPACE_TAG) {
+		if (object->tags & TAG_FORWARDED) {
+			// The same over-marked garbage can carry the TAG_FORWARDED bit by chance;
+			// then the plausibility check below is skipped and processTaggedPointer
+			// trusts object->class as a forwarding pointer -> wild class fed to the
+			// mutator / assert 537 (only reachable under a peer STW that stops a fiber
+			// at a JIT safepoint poll, i.e. multi-worker). A REAL forward targets old
+			// space or the destination semispace [fromSpace, top) (mirrors the assert
+			// in processTaggedPointer); anything else means this slot never validly
+			// held a live object -> its logical value is nil.
+			uint8_t *target = (uint8_t *) object->class;
+			if (!(isOldObject((RawObject *) target)
+			      || (scavenger->fromSpace <= target && target < scavenger->top))) {
+				*value = tagPtr(Handles.nil->raw);
+			}
+		} else if (!plausibleObject(scavenger, object)) {
+			*value = tagPtr(Handles.nil->raw);
+		}
 	}
 	processTaggedPointer(scavenger, value);
 	noteYoungRoot(scavenger, *value);

@@ -38,8 +38,14 @@ ActorSystem := Object [
 	"------------------------------------------------------ registry"
 
 	nextId [
+		"Unique id generation. Under the multi-worker pool `counter := counter + 1` is a
+		 racy read-modify-write (→ duplicate Pids), so it runs under the global sync monitor."
+		| id |
+		Processor monitorEnter.
 		counter := counter + 1.
-		^counter
+		id := counter.
+		Processor monitorExit.
+		^id
 	]
 
 
@@ -48,19 +54,29 @@ ActorSystem := Object [
 		| id pid |
 		id := self nextId.
 		pid := Pid system: self id: id.
+		Processor monitorEnter.
 		registry at: id put: anEndpoint.
+		Processor monitorExit.
 		^pid
 	]
 
 
 	unregister: aPid [
+		"The registry is one shared Dictionary mutated by every worker; guard it (there are
+		 no concurrent collections yet, so the monitor serializes at:put:/removeKey:/at:)."
+		Processor monitorEnter.
 		registry removeKey: aPid id ifAbsent: [].
+		Processor monitorExit.
 		^self
 	]
 
 
 	endpointFor: aPid [
-		^registry at: aPid id ifAbsent: [nil]
+		| e |
+		Processor monitorEnter.
+		e := registry at: aPid id ifAbsent: [nil].
+		Processor monitorExit.
+		^e
 	]
 
 
@@ -105,7 +121,9 @@ ActorSystem := Object [
 		context system: self selfPid: pid parent: aParentPid props: aProps mailbox: mailbox.
 		context actor: aProps producer value.
 		mailbox invoker: context.
+		Processor monitorEnter.
 		registry at: id put: mailbox.
+		Processor monitorExit.
 		mailbox postSystem: ActorStarted.
 		mailbox start.
 		^pid

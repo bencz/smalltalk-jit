@@ -39,6 +39,11 @@ void schedulerYield(void);
 // semaphores, channels and other blocking synchronisation.
 void schedulerSuspend(void);
 
+// Like schedulerSuspend, but atomically releases the per-heap sync monitor as part of
+// the park (lost-wakeup-safe hand-off for the Smalltalk sync primitives). Caller MUST
+// hold the monitor via heapMonitorEnter.
+void schedulerParkAndUnlockMonitor(void);
+
 // Park the current fiber until at least `micros` microseconds have elapsed.
 void schedulerSleep(int64_t micros);
 

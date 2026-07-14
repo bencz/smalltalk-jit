@@ -76,6 +76,7 @@ typedef struct Fiber {
 	// instead of parking, so no wakeup is ever lost.
 	ParkIntent parkIntent;
 	_Bool parkPending;
+	int homeWorker; // the ONE worker this fiber runs on (pinned; assigned round-robin at spawn)
 	FiberRoots roots;
 
 	Value entryBlock;       // Smalltalk block to run (nil for C-entry fibers), a GC root

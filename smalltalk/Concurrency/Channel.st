@@ -1,6 +1,10 @@
 "An unbounded blocking channel (a la Go channels / actor mailboxes). Senders
  never block; a receiver blocks until an item is available. Safe for multiple
- producers and consumers under the cooperative scheduler."
+ producers and consumers across the multi-worker scheduler pool: the backing queue
+ is mutated only under the global sync monitor, and item availability is tracked by
+ an internal Semaphore (itself monitor-protected). The queue mutation and the
+ semaphore op are kept as separate flat critical sections (never nested), since the
+ monitor is not re-entrant."
 Channel := Object [
 
 	| queue itemsAvailable |
@@ -21,7 +25,9 @@ Channel := Object [
 	"sending"
 
 	send: anObject [
+		Processor monitorEnter.
 		queue addLast: anObject.
+		Processor monitorExit.
 		itemsAvailable signal.
 		^anObject
 	]
@@ -30,21 +36,35 @@ Channel := Object [
 	"receiving"
 
 	receive [
-		"Block the current process until an item is available, then return it."
+		"Block the current process until an item is available, then return it. The wait
+		 returns only after a matching send has enqueued its item (send does addLast
+		 before signal), so removeFirst under the monitor always finds an element."
+		| item |
 		itemsAvailable wait.
-		^queue removeFirst
+		Processor monitorEnter.
+		item := queue removeFirst.
+		Processor monitorExit.
+		^item
 	]
 
 
-	"testing"
+	"testing (advisory snapshots)"
 
 	isEmpty [
-		^queue isEmpty
+		| empty |
+		Processor monitorEnter.
+		empty := queue isEmpty.
+		Processor monitorExit.
+		^empty
 	]
 
 
 	size [
-		^queue size
+		| n |
+		Processor monitorEnter.
+		n := queue size.
+		Processor monitorExit.
+		^n
 	]
 
 ]

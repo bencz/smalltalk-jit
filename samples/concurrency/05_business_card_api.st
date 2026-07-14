@@ -138,22 +138,30 @@ CardDirectory := Object [
 	class new [ ^super new init ]
 
 	init [
-		users := Dictionary new.
-		cards := Dictionary new.
+		"Shared registries read/written directly from many request fibers. Under the
+		 multi-worker scheduler (the default now) those fibers run in PARALLEL, so the
+		 registries must be thread-safe collections and the id counters must be bumped
+		 atomically — the old 'atomic under the cooperative single-thread scheduler'
+		 assumption no longer holds."
+		users := SharedDictionary new.
+		cards := SharedDictionary new.
 		userSeq := 0.
 		cardSeq := 0.
 		^self
 	]
 
-	"reads -- direct, no actor hop"
+	"reads -- direct, no actor hop (SharedDictionary makes at:ifAbsent: atomic)"
 	lookupUser: anId [ ^users at: anId ifAbsent: [ nil ] ]
 	lookupCard: anId [ ^cards at: anId ifAbsent: [ nil ] ]
 
-	"writes -- synchronous, atomic under the cooperative scheduler"
+	"atomic id generation (a bare `seq := seq + 1` races across workers → duplicate ids)"
+	nextUserId [ | id | Processor monitorEnter. userSeq := userSeq + 1. id := userSeq. Processor monitorExit. ^id ]
+	nextCardId [ | id | Processor monitorEnter. cardSeq := cardSeq + 1. id := cardSeq. Processor monitorExit. ^id ]
+
+	"writes -- atomic id + concurrent-safe store; the spawn runs between them (no lock held)"
 	registerUserName: aName email: anEmail [
 		| uid pid |
-		userSeq := userSeq + 1.
-		uid := userSeq.
+		uid := self nextUserId.
 		pid := Actors spawn: (Props fromProducer: [
 			UserActor id: uid name: aName email: anEmail ]).
 		users at: uid put: pid.
@@ -164,8 +172,7 @@ CardDirectory := Object [
 		| ownerPid cid cardPid |
 		ownerPid := users at: ownerId ifAbsent: [ nil ].
 		ownerPid isNil ifTrue: [ ^nil ].
-		cardSeq := cardSeq + 1.
-		cid := cardSeq.
+		cid := self nextCardId.
 		cardPid := Actors spawn: (Props fromProducer: [
 			BusinessCardActor id: cid owner: ownerId fields: aDict ]).
 		cards at: cid put: cardPid.

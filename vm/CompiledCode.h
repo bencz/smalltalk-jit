@@ -91,13 +91,13 @@ void printMethodsUsage(void);
 
 static void compiledBlockSetNativeCode(CompiledBlock *block, NativeCode *code)
 {
-	block->raw->nativeCode = code;
+	__atomic_store_n(&block->raw->nativeCode, code, __ATOMIC_RELEASE); // atomic publish (see method variant)
 }
 
 
 static NativeCode *compiledBlockGetNativeCode(CompiledBlock *block)
 {
-	return block->raw->nativeCode;
+	return __atomic_load_n(&block->raw->nativeCode, __ATOMIC_ACQUIRE);
 }
 
 
@@ -157,13 +157,17 @@ static uint8_t *compiledBlockGetBytes(CompiledBlock *block)
 
 static void compiledMethodSetNativeCode(CompiledMethod *method, NativeCode *code)
 {
-	method->raw->nativeCode = code;
+	// Atomic publish: multiple workers may lazily compile the same cold method
+	// concurrently; the RELEASE store pairs with the ACQUIRE load in the getter so a
+	// peer never observes a half-published NativeCode pointer. Serialized by codegenLock
+	// in getNativeCode, but the atomic makes the read side lock-free.
+	__atomic_store_n(&method->raw->nativeCode, code, __ATOMIC_RELEASE);
 }
 
 
 static NativeCode *compiledMethodGetNativeCode(CompiledMethod *method)
 {
-	return method->raw->nativeCode;
+	return __atomic_load_n(&method->raw->nativeCode, __ATOMIC_ACQUIRE);
 }
 
 

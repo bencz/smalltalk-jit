@@ -1,0 +1,14 @@
+=== HS RING DUMP === tid=420963 expected(scope to close)=0x7f821cffd560 actualHead(extra)=(nil)
+    (the extra scope (nil); find its OPEN with no matching CLOSE and any SAVE/LOAD after it)
+--- ring #0 tid=420959 totalRecs=5 (showing last 5) ---
+  #0[0] LOAD  fiber=0 scope=(nil) parent=(nil) pc=0x7f82214d1064  <== EXTRA scope
+  #0[1] SAVE  fiber=0 scope=0x7f821cffd560 parent=(nil) pc=0x7f82214c3ac1  <== expected scope
+  #0[2] LOAD  fiber=0 scope=0x7f821cffd560 parent=(nil) pc=0x7f82214d1064  <== expected scope
+  #0[3] SAVE  fiber=0 scope=0x7f821cffd560 parent=(nil) pc=0x7f82214c3ac1  <== expected scope
+  #0[4] LOAD  fiber=1 scope=0x7f8218ff7780 parent=(nil) pc=0x7f82214d1064  (parent is EXTRA)
+--- ring #1 tid=420960 totalRecs=2 (showing last 2) ---
+  #1[0] LOAD  fiber=1 scope=(nil) parent=(nil) pc=0x7f82214d1064  <== EXTRA scope
+  #1[1] SAVE  fiber=1 scope=0x7f8218ff7780 parent=(nil) pc=0x7f82214c3a21  (parent is EXTRA)
+--- ring #2 tid=420963 totalRecs=1 (showing last 1) ---
+  #2[0] LOAD  fiber=0 scope=0x7f821cffd560 parent=(nil) pc=0x7f82214d1064  <== expected scope
+timeout: the monitored command dumped core

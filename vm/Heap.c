@@ -47,6 +47,10 @@ void initHeap(Heap *heap, struct Thread *thread)
 	pthread_mutex_init(&heap->oldLock, NULL);
 	pthread_mutex_init(&heap->execLock, NULL);
 	pthread_mutex_init(&heap->codegenLock, NULL);
+	pthread_mutex_init(&heap->monitorLock, NULL);
+	pthread_mutex_init(&heap->symbolLock, NULL);
+	heap->symbolCount = 0;
+	heap->symbolCountValid = 0; // force a recount on first intern (snapshot restores the table only)
 	pthread_mutex_init(&heap->gcLock, NULL);
 	pthread_mutex_init(&heap->safepointLock, NULL);
 	pthread_cond_init(&heap->safepointCond, NULL);
@@ -218,6 +222,50 @@ void heapCodegenLockLeave(Heap *heap)
 }
 
 
+// ---- Smalltalk sync monitor (Semaphore/Channel/...) ----
+// Acquisition mirrors heapCodegenLockEnter: a fiber holding the monitor may allocate
+// (the critical sections do `waiting addLast:` etc.) and thus trigger a scavenge, and a
+// fiber WAITING on the monitor must not stall the STW handshake — so it enters the
+// blocked state before locking. Unlike codegenLock this is NOT re-entrant: the sync
+// primitives keep their critical sections flat (never take the monitor while holding it).
+void heapMonitorEnter(Heap *heap)
+{
+	heapGcEnterBlocked(heap, &CurrentThread); // waiting on monitorLock counts as safe
+	pthread_mutex_lock(&heap->monitorLock);
+	heapGcLeaveBlocked(heap, &CurrentThread);
+}
+
+void heapMonitorExit(Heap *heap)
+{
+	pthread_mutex_unlock(&heap->monitorLock);
+}
+
+
+// ---- symbol interning lock (asSymbol / growSymbolTable) ----
+// Re-entrant (growSymbolTable re-enters asSymbol through setGlobal to keep the Smalltalk
+// `SymbolTable` global in sync), with a per-thread depth counter like codegenLock. GC-safe
+// acquisition: interning allocates (a new Symbol, or a 2x table) and can scavenge, and a
+// thread waiting on this lock must not stall a peer's STW — so it enters the blocked state
+// before locking. A leaf lock (never taken while holding it another lock that could invert).
+static PER_ISOLATE int gSymbolDepth = 0;
+
+void heapSymbolLockEnter(Heap *heap)
+{
+	if (gSymbolDepth++ == 0) {
+		heapGcEnterBlocked(heap, &CurrentThread); // waiting on symbolLock counts as safe
+		pthread_mutex_lock(&heap->symbolLock);
+		heapGcLeaveBlocked(heap, &CurrentThread);
+	}
+}
+
+void heapSymbolLockLeave(Heap *heap)
+{
+	if (--gSymbolDepth == 0) {
+		pthread_mutex_unlock(&heap->symbolLock);
+	}
+}
+
+
 void freeHeap(Heap *heap)
 {
 	freeScavenger(&heap->newSpace);
@@ -339,6 +387,22 @@ static void youngFill(uint8_t *p, size_t size)
 	filler->next = NULL;
 	filler->size = size;
 	filler->tags = TAG_FREESPACE;
+}
+
+// Retire EVERY mutator's live TLAB tail into a FREESPACE filler so the whole young
+// space [fromSpace, newSpace.top) is linearly walkable. For become: under a
+// stop-the-world safepoint: all peers are parked, so their tlab.top/end are stable, and
+// a plain walker (swapObjectInNewSpace) can then skip the retired tails. Does NOT advance
+// tlab.top — each mutator resumes bump-allocating from where it left off (overwriting the
+// now-dead filler), so no TLAB space is lost.
+void heapFillAllTlabTails(Heap *heap)
+{
+	for (struct Thread *m = heap->mutators; m != NULL; m = m->nextMutator) {
+		size_t tail = (size_t) (m->tlab.end - m->tlab.top);
+		if (tail >= HEAP_OBJECT_ALIGN) {
+			youngFill(m->tlab.top, tail);
+		}
+	}
 }
 
 // Carve a fresh TLAB chunk from the shared young space for the CALLING OS thread.
