@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.10)
 project(smalltalk-jit)
 
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 set(CMAKE_C_FLAGS "-std=gnu11 -pedantic -Werror -Wno-flexible-array-extensions -Wno-c11-extensions -Wno-gnu -fcommon -fno-omit-frame-pointer")
 
 # Default to an optimized build with debug info and assertions kept on (the VM's
@@ -20,52 +22,118 @@ if(SANITIZE)
 	string(APPEND CMAKE_SHARED_LINKER_FLAGS " -fsanitize=${SANITIZE}")
 endif()
 
+# ---- CPU architecture selection --------------------------------------------
+# ST_ARCH names the vm/jit/<arch>/ directory holding ALL CPU-specific code:
+# assembler, code generator, stubs, primitive generators, fiber switch. Arch
+# binding is link-time — this block picks WHICH backend .c files get compiled;
+# generic code calls them through the arch-neutral vm/jit/Target*.h contract
+# headers. Keep this block and vm/jit/TargetAssembler.h in sync (both fail
+# loudly on a mismatch). Porting checklist: PORTING.md.
+if(NOT ST_ARCH)
+	if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+		set(ST_ARCH x64)
+	else()
+		message(FATAL_ERROR
+			"No JIT backend for CPU '${CMAKE_SYSTEM_PROCESSOR}'. Supported: x86_64. "
+			"To start a port, create vm/jit/<arch>/ and register it here - see PORTING.md.")
+	endif()
+endif()
+
+if(ST_ARCH STREQUAL "x64")
+	set(vmArchSources
+		vm/jit/x64/CodeGeneratorX64.c
+		vm/jit/x64/FiberX64.c
+		vm/jit/x64/PrimitivesX64.c
+		vm/jit/x64/StubCodeX64.c)
+else()
+	message(FATAL_ERROR "Unknown ST_ARCH '${ST_ARCH}' (supported: x64)")
+endif()
+
+# ---- OS selection -----------------------------------------------------------
+# ST_OS names the vm/os/<os>/ directory implementing the vm/os/Os.h contract,
+# split by domain (OsTime/OsMemory/OsEvents/OsSignals/OsCpu, plus future
+# domains such as OsCrypto). Same link-time model as ST_ARCH. Porting
+# checklist: PORTING.md.
+if(NOT ST_OS)
+	if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+		set(ST_OS linux)
+	else()
+		message(FATAL_ERROR
+			"No OS layer for '${CMAKE_SYSTEM_NAME}'. Supported: Linux. "
+			"To start a port, create vm/os/<os>/ and register it here - see PORTING.md.")
+	endif()
+endif()
+
+if(ST_OS STREQUAL "linux")
+	set(vmOsSources
+		vm/os/linux/OsCpu.c
+		vm/os/linux/OsEvents.c
+		vm/os/linux/OsMemory.c
+		vm/os/linux/OsSignals.c
+		vm/os/linux/OsTime.c)
+else()
+	message(FATAL_ERROR "Unknown ST_OS '${ST_OS}' (supported: linux)")
+endif()
+
 set(vmSources
-	vm/Bootstrap.c
-	vm/Class.c
-	vm/CodeGeneratorX64.c
-	vm/Collection.c
-	vm/CompiledCode.c
-	vm/Compiler.c
-	vm/Dictionary.c
-	vm/Entry.c
-	vm/Exception.c
-	vm/Fiber.c
-	vm/FreeList.c
-	vm/GarbageCollector.c
-	vm/Handle.c
-	vm/Message.c
-	vm/Heap.c
-	vm/HeapPage.c
-	vm/Iterator.c
-	vm/Json.c
-	vm/Lookup.c
-	vm/Optimizer.c
-	vm/OsLinux.c
-	vm/Parser.c
-	vm/Primitives.c
-	vm/RegisterAllocator.c
-	vm/Repl.c
-	vm/Safepoint.c
-	vm/Scavenger.c
-	vm/Scheduler.c
-	vm/Scope.c
-	vm/Smalltalk.c
-	vm/Snapshot.c
-	vm/Socket.c
-	vm/StackFrame.c
-	vm/Stream.c
-	vm/String.c
-	vm/StubCodeX64.c
-	vm/Thread.c
-	vm/Tokenizer.c
+	vm/compiler/Compiler.c
+	vm/compiler/Optimizer.c
+	vm/compiler/Parser.c
+	vm/compiler/Scope.c
+	vm/compiler/Tokenizer.c
+	vm/concurrency/Fiber.c
+	vm/concurrency/Scheduler.c
+	vm/core/Class.c
+	vm/core/CompiledCode.c
+	vm/core/Entry.c
+	vm/core/Exception.c
+	vm/core/Handle.c
+	vm/core/Lookup.c
+	vm/core/Smalltalk.c
+	vm/core/StackFrame.c
+	vm/core/Thread.c
+	vm/jit/RegisterAllocator.c
+	vm/memory/FreeList.c
+	vm/memory/GarbageCollector.c
+	vm/memory/Heap.c
+	vm/memory/HeapPage.c
+	vm/memory/Safepoint.c
+	vm/memory/Scavenger.c
+	vm/runtime/Collection.c
+	vm/runtime/Dictionary.c
+	vm/runtime/Iterator.c
+	vm/runtime/Json.c
+	vm/runtime/Message.c
+	vm/runtime/Primitives.c
+	vm/runtime/Socket.c
+	vm/runtime/Stream.c
+	vm/runtime/String.c
+	vm/tools/Bootstrap.c
+	vm/tools/Repl.c
+	vm/tools/Snapshot.c
+	${vmArchSources}
+	${vmOsSources}
 )
 
 find_package(Threads)
 add_library(CityHash SHARED cityhash/city.c)
 add_library(Linenoise SHARED linenoise/linenoise.c)
 add_library(VM SHARED ${vmSources})
-add_executable(st main.c)
+add_executable(st main.c vm/tests/SelfTests.c)
+target_include_directories(st PRIVATE ${CMAKE_SOURCE_DIR})
+
+# Standalone C unit test for the tokenizer (own main(), not part of `st`):
+# built on demand — `cmake --build <build> --target TokenizerTest`.
+# (vm/tests/ParserTest.c is NOT wired: it predates the current AST API and no
+# longer compiles — candidate for deletion.)
+add_executable(TokenizerTest EXCLUDE_FROM_ALL vm/tests/TokenizerTest.c)
+target_link_libraries(TokenizerTest VM)
+
+# All VM-internal includes are bucket-qualified from the vm/ root
+# (#include "memory/Heap.h"); third-party includes are root-qualified
+# (#include "cityhash/city.h").
+target_include_directories(VM PUBLIC ${CMAKE_SOURCE_DIR}/vm)
+target_include_directories(VM PRIVATE ${CMAKE_SOURCE_DIR})
 
 target_link_libraries(VM CityHash)
 target_link_libraries(VM Linenoise)

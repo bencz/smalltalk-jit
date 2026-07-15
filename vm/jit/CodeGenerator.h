@@ -1,0 +1,44 @@
+#ifndef CODE_GENERATOR_H
+#define CODE_GENERATOR_H
+
+#include "core/Object.h"
+#include "core/CompiledCode.h"
+#include "jit/Assembler.h"
+#include "jit/TargetAssembler.h"
+#include "core/Lookup.h"
+#include "runtime/String.h"
+#include "jit/RegisterAllocator.h"
+
+typedef struct {
+	CompiledCode code;
+	AssemblerBuffer buffer;
+	size_t frameSize;
+	size_t frameRawAreaSize;
+	RegsAlloc regsAlloc;
+	uint8_t tmpVar;
+	ptrdiff_t bytecodeNumber;
+	OrderedCollection *stackmaps;
+	OrderedCollection *descriptors;
+	// When set, generateStackmap over-approximates liveness (marks every spilled
+	// temp whose range starts at/before the current bytecode, ignoring its end).
+	// Used only for a loop back-edge safepoint poll, where the control-flow-unaware
+	// linear-scan liveness would otherwise omit a loop-carried, body-only pointer
+	// that is live into the next iteration — see generateSafepointPoll.
+	_Bool overapproxStackmap;
+} CodeGenerator;
+
+NativeCode *generateMethodCode(CompiledMethod *method);
+void generateLoadObject(AssemblerBuffer *buffer, RawObject *object, Register dst, _Bool tag);
+void generateLoadClass(AssemblerBuffer *buffer, Register src, Register dst);
+void generateStoreCheck(CodeGenerator *generator, Register object, Register value);
+void generateMethodLookup(CodeGenerator *generator);
+void generateStackmap(CodeGenerator *generator);
+void generateCCall(CodeGenerator *generator, intptr_t cFunction, size_t argsSize, _Bool storeIp);
+void generateMethodContextAllocation(CodeGenerator *generator, size_t size);
+void generateBlockContextAllocation(CodeGenerator *generator);
+void generatePushDummyContext(AssemblerBuffer *buffer);
+NativeCode *generateDoesNotUnderstand(String *selector);
+NativeCode *buildNativeCode(CodeGenerator *generator);
+NativeCode *buildNativeCodeFromAssembler(AssemblerBuffer *buffer);
+
+#endif

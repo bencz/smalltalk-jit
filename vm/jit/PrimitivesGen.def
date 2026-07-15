@@ -1,0 +1,60 @@
+// X-macro registry of the GENERATED (JIT-emitted) primitives — the per-arch
+// contract: every CPU backend must define each function listed here (they are
+// wired into the Primitives[] table in vm/runtime/Primitives.c, which also
+// declares them via vm/jit/TargetPrimitives.h).
+//
+//   GEN_PRIMITIVE(<table name string>, <generator function>)
+//
+// The table name is what <primitive: Name> pragmas resolve against; the
+// function emits the primitive's machine code into the method being compiled.
+// NOTE: entries here mirror the Primitives[] table but do NOT define its order —
+// the table in Primitives.c is the single source of truth for primitive
+// NUMBERS (CompiledMethods in the snapshot store indexes into it; never
+// reorder that table).
+//
+// Porting bring-up tip: a new backend can start with
+//   #define GEN_PRIMITIVE(name, fn) void fn(CodeGenerator *g) { FAIL(); }
+//   #include "jit/PrimitivesGen.def"
+// and implement primitives incrementally — see PORTING.md.
+
+GEN_PRIMITIVE("AtPrimitive", generateAtPrimitive)
+GEN_PRIMITIVE("AtPutPrimitive", generateAtPutPrimitive)
+GEN_PRIMITIVE("SizePrimitive", generateSizePrimitive)
+GEN_PRIMITIVE("InstVarAtPrimitive", generateInstVarAtPrimitive)
+GEN_PRIMITIVE("InstVarAtPutPrimitive", generateInstVarAtPutPrimitive)
+GEN_PRIMITIVE("IdentityPrimitive", generateIdentityPrimitive)
+GEN_PRIMITIVE("HashPrimitive", generateHashPrimitive)
+GEN_PRIMITIVE("ClassPrimitive", generateClassPrimitive)
+GEN_PRIMITIVE("BehaviorNewPrimitive", generateBehaviorNewPrimitive)
+GEN_PRIMITIVE("BehaviorNewSizePrimitive", generateBehaviorNewSizePrimitive)
+GEN_PRIMITIVE("CharacterNewPrimitive", generateCharacterNewPrimitive)
+GEN_PRIMITIVE("CharacterCodePrimitive", generateCharacterCodePrimitive)
+GEN_PRIMITIVE("BlockValuePrimitive", generateBlockValuePrimitive0Args)
+GEN_PRIMITIVE("BlockValuePrimitive1", generateBlockValuePrimitive1Args)
+GEN_PRIMITIVE("BlockValuePrimitive2", generateBlockValuePrimitive2Args)
+GEN_PRIMITIVE("BlockValuePrimitive3", generateBlockValuePrimitive3Args)
+GEN_PRIMITIVE("BlockValueArgsPrimitive", generateBlockValueArgsPrimitive)
+GEN_PRIMITIVE("BlockWhileTruePrimitive", generateBlockWhileTrue)
+GEN_PRIMITIVE("BlockWhileTrue2Primitive", generateBlockWhileTrue2)
+GEN_PRIMITIVE("BlockOnExceptionPrimitive", generateBlockOnExceptionPrimitive)
+GEN_PRIMITIVE("ExceptionSignal", generateExceptionSignalPrimitive)
+GEN_PRIMITIVE("StringHashPrimitive", generateStringHashPrimitive)
+GEN_PRIMITIVE("IntLessThanPrimitive", generateIntLessThanPrimitive)
+GEN_PRIMITIVE("IntAddPrimitive", generateIntAddPrimitive)
+GEN_PRIMITIVE("IntSubPrimitive", generateIntSubPrimitive)
+GEN_PRIMITIVE("IntMulPrimitive", generateIntMulPrimitive)
+GEN_PRIMITIVE("IntQuoPrimitive", generateIntQuoPrimitive)
+GEN_PRIMITIVE("IntModPrimitive", generateIntModPrimitive)
+GEN_PRIMITIVE("IntRemPrimitive", generateIntRemPrimitive)
+GEN_PRIMITIVE("IntNegPrimitive", generateIntNegPrimitive)
+GEN_PRIMITIVE("IntAndPrimitive", generateIntAndPrimitive)
+GEN_PRIMITIVE("IntOrPrimitive", generateIntOrPrimitive)
+GEN_PRIMITIVE("IntXorPrimitive", generateIntXorPrimitive)
+GEN_PRIMITIVE("IntShiftPrimitive", generateIntShiftPrimitive)
+// IntAsObject is intentionally unimplemented (the generator emits a trap);
+// the row keeps its table slot/number.
+GEN_PRIMITIVE("IntAsObjectPrimitive", generateNotImplementedPrimitive)
+GEN_PRIMITIVE("InterruptPrimitive", generateInterruptPrimitive)
+GEN_PRIMITIVE("ExitPrimitive", generateExitPrimitive)
+GEN_PRIMITIVE("MethodSendPrimitive", generateMethodSendPrimitive)
+GEN_PRIMITIVE("MethodSendArgsPrimitive", generateMethodSendArgsPrimitive)
