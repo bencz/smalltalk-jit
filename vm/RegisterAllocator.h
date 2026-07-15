@@ -27,6 +27,12 @@ typedef struct {
 	int8_t reg;
 	size_t start;
 	size_t end;
+	// GC liveness bound, >= end. `end` is the last TEXTUAL use and drives register
+	// allocation only. A variable inside a loop is live around the back-edge though
+	// its last textual use may precede it, so the stackmap filter uses gcEnd, which
+	// extendLoopVarRanges widens to each enclosing loop's back-edge. Keeping the two
+	// apart adds GC coverage without changing register pressure/assignment at all.
+	size_t gcEnd;
 	ptrdiff_t frameOffset;
 } Variable;
 

@@ -9,8 +9,13 @@
 
   One request exercises the whole stack:
      socket (epoll) -> handler fiber -> actor mailbox -> channel
-  and back. It all runs cooperatively on a single OS thread, so
-  thousands of connections multiplex without threads or locks.
+  and back, with handler fibers running IN PARALLEL across the
+  scheduler's worker threads (one per core by default).
+
+  All JSON payloads are typed DTOs: responses are plain objects
+  rendered by Json's reflective encoder (instanceVariables +
+  instVarAt:), and request bodies bind straight into DTO classes
+  via jsonBodyAs: -- no hand-built Dictionaries on either side.
 
   Endpoints:
      POST /users                {name,email}   -> {id}
@@ -36,6 +41,64 @@ AddCard := Object [
 ]
 
 
+"---- Typed JSON payloads (DTOs). No hand-built Dictionaries anywhere: responses
+     are plain objects rendered by Json's REFLECTIVE encoder (class
+     instanceVariables + instVarAt: -> {'ivar': value, ...}), and request bodies
+     are decoded straight into DTOs with jsonBodyAs:. The ivar names ARE the
+     JSON keys, on both sides of the wire. ----"
+UserFields := Object [
+	| name email |
+	class name: aName email: anEmail [ | r | r := self new. r setName: aName email: anEmail. ^r ]
+	setName: aName email: anEmail [ name := aName. email := anEmail. ^self ]
+	name [ ^name ]
+	email [ ^email ]
+]
+
+CardFields := Object [
+	| title company phone |
+	class title: t company: c phone: p [ | r | r := self new. r setTitle: t company: c phone: p. ^r ]
+	setTitle: t company: c phone: p [ title := t. company := c. phone := p. ^self ]
+	title [ ^title ]
+	company [ ^company ]
+	phone [ ^phone ]
+]
+
+UserProfile := Object [
+	| id name email cards |
+	class id: i name: n email: e cards: c [ | r | r := self new. r setId: i name: n email: e cards: c. ^r ]
+	setId: i name: n email: e cards: c [ id := i. name := n. email := e. cards := c. ^self ]
+]
+
+CardView := Object [
+	| id owner views title company phone |
+	class id: i owner: o views: v fields: f [ | r | r := self new. r setId: i owner: o views: v fields: f. ^r ]
+	setId: i owner: o views: v fields: f [
+		id := i. owner := o. views := v.
+		f isNil ifFalse: [ title := f title. company := f company. phone := f phone ].
+		^self ]
+]
+
+CardStats := Object [
+	| id owner views |
+	class id: i owner: o views: v [ | r | r := self new. r setId: i owner: o views: v. ^r ]
+	setId: i owner: o views: v [ id := i. owner := o. views := v. ^self ]
+	views [ ^views ]
+]
+
+IdReply := Object [
+	| id |
+	class of: i [ | r | r := self new. r setId: i. ^r ]
+	setId: i [ id := i. ^self ]
+	id [ ^id ]
+]
+
+Health := Object [
+	| status |
+	class ok [ | r | r := self new. r setOk. ^r ]
+	setOk [ status := 'ok'. ^self ]
+]
+
+
 "---- Each registered user is an actor ----"
 UserActor := Actor [
 	| id name email cardIds |
@@ -58,13 +121,7 @@ UserActor := Actor [
 	]
 
 	profile [
-		| d |
-		d := Dictionary new.
-		d at: 'id' put: id.
-		d at: 'name' put: name.
-		d at: 'email' put: email.
-		d at: 'cards' put: cardIds asArray.
-		^d
+		^UserProfile id: id name: name email: email cards: cardIds asArray
 	]
 ]
 
@@ -73,12 +130,12 @@ UserActor := Actor [
 BusinessCardActor := Actor [
 	| id ownerId fields views |
 
-	class id: anId owner: anOwner fields: aDict [
-		^self new setId: anId owner: anOwner fields: aDict
+	class id: anId owner: anOwner fields: aCardFields [
+		^self new setId: anId owner: anOwner fields: aCardFields
 	]
 
-	setId: anId owner: anOwner fields: aDict [
-		id := anId. ownerId := anOwner. fields := aDict. views := 0.
+	setId: anId owner: anOwner fields: aCardFields [
+		id := anId. ownerId := anOwner. fields := aCardFields. views := 0.
 		^self
 	]
 
@@ -93,23 +150,12 @@ BusinessCardActor := Actor [
 
 	"the full card, having just counted this read"
 	dataWithViews [
-		| d |
-		d := Dictionary new.
-		fields keysAndValuesDo: [:k :v | d at: k put: v ].
-		d at: 'id' put: id.
-		d at: 'owner' put: ownerId.
-		d at: 'views' put: views.
-		^d
+		^CardView id: id owner: ownerId views: views fields: fields
 	]
 
 	"just the counter, without counting this read"
 	stats [
-		| d |
-		d := Dictionary new.
-		d at: 'id' put: id.
-		d at: 'owner' put: ownerId.
-		d at: 'views' put: views.
-		^d
+		^CardStats id: id owner: ownerId views: views
 	]
 ]
 
@@ -186,18 +232,17 @@ CardDirectory := Object [
 BusinessCardApi := Object [
 
 	class on: aServer directory: directory [
-		"POST /users {name,email} -> 201 {id}"
+		"POST /users {name,email} -> 201 {id}   (typed decode: body -> UserFields DTO)"
 		aServer post: '/users' do: [:req |
-			| payload name uid |
-			payload := req jsonBody.
-			(payload isNil or: [ (payload at: 'name' ifAbsent: [ nil ]) isNil ])
+			| payload uid |
+			payload := req jsonBodyAs: UserFields.
+			(payload isNil or: [ payload name isNil ])
 				ifTrue: [ HttpResponse badRequest: 'name is required' ]
 				ifFalse: [
-					name := payload at: 'name'.
 					uid := directory
-						registerUserName: name
-						email: (payload at: 'email' ifAbsent: [ '' ]).
-					HttpResponse created: (Dictionary new at: 'id' put: uid; yourself) ] ].
+						registerUserName: payload name
+						email: (payload email isNil ifTrue: [ '' ] ifFalse: [ payload email ]).
+					HttpResponse created: (IdReply of: uid) ] ].
 
 		"GET /users/:id -> 200 profile   (id->Pid is a direct lookup; the profile
 		 is the only actor round-trip)"
@@ -208,17 +253,17 @@ BusinessCardApi := Object [
 				ifTrue: [ HttpResponse notFound ]
 				ifFalse: [ (HttpResponse ok) json: ((pid request: #profile) await) ] ].
 
-		"POST /users/:id/cards {title,company,...} -> 201 {id}"
+		"POST /users/:id/cards {title,company,phone} -> 201 {id}   (typed decode)"
 		aServer post: '/users/:id/cards' do: [:req |
 			| payload cid |
-			payload := req jsonBody.
-			payload isNil ifTrue: [ payload := Dictionary new ].
+			payload := req jsonBodyAs: CardFields.
+			payload isNil ifTrue: [ payload := CardFields new ].
 			cid := directory
 				createCardOwner: (req param: 'id') asNumber
 				fields: payload.
 			cid isNil
 				ifTrue: [ HttpResponse notFound ]
-				ifFalse: [ HttpResponse created: (Dictionary new at: 'id' put: cid; yourself) ] ].
+				ifFalse: [ HttpResponse created: (IdReply of: cid) ] ].
 
 		"GET /cards/:id -> 200 card data (this counts as a view).
 		 Direct id->Pid lookup, then ONE round-trip to the card actor for #view."
@@ -239,7 +284,7 @@ BusinessCardApi := Object [
 
 		"GET /health -> 200 {status:ok}"
 		aServer get: '/health' do: [:req |
-			(HttpResponse ok) json: (Dictionary new at: 'status' put: 'ok'; yourself) ].
+			(HttpResponse ok) json: Health ok ].
 		^aServer
 	]
 ]
@@ -263,23 +308,18 @@ BusinessCardApi := Object [
 	"one keep-alive client drives the whole demo"
 	client := HttpClient on: addr port: port.
 
-	"1) register two users"
-	r := client post: '/users' json: (Dictionary new
-		at: 'name' put: 'Alice'; at: 'email' put: 'alice@example.com'; yourself).
-	aliceId := r jsonBody at: 'id'.
-	r := client post: '/users' json: (Dictionary new
-		at: 'name' put: 'Bob'; at: 'email' put: 'bob@example.com'; yourself).
-	bobId := r jsonBody at: 'id'.
+	"1) register two users -- the request DTOs are encoded reflexively too"
+	r := client post: '/users' json: (UserFields name: 'Alice' email: 'alice@example.com').
+	aliceId := (r jsonBodyAs: IdReply) id.
+	r := client post: '/users' json: (UserFields name: 'Bob' email: 'bob@example.com').
+	bobId := (r jsonBodyAs: IdReply) id.
 	Transcript nextPutAll: 'registered Alice (id '; nextPutAll: aliceId printString;
 		nextPutAll: ') and Bob (id '; nextPutAll: bobId printString; nextPutAll: ')'; lf.
 
 	"2) Alice creates a business card"
-	r := client post: '/users/', aliceId printString, '/cards' json: (Dictionary new
-		at: 'title' put: 'Founder';
-		at: 'company' put: 'Smalltalk Works';
-		at: 'phone' put: '+1-555-0100';
-		yourself).
-	cardId := r jsonBody at: 'id'.
+	r := client post: '/users/', aliceId printString, '/cards' json: (CardFields
+		title: 'Founder' company: 'Smalltalk Works' phone: '+1-555-0100').
+	cardId := (r jsonBodyAs: IdReply) id.
 	Transcript nextPutAll: 'Alice created card id '; nextPutAll: cardId printString; lf; lf.
 
 	"3) read the card a few times; watch the view counter climb (actor state)"
@@ -324,7 +364,7 @@ BusinessCardApi := Object [
 
 	"6) confirm the counter equals every read so far (3 + burst)"
 	r := client get: '/cards/', cardId printString, '/views'.
-	finalViews := r jsonBody at: 'views'.
+	finalViews := (r jsonBodyAs: CardStats) views.
 	Transcript nextPutAll: 'final view count for card '; nextPutAll: cardId printString;
 		nextPutAll: ' = '; nextPutAll: finalViews printString;
 		nextPutAll: ' (expected '; nextPutAll: (3 + collected) printString; nextPutAll: ')'; lf.

@@ -142,15 +142,45 @@ static void printAllocation(Vars *vars)
 }
 
 
+// A backward jump at bytecode `jump` closes a loop whose body starts at bytecode
+// `target`. The textual [start, end] ranges scanCode computes are control-flow-blind:
+// a variable whose last textual use precedes the back-edge is still live INTO the
+// next iteration when its range reaches the loop body, but every allocating send
+// between that last use and the back-edge gets a GC stackmap that omits it. A
+// scavenge at such a send then leaves the variable's frame slot pointing into the
+// abandoned semispace, and the next iteration reads a dangling object (e.g. a
+// young Boolean flag tested at the loop top). Widen gcEnd — the stackmap filter's
+// upper bound — of every range that overlaps [target, jump] to cover the whole
+// loop. Only gcEnd moves: `end` still drives register allocation, so assignment
+// and spill pressure are untouched, and the extra coverage is safe (the scavenger
+// tolerates stale slots) at the cost of a few stackmap bits.
+static void extendLoopVarRanges(Vars *vars, size_t target, size_t jump)
+{
+	for (Variable **pVar = vars->order; pVar < vars->last; pVar++) {
+		Variable *var = *pVar;
+		if (var->start <= jump && var->end >= target && var->gcEnd < jump) {
+			var->gcEnd = jump;
+		}
+	}
+}
+
+
 static void scanCode(Vars *vars, CompiledCode *code)
 {
 	BytecodesIterator iterator;
 	Bytecode bytecode;
 	_Bool returns = 0;
+	// Bytecode number at each instruction's start byte-offset: jump targets are
+	// byte offsets, liveness ranges are bytecode numbers, and a backward target
+	// was always visited before the jump that references it.
+	ptrdiff_t *bnAtByte = calloc(code->bytecodesSize + 1, sizeof(ptrdiff_t));
 
 	bytecodeInitIterator(&iterator, code->bytecodes, code->bytecodesSize);
 	while (bytecodeHasNext(&iterator)) {
-		switch (bytecode = bytecodeNext(&iterator)) {
+		ptrdiff_t startByte = bytecodeOffset(&iterator);
+		bytecode = bytecodeNext(&iterator);
+		bnAtByte[startByte] = bytecodeNumber(&iterator);
+		switch (bytecode) {
 		case BYTECODE_COPY:;
 			Operand src = bytecodeNextOperand(&iterator);
 			Operand dst = bytecodeNextOperand(&iterator);
@@ -186,20 +216,32 @@ static void scanCode(Vars *vars, CompiledCode *code)
 			examineOperand(vars, bytecodeNextOperand(&iterator), bytecodeNumber(&iterator));
 			break;
 
-		case BYTECODE_JUMP:
-			bytecodeNextInt32(&iterator); // skip destination
+		case BYTECODE_JUMP: {
+			// Relative displacement; the target byte offset is relative to the
+			// post-read position (same recovery as generateBody).
+			int32_t disp = bytecodeNextInt32(&iterator);
+			if (disp < 0) {
+				extendLoopVarRanges(vars, bnAtByte[bytecodeOffset(&iterator) + disp], bytecodeNumber(&iterator));
+			}
 			break;
+		}
 
-		case BYTECODE_JUMP_NOT_MEMBER_OF:
+		case BYTECODE_JUMP_NOT_MEMBER_OF: {
 			bytecodeNextByte(&iterator); // skip literal
 			examineOperand(vars, bytecodeNextOperand(&iterator), bytecodeNumber(&iterator));
-			bytecodeNextInt32(&iterator); // skip destination
+			int32_t disp = bytecodeNextInt32(&iterator);
+			if (disp < 0) {
+				extendLoopVarRanges(vars, bnAtByte[bytecodeOffset(&iterator) + disp], bytecodeNumber(&iterator));
+			}
 			break;
+		}
 
 		default:
 			FAIL();
 		}
 	}
+
+	free(bnAtByte);
 
 	if (!returns) {
 		ptrdiff_t offset = bytecodeNumber(&iterator);
@@ -265,6 +307,9 @@ static void defineTmpVar(Vars *vars, uint8_t index, size_t offset)
 		defineVar(vars, VAR_TMP, index, offset);
 	} else {
 		vars->vars[index].end = offset;
+		if (offset > vars->vars[index].gcEnd) {
+			vars->vars[index].gcEnd = offset;
+		}
 	}
 	if (offset > vars->maxOffset) {
 		vars->maxOffset = offset;
@@ -277,10 +322,16 @@ static Variable *defineSpecialVar(Vars *vars, uint8_t type, uint8_t index, size_
 	if (vars->specialVars[type][index] == NULL) {
 		if (type == VAR_CONTEXT) {
 			vars->vars[CONTEXT_INDEX].end = offset;
+			if (offset > vars->vars[CONTEXT_INDEX].gcEnd) {
+				vars->vars[CONTEXT_INDEX].gcEnd = offset;
+			}
 		}
 		vars->specialVars[type][index] = defineVar(vars, type, vars->varsSize++, offset);
 	} else {
 		vars->specialVars[type][index]->end = offset;
+		if (offset > vars->specialVars[type][index]->gcEnd) {
+			vars->specialVars[type][index]->gcEnd = offset;
+		}
 	}
 	if (offset > vars->maxOffset) {
 		vars->maxOffset = offset;
@@ -295,7 +346,7 @@ static Variable *defineVar(Vars *vars, uint8_t type, uint8_t index, size_t offse
 	var->flags = VAR_DEFINED;
 	var->index = index;
 	var->reg = SPILLED_REG;
-	var->start = var->end = offset;
+	var->start = var->end = var->gcEnd = offset;
 	if (type == VAR_TMP || type == VAR_CONTEXT || type == VAR_CLASS) {
 		var->frameOffset = vars->frameSize--;
 	}

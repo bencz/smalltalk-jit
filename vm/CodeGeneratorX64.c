@@ -1683,10 +1683,11 @@ void generateStackmap(CodeGenerator *generator)
 	size_t varsSize = generator->regsAlloc.varsSize;
 	for (size_t i = 0; i < varsSize; i++) {
 		Variable *var = variableAt(generator, i);
-		// A back-edge poll (overapproxStackmap) drops the `bytecodeNumber <= end`
-		// upper bound: a loop-carried temp whose last textual use precedes the
-		// back-edge is still live into the next iteration and must be marked.
-		if (i == CONTEXT_INDEX || (var->frameOffset < 0 && (var->flags & VAR_ON_STACK) && var->start <= generator->bytecodeNumber && (generator->overapproxStackmap || generator->bytecodeNumber <= var->end))) {
+		// The upper bound is gcEnd, not end: a loop-carried temp whose last textual
+		// use precedes an allocating send inside the loop is still live into the
+		// next iteration, so extendLoopVarRanges widened gcEnd to the enclosing
+		// back-edge. A back-edge poll (overapproxStackmap) drops the bound entirely.
+		if (i == CONTEXT_INDEX || (var->frameOffset < 0 && (var->flags & VAR_ON_STACK) && var->start <= generator->bytecodeNumber && (generator->overapproxStackmap || generator->bytecodeNumber <= var->gcEnd))) {
 			ASSERT(var->frameOffset < -1);
 			size_t index = -var->frameOffset - 1;
 			if (index > 1) {
