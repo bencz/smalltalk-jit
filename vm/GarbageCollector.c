@@ -70,12 +70,74 @@ static void iterateExceptionHandlerChain(MarkingQueue *queue, Thread *thread, Va
 }
 
 
+// Mirror of the scavenger's stale-slot tolerance, for the mark phase's frame walk.
+// A back-edge safepoint poll records an OVER-APPROXIMATED stackmap (the linear-scan
+// liveness is control-flow-unaware), so a walked frame slot can be DEAD and hold a
+// pointer to an OLD object that a PREVIOUS sweep already freed: the scavenge that
+// precedes marking sanitizes stale YOUNG slots (scavengeStackSlot), but passes OLD
+// pointers through untouched. Marking such a pointer raw walks freed/reused memory
+// as an object — a garbage class word in the young range trips markObject's assert,
+// and a plausible-looking one silently wild-marks. Validate an old referent's header
+// before treating it as live: mapped old page, not a free block, a 2-level-plausible
+// class chain, and a sane size. An implausible referent means the slot was dead ->
+// skip it (a truly live object is anchored by an exact root elsewhere; a false PASS
+// on reused memory merely retains that memory conservatively for one cycle).
+static _Bool plausibleOldMarkRoot(Heap *heap, RawObject *object)
+{
+	if ((((uintptr_t) object & ~(uintptr_t) SPACE_TAG) & (HEAP_OBJECT_ALIGN - 1)) != 0) {
+		return 0;
+	}
+	if (!pageSpaceIncludes(&heap->oldSpace, (uint8_t *) object)) {
+		return 0; // the swept page was already unmapped / never an old object
+	}
+	if (object->tags & (TAG_FREESPACE | TAG_FORWARDED)) {
+		return 0; // freelist block header, or nonsense for old space
+	}
+	// The class word must be aligned and mapped (old page or the CURRENT young
+	// space) BEFORE dereferencing it for the second level.
+	uint8_t *class = (uint8_t *) ((uintptr_t) object->class & ~(uintptr_t) SPACE_TAG);
+	uint8_t *youngLo = heap->newSpace.fromSpace;
+	uint8_t *youngHi = heap->newSpace.fromSpace + heap->newSpace.size;
+	if (((uintptr_t) class & (HEAP_OBJECT_ALIGN - 1)) != 0) {
+		return 0;
+	}
+	if (!(pageSpaceIncludes(&heap->oldSpace, class) || (youngLo <= class && class <= youngHi))) {
+		return 0;
+	}
+	// Second level: the class's own class (the metaclass) must be mapped too.
+	uint8_t *metaclass = (uint8_t *) ((uintptr_t) ((RawObject *) object->class)->class & ~(uintptr_t) SPACE_TAG);
+	if (((uintptr_t) metaclass & (HEAP_OBJECT_ALIGN - 1)) != 0) {
+		return 0;
+	}
+	if (!(pageSpaceIncludes(&heap->oldSpace, metaclass) || (youngLo <= metaclass && metaclass <= youngHi))) {
+		return 0;
+	}
+	// Size as a final sanity net only — the 2-level class validation above already
+	// rejects almost all garbage; the bound just has to stop lunatic sizes while
+	// never rejecting a legitimate large object (big Arrays get their own pages).
+	size_t size = computeRawObjectSize(object);
+	return size > 0 && size <= (1u << 30);
+}
+
+// Mark one JIT frame slot/arg value. Old referents are validated first (above);
+// young referents were just sanitized by the preceding scavenge and stay exact.
+static void markStackSlot(MarkingQueue *queue, Thread *thread, Value value)
+{
+	RawObject *object = asObject(value);
+	if (isOldObject(object) && !plausibleOldMarkRoot(thread->heap, object)) {
+		return;
+	}
+	markObject(queue, thread, object);
+}
+
 static void iterateStackFrames(MarkingQueue *queue, Thread *thread, EntryStackFrame *entryFrame)
 {
 	while (entryFrame != NULL) {
 		StackFrame *prev = entryFrame->exit;
 		StackFrame *frame = stackFrameGetParent(prev, entryFrame);
 
+		// slot 0 of the exit mini-frame is the generateCCall-spilled CTX: always a
+		// real live context, so it stays an exact (unguarded) root.
 		Value value = stackFrameGetSlot	(prev, 0);
 		if (valueTypeOf(value, VALUE_POINTER)) {
 			markObject(queue, thread, asObject(value));
@@ -87,7 +149,7 @@ static void iterateStackFrames(MarkingQueue *queue, Thread *thread, EntryStackFr
 			for (ptrdiff_t i = 0; i < argsSize; i++) {
 				Value value = stackFrameGetArg(frame, i);
 				if (valueTypeOf(value, VALUE_POINTER)) {
-					markObject(queue, thread, asObject(value));
+					markStackSlot(queue, thread, value);
 				}
 			}
 
@@ -98,7 +160,7 @@ static void iterateStackFrames(MarkingQueue *queue, Thread *thread, EntryStackFr
 				if (stackmapIncludes(stackmap, i)) {
 					Value value = stackFrameGetSlot(frame, i);
 					if (valueTypeOf(value, VALUE_POINTER)) {
-						markObject(queue, thread, asObject(value));
+						markStackSlot(queue, thread, value);
 					}
 				}
 			}

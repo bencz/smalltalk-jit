@@ -13,6 +13,15 @@
 
 #define SCAVENGER_ALIGN 8
 
+// Zero the just-abandoned source semispace at the end of every scavenge, so a
+// missed-update bug (a stale slot still pointing into it) reads zeros and fails
+// loudly at its next use, instead of finding plausible stale object images and
+// corrupting silently, possibly many cycles later (that latency is exactly what
+// made the 2026-07 old->young class-edge bug take a day to pin down). A full-
+// semispace memset per scavenge is real cost, so release builds skip it; turn it
+// on for corruption hunts.
+#define SCRUB_ABANDONED_SEMISPACE 0
+
 static void iterateFiberRoots(Scavenger *scavenger, Fiber *fiber);
 static void iteratePersistentHandles(Scavenger *scavenger);
 static void iterateThreadRoots(Scavenger *scavenger);
@@ -119,7 +128,11 @@ void scavengerScavenge(Scavenger *scavenger)
 	}
 	LastGCStats.youngSurvivorBytes =
 		scavenger->top - (uint8_t *) ((uintptr_t) scavenger->fromSpace | NEW_SPACE_TAG);
-	memset(scavenger->toSpace, scavenger->size, 0);
+#if SCRUB_ABANDONED_SEMISPACE
+	// (The pre-2026-07 line here had memset's size/value args swapped — it zeroed
+	// 0 bytes, so the scrub never actually ran anywhere.)
+	memset(scavenger->toSpace, 0, scavenger->size);
+#endif
 
 	LastGCStats.scavengeCount++;
 	LastGCStats.scavengeTimeUs += osCurrentMicroTime() - scavengeStart;
