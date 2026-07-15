@@ -8,6 +8,7 @@
 #include "Compiler.h"
 #include "Stream.h"
 #include "Socket.h"
+#include "Json.h"
 #include "Parser.h"
 #include "Lookup.h"
 #include "StackFrame.h"
@@ -64,6 +65,8 @@ static PrimitiveResult streamAvailablePrimitive(Value receiver, Value descriptor
 static PrimitiveResult socketConnectPrimitive(Value socket, Value ip, Value port);
 static PrimitiveResult socketBindPrimitive(Value socket, Value ip, Value port, Value queueSize);
 static PrimitiveResult socketAcceptPrimitive(Value socket);
+static PrimitiveResult jsonParsePrimitive(Value receiver, Value vString);
+static PrimitiveResult jsonEncodePrimitive(Value receiver, Value vObject);
 static PrimitiveResult socketReadPrimitive(Value self, Value fd, Value buffer, Value size, Value start);
 static PrimitiveResult socketWritePrimitive(Value self, Value fd, Value buffer, Value size);
 static PrimitiveResult socketSetNoDelayPrimitive(Value self, Value fd);
@@ -214,6 +217,9 @@ Primitive Primitives[] = {
 	{"SocketHostLookup", CCALL, .cFunction = socketHostLookupPrimitive, 2},
 
 	{"LastIoErrorPrimitive", CCALL, .cFunction = lastIoErrorPrimitive, 1},
+
+	{"JsonParsePrimitive", CCALL, .cFunction = jsonParsePrimitive, 2},
+	{"JsonEncodePrimitive", CCALL, .cFunction = jsonEncodePrimitive, 2},
 
 	{"CurrentMicroTimePrimitive", CCALL, .cFunction = currentMicroTimePrimitive, 1},
 
@@ -753,6 +759,54 @@ static PrimitiveResult lastIoErrorPrimitive(Value receiver)
 }
 
 
+// Json class >> parse: — the strict fast-path parser (vm/Json.c). Fails on any
+// syntax error, over-SmallInteger integer or over-depth input; the Smalltalk
+// fallback (Json.st slowParse:) then re-parses for a precise JsonParseError or
+// a LargeInteger. The result Value is captured BEFORE closing the scope and
+// nothing allocates after (the floatResult lesson: never return a handle
+// through closeHandleScope, it would leak one caller-scope slot per call).
+// Json class >> encode: / primEncode: — the core-type fast path (vm/Json.c).
+// Fails on any non-core class in the graph, NaN/Infinity or over-depth; the
+// Smalltalk fallback then walks that level reflectively (re-entering this
+// primitive for core subtrees).
+static PrimitiveResult jsonEncodePrimitive(Value receiver, Value vObject)
+{
+	HandleScope scope;
+	openHandleScope(&scope);
+	String *encoded;
+	if (!jsonEncode(vObject, &encoded)) {
+		closeHandleScope(&scope, NULL);
+		return primFailed();
+	}
+	Value result = getTaggedPtr(encoded);
+	closeHandleScope(&scope, NULL);
+	return primSuccess(result);
+}
+
+
+static PrimitiveResult jsonParsePrimitive(Value receiver, Value vString)
+{
+	if (!valueTypeOf(vString, VALUE_POINTER)) {
+		return primFailed();
+	}
+	RawClass *class = asObject(vString)->class;
+	if (class != Handles.String->raw && class != Handles.Symbol->raw) {
+		return primFailed();
+	}
+
+	HandleScope scope;
+	openHandleScope(&scope);
+	String *input = (String *) scopeHandle(asObject(vString));
+	Value result;
+	if (!jsonParse(input, &result)) {
+		closeHandleScope(&scope, NULL);
+		return primFailed();
+	}
+	closeHandleScope(&scope, NULL);
+	return primSuccess(result);
+}
+
+
 static PrimitiveResult currentMicroTimePrimitive(Value receiver)
 {
 	return primSuccess(tagInt(osCurrentMicroTime()));
@@ -1207,35 +1261,8 @@ static PrimitiveResult floatAsStringPrimitive(Value self)
 		strcpy(buf, "nan");
 	} else if (isinf(x)) {
 		strcpy(buf, x < 0 ? "-inf" : "inf");
-	} else if (x == 0.0) {
-		strcpy(buf, signbit(x) ? "-0.0" : "0.0");
 	} else {
-		/* shortest number of significant digits that round-trips */
-		int sig = 17;
-		for (int s = 1; s <= 17; s++) {
-			snprintf(buf, sizeof(buf), "%.*e", s - 1, x);
-			if (strtod(buf, NULL) == x) {
-				sig = s;
-				break;
-			}
-		}
-		/* prefer plain decimal notation for human-friendly magnitudes */
-		int exp10 = (int) floor(log10(fabs(x)));
-		if (exp10 >= -4 && exp10 < 16) {
-			int frac = sig - 1 - exp10;
-			if (frac < 0) {
-				frac = 0;
-			}
-			snprintf(buf, sizeof(buf), "%.*f", frac, x);
-			if (strtod(buf, NULL) != x) {
-				snprintf(buf, sizeof(buf), "%.*e", sig - 1, x);
-			}
-		} else {
-			snprintf(buf, sizeof(buf), "%.*e", sig - 1, x);
-		}
-		if (strpbrk(buf, ".eEnN") == NULL) {
-			strcat(buf, ".0");
-		}
+		jsonFormatDouble(x, buf); /* shared shortest-round-trip form (vm/Json.c) */
 	}
 
 	HandleScope scope;

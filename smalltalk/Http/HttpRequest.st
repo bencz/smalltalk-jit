@@ -120,6 +120,15 @@ HttpRequest := Object [
 	]
 
 
+	"Model binding: materialize the JSON body straight into an instance of
+	 aClass (see Json decode:as: — keys map to instance variable names; an
+	 optional class-side jsonTypes declares nested field classes)."
+	jsonBodyAs: aClass [
+		(body isNil or: [ body isEmpty ]) ifTrue: [ ^nil ].
+		^Json decode: body as: aClass
+	]
+
+
 	isKeepAlive [
 		| conn |
 		conn := self header: 'connection'.

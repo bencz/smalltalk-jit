@@ -105,6 +105,14 @@ HttpResponse := Object [
 	]
 
 
+	"Model binding (client side): materialize the JSON body into an instance
+	 of aClass (see Json decode:as:)."
+	jsonBodyAs: aClass [
+		(body isNil or: [ body isEmpty ]) ifTrue: [ ^nil ].
+		^Json decode: body as: aClass
+	]
+
+
 	"---- writing (server side) ----"
 
 	writeOn: aSocket keepAlive: keepAlive [

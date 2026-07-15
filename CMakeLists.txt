@@ -38,6 +38,7 @@ set(vmSources
 	vm/Heap.c
 	vm/HeapPage.c
 	vm/Iterator.c
+	vm/Json.c
 	vm/Lookup.c
 	vm/Optimizer.c
 	vm/OsLinux.c

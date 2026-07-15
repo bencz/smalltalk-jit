@@ -87,7 +87,7 @@ scheduler, channels, an actor layer, and non-blocking sockets.
 | `07_mediator_cqrs.st`       | **Advanced Mediator (CQRS)** — commands/queries routed to one handler through a pipeline (`log → validate → time`); events published **fire-and-forget** to per-subscriber fibers; a saga reacts to a `StockLow` event by issuing a `Restock`; concurrent buyers fan out as fibers and fan in over a channel |
 
 The HTTP server, client and JSON codec used by 05/06 live in the kernel
-(`smalltalk/Streams/Http/*.st` and `smalltalk/Json.st`), so they are reusable
+(`smalltalk/Http/*.st` and `smalltalk/Json.st`), so they are reusable
 building blocks, not just sample code:
 
 ```smalltalk

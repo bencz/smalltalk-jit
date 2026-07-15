@@ -283,16 +283,15 @@ static _Bool parseKernelFiles(char *kernelDir)
 		"Streams/ServerSocket.st",
 		"Streams/InternetAddress.st",
 
-		// general-purpose JSON codec (used by the HTTP framework, but standalone)
-		"Json.st",
-
-		// HTTP framework (server + client) on top of the non-blocking sockets
-		"Streams/Http/HttpRequest.st",
-		"Streams/Http/HttpConnection.st",
-		"Streams/Http/HttpResponse.st",
-		"Streams/Http/HttpRouter.st",
-		"Streams/Http/HttpServer.st",
-		"Streams/Http/HttpClient.st",
+		// HTTP framework (server + client) on top of the non-blocking sockets.
+		// (Json is referenced only inside method BODIES here — late-bound — so it
+		// can load later, after the exception hierarchy its error classes need.)
+		"Http/HttpRequest.st",
+		"Http/HttpConnection.st",
+		"Http/HttpResponse.st",
+		"Http/HttpRouter.st",
+		"Http/HttpServer.st",
+		"Http/HttpClient.st",
 
 		"GarbageCollector.st",
 
@@ -327,6 +326,10 @@ static _Bool parseKernelFiles(char *kernelDir)
 		"ShouldNotImplement.st",
 		"SubClassResponsibility.st",
 		"IoError.st",
+
+		// general-purpose JSON codec (used by the HTTP framework, but standalone);
+		// after the exception classes: JsonError/JsonParseError subclass Error
+		"Json.st",
 
 		"Parser/ParseError.st",
 		"Parser/Parser.st",
