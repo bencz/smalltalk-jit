@@ -13,4 +13,11 @@ int selfTestFromEnv(char *snapshotFileName, char *bootstrapDir,
 // vmArchTestSources in CMakeLists.txt). mode "print" regenerates the vectors.
 int abiEmitGoldenSelfTest(const char *mode);
 
+// The ppc64 (big-endian) golden, runnable on ANY build host (the encoders
+// emit explicitly big-endian words — nothing executes): the ppc64 port's
+// rung-1 bring-up vehicle, developed natively on x86. On ppc64 builds
+// EmitGoldenPpc64Bind.c aliases abiEmitGoldenSelfTest to it; ppc64le builds
+// get a stub (separate backend).
+int ppc64EmitGoldenSelfTest(const char *mode);
+
 #endif

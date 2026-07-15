@@ -4,6 +4,7 @@
 #include "core/Class.h"
 #include "core/Lookup.h"
 #include "jit/StubCode.h"
+#include "jit/TargetEntry.h"
 #include "compiler/Compiler.h"
 #include "runtime/Iterator.h"
 #include "memory/Heap.h"
@@ -24,14 +25,13 @@ Value invokeMethod(CompiledMethod *method, EntryArgs *args)
 
     Class *class = scopeHandle(args->values[0].isHandle ? args->values[0].handle->raw->class : getClassOf(args->values[0].value));
 
-    union PointerConverter converter;
-    converter.object_pointer = getStubNativeCode(&SmalltalkEntry)->insts;
-    NativeCodeEntry entry = converter.function_pointer;
-
     Value rawArgs[args->size];
     initArgs(rawArgs, args);
     initThreadContext(&CurrentThread);
-    Value result = entry(method->raw, getNativeCode(class, method)->insts, rawArgs, &CurrentThread);
+    // C -> JIT crossing goes through the per-arch seam (ppc64 ELFv1 requires
+    // a function descriptor; x64 is a plain cast) — jit/TargetEntry.h.
+    Value result = targetCallSmalltalkEntry(getStubNativeCode(&SmalltalkEntry)->insts,
+        method->raw, getNativeCode(class, method)->insts, rawArgs, &CurrentThread);
 
     closeHandleScope(&scope, NULL);
     return result;
@@ -53,21 +53,22 @@ Value invokeInititalize(Object *object)
 
 Value sendMessage(String *selector, EntryArgs *args)
 {
-    union PointerConverter converter;
-    converter.object_pointer = getStubNativeCode(&SmalltalkEntry)->insts;
-    NativeCodeEntry entry = converter.function_pointer;
-
     RawClass *class = args->values[0].isHandle ? args->values[0].handle->raw->class : getClassOf(args->values[0].value);
 
     NativeCodeEntry nativeCodeEntry = cachedLookupNativeCode(class, selector->raw);
 
+    union PointerConverter converter;
     converter.function_pointer = nativeCodeEntry;
-    NativeCode *nativeCode = (NativeCode *) ((uint8_t *) converter.object_pointer - offsetof(NativeCode, insts));
+    void *nativeCodeInsts = converter.object_pointer;
+    NativeCode *nativeCode = (NativeCode *) ((uint8_t *) nativeCodeInsts - offsetof(NativeCode, insts));
 
     Value rawArgs[args->size];
     initArgs(rawArgs, args);
     initThreadContext(&CurrentThread);
-    return entry(nativeCode->compiledCode, nativeCodeEntry, rawArgs, &CurrentThread);
+    // C -> JIT crossing goes through the per-arch seam (ppc64 ELFv1 requires
+    // a function descriptor; x64 is a plain cast) — jit/TargetEntry.h.
+    return targetCallSmalltalkEntry(getStubNativeCode(&SmalltalkEntry)->insts,
+        nativeCode->compiledCode, nativeCodeInsts, rawArgs, &CurrentThread);
 }
 
 static void initArgs(Value *rawArgs, EntryArgs *args)

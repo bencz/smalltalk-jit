@@ -3,12 +3,19 @@
 
 #include "core/Assert.h"
 #include "core/Endian.h"
+#include "jit/TargetCodePatch.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <stddef.h>
 
 #define ASM_BUFFER_GAP 32
+
+// Fixup "size" tag for a baked 64-bit immediate that is NOT a contiguous
+// 8-byte word in the instruction stream (ppc64's 5-instruction asmLi64,
+// 20 bytes): asmBindFixup routes it through targetWriteCodePointer instead
+// of a raw store. x64 keeps plain size-8 fixups.
+#define ASM_FIXUP_SIZE_CODE_POINTER 20
 
 typedef struct {
 	uint8_t argRegsSize;
@@ -188,6 +195,9 @@ static void asmBindFixup(AssemblerBuffer *buffer, AssemblerFixup *fixup, int64_t
 	case 8:
 		ASSERT(INT64_MIN <= value && value <= INT64_MAX);
 		storeU64(p, (uint64_t) value);
+		break;
+	case ASM_FIXUP_SIZE_CODE_POINTER:
+		targetWriteCodePointer((uint8_t *) p, (uint64_t) value);
 		break;
 	default:
 		FAIL();

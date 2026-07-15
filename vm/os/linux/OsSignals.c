@@ -2,6 +2,7 @@
 // and SIGPIPE suppression.
 #include "os/Os.h"
 #include <signal.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -16,11 +17,12 @@ static void segvHandler(int sig, siginfo_t *si, void *ucontext)
 {
 	(void) sig;
 	(void) ucontext;
-	if (
-#ifdef SEGV_ACCERR
-	    si->si_code == SEGV_ACCERR && // mapped-but-PROT_NONE, i.e. a reserved window
-#endif
-	    gSegvCallback((uintptr_t) si->si_addr)) {
+	// No si_code filter: a fault in a reserved-but-PROT_NONE window is
+	// SEGV_ACCERR natively, but qemu-user (the ppc64 bring-up vehicle)
+	// reports it as SEGV_MAPERR. The callback itself validates the fault
+	// address against the fiber stack reservations, so wild accesses still
+	// fall through to the fatal path below.
+	if (gSegvCallback((uintptr_t) si->si_addr)) {
 		return; // consumed (e.g. stack grown) -> retry the faulting instruction
 	}
 	static const char msg[] = "fatal: stack overflow past reservation / invalid memory access\n";

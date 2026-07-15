@@ -24,12 +24,16 @@ CFLAGS="-std=gnu11 -O2 -fcommon -fno-omit-frame-pointer -I$ROOT/vm -I$ROOT"
 case "$TARGET_ARCH" in
 	ppc64)
 		ARCH_DIR="ppc64"
-		ABI_BIND="$ROOT/vm/jit/ppc64/abi/elfv1/AbiElfV1Bind.c"
+		ABI_SRCS="$ROOT/vm/jit/ppc64/abi/elfv1/AbiElfV1.c
+			$ROOT/vm/jit/ppc64/abi/elfv1/AbiElfV1Bind.c
+			$ROOT/vm/jit/ppc64/abi/elfv1/FiberElfV1.c"
+		TEST_SRCS="$ROOT/vm/tests/EmitGoldenPpc64.c $ROOT/vm/tests/EmitGoldenPpc64Bind.c"
 		CITYHASH_FLAGS="-DWORDS_BIGENDIAN"
 		;;
 	ppc64le)
 		ARCH_DIR="ppc64le"
-		ABI_BIND="$ROOT/vm/jit/ppc64le/abi/elfv2/AbiElfV2Bind.c"
+		ABI_SRCS="$ROOT/vm/jit/ppc64le/abi/elfv2/AbiElfV2Bind.c"
+		TEST_SRCS="$ROOT/vm/tests/EmitGoldenPpc64le.c"
 		CITYHASH_FLAGS=""
 		;;
 	*) echo "build-nocmake.sh targets ppc64/ppc64le (got $TARGET_ARCH)"; exit 1 ;;
@@ -39,12 +43,12 @@ SOURCES=$(ls "$ROOT"/vm/compiler/*.c "$ROOT"/vm/concurrency/*.c "$ROOT"/vm/core/
 	"$ROOT"/vm/jit/RegisterAllocator.c "$ROOT"/vm/jit/StubCode.c \
 	"$ROOT"/vm/jit/$ARCH_DIR/*.c "$ROOT"/vm/memory/*.c "$ROOT"/vm/os/linux/*.c \
 	"$ROOT"/vm/runtime/*.c "$ROOT"/vm/tools/*.c)
-SOURCES="$SOURCES $ABI_BIND $ROOT/vm/thirdparty/cityhash/city.c $ROOT/vm/thirdparty/linenoise/linenoise.c"
+SOURCES="$SOURCES $ABI_SRCS $ROOT/vm/thirdparty/cityhash/city.c $ROOT/vm/thirdparty/linenoise/linenoise.c"
 
 if [ "$STATIC" = "1" ]; then
 	echo "cross-static build ($TARGET_ARCH via $CC)..."
 	$CC $CFLAGS $CITYHASH_FLAGS -static -o "$BUILD/st" \
-		"$ROOT/main.c" "$ROOT/vm/tests/SelfTests.c" "$ROOT/vm/tests/EmitGoldenPpc64.c" \
+		"$ROOT/main.c" "$ROOT/vm/tests/SelfTests.c" $TEST_SRCS \
 		$SOURCES -lpthread -lm
 	$CC $CFLAGS $CITYHASH_FLAGS -static -o "$BUILD/TokenizerTest" \
 		"$ROOT/vm/tests/TokenizerTest.c" $SOURCES -lpthread -lm
@@ -52,7 +56,7 @@ else
 	echo "native shared build ($TARGET_ARCH)..."
 	$CC $CFLAGS $CITYHASH_FLAGS -fPIC -shared -o "$BUILD/libVM.so" $SOURCES -lpthread -lm
 	$CC $CFLAGS -o "$BUILD/st" "$ROOT/main.c" "$ROOT/vm/tests/SelfTests.c" \
-		"$ROOT/vm/tests/EmitGoldenPpc64.c" -L"$BUILD" -lVM -Wl,-rpath,'$ORIGIN'
+		$TEST_SRCS -L"$BUILD" -lVM -Wl,-rpath,'$ORIGIN'
 	$CC $CFLAGS -o "$BUILD/TokenizerTest" "$ROOT/vm/tests/TokenizerTest.c" \
 		-L"$BUILD" -lVM -Wl,-rpath,'$ORIGIN'
 fi

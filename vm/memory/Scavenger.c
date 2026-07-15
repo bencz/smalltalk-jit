@@ -1,5 +1,6 @@
 #include "memory/Scavenger.h"
 #include "memory/Heap.h"
+#include "jit/TargetCodePatch.h"
 #include "core/StackFrame.h"
 #include "jit/CodeDescriptors.h"
 #include "core/Thread.h"
@@ -531,12 +532,17 @@ static void iterateNativeCode(Scavenger *scavenger)
 			}
 			for (size_t i = 0; i < code->pointersOffsetsSize; i++) {
 				uint16_t offset = ((uint16_t *) (code->insts + code->size))[i];
-				Value *ptr = (Value *) (code->insts + offset);
-				if (valueTypeOf(*ptr, VALUE_POINTER)) {
-					processTaggedPointer(scavenger, ptr);
+				// The baked immediate has no contiguous in-memory form on
+				// every arch (ppc64 splits it across instruction halfwords):
+				// read/patch through the per-arch seam — jit/TargetCodePatch.h.
+				uint8_t *site = code->insts + offset;
+				Value value = (Value) targetReadCodePointer(site);
+				if (valueTypeOf(value, VALUE_POINTER)) {
+					processTaggedPointer(scavenger, &value);
 				} else {
-					processPointer(scavenger, (RawObject **) ptr);
+					processPointer(scavenger, (RawObject **) &value);
 				}
+				targetWriteCodePointer(site, (uint64_t) value);
 			}
 			if (code->pointersOffsetsSize > 0) {
 				// Baked object immediates INSIDE instructions may have been

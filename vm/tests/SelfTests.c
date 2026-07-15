@@ -1098,6 +1098,14 @@ int selfTestFromEnv(char *snapshotFileName, char *bootstrapDir,
 		return abiEmitGoldenSelfTest(getenv("ST_ABI_EMIT_TEST"));
 	}
 
+	// ppc64 (big-endian) emission golden test — HOST-INDEPENDENT: the POWER
+	// encoders emit explicitly big-endian words into a buffer, so the ppc64
+	// port's rung-1 bring-up runs natively on the x86 dev host too:
+	// ST_PPC64_EMIT_TEST=1 ./st (=print regenerates the expected vectors)
+	if (getenv("ST_PPC64_EMIT_TEST") != NULL) {
+		return ppc64EmitGoldenSelfTest(getenv("ST_PPC64_EMIT_TEST"));
+	}
+
 	// Multicore safepoint handshake self-test (C-level): ST_SAFEPOINT_TEST=1 ./st
 	if (getenv("ST_SAFEPOINT_TEST") != NULL) {
 		return safepointSelfTest();

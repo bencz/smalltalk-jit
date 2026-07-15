@@ -15,6 +15,8 @@
 #endif
 #include <stdlib.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <unistd.h>
 
 // The context switch itself (fiberSwitchAsm) and the initial stack frame
 // layout are CPU-specific and live in the selected backend
@@ -26,6 +28,21 @@
 // once per OS thread by fiberInitStackGrowth (from schedulerInit).
 static size_t gInitialCommit = 64 * 1024;
 static long gPageSize = 4096;
+static int gPrecommitStacks = -1;
+
+// ST_FIBER_PRECOMMIT=1 commits every fiber stack in full at creation and
+// never relies on the SIGSEGV grow-on-fault path. Bring-up workaround for
+// qemu-user (its signal emulation delivers si_addr = NULL, so guard faults
+// cannot be attributed — real kernels fill si_addr and keep the default
+// lazy-commit behavior).
+static _Bool fiberPrecommitStacks(void)
+{
+	if (gPrecommitStacks < 0) {
+		char *env = getenv("ST_FIBER_PRECOMMIT");
+		gPrecommitStacks = env != NULL && env[0] == '1';
+	}
+	return gPrecommitStacks == 1;
+}
 
 void fiberInitStackGrowth(size_t initialCommitBytes)
 {
@@ -72,6 +89,9 @@ Fiber *fiberCreate(size_t stackSize)
 	// whole stack up front so no guard fault ever occurs during a sanitizer run.
 	commit = stackSize;
 #endif
+	if (fiberPrecommitStacks()) {
+		commit = stackSize; // ST_FIBER_PRECOMMIT=1 (qemu-user bring-up)
+	}
 	uint8_t *top = base + mapSize;
 	uint8_t *committedLow = top - commit;
 	if (!osPageCommit(committedLow, commit)) {

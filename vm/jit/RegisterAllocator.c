@@ -1,4 +1,5 @@
 #include "jit/RegisterAllocator.h"
+#include "jit/TargetAssembler.h"
 #include "compiler/Compiler.h"
 #include "core/Assert.h"
 #include <stdlib.h>
@@ -365,8 +366,12 @@ static void scanRegisters(Vars *vars, AvailableRegs *regs)
 	initSortedVars(&sortedVars);
 	initRegsPool(&regsPool, regs);
 
+	// The context variable is PINNED to the backend's dedicated context
+	// register (x64: R12 = 12, ppc64: r30) — this used to be a hardcoded 12,
+	// which is correct only on x64; on ppc64 register 12 is the send-target
+	// scratch, so every context died at a method's first send.
 	var = vars->specialVars[VAR_CONTEXT][0];
-	var->reg = 12; // TODO: use regs->contextReg
+	var->reg = CTX;
 
 	for (Variable **pVar = vars->order; pVar < vars->last; pVar++) {
 		var = *pVar;

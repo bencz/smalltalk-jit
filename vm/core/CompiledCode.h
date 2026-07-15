@@ -3,6 +3,7 @@
 
 #include "core/Object.h"
 #include "core/Class.h"
+#include "core/Endian.h"
 #include "compiler/Bytecodes.h"
 #include "runtime/Collection.h"
 #include "runtime/String.h"
@@ -24,6 +25,24 @@ typedef struct NativeCode {
 	// uint16_t pointersOffsets;
 } NativeCode;
 
+// The header is stored INSIDE the scanned vars area of CompiledMethod/Block
+// objects, so the GC and the snapshot walker read this 8-byte struct as a
+// tagged Value. The low two bits of that word must ALWAYS read as VALUE_INT
+// (00) — on little-endian the low byte is `tag` (always 0); on big-endian
+// the low byte is the struct's LAST byte, so the field order is mirrored to
+// keep `tag` there. Field ACCESS is by name everywhere (C and the JIT's
+// offsetof-based emitters), so only this declaration ever changes.
+#if TARGET_BIG_ENDIAN
+typedef struct {
+	uint16_t primitive;
+	uint8_t outerReturns;
+	uint8_t contextSize;
+	uint8_t hasContext;
+	uint8_t tempsSize;
+	uint8_t argsSize;
+	uint8_t tag;
+} CompiledCodeHeader;
+#else
 typedef struct {
 	uint8_t tag;
 	uint8_t argsSize;
@@ -33,6 +52,7 @@ typedef struct {
 	uint8_t outerReturns;
 	uint16_t primitive;
 } CompiledCodeHeader;
+#endif
 
 typedef struct {
 	OBJECT_HEADER;

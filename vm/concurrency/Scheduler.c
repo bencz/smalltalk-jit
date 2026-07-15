@@ -497,7 +497,24 @@ void schedulerFiberMain(void)
 static _Bool fiberSegvGrowCallback(uintptr_t faultAddr)
 {
 	Fiber *fiber = gCurrent;
-	return fiber != NULL && fiberGrowStack(fiber, faultAddr);
+	if (fiber == NULL) {
+		return 0;
+	}
+	// qemu-user (the ppc64 bring-up vehicle) delivers si_addr = NULL for
+	// guard faults, so the fault cannot be attributed to an address. Fall
+	// back to growing the RUNNING fiber's window one chunk — by far the
+	// likeliest fault source. A non-stack fault then re-faults after each
+	// growth until the reserve floor is hit and the fatal path still fires
+	// (bounded). Real kernels always fill si_addr and never take this branch.
+	if (faultAddr == 0) {
+		uintptr_t clow = (uintptr_t) fiber->committedLow;
+		uintptr_t floor = (uintptr_t) fiber->reserveFloor;
+		if (clow <= floor) {
+			return 0; // fully grown already: a genuine wild access
+		}
+		return fiberGrowStack(fiber, clow - 1);
+	}
+	return fiberGrowStack(fiber, faultAddr);
 }
 
 

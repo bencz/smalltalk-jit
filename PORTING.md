@@ -168,13 +168,21 @@ this directory.
 
 ## ppc64 (big-endian ELFv1 first, then little-endian ELFv2)
 
-The ground is prepared: `vm/jit/ppc64/` (big-endian, ELFv1) and
-`vm/jit/ppc64le/` (little-endian, ELFv2) exist as compiling, linking SKELETONS
-(real `Register` enum + traits; every codegen entry point `FAIL()`s), selected
-automatically per host (`ST_ARCH=ppc64|ppc64le` with a fixed `ST_ABI` each).
-They are SEPARATE backends by design — the ecosystem treats them as distinct
+Status: **the ppc64 (BE) port is COMPLETE through the full JIT** —
+`CodeGeneratorPpc64.c`, `StubCodePpc64.c` and `PrimitivesPpc64.c` are real
+(a 1:1 translation of the x64 backend under the mapping in
+`vm/jit/ppc64/DESIGN.md`, which also documents the seven bring-up bugs that
+were root-caused on the way — read it before porting the next arch).
+Verified: bootstrap produces a byte-count-identical image, `tests/` 40/40 and
+the suite's samples all pass under qemu-user, and `./build.sh` (cmake + full
+native compile + the whole test suite) runs green inside a native ppc64 BE
+debian-ports rootfs (`mmdebstrap --mode=chrootless` + `podman import`; the
+host's binfmt qemu makes the container transparently executable).
+`vm/jit/ppc64le/` remains a compiling, linking SKELETON (deliberately
+deferred); it inherits every shared-code fix listed in DESIGN.md. They are
+SEPARATE backends by design — the ecosystem treats them as distinct
 architectures and the codegen diverges beyond the ABI; shared POWER encoding
-helpers can be factored into a common header once the real encoders land. The
+helpers can be factored into a common header once the LE encoders land. The
 endianness/portability hazards found by the deep audit are FIXED in generic
 code: snapshot format v2 is self-describing (magic/version/byte-order header,
 struct-layout-independent shape encoding, loud refusal of foreign images),
@@ -184,44 +192,99 @@ char), `tagChar` normalizes through unsigned char, the GC's madvise uses
 `osPageSize()` (ppc64 distros default to 64 KB pages), and CityHash gets
 `WORDS_BIGENDIAN` on BE builds.
 
+What exists (rung 1):
+
+- **Encoders** (`vm/jit/ppc64/AssemblerPpc64.h`): ld/std/stdu, lwz/stw,
+  lfd/stfd, addi/addis/li/lis, ori/oris/or/mr/nop, rldicr/sldi, cmpdi,
+  mfspr/mtspr (LR/CTR) + mfcr/mtcrf, blr/bctr/bctrl, b/bc with
+  ppc64-specific label emit/bind (branch displacements are relative to the
+  instruction's OWN address and live inside the word — asmPpcLabelBind
+  patches the big-endian word, telling I-form from B-form by opcode), and
+  `asmLi64` — the movabs analog: a FIXED 5-instruction shape
+  (lis/ori/sldi 32/oris/ori) for any 64-bit immediate, patchable in place by
+  `asmLi64Patch` (what a GC pointer-patch loop must use).
+- **HOST-INDEPENDENT emission**: encoders store words EXPLICITLY big-endian
+  (== native order on every host the backend executes on), so the x86 dev
+  host compiles them, links the ELFv1 instance into its own `st`, and runs
+  the full golden natively: `ST_PPC64_EMIT_TEST=1|print` (19th self-test).
+  Pinned vectors: `vm/tests/EmitGoldenPpc64Expected.h`, validated
+  byte-identical against the debian cross binutils by
+  `scripts/ppc64/golden-oracle.sh` (hand-maintained reference `.s` — an
+  independent derivation, which is what makes it an oracle). The same test
+  re-runs on a real BE target in rung 2 (`cross-test.sh be`).
+- **`Ppc64Abi` ops-struct** (`vm/jit/ppc64/Abi.h`, mirroring `X64Abi`):
+  argRegs r3-r10, callee-saved map (r1/r2/r13 reserved), caller-saved spill
+  table (PLACEHOLDER contract: pool volatiles + r3-r6, invariant-checked by
+  the golden), `paramSaveArea = 64` (the ELFv1 shadow-space analog),
+  `emitLoadTls` (addis/addi ha/lo from r13 — the 0x7000 bias cancels out
+  because tpoffs are computed at runtime from r13 itself),
+  `emitCallCFunction` (the `.opd` descriptor dance: save r2 to 40(r1), load
+  entry/TOC/env from the descriptor, mtctr/bctrl, restore r2), entry-stub
+  save/restore hooks (the full nonvolatile stdu frame), and the fiber pair.
+  `emitCCallPrimArgs`/`emitPrimResultCheck` FAIL() — see the sret hazard
+  below.
+- **Instance/Bind/asm split** (`vm/jit/ppc64/abi/elfv1/`): `AbiElfV1.c`
+  (instance + all emitter hooks + the C fiber PRIME) is host-independent;
+  `FiberElfV1.c` (the fiber SWITCH, real POWER asm with its own `.opd`
+  descriptor) is the ONLY arch-only TU and foreign hosts link a FAIL() stub
+  (`vm/tests/EmitGoldenPpc64HostStub.c`) in its place; `AbiElfV1Bind.c`
+  binds the generic names (gPpc64Abi, asmLoadTls, TargetFiber.h) on real
+  ppc64 builds only. Fiber frame: 336-byte ELFV1_NV frame (back chain via
+  stdu, CR/LR in the CALLER header slots, TOC at 40, r14-r31 at 48, f14-f31
+  at 192 — ppc64 HAS nonvolatile FP regs, unlike SysV x64). The prime half
+  dereferences the entry DESCRIPTOR at prime time (entry address → LR slot,
+  TOC → r2 slot); its layout is checked natively by the golden.
+
 ### Bring-up ladder (in order)
 
-1. **Golden emission, natively on x86** — write the ppc64 encoders in
-   `AssemblerPpc64.h` and clone `EmitGoldenX64.c` as a real
-   `EmitGoldenPpc64.c`: emitters produce bytes into a buffer and are
-   byte-compared — no target hardware, no emulation, fastest inner loop.
-   (Instruction words are emitted in the target's NATIVE byte order; the
-   golden vectors for BE and LE differ accordingly.)
-2. **Non-JIT tests under qemu-user** — `./scripts/ppc64/emu-test.sh be|le`
+1. **Golden emission, natively on x86 — DONE for BE** (see above; the LE
+   port repeats the recipe with its own explicitly-little-endian emitters
+   and vectors).
+2. **Non-JIT tests under qemu-user** — `./scripts/ppc64/cross-test.sh be|le`
    (VALIDATED on both byte orders): cross-compiles STATIC test binaries at
    native speed inside an x86_64 debian container (debian's
    `gcc-powerpc64{,le}-linux-gnu` + `libc6-dev-ppc64{,el}-cross` ship a full
    libc, unlike Fedora's kernel-only cross packages), then runs them directly
    on the host through binfmt/`qemu-user-static`. Covers TokenizerTest,
-   ST_SAFEPOINT_TEST, ST_TLAB_TEST and ST_SNAPSHOT_FORMAT_TEST — the last one
-   is the big-endian fire test for the image-format code. Host prerequisite
-   (once): `sudo dnf install -y qemu-user-static-ppc`. Gotchas learned: pin
-   `--platform` on every podman run (a cached foreign-arch image can hijack a
-   tag) and mount shared volumes with `:z`, not `:Z` (concurrent containers
-   relabel each other's access away).
+   ST_SAFEPOINT_TEST, ST_TLAB_TEST, ST_SNAPSHOT_FORMAT_TEST (the big-endian
+   fire test for the image format) and, on `be`, ST_ABI_EMIT_TEST — the same
+   pinned golden vectors re-checked on a genuinely big-endian target. Host
+   prerequisite (once): `sudo dnf install -y qemu-user-static-ppc`. Gotchas
+   learned: pin `--platform` on every podman run (a cached foreign-arch image
+   can hijack a tag) and mount shared volumes with `:z`, not `:Z` (concurrent
+   containers relabel each other's access away).
 3. **Full JIT under qemu-system** — once codegen is real, boot a Debian
    ports (BE) / Debian (LE) VM in `qemu-system-ppc64` for faithful signals,
    RWX mappings and SMP behavior; only then trust the concurrency battery.
+   The fiber SWITCH asm assembles, links and disassembles correctly today,
+   but only executes at this rung.
 
 ### ELFv1 (BE) facts the backend must implement
 
 - **Function descriptors**: a C function pointer points at an `.opd` entry
-  `{entry, TOC, environ}` — `generateCCall` must load the real entry AND r2
-  from the descriptor before `mtctr/bctrl`, and restore the caller's r2
-  after. (ELFv2 instead has global/local entry points — `localentry` — and
-  r12 must hold the entry address at global entry.)
-- **TOC (r2)**: reserved; save/restore across cross-module calls per ABI.
+  `{entry, TOC, environ}` — implemented in `emitCallCFunction` (and the
+  fiber prime, which reads the descriptor in C). The future ppc64
+  `generateCCall` builds its frame around that hook. (ELFv2 instead has
+  global/local entry points — `localentry` — and r12 must hold the entry
+  address at global entry.)
+- **PrimitiveResult sret** — PORT_ME(elfv1-sret): ELFv1 returns ALL structs
+  (including the 16-byte PrimitiveResult) through a HIDDEN pointer in r3,
+  shifting every argument right by one — the same class of silent break as
+  Win64 item 1. Owns `emitCCallPrimArgs`/`emitPrimResultCheck`, FAIL()-stubbed
+  until the ppc64 generateCCall frame design decides where the sret buffer
+  lives.
+- **TOC (r2)**: reserved; save/restore across cross-module calls per ABI
+  (`emitCallCFunction` uses the 40(r1) slot).
 - **No push/pop**: frames are `stdu r1, -N(r1)` with a back-chain word; the
-  fiber switch and entry stub save nonvolatiles (r14-r31, f14-f31 if FP is
-  ever live, CR2-CR4, LR) into the frame's register save area.
-- **TLS**: r13 is the thread pointer with the **0x7000 bias** baked into the
-  TLS ABI's offsets — re-derive the `gCurrentThreadTpoff` contract
-  (`PORT_ME(tls)`) before implementing `emitLoadTls`.
+  fiber switch and entry-stub hooks save the nonvolatiles (r14-r31, f14-f31,
+  CR, LR) into the shared ELFV1_NV frame shape. **v20-v31/VSX are NOT
+  saved** — audit before enabling VMX/VSX anywhere (compiler flags on the C
+  side count too, if callers ever hold vector values across a switch).
+- **TLS**: r13 is the thread pointer; the ABI's **0x7000 bias** cancels out
+  of our runtime-computed tpoffs (Thread.c derives them FROM r13 via
+  `targetThreadPointer()`), so `emitLoadTls` is a plain ha/lo add — no bias
+  constant appears anywhere. The bias only matters if link-time TPREL
+  relocations ever get involved (they don't today).
 - **I-cache**: not coherent with stores — after writing code:
   `dcbst; sync; icbi; isync` per block (`__builtin___clear_cache` handles the
   local hart via `osFlushICache`, already called at every publish point);

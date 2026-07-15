@@ -52,4 +52,9 @@ echo "== TokenizerTest:"; "$OUT/TokenizerTest" && echo OK
 echo "== ST_SAFEPOINT_TEST:"; ST_SAFEPOINT_TEST=1 "$OUT/st" && echo OK
 echo "== ST_TLAB_TEST:"; ST_TLAB_TEST=1 "$OUT/st" && echo OK
 echo "== ST_SNAPSHOT_FORMAT_TEST:"; ST_SNAPSHOT_FORMAT_TEST=1 "$OUT/st" && echo OK
+if [ "$MODE" = be ]; then
+	# The ppc64 (BE) emission golden — same pinned vectors the x86 host runs
+	# natively, re-checked on a real big-endian target under qemu.
+	echo "== ST_ABI_EMIT_TEST:"; ST_ABI_EMIT_TEST=1 "$OUT/st" && echo OK
+fi
 echo "ALL $MODE TESTS PASSED ($TARGET_ARCH under qemu-user)"

@@ -49,24 +49,39 @@ if(ST_ARCH STREQUAL "x64")
 		vm/jit/x64/CodeGeneratorX64.c
 		vm/jit/x64/PrimitivesX64.c
 		vm/jit/x64/StubCodeX64.c)
-	# Golden-byte emission tests for this backend's ABI emitters (linked into st).
-	set(vmArchTestSources vm/tests/EmitGoldenX64.c)
+	# Golden-byte emission tests for this backend's ABI emitters (linked into
+	# st), PLUS the ppc64 (BE) golden: those POWER encoders and the ELFv1
+	# instance are host-independent (explicitly big-endian emission, nothing
+	# executes), so the ppc64 port's rung-1 bring-up develops natively here —
+	# ST_PPC64_EMIT_TEST=1|print. The host stub traps the one arch-only
+	# symbol (the POWER fiber switch) if anything tries to RUN it.
+	set(vmArchTestSources
+		vm/tests/EmitGoldenX64.c
+		vm/tests/EmitGoldenPpc64.c
+		vm/tests/EmitGoldenPpc64HostStub.c
+		vm/jit/ppc64/abi/elfv1/AbiElfV1.c)
 elseif(ST_ARCH STREQUAL "ppc64")
-	# SKELETON backend (big-endian, ELFv1): compiles and links; everything that
-	# would GENERATE machine code FAIL()s. Heap/scheduler/format tests run; the
-	# JIT does not (yet). Bring-up order: PORTING.md.
+	# Backend under bring-up (big-endian, ELFv1): the POWER encoders and the
+	# ELFv1 ABI instance (TLS load, descriptor C-call, entry save/restore,
+	# fiber pair) are real and golden-tested; the code GENERATOR entry points
+	# still FAIL(). Heap/scheduler/format tests run; the JIT does not (yet).
+	# Bring-up order: PORTING.md.
 	set(vmArchSources
 		vm/jit/ppc64/CodeGeneratorPpc64.c
 		vm/jit/ppc64/PrimitivesPpc64.c
 		vm/jit/ppc64/StubCodePpc64.c)
-	set(vmArchTestSources vm/tests/EmitGoldenPpc64.c)
+	set(vmArchTestSources
+		vm/tests/EmitGoldenPpc64.c
+		vm/tests/EmitGoldenPpc64Bind.c)
 elseif(ST_ARCH STREQUAL "ppc64le")
-	# SKELETON backend (little-endian, ELFv2): same status as ppc64.
+	# SKELETON backend (little-endian, ELFv2): compiles and links; everything
+	# that would GENERATE machine code FAIL()s. Separate backend from ppc64
+	# by design — its golden TU arrives with its own encoders.
 	set(vmArchSources
 		vm/jit/ppc64le/CodeGeneratorPpc64le.c
 		vm/jit/ppc64le/PrimitivesPpc64le.c
 		vm/jit/ppc64le/StubCodePpc64le.c)
-	set(vmArchTestSources vm/tests/EmitGoldenPpc64.c)
+	set(vmArchTestSources vm/tests/EmitGoldenPpc64le.c)
 else()
 	message(FATAL_ERROR "Unknown ST_ARCH '${ST_ARCH}' (supported: x64, ppc64 [skeleton], ppc64le [skeleton])")
 endif()
@@ -129,7 +144,10 @@ if(ST_ARCH STREQUAL "x64" AND ST_ABI STREQUAL "sysv")
 		vm/jit/x64/abi/sysv/AbiSysVBind.c
 		vm/jit/x64/abi/sysv/FiberSysV.c)
 elseif(ST_ARCH STREQUAL "ppc64" AND ST_ABI STREQUAL "elfv1")
-	set(vmAbiSources vm/jit/ppc64/abi/elfv1/AbiElfV1Bind.c)
+	set(vmAbiSources
+		vm/jit/ppc64/abi/elfv1/AbiElfV1.c
+		vm/jit/ppc64/abi/elfv1/AbiElfV1Bind.c
+		vm/jit/ppc64/abi/elfv1/FiberElfV1.c)
 elseif(ST_ARCH STREQUAL "ppc64le" AND ST_ABI STREQUAL "elfv2")
 	set(vmAbiSources vm/jit/ppc64le/abi/elfv2/AbiElfV2Bind.c)
 else()
