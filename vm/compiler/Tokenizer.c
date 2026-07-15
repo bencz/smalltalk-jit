@@ -442,16 +442,14 @@ static void appendChar(Token *token, size_t pos, char ch)
 
 static char peekChar(Tokenizer *tokenizer)
 {
-	char ch;
-
+	// Mirror nextChar's EOF handling: getc returns an int; storing EOF (-1)
+	// straight into a char reads as 0xFF on unsigned-char targets (ppc64/arm).
 	if (tokenizer->isFile) {
-		ch = getc(tokenizer->source.file);
+		int ch = getc(tokenizer->source.file);
 		fseek(tokenizer->source.file, -1, SEEK_CUR);
-	} else {
-		ch = *tokenizer->current;
+		return ch == EOF ? '\0' : (char) ch;
 	}
-
-	return ch;
+	return *tokenizer->current;
 }
 
 
@@ -487,43 +485,46 @@ static size_t getPosition(Tokenizer *tokenizer)
 }
 
 
+// All table predicates index with (unsigned char): a plain char index is
+// NEGATIVE for bytes >= 0x80 on signed-char targets (out-of-bounds read), and
+// char signedness differs by arch (ppc64/s390x/arm default to unsigned).
 static _Bool isNumeric(char ch)
 {
-	return Characters[ch] == NUM;
+	return Characters[(unsigned char) ch] == NUM;
 }
 
 
 static _Bool isDigit(char ch, uint8_t base)
 {
-	return CharacterDigitValues[ch] < base;
+	return CharacterDigitValues[(unsigned char) ch] < base;
 }
 
 
 static _Bool isLetter(char ch)
 {
-	return Characters[ch] == LET;
+	return Characters[(unsigned char) ch] == LET;
 }
 
 
 static _Bool isSeparator(char ch)
 {
-	return Characters[ch] == SEP;
+	return Characters[(unsigned char) ch] == SEP;
 }
 
 
 static _Bool isSpecial(char ch)
 {
-	return Characters[ch] == SPEC;
+	return Characters[(unsigned char) ch] == SPEC;
 }
 
 
 static _Bool isIdentifier(char ch)
 {
-	return CharacterClasses[ch] >= IDENT_BEGIN;
+	return CharacterClasses[(unsigned char) ch] >= IDENT_BEGIN;
 }
 
 
 static _Bool isIdentifierBegining(char ch)
 {
-	return CharacterClasses[ch] == IDENT_BEGIN;
+	return CharacterClasses[(unsigned char) ch] == IDENT_BEGIN;
 }

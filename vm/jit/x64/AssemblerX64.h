@@ -2,6 +2,7 @@
 #define ASSEMBLERX64_H
 
 #include "jit/Assembler.h"
+#include "jit/x64/TraitsX64.h"
 #include "core/Assert.h"
 #include <stddef.h>
 
@@ -56,11 +57,6 @@ typedef enum {
 
 #define TMP R10
 #define CTX R12
-
-// Byte used to fill fresh executable pages so a stray jump into unwritten
-// memory traps instead of sliding: INT3 on x86. Part of the per-arch contract
-// (aarch64/riscv would use an illegal/breakpoint instruction pattern instead).
-#define TARGET_CODE_FILLER_BYTE 0xCC
 
 enum {
 	REX_W = 8,

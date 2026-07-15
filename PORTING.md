@@ -55,7 +55,7 @@ they disagree):
 | `PORT_ME(tls)` | `vm/core/Thread.c` | `gCurrentThreadTpoff`/`gLookupCacheTpoff` are byte offsets from the thread pointer, computed portably via `__builtin_thread_pointer()`. The JIT bakes them into shared code and loads TP-relative per worker (x64: `%fs`). aarch64 uses `tpidr_el0`, riscv uses `tp`; **ppc64 uses r13 with a 0x7000 bias in the TLS ABI** — re-derive the offset semantics per ABI before trusting the subtraction. |
 | `PORT_ME(icache)` | `vm/os/Os.h` | `osFlushICache` is already called at every code-publish point (the `buildNativeCodeFromAssembler` funnel + the scavenger's baked-immediate patch loop). `__builtin___clear_cache` handles the local hart, **but RISC-V `fence.i` is hart-local**: cross-thread publication of fresh code needs a per-arch audit (remote fence via syscall, or publish handshakes). |
 | `PORT_ME(wxorx)` | `vm/memory/HeapPage.c` | Executable pages are RWX for the process lifetime. Hardened kernels (and some platforms) refuse RWX: add a W^X toggle protocol around code writes. |
-| `PORT_ME(endianness)` | `vm/tools/Snapshot.c` | The image is a raw dump of native-endian words (object headers, `InstanceShape` reinterpreted as `int64`, bytecode streams with native-endian `int32` jump offsets). **Little-endian only today**; ppc64 BE needs a byte-order-explicit format (or a BE-built image with no cross-endian exchange). |
+| endianness | `vm/tools/Snapshot.c` | RESOLVED by image format v2: a self-describing header (magic/version/byte-order/word-size) plus struct-layout-independent shape/object-header encodings. Images stay NATIVE-endian and per-build (a BE build reads/writes its own images correctly); a foreign-endian or legacy image is refused with an actionable error. Multi-byte bytecode fields are memcpy-based (alignment-safe). |
 | `PORT_ME(memory-model)` | `vm/memory/Safepoint.h` | All cross-thread protocols use `__atomic` acquire/release builtins — portable in principle, but validated only under x86-TSO. Audit every publish/observe pair (safepoint flags, JIT code publish, remembered sets) before the first weak-memory port. |
 | `PORT_ME(frame-layout)` | `vm/core/StackFrame.c` | The frame walker's slot arithmetic mirrors the frame the JIT emits. A backend must reproduce that layout (saved BP at `*frame`, slots growing down) or take over these accessors. |
 | `PORT_ME(addr-tagging)` | `vm/core/Object.h` | Bit 3 of an object's *address* distinguishes young/old space. Keep 16-byte object alignment and page mappings that leave that bit meaningful. Arch-neutral, but an invariant to respect. |
@@ -73,8 +73,8 @@ big-endian). This is the third link-time axis, subordinate to the arch:
 |---|---|---|
 | x64 | linux, osx | sysv |
 | x64 | windows | win64 (reserved) |
-| ppc64le | linux | elfv2 (future) |
-| ppc64 | aix / linux BE | elfv1 (future) |
+| ppc64le | linux | elfv2 (skeleton) |
+| ppc64 | aix / linux BE | elfv1 (skeleton) |
 
 The binding is an **ops-struct (vtable)** — `X64Abi` in `vm/jit/x64/Abi.h`:
 data tables (arg registers, callee-saved map, caller-saved spill order, shadow
@@ -166,10 +166,77 @@ sockets are used directly by the VM (POSIX-portable by design) — a Windows
 port would need equivalents for those too, which is a bigger surface than
 this directory.
 
+## ppc64 (big-endian ELFv1 first, then little-endian ELFv2)
+
+The ground is prepared: `vm/jit/ppc64/` (big-endian, ELFv1) and
+`vm/jit/ppc64le/` (little-endian, ELFv2) exist as compiling, linking SKELETONS
+(real `Register` enum + traits; every codegen entry point `FAIL()`s), selected
+automatically per host (`ST_ARCH=ppc64|ppc64le` with a fixed `ST_ABI` each).
+They are SEPARATE backends by design — the ecosystem treats them as distinct
+architectures and the codegen diverges beyond the ABI; shared POWER encoding
+helpers can be factored into a common header once the real encoders land. The
+endianness/portability hazards found by the deep audit are FIXED in generic
+code: snapshot format v2 is self-describing (magic/version/byte-order header,
+struct-layout-independent shape encoding, loud refusal of foreign images),
+bytecode multi-byte fields are memcpy-based (alignment-safe), the tokenizer
+indexes its tables with `unsigned char` (ppc64/s390x/arm have unsigned plain
+char), `tagChar` normalizes through unsigned char, the GC's madvise uses
+`osPageSize()` (ppc64 distros default to 64 KB pages), and CityHash gets
+`WORDS_BIGENDIAN` on BE builds.
+
+### Bring-up ladder (in order)
+
+1. **Golden emission, natively on x86** — write the ppc64 encoders in
+   `AssemblerPpc64.h` and clone `EmitGoldenX64.c` as a real
+   `EmitGoldenPpc64.c`: emitters produce bytes into a buffer and are
+   byte-compared — no target hardware, no emulation, fastest inner loop.
+   (Instruction words are emitted in the target's NATIVE byte order; the
+   golden vectors for BE and LE differ accordingly.)
+2. **Non-JIT tests under qemu-user** — `./scripts/ppc64/emu-test.sh be|le`
+   (VALIDATED on both byte orders): cross-compiles STATIC test binaries at
+   native speed inside an x86_64 debian container (debian's
+   `gcc-powerpc64{,le}-linux-gnu` + `libc6-dev-ppc64{,el}-cross` ship a full
+   libc, unlike Fedora's kernel-only cross packages), then runs them directly
+   on the host through binfmt/`qemu-user-static`. Covers TokenizerTest,
+   ST_SAFEPOINT_TEST, ST_TLAB_TEST and ST_SNAPSHOT_FORMAT_TEST — the last one
+   is the big-endian fire test for the image-format code. Host prerequisite
+   (once): `sudo dnf install -y qemu-user-static-ppc`. Gotchas learned: pin
+   `--platform` on every podman run (a cached foreign-arch image can hijack a
+   tag) and mount shared volumes with `:z`, not `:Z` (concurrent containers
+   relabel each other's access away).
+3. **Full JIT under qemu-system** — once codegen is real, boot a Debian
+   ports (BE) / Debian (LE) VM in `qemu-system-ppc64` for faithful signals,
+   RWX mappings and SMP behavior; only then trust the concurrency battery.
+
+### ELFv1 (BE) facts the backend must implement
+
+- **Function descriptors**: a C function pointer points at an `.opd` entry
+  `{entry, TOC, environ}` — `generateCCall` must load the real entry AND r2
+  from the descriptor before `mtctr/bctrl`, and restore the caller's r2
+  after. (ELFv2 instead has global/local entry points — `localentry` — and
+  r12 must hold the entry address at global entry.)
+- **TOC (r2)**: reserved; save/restore across cross-module calls per ABI.
+- **No push/pop**: frames are `stdu r1, -N(r1)` with a back-chain word; the
+  fiber switch and entry stub save nonvolatiles (r14-r31, f14-f31 if FP is
+  ever live, CR2-CR4, LR) into the frame's register save area.
+- **TLS**: r13 is the thread pointer with the **0x7000 bias** baked into the
+  TLS ABI's offsets — re-derive the `gCurrentThreadTpoff` contract
+  (`PORT_ME(tls)`) before implementing `emitLoadTls`.
+- **I-cache**: not coherent with stores — after writing code:
+  `dcbst; sync; icbi; isync` per block (`__builtin___clear_cache` handles the
+  local hart via `osFlushICache`, already called at every publish point);
+  CROSS-CORE publish needs the memory-model audit (`PORT_ME(memory-model)`).
+- **Pages**: 64 KB default on most ppc64 distros — everything goes through
+  `osPageSize()` already; keep it that way.
+- **Weak memory model**: run the acquire/release audit before trusting the
+  multi-worker scheduler (x86-TSO hid any missing barrier so far).
+
 ## Future work (known, deliberate gaps)
 
-- **Snapshot format**: endianness above; also `InstanceShape` is serialized by
-  struct reinterpret, so struct layout/padding is part of the image format.
+- **Snapshot format**: v2 resolved the endianness/struct-padding hazards; the
+  remaining stance is that images are per-endianness artifacts by design
+  (cross-endian image EXCHANGE is a non-goal — heap Values punned from C
+  structs, e.g. the bootstrap `*Shape` globals, are only self-consistent).
 - **Primitive numbering**: `Primitives[]` in `vm/runtime/Primitives.c` is
   indexed by the primitive numbers stored in CompiledMethods (i.e. in the
   image). **Never reorder that table**; `PrimitivesGen.def` documents the

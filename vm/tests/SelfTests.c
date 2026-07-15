@@ -5,6 +5,7 @@
 // Always run these SANDBOXED (systemd-run + taskset) — see the project notes.
 #include "vm/tests/SelfTests.h"
 #include "vm/core/Entry.h"
+#include "vm/tools/Snapshot.h"
 #include "vm/core/Thread.h"
 #include "vm/concurrency/Scheduler.h"
 #include "vm/runtime/Message.h"
@@ -1007,9 +1008,90 @@ static int schedExcSelfTest(void)
 }
 
 
+// Snapshot format primitives: shape/object-header encodings must round-trip
+// exactly, and the image header must accept a same-host image and REFUSE
+// legacy (no magic) and foreign-endian images with an actionable error. Runs
+// without a heap, so it also runs on an emulated foreign arch with a stub JIT
+// backend (the whole point: it validates the format code on big-endian hosts).
+static int snapshotFormatSelfTest(void)
+{
+	int failures = 0;
+
+	// shape round-trip over a spread of field values (incl. the 16-bit size)
+	InstanceShape shapes[] = {
+		{ 0, 0, 0, 0, 0, 0, 0 },
+		{ 3, 1, 0, 0, 0, 2, 0 },
+		{ 255, 255, 255, 1, 1, 255, 0xABCD },
+		{ 1, 2, 3, 1, 0, 4, 512 },
+	};
+	for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++) {
+		uint64_t bits = snapshotEncodeShape(shapes[i]);
+		InstanceShape back = snapshotDecodeShape(bits);
+		if (memcmp(&back, &shapes[i], sizeof(InstanceShape)) != 0) {
+			printf("snapshot-format: shape %zu did not round-trip (bits 0x%llx)\n",
+				i, (unsigned long long) bits);
+			failures++;
+		}
+	}
+
+	// object-header round-trip
+	uint32_t hash;
+	uint8_t payloadSize, varsSize;
+	snapshotDecodeObjectHeader(snapshotEncodeObjectHeader(0xDEADBEEF, 7, 200),
+		&hash, &payloadSize, &varsSize);
+	if (hash != 0xDEADBEEF || payloadSize != 7 || varsSize != 200) {
+		printf("snapshot-format: object header did not round-trip\n");
+		failures++;
+	}
+
+	// image header: accept own, refuse legacy and foreign-endian
+	char err[256];
+	FILE *f = tmpfile();
+	snapshotWriteHeader(f);
+	rewind(f);
+	if (snapshotCheckHeader(f, err, sizeof(err)) != 0) {
+		printf("snapshot-format: own header rejected: %s\n", err);
+		failures++;
+	}
+	rewind(f);
+	fwrite("JUNK", 1, 4, f); // clobber the magic -> legacy/corrupt
+	rewind(f);
+	if (snapshotCheckHeader(f, err, sizeof(err)) == 0) {
+		printf("snapshot-format: junk magic ACCEPTED?!\n");
+		failures++;
+	}
+	fclose(f);
+
+	f = tmpfile();
+	snapshotWriteHeader(f);
+	rewind(f);
+	uint8_t header[8];
+	size_t r = fread(header, 1, 8, f);
+	(void) r;
+	header[5] = header[5] == 1 ? 2 : 1; // flip declared endianness
+	rewind(f);
+	fwrite(header, 1, 8, f);
+	rewind(f);
+	if (snapshotCheckHeader(f, err, sizeof(err)) == 0) {
+		printf("snapshot-format: foreign-endian image ACCEPTED?!\n");
+		failures++;
+	}
+	fclose(f);
+
+	printf(failures == 0 ? "snapshot format self-test PASSED\n"
+	                     : "snapshot format self-test FAILED (%d)\n", failures);
+	return failures == 0 ? 0 : 1;
+}
+
+
 int selfTestFromEnv(char *snapshotFileName, char *bootstrapDir,
 	void (*bootstrap)(char *snapshotFileName, char *bootstrapDir))
 {
+	// Snapshot format primitives (C-level, no image/heap): ST_SNAPSHOT_FORMAT_TEST=1 ./st
+	if (getenv("ST_SNAPSHOT_FORMAT_TEST") != NULL) {
+		return snapshotFormatSelfTest();
+	}
+
 	// ABI emission golden test (C-level, no image): ST_ABI_EMIT_TEST=1 ./st
 	// (=print regenerates the expected vectors)
 	if (getenv("ST_ABI_EMIT_TEST") != NULL) {

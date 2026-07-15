@@ -33,7 +33,6 @@ typedef struct {
 static NativeCode *generateBlockCode(CompiledBlock *block, CodeGenerator *parentGenerator);
 static void generateSafepointPoll(CodeGenerator *generator, _Bool atBackEdge);
 static void generateCode(CodeGenerator *generator);
-static void initCodeGenerator(CodeGenerator *generator);
 static void freeCodeGenerator(CodeGenerator *generator);
 static void generatePrologue(CodeGenerator *generator, size_t frameSize);
 static void generateEpilogue(CodeGenerator *generator);
@@ -66,8 +65,10 @@ NativeCode *generateMethodCode(CompiledMethod *method)
 	openHandleScope(&scope);
 
 	CodeGenerator generator;
-	initMethodCompiledCode(&generator.code, method);
+	// init FIRST (it resets code.methodOrBlock), then bind the method's code
 	initCodeGenerator(&generator);
+	initMethodCompiledCode(&generator.code, method);
+	generator.descriptors = newOrdColl(32);
 	generateCode(&generator);
 
 	NativeCode *code = buildNativeCode(&generator);
@@ -81,8 +82,9 @@ NativeCode *generateMethodCode(CompiledMethod *method)
 static NativeCode *generateBlockCode(CompiledBlock *block, CodeGenerator *parentGenerator)
 {
 	CodeGenerator generator;
-	initBlockCompiledCode(&generator.code, block);
 	initCodeGenerator(&generator);
+	initBlockCompiledCode(&generator.code, block);
+	generator.descriptors = newOrdColl(32);
 	generateCode(&generator);
 
 	NativeCode *code = buildNativeCode(&generator);
@@ -132,18 +134,6 @@ static void generateCode(CodeGenerator *generator)
 	} else {
 		asmRet(&generator->buffer);
 	}
-}
-
-
-static void initCodeGenerator(CodeGenerator *generator)
-{
-	asmInitBuffer(&generator->buffer, 256);
-	generator->frameRawAreaSize = 0;
-	generator->tmpVar = 0;
-	generator->bytecodeNumber = 0;
-	generator->overapproxStackmap = 0;
-	generator->stackmaps = newOrdColl(32);
-	generator->descriptors = newOrdColl(32);
 }
 
 

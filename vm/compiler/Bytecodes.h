@@ -152,7 +152,7 @@ static void bytecodeOperand(AssemblerBuffer *buffer, Operand *operand)
 	switch (operand->type) {
 	case OPERAND_VALUE:
 		asmEmitUint8(buffer, operand->type);
-		*((Value *) buffer->p) = operand->value;
+		storeU64(buffer->p, operand->value); // unaligned-safe (core/Endian.h)
 		buffer->p += sizeof(operand->value);
 		break;
 
@@ -220,7 +220,7 @@ static Operand bytecodeNextOperand(BytecodesIterator *iterator)
 	Operand operand = { .isValid = 1, .type = bytecodeNextByte(iterator) };
 	switch (operand.type) {
 	case OPERAND_VALUE:
-		operand.value = *(Value *) iterator->p;
+		operand.value = loadU64(iterator->p); // unaligned-safe (core/Endian.h)
 		iterator->p += sizeof(Value);
 		break;
 	case OPERAND_TEMP_VAR:
@@ -259,9 +259,10 @@ static uint8_t bytecodeNextByte(BytecodesIterator *iterator)
 
 static int32_t bytecodeNextInt32(BytecodesIterator *iterator)
 {
-	int32_t *p = (int32_t *) iterator->p;
-	int32_t result = *p++;
-	iterator->p = (uint8_t *) p;
+	// The stream mixes 1-byte opcodes with these 4-byte fields, so the cursor
+	// is frequently unaligned: memcpy-based load (core/Endian.h).
+	int32_t result = loadI32(iterator->p);
+	iterator->p += sizeof(int32_t);
 	return result;
 }
 

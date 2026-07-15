@@ -27,6 +27,9 @@ typedef struct {
 	_Bool overapproxStackmap;
 } CodeGenerator;
 
+// Neutral initializer (jit/StubCode.c) — fresh buffer + zeroed frame state.
+void initCodeGenerator(CodeGenerator *generator);
+
 NativeCode *generateMethodCode(CompiledMethod *method);
 void generateLoadObject(AssemblerBuffer *buffer, RawObject *object, Register dst, _Bool tag);
 void generateLoadClass(AssemblerBuffer *buffer, Register src, Register dst);

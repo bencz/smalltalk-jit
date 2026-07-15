@@ -2,6 +2,7 @@
 #define ASSEMBLER_H
 
 #include "core/Assert.h"
+#include "core/Endian.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -128,16 +129,14 @@ static void asmLabelBind(AssemblerBuffer *buffer, AssemblerLabel *label, ptrdiff
 			*p = offset - label->offset - label->size;
 			break;
 		}
-		case 4: {
-			uint32_t *p = (uint32_t *) (buffer->buffer + label->offset);
-			*p = offset - label->offset - label->size;
+		case 4:
+			storeU32(buffer->buffer + label->offset,
+				(uint32_t) (offset - label->offset - label->size));
 			break;
-		}
-		case 8: {
-			uint64_t *p = (uint64_t *) (buffer->buffer + label->offset);
-			*p = offset - label->offset - label->size;
+		case 8:
+			storeU64(buffer->buffer + label->offset,
+				(uint64_t) (offset - label->offset - label->size));
 			break;
-		}
 		default:
 			FAIL();
 		}
@@ -184,11 +183,11 @@ static void asmBindFixup(AssemblerBuffer *buffer, AssemblerFixup *fixup, int64_t
 		break;
 	case 4:
 		ASSERT(INT32_MIN <= value && value <= INT32_MAX);
-		*(int32_t *) p = value;
+		storeI32(p, (int32_t) value);
 		break;
 	case 8:
 		ASSERT(INT64_MIN <= value && value <= INT64_MAX);
-		*(int64_t *) p = value;
+		storeU64(p, (uint64_t) value);
 		break;
 	default:
 		FAIL();
@@ -227,16 +226,20 @@ static void asmEmitUint8(AssemblerBuffer *buffer, uint8_t v)
 }
 
 
+// memcpy-based (see core/Endian.h): same bytes and same single store on the
+// hosts we target, but defined behavior at ANY byte offset — bytecode streams
+// interleave 1-byte opcodes with these multi-byte fields, so the destination
+// is frequently unaligned.
 static void asmEmitInt32(AssemblerBuffer *buffer, int32_t v)
 {
-	*(int32_t *) buffer->p = v;
+	storeI32(buffer->p, v);
 	buffer->p += sizeof(int32_t);
 }
 
 
 static void asmEmitUint64(AssemblerBuffer *buffer, uint64_t v)
 {
-	*(uint64_t *) buffer->p = v;
+	storeU64(buffer->p, v);
 	buffer->p += sizeof(uint64_t);
 }
 

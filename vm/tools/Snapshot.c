@@ -6,6 +6,7 @@
 #include "core/Handle.h"
 #include "core/Smalltalk.h"
 #include "core/Assert.h"
+#include "core/Endian.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -55,10 +56,102 @@ static SnapshotAssoc *snapshotDictAt(SnapshotDictionary *dict, intptr_t key);
 static ptrdiff_t findIndex(SnapshotDictionary *dict, intptr_t key);
 
 
+// ---- format primitives ------------------------------------------------------
+
+uint64_t snapshotEncodeShape(InstanceShape shape)
+{
+	return (uint64_t) shape.tag
+		| (uint64_t) shape.payloadSize << 8
+		| (uint64_t) shape.varsSize << 16
+		| (uint64_t) shape.isIndexed << 24
+		| (uint64_t) shape.isBytes << 32
+		| (uint64_t) shape.valueType << 40
+		| (uint64_t) shape.size << 48;
+}
+
+
+InstanceShape snapshotDecodeShape(uint64_t bits)
+{
+	InstanceShape shape;
+	shape.tag = (uint8_t) bits;
+	shape.payloadSize = (uint8_t) (bits >> 8);
+	shape.varsSize = (uint8_t) (bits >> 16);
+	shape.isIndexed = (uint8_t) (bits >> 24);
+	shape.isBytes = (uint8_t) (bits >> 32);
+	shape.valueType = (uint8_t) (bits >> 40);
+	shape.size = (uint16_t) (bits >> 48);
+	return shape;
+}
+
+
+uint64_t snapshotEncodeObjectHeader(uint32_t hash, uint8_t payloadSize, uint8_t varsSize)
+{
+	return (uint64_t) hash
+		| (uint64_t) payloadSize << 40
+		| (uint64_t) varsSize << 48;
+}
+
+
+void snapshotDecodeObjectHeader(uint64_t bits, uint32_t *hash, uint8_t *payloadSize, uint8_t *varsSize)
+{
+	*hash = (uint32_t) bits;
+	*payloadSize = (uint8_t) (bits >> 40);
+	*varsSize = (uint8_t) (bits >> 48);
+}
+
+
+void snapshotWriteHeader(FILE *file)
+{
+	uint8_t header[8];
+	memcpy(header, SNAPSHOT_MAGIC, 4);
+	header[4] = SNAPSHOT_FORMAT_VERSION;
+	header[5] = TARGET_BIG_ENDIAN ? SNAPSHOT_BYTE_ORDER_BIG : SNAPSHOT_BYTE_ORDER_LITTLE;
+	header[6] = sizeof(Value);
+	header[7] = 0;
+	size_t written = fwrite(header, 1, sizeof(header), file);
+	ASSERT(written == sizeof(header));
+}
+
+
+int snapshotCheckHeader(FILE *file, char *err, size_t errSize)
+{
+	uint8_t header[8];
+	if (fread(header, 1, sizeof(header), file) != sizeof(header)
+		|| memcmp(header, SNAPSHOT_MAGIC, 4) != 0) {
+		snprintf(err, errSize,
+			"not a valid image (missing '%s' magic): legacy or corrupt snapshot - "
+			"regenerate it with `st -s <image> -b smalltalk`", SNAPSHOT_MAGIC);
+		return -1;
+	}
+	if (header[4] != SNAPSHOT_FORMAT_VERSION) {
+		snprintf(err, errSize,
+			"image format v%d, this VM reads v%d - re-bootstrap the image",
+			header[4], SNAPSHOT_FORMAT_VERSION);
+		return -1;
+	}
+	uint8_t hostOrder = TARGET_BIG_ENDIAN ? SNAPSHOT_BYTE_ORDER_BIG : SNAPSHOT_BYTE_ORDER_LITTLE;
+	if (header[5] != hostOrder) {
+		snprintf(err, errSize,
+			"image was built %s-endian but this host is %s-endian: images are "
+			"per-build artifacts - re-bootstrap on this host",
+			header[5] == SNAPSHOT_BYTE_ORDER_BIG ? "big" : "little",
+			hostOrder == SNAPSHOT_BYTE_ORDER_BIG ? "big" : "little");
+		return -1;
+	}
+	if (header[6] != sizeof(Value)) {
+		snprintf(err, errSize, "image word size %d, host word size %zu - re-bootstrap",
+			header[6], sizeof(Value));
+		return -1;
+	}
+	return 0;
+}
+
+
 void snapshotWrite(FILE *file)
 {
 	Snapshot snapshot;
 	snapshot.file = file;
+	snapshotWriteHeader(file);
 	initDicitonary(&snapshot.dict);
 	registerBuiltinObjects(&snapshot);
 	iterateHandles(&snapshot);
@@ -119,13 +212,14 @@ static void writeObject(Snapshot *snapshot, RawObject *object)
 		size += rawObjectSize(object);
 	}
 
-	// PORT_ME(endianness): the image is a raw dump of native-endian words (this
-	// InstanceShape reinterpret, the raw header word below, byte payloads,
-	// bytecode streams with native-endian int32 jump offsets). Little-endian
-	// only today; ppc64 BE needs a format decision — see PORTING.md.
+	// The stream is native-endian and the image header declares which (the
+	// loader refuses foreign images loudly) — but the SHAPE and OBJECT-HEADER
+	// words use the explicit field encodings so the format never depends on
+	// struct layout/padding. Bytecode byte-payloads still carry native-endian
+	// int32/Value fields; that is covered by the same per-endianness stance.
 	writeInt64(snapshot, (id->value << 3) | OBJECT_INLINE);
-	writeInt64(snapshot, *(int64_t *) &object->class->instanceShape);
-	writeInt64(snapshot, ((Value *) object)[1]); // header
+	writeInt64(snapshot, (int64_t) snapshotEncodeShape(object->class->instanceShape));
+	writeInt64(snapshot, (int64_t) snapshotEncodeObjectHeader(object->hash, object->payloadSize, object->varsSize));
 	if (object->class->instanceShape.isIndexed) {
 		writeInt64(snapshot, rawObjectSize(object));
 	}
@@ -140,7 +234,9 @@ static void writeObject(Snapshot *snapshot, RawObject *object)
 	if (isFloatShape(object->class->instanceShape)) {
 		/* the double lives in the (unscanned) payload word, which is not a
 		   pointer field, so serialize its raw bits explicitly */
-		writeInt64(snapshot, *(int64_t *) &((RawFloat *) object)->value);
+		int64_t floatBits;
+		memcpy(&floatBits, &((RawFloat *) object)->value, sizeof(floatBits));
+		writeInt64(snapshot, floatBits);
 	}
 }
 
@@ -212,6 +308,13 @@ void snapshotRead(FILE *file)
 {
 	Snapshot snapshot;
 	snapshot.file = file;
+
+	char err[256];
+	if (snapshotCheckHeader(file, err, sizeof(err)) != 0) {
+		fprintf(stderr, "snapshot: %s\n", err);
+		exit(EXIT_FAILURE);
+	}
+
 	initDicitonary(&snapshot.dict);
 
 	do {
@@ -253,7 +356,7 @@ static Value readObject(int64_t field, Snapshot *snapshot)
 	ASSERT(read == 2);
 
 	uint64_t id = field >> 3;
-	InstanceShape shape = *(InstanceShape *) &header[0];
+	InstanceShape shape = snapshotDecodeShape((uint64_t) header[0]);
 	size_t size = shape.varsSize;
 	size_t indexedSize = shape.isIndexed ? readInt64(snapshot) : 0;
 
@@ -267,7 +370,13 @@ static Value readObject(int64_t field, Snapshot *snapshot)
 		}
 	}
 
-	((Value *) object)[1] = header[1]; // object header
+	uint32_t hash;
+	uint8_t payloadSize, varsSize;
+	snapshotDecodeObjectHeader((uint64_t) header[1], &hash, &payloadSize, &varsSize);
+	object->hash = hash;
+	object->payloadSize = payloadSize;
+	object->varsSize = varsSize;
+	object->unused = 0;
 	object->tags = 0;
 	object->class = (RawClass *) asObject(readField(snapshot));
 	ASSERT(object->class != NULL);
@@ -282,7 +391,7 @@ static Value readObject(int64_t field, Snapshot *snapshot)
 	}
 	if (isFloatShape(shape)) {
 		int64_t bits = readInt64(snapshot);
-		((RawFloat *) object)->value = *(double *) &bits;
+		memcpy(&((RawFloat *) object)->value, &bits, sizeof(bits));
 	}
 
 	return tagPtr(object);

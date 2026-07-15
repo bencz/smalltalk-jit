@@ -1,7 +1,18 @@
 #include "concurrency/Fiber.h"
 #include "concurrency/Scheduler.h"
 #include "core/Assert.h"
+#include "jit/TargetTraits.h"
 #include "os/Os.h"
+
+// PORT_ME(stack-direction): everything below — priming at the HIGH end,
+// the guard floor at the BASE, fiberGrowStack committing DOWNWARD toward the
+// fault, fiberReleaseIdleStack reclaiming [committedLow, sp) — assumes the
+// stack grows toward lower addresses. All currently supported targets do; an
+// upward-stack port must rework this file (and StackFrame.c, see
+// PORT_ME(frame-layout)) rather than flip a flag.
+#if !TARGET_STACK_GROWS_DOWN
+#error "Fiber stack management assumes a downward-growing stack - see PORT_ME(stack-direction)"
+#endif
 #include <stdlib.h>
 #include <stdint.h>
 

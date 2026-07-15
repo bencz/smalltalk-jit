@@ -273,7 +273,9 @@ static inline intptr_t asCInt(Value value)
 static inline char asCChar(Value value)
 {
 	ASSERT((value & 3) == VALUE_CHAR);
-	return (char) (value >> 2);
+	// Tagged Characters carry the byte as UNSIGNED (see tagChar), so the
+	// round-trip is identical on signed- and unsigned-char targets.
+	return (char) (unsigned char) (value >> 2);
 }
 
 
@@ -295,7 +297,9 @@ static inline Value tagInt(intptr_t i)
 
 static inline Value tagChar(char ch)
 {
-	return (Value) (ch << 2) + VALUE_CHAR;
+	// Normalize through unsigned char: bytes 128..255 tag to the same Value on
+	// every target (a signed char would sign-extend and smear the high bits).
+	return ((Value) (unsigned char) ch << 2) + VALUE_CHAR;
 }
 
 

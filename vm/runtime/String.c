@@ -3,7 +3,7 @@
 #include "memory/Heap.h"
 #include "core/Smalltalk.h"
 #include "core/Handle.h"
-#include "cityhash/city.h"
+#include "thirdparty/cityhash/city.h"
 #include <string.h>
 
 

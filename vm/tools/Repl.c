@@ -4,7 +4,7 @@
 #include "core/Smalltalk.h"
 #include "core/Class.h"
 #include "runtime/Iterator.h"
-#include "linenoise/linenoise.h"
+#include "thirdparty/linenoise/linenoise.h"
 #include <stdlib.h>
 
 static void replAutocomplete(const char *buf, linenoiseCompletions *lc);

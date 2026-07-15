@@ -16,7 +16,6 @@
 #include "core/Handle.h"
 #include "core/Smalltalk.h"
 
-static void initCodeGenerator(CodeGenerator *generator);
 static CompiledMethod *createDoesNotUnderstandCode(void);
 
 
@@ -24,50 +23,6 @@ static CompiledMethod *createDoesNotUnderstandCode(void);
 // mutator of that heap. Double-checked locking with acquire/release so the common
 // (already-generated) path is lock-free and race-free: the slot is published with a
 // release store only after the NativeCode is fully built.
-NativeCode *getStubNativeCode(StubCode *stub)
-{
-	Heap *heap = CurrentThread.heap;
-	NativeCode *code = __atomic_load_n(&heap->stubCode[stub->id], __ATOMIC_ACQUIRE);
-	if (code != NULL) {
-		return code;
-	}
-	heapCodegenLockEnter(heap); // serialize codegen across this heap's workers
-	code = __atomic_load_n(&heap->stubCode[stub->id], __ATOMIC_ACQUIRE); // re-check under lock
-	if (code == NULL) {
-		HandleScope scope;
-		openHandleScope(&scope);
-
-		CodeGenerator generator;
-		initCodeGenerator(&generator);
-		stub->generator(&generator);
-		code = buildNativeCode(&generator);
-		if (generator.code.methodOrBlock != NULL) {
-			compiledMethodSetNativeCode((CompiledMethod *) generator.code.methodOrBlock, code);
-		}
-		asmFreeBuffer(&generator.buffer);
-		__atomic_store_n(&heap->stubCode[stub->id], code, __ATOMIC_RELEASE); // publish last
-
-		closeHandleScope(&scope, NULL);
-	}
-	heapCodegenLockLeave(heap);
-	return code;
-}
-
-
-static void initCodeGenerator(CodeGenerator *generator)
-{
-	asmInitBuffer(&generator->buffer, 256);
-	generator->code.methodOrBlock = NULL;
-	generator->regsAlloc.varsSize = 0;
-	generator->regsAlloc.frameSize = generator->frameSize = 0;
-	generator->frameRawAreaSize = 0;
-	generator->tmpVar = 0;
-	generator->bytecodeNumber = 0;
-	generator->stackmaps = newOrdColl(8);
-	generator->descriptors = NULL;
-}
-
-
 void generateStubCall(CodeGenerator *generator, StubCode *stubCode)
 {
 	AssemblerBuffer *buffer = &generator->buffer;

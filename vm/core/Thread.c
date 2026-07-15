@@ -1,4 +1,5 @@
 #include "core/Thread.h"
+#include "jit/TargetTraits.h"
 #include "core/Lookup.h"
 #include "core/StackFrame.h"
 #include "memory/Heap.h"
@@ -14,17 +15,17 @@ ptrdiff_t gLookupCacheTpoff = 0;
 
 void initThread(Thread *thread)
 {
-	// PORT_ME(tls): the tpoff computation via __builtin_thread_pointer() is
-	// portable, but each backend must emit its own TP-relative load (x64: %fs
+	// PORT_ME(tls): the tpoff computation via targetThreadPointer() (per-arch
+	// trait) is uniform, but each backend must emit its own TP-relative load (x64: %fs
 	// prefix in asmLoadTls; aarch64: tpidr_el0; riscv: tp; ppc64: r13 with the
 	// 0x7000 TP bias baked into the offset semantics — re-derive per ABI).
 	// Offset of &CurrentThread from the thread pointer (same on every thread, initial-exec).
 	// Computed here (before any JIT codegen); asmLoadTls bakes it so shared JIT code reaches
 	// each running worker's own CurrentThread via %fs.
-	gCurrentThreadTpoff = (char *) &CurrentThread - (char *) __builtin_thread_pointer();
+	gCurrentThreadTpoff = (char *) &CurrentThread - (char *) targetThreadPointer();
 	// Same idea for the per-thread lookup cache: the JIT probes it via %fs:tpoff so
 	// every worker uses its OWN cache (see Lookup.h for why baking &LookupCache races).
-	gLookupCacheTpoff = (char *) &LookupCache - (char *) __builtin_thread_pointer();
+	gLookupCacheTpoff = (char *) &LookupCache - (char *) targetThreadPointer();
 	// The heap is heap-allocated (not embedded) so that, in the multicore model,
 	// several worker OS threads of one isolate can point their `heap` at the SAME
 	// Heap. Each thread still owns its TLAB and roots.

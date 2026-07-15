@@ -440,8 +440,9 @@ void gcSweep(PageSpace *space)
 		if (runStart != NULL) { \
 			freeListAddFreeSpace(&space->freeList, createFreeSpace(runStart, runSize)); \
 			if (runSize >= 256 * 1024) { \
-				uintptr_t lo = ((uintptr_t) runStart + sizeof(FreeSpace) + 4095) & ~(uintptr_t) 4095; \
-				uintptr_t hi = ((uintptr_t) runStart + runSize) & ~(uintptr_t) 4095; \
+				uintptr_t pageMask = (uintptr_t) osPageSize() - 1; \
+				uintptr_t lo = ((uintptr_t) runStart + sizeof(FreeSpace) + pageMask) & ~pageMask; \
+				uintptr_t hi = ((uintptr_t) runStart + runSize) & ~pageMask; \
 				if (hi > lo) osPageRelease((void *) lo, hi - lo); \
 			} \
 			runStart = NULL; runSize = 0; \

@@ -1,7 +1,7 @@
 #include "memory/HeapPage.h"
 #include "core/CompiledCode.h"
 #include "core/Assert.h"
-#include "jit/TargetAssembler.h" // TARGET_CODE_FILLER_BYTE
+#include "jit/TargetTraits.h" // TARGET_CODE_FILLER_BYTE
 #include "os/Os.h"
 #include <stdio.h>
 #include <stdlib.h>

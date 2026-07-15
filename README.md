@@ -46,6 +46,7 @@ vm/concurrency/  fiber scheduler (N workers over one heap) + fibers
 vm/os/           the OS seam (vm/os/Os.h contract); one directory per
                  platform (vm/os/linux/ today, selected by CMake ST_OS),
                  split by domain: OsTime, OsMemory, OsEvents, OsSignals, OsCpu
+vm/thirdparty/   vendored third-party code (cityhash, linenoise)
 vm/tools/        bootstrap, snapshot, REPL, CLI
 vm/tests/        C-level self-test battery (ST_*_TEST env vars) + unit tests
 ```

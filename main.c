@@ -75,6 +75,20 @@ int main(int argc, char **args)
 	initThread(&CurrentThread);
 	bootstrapSmalltalk(cliArgs.snapshotFileName, cliArgs.bootstrapDir);
 
+	// Image idempotence probe (scripts/check-image-idempotence.sh): re-save the
+	// just-loaded image and exit — a load->save round trip must be a fixpoint.
+	char *resavePath = getenv("ST_RESAVE");
+	if (resavePath != NULL) {
+		FILE *out = fopen(resavePath, "w+");
+		if (out == NULL) {
+			printf("Cannot write to snapshot file: '%s'\n", resavePath);
+			return EXIT_FAILURE;
+		}
+		snapshotWrite(out);
+		fclose(out);
+		return EXIT_SUCCESS;
+	}
+
 	schedulerInit();
 
 	// Hand execution over to the cooperative fiber scheduler: the program runs

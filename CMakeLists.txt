@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(smalltalk-jit)
+project(smalltalk-jit C)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -32,6 +32,10 @@ endif()
 if(NOT ST_ARCH)
 	if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
 		set(ST_ARCH x64)
+	elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(ppc64le|powerpc64le)$")
+		set(ST_ARCH ppc64le)
+	elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(ppc64|powerpc64)$")
+		set(ST_ARCH ppc64)
 	else()
 		message(FATAL_ERROR
 			"No JIT backend for CPU '${CMAKE_SYSTEM_PROCESSOR}'. Supported: x86_64. "
@@ -47,8 +51,24 @@ if(ST_ARCH STREQUAL "x64")
 		vm/jit/x64/StubCodeX64.c)
 	# Golden-byte emission tests for this backend's ABI emitters (linked into st).
 	set(vmArchTestSources vm/tests/EmitGoldenX64.c)
+elseif(ST_ARCH STREQUAL "ppc64")
+	# SKELETON backend (big-endian, ELFv1): compiles and links; everything that
+	# would GENERATE machine code FAIL()s. Heap/scheduler/format tests run; the
+	# JIT does not (yet). Bring-up order: PORTING.md.
+	set(vmArchSources
+		vm/jit/ppc64/CodeGeneratorPpc64.c
+		vm/jit/ppc64/PrimitivesPpc64.c
+		vm/jit/ppc64/StubCodePpc64.c)
+	set(vmArchTestSources vm/tests/EmitGoldenPpc64.c)
+elseif(ST_ARCH STREQUAL "ppc64le")
+	# SKELETON backend (little-endian, ELFv2): same status as ppc64.
+	set(vmArchSources
+		vm/jit/ppc64le/CodeGeneratorPpc64le.c
+		vm/jit/ppc64le/PrimitivesPpc64le.c
+		vm/jit/ppc64le/StubCodePpc64le.c)
+	set(vmArchTestSources vm/tests/EmitGoldenPpc64.c)
 else()
-	message(FATAL_ERROR "Unknown ST_ARCH '${ST_ARCH}' (supported: x64)")
+	message(FATAL_ERROR "Unknown ST_ARCH '${ST_ARCH}' (supported: x64, ppc64 [skeleton], ppc64le [skeleton])")
 endif()
 
 # ---- OS selection -----------------------------------------------------------
@@ -92,6 +112,10 @@ if(NOT ST_ABI)
 		set(ST_ABI sysv)
 	elseif(ST_ARCH STREQUAL "x64" AND ST_OS STREQUAL "windows")
 		set(ST_ABI win64)
+	elseif(ST_ARCH STREQUAL "ppc64")
+		set(ST_ABI elfv1)
+	elseif(ST_ARCH STREQUAL "ppc64le")
+		set(ST_ABI elfv2)
 	else()
 		message(FATAL_ERROR
 			"No C-ABI binding for (ST_ARCH='${ST_ARCH}', ST_OS='${ST_OS}'). "
@@ -104,6 +128,10 @@ if(ST_ARCH STREQUAL "x64" AND ST_ABI STREQUAL "sysv")
 		vm/jit/x64/abi/sysv/AbiSysV.c
 		vm/jit/x64/abi/sysv/AbiSysVBind.c
 		vm/jit/x64/abi/sysv/FiberSysV.c)
+elseif(ST_ARCH STREQUAL "ppc64" AND ST_ABI STREQUAL "elfv1")
+	set(vmAbiSources vm/jit/ppc64/abi/elfv1/AbiElfV1Bind.c)
+elseif(ST_ARCH STREQUAL "ppc64le" AND ST_ABI STREQUAL "elfv2")
+	set(vmAbiSources vm/jit/ppc64le/abi/elfv2/AbiElfV2Bind.c)
 else()
 	message(FATAL_ERROR
 		"Unknown ST_ABI '${ST_ABI}' for ST_ARCH '${ST_ARCH}' (implemented: x64+sysv). "
@@ -128,6 +156,7 @@ set(vmSources
 	vm/core/StackFrame.c
 	vm/core/Thread.c
 	vm/jit/RegisterAllocator.c
+	vm/jit/StubCode.c
 	vm/memory/FreeList.c
 	vm/memory/GarbageCollector.c
 	vm/memory/Heap.c
@@ -143,6 +172,8 @@ set(vmSources
 	vm/runtime/Socket.c
 	vm/runtime/Stream.c
 	vm/runtime/String.c
+	vm/thirdparty/cityhash/city.c
+	vm/thirdparty/linenoise/linenoise.c
 	vm/tools/Bootstrap.c
 	vm/tools/Repl.c
 	vm/tools/Snapshot.c
@@ -152,8 +183,13 @@ set(vmSources
 )
 
 find_package(Threads)
-add_library(CityHash SHARED cityhash/city.c)
-add_library(Linenoise SHARED linenoise/linenoise.c)
+# CityHash byte-swaps its unaligned loads on big-endian ONLY when this macro is
+# set (city.c:50-75); without it a BE build computes different, self-consistent
+# but untested hashes. Inert on little-endian hosts.
+if(CMAKE_C_BYTE_ORDER STREQUAL "BIG_ENDIAN")
+	set_source_files_properties(vm/thirdparty/cityhash/city.c
+		PROPERTIES COMPILE_DEFINITIONS WORDS_BIGENDIAN)
+endif()
 add_library(VM SHARED ${vmSources})
 add_executable(st main.c vm/tests/SelfTests.c ${vmArchTestSources})
 target_include_directories(st PRIVATE ${CMAKE_SOURCE_DIR})
@@ -166,13 +202,10 @@ add_executable(TokenizerTest EXCLUDE_FROM_ALL vm/tests/TokenizerTest.c)
 target_link_libraries(TokenizerTest VM)
 
 # All VM-internal includes are bucket-qualified from the vm/ root
-# (#include "memory/Heap.h"); third-party includes are root-qualified
-# (#include "cityhash/city.h").
+# (#include "memory/Heap.h"); vendored third-party code lives under
+# vm/thirdparty/ and is included the same way ("thirdparty/cityhash/city.h").
 target_include_directories(VM PUBLIC ${CMAKE_SOURCE_DIR}/vm)
-target_include_directories(VM PRIVATE ${CMAKE_SOURCE_DIR})
 
-target_link_libraries(VM CityHash)
-target_link_libraries(VM Linenoise)
 target_link_libraries(VM ${CMAKE_THREAD_LIBS_INIT})
 target_link_libraries(VM m)
 target_link_libraries(st VM)
