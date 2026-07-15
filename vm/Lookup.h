@@ -24,6 +24,17 @@ typedef struct {
 
 extern PER_ISOLATE LookupTable LookupCache;
 
+// Offset of the per-thread LookupCache from the thread pointer (initial-exec TLS,
+// identical on every thread; computed once in initThread like gCurrentThreadTpoff).
+// The JIT send fast path reaches the cache with asmLoadTls(tpoff) so SHARED code
+// probes the RUNNING worker's own cache. Baking `&LookupCache` as an immediate
+// instead pins every worker to the CODEGEN thread's cache: that owner rewrites a
+// 3-word entry in place (class, selector, code) while peers read it lock-free, and
+// a torn read (old class+selector, new code) dispatches the WRONG nativeCode —
+// under multi-worker socket load that meant receivers executed against another
+// method's code (type confusion, frame corruption, hangs), with no GC involved.
+extern ptrdiff_t gLookupCacheTpoff;
+
 NativeCodeEntry lookupNativeCode(RawClass *class, RawString *selector);
 NativeCode *getNativeCode(Class *class, CompiledMethod *method);
 

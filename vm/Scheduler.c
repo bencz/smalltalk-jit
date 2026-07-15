@@ -609,14 +609,16 @@ void schedulerInit(void)
 		pthread_mutex_init(&sched->lock, NULL);
 		pthread_cond_init(&sched->work, NULL);
 		// Worker-pool size: N OS threads share this scheduler, each running fibers pinned
-		// to it. The VM's core MT machinery is in place and the whole self-test suite is
-		// green at N workers (shared-heap GC via STW safepoints incl. the strengthened
-		// stack-root scan, per-heap sync monitor + symbol lock, become: under STW, thread-
-		// safe actors, no fiber migration). BUT the heaviest socket/HTTP/actor path still
-		// has residual multi-worker bugs, so the DEFAULT is a safe cooperative single
-		// thread; multi-worker is OPT-IN via `ST_SCHED_WORKERS`: a fixed count N>=1, or 0
-		// to use all available cores (respects taskset/cgroup affinity).
-		sched->workerCount = 1;
+		// to it. DEFAULT = one worker per available core (respects taskset/cgroup
+		// affinity). The whole gate is green at N workers: shared-heap GC via STW
+		// safepoints incl. the strengthened stack-root scan, per-heap sync monitor +
+		// symbol lock, become: under STW, thread-safe actors, no fiber migration, the
+		// per-worker TLS lookup cache (a baked &LookupCache immediate in shared send
+		// code tore under the owner's concurrent rewrites -> wrong-method dispatch),
+		// and the remembered-set barrier on old-space-born objects. `ST_SCHED_WORKERS`
+		// overrides: a fixed count N>=1 (1 = the old cooperative single thread), or 0
+		// for one-per-core explicitly.
+		sched->workerCount = availableCoreCount();
 		char *workersEnv = getenv("ST_SCHED_WORKERS");
 		if (workersEnv != NULL) {
 			long n = atol(workersEnv);

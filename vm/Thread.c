@@ -1,4 +1,5 @@
 #include "Thread.h"
+#include "Lookup.h"
 #include "StackFrame.h"
 #include "Heap.h"
 #include "Handle.h"
@@ -8,6 +9,7 @@
 
 __thread Thread CurrentThread = { 0 };
 ptrdiff_t gCurrentThreadTpoff = 0;
+ptrdiff_t gLookupCacheTpoff = 0;
 
 
 void initThread(Thread *thread)
@@ -16,6 +18,9 @@ void initThread(Thread *thread)
 	// Computed here (before any JIT codegen); asmLoadTls bakes it so shared JIT code reaches
 	// each running worker's own CurrentThread via %fs.
 	gCurrentThreadTpoff = (char *) &CurrentThread - (char *) __builtin_thread_pointer();
+	// Same idea for the per-thread lookup cache: the JIT probes it via %fs:tpoff so
+	// every worker uses its OWN cache (see Lookup.h for why baking &LookupCache races).
+	gLookupCacheTpoff = (char *) &LookupCache - (char *) __builtin_thread_pointer();
 	// The heap is heap-allocated (not embedded) so that, in the multicore model,
 	// several worker OS threads of one isolate can point their `heap` at the SAME
 	// Heap. Each thread still owns its TLAB and roots.

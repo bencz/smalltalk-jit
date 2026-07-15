@@ -996,8 +996,11 @@ void generateMethodLookup(CodeGenerator *generator)
 	asmShrqImm(buffer, RDX, 4);
 	asmAndqImm(buffer, RDX, LOOKUP_CACHE_SIZE - 1);
 
-	// check class
-	asmMovqImm(buffer, (uint64_t) &LookupCache, TMP);
+	// check class. TMP = the RUNNING worker's own TLS LookupCache (see Lookup.h:
+	// a baked &LookupCache immediate pins every worker to the codegen thread's
+	// cache, whose in-place 3-word rewrites tear under concurrent readers and
+	// dispatch the wrong nativeCode).
+	asmLoadTls(buffer, TMP, gLookupCacheTpoff);
 	asmCmpqMem(buffer, asmMem(TMP, RDX, SS_8, offsetof(LookupTable, classes)), RDI);
 	asmJ(buffer, COND_NOT_EQUAL, &lookup);
 

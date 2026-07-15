@@ -297,6 +297,19 @@ RawObject *allocateObject(Heap *heap, RawClass *class, size_t size)
 	object->varsSize = shape.varsSize;
 	object->tags = 0;
 
+	// An exhausted young space sends this allocation to OLD space (allocate()'s
+	// tryAllocateOld fallback). C-side creators then initialize such an object with
+	// RAW stores that pass through no write barrier: this class word (young while a
+	// snapshot-loaded class is still un-promoted), copyResizedObject's field memcpy,
+	// primitive init loops. Any young referent stored that way is an UNTRACKED
+	// old->young edge — the next scavenge moves the referent and leaves this
+	// object's word dangling (seen as ST_PARFULLGC's corrupted-kernel-class family).
+	// Conservatively remember every old-space birth; the next scavenge re-scans it
+	// and drops it from the set again if it holds no young referent after all.
+	if (isOldObject(object)) {
+		rememberedSetAdd(&CurrentThread.rememberedSet, object);
+	}
+
 	if (shape.isIndexed) {
 		((RawIndexedObject *) object)->size = size;
 		memset(((RawIndexedObject *) object)->body, 0, shape.payloadSize * sizeof(Value));
