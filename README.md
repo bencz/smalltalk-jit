@@ -36,7 +36,10 @@ vm/memory/       heap, scavenger (young GC), mark-sweep (old GC), safepoints
 vm/compiler/     tokenizer, parser, AST, bytecode compiler, optimizer
 vm/jit/          arch-neutral JIT layer (assembler buffer, codegen API,
                  register allocator, stackmaps) + Target*.h arch contracts
-vm/jit/x64/      the x86-64 backend (selected by CMake ST_ARCH)
+vm/jit/x64/      the x86-64 backend (selected by CMake ST_ARCH); its
+                 abi/sysv/ subdirectory binds the platform C ABI (ST_ABI) —
+                 calling convention, TLS access, fiber switch — as an
+                 ops-struct, golden-byte-tested (ST_ABI_EMIT_TEST=1)
 vm/runtime/      built-in classes' C support (collections, strings, streams,
                  sockets, JSON) + the primitives table
 vm/concurrency/  fiber scheduler (N workers over one heap) + fibers

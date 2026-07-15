@@ -1010,6 +1010,12 @@ static int schedExcSelfTest(void)
 int selfTestFromEnv(char *snapshotFileName, char *bootstrapDir,
 	void (*bootstrap)(char *snapshotFileName, char *bootstrapDir))
 {
+	// ABI emission golden test (C-level, no image): ST_ABI_EMIT_TEST=1 ./st
+	// (=print regenerates the expected vectors)
+	if (getenv("ST_ABI_EMIT_TEST") != NULL) {
+		return abiEmitGoldenSelfTest(getenv("ST_ABI_EMIT_TEST"));
+	}
+
 	// Multicore safepoint handshake self-test (C-level): ST_SAFEPOINT_TEST=1 ./st
 	if (getenv("ST_SAFEPOINT_TEST") != NULL) {
 		return safepointSelfTest();

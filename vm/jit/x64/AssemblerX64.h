@@ -5,23 +5,28 @@
 #include "core/Assert.h"
 #include <stddef.h>
 
+// Register numbers are the hardware encoding. C-ABI roles (argument order,
+// caller/callee-saved sets) are NOT annotated here — they belong to the
+// selected ABI instance (vm/jit/x64/Abi.h, abi/<abi>/). VM-internal roles:
+// TMP=R10 per-instruction scratch, CTX=R12 context pointer, R11 native-code
+// entry across sends, RAX result.
 typedef enum {
-	RAX = 0, // temp, 1. return
-	RCX = 1, // 4. arg
-	RDX = 2, // 3. arg, 2. return
-	RBX = 3, // callee-saved register; optionally used as base pointer
+	RAX = 0,
+	RCX = 1,
+	RDX = 2,
+	RBX = 3,
 	RSP = 4,
 	RBP = 5,
-	RSI = 6, // 2. arg
-	RDI = 7, // 1. arg
-	R8  = 8, // 5. arg
-	R9  = 9, // 6. arg
-	R10 = 10, // context pointer (static chain pointer)
-	R11 = 11, // temp
-	R12 = 12, // temp (calee-saved)
-	R13 = 13, // temp (calee-saved)
-	R14 = 14, // temp (calee-saved)
-	R15 = 15, // temp (calee-saved)
+	RSI = 6,
+	RDI = 7,
+	R8  = 8,
+	R9  = 9,
+	R10 = 10,
+	R11 = 11,
+	R12 = 12,
+	R13 = 13,
+	R14 = 14,
+	R15 = 15,
 	RIP = -1,
 	NO_REGISTER = -2,
 } Register;
@@ -136,31 +141,10 @@ typedef struct {
 } MemoryOperand;
 
 static uint8_t Registers[] = { R11, R13, R14, R15, RBX, R9, R8, RCX, RDX, /*RSI, RDI*/ };
-static uint8_t ArgumentsRegisters[] = { RDI, RSI, RDX, RCX, R8, R9 };
 static AvailableRegs X64AvailableRegs = {
 	.regsSize = sizeof(Registers),
 	.regs = Registers,
 };
-static _Bool CalleeSavedRegisters[] = {
-	/* RAX */ 0,
-	/* RCX */ 0,
-	/* RDX */ 0,
-	/* RBX */ 1,
-	/* RSP */ 1,
-	/* RBP */ 1,
-	/* RSI */ 0,
-	/* RDI */ 0,
-	/* R8  */ 0,
-	/* R9  */ 0,
-	/* R10 */ 0,
-	/* R11 */ 0,
-	/* R12 */ 1,
-	/* R13 */ 1,
-	/* R14 */ 1,
-	/* R15 */ 1,
-};
-
-static _Bool asmIsCalleeSavedRegister(Register reg);
 static MemoryOperand asmMem(Register base, Register index, Scale scale, ptrdiff_t disp);
 
 static void asmPushq(AssemblerBuffer *buffer, Register src);
@@ -176,8 +160,11 @@ static void asmMovqImm(AssemblerBuffer *buffer, int64_t imm, Register dst);
 static void asmMovqToMem(AssemblerBuffer *buffer, Register src, MemoryOperand operand);
 static void asmMovqMem(AssemblerBuffer *buffer, MemoryOperand operand, Register dst);
 static void asmMovqMemImm(AssemblerBuffer *buffer, int64_t imm, MemoryOperand operand);
-static void asmMovqFsAbs(AssemblerBuffer *buffer, int32_t disp, Register dst);
-static void asmLoadTls(AssemblerBuffer *buffer, Register dst, ptrdiff_t tpoff);
+// TLS load is a PLATFORM-ABI operation (sysv: %fs:0 + tpoff; win64: %gs TEB):
+// an extern delegate into the selected ABI instance — see jit/x64/Abi.h and
+// the implementation in abi/<abi>/. Unlike the static encoders around it,
+// this is one real function per process (Abi.c).
+void asmLoadTls(AssemblerBuffer *buffer, Register dst, ptrdiff_t tpoff);
 static void asmMovb(AssemblerBuffer *buffer, ByteRegister src, ByteRegister dst);
 static void asmMovbToMem(AssemblerBuffer *buffer, ByteRegister src, MemoryOperand operand);
 static void asmMovbMem(AssemblerBuffer *buffer, MemoryOperand operand, ByteRegister dst);
@@ -261,12 +248,6 @@ static void asmInitMemoryOperand(Operands *operands, MemoryOperand operand);
 static void asmEmitRexOperands(AssemblerBuffer *buffer, uint8_t rex, Operands *operands);
 static void asmEmitRex(AssemblerBuffer *buffer, uint8_t rex);
 static void asmEmitOperands(AssemblerBuffer *buffer, Operands *operands);
-
-
-static _Bool asmIsCalleeSavedRegister(Register reg)
-{
-	return CalleeSavedRegisters[reg];
-}
 
 
 static MemoryOperand asmMem(Register base, Register index, Scale scale, ptrdiff_t disp)
@@ -383,34 +364,6 @@ static void asmMovqMemImm(AssemblerBuffer *buffer, int64_t imm, MemoryOperand op
 	asmEmitUint8(buffer, 0xC7);
 	asmEmitOperands(buffer, &operands);
 	asmEmitInt32(buffer, imm);
-}
-
-
-// mov dst, %fs:[disp32] — a segment-prefixed absolute load from the %fs (thread-pointer)
-// segment. Used to read thread-local state directly (see asmLoadTls). Encoding:
-//   64 (FS prefix)  REX.W[.R]  8B  ModRM(mod=00,reg=dst,rm=100=SIB)  SIB(0x25)  disp32
-static void asmMovqFsAbs(AssemblerBuffer *buffer, int32_t disp, Register dst)
-{
-	asmEnsureCapacity(buffer);
-	asmEmitUint8(buffer, 0x64);                             // FS segment override prefix
-	asmEmitRex(buffer, REX_W | (uint8_t) ((dst & 8) >> 1)); // REX.W (+ REX.R for R8..R15 in reg field)
-	asmEmitUint8(buffer, 0x8B);                             // MOV r64, r/m64
-	asmEmitUint8(buffer, (uint8_t) (((dst & 7) << 3) | 4)); // mod=00, reg=dst, rm=100 (SIB follows)
-	asmEmitUint8(buffer, 0x25);                             // SIB: scale=0, index=none(100), base=disp32(101)
-	asmEmitInt32(buffer, disp);
-}
-
-
-// Load the address of the current OS thread's initial-exec TLS block variable
-// `CurrentThread` into `dst`: dst = threadPointer (%fs:0) + tpoff. `tpoff` is the
-// link-time-constant offset of &CurrentThread from the thread pointer, the SAME on
-// every thread — so JIT code compiled once and shared by every worker still reaches
-// EACH worker's own CurrentThread (unlike a baked &CurrentThread or a CTX->thread that
-// goes stale when a fiber migrates OS threads).
-static void asmLoadTls(AssemblerBuffer *buffer, Register dst, ptrdiff_t tpoff)
-{
-	asmMovqFsAbs(buffer, 0, dst);                                // dst = thread pointer (%fs:0 self-ref)
-	asmLeaq(buffer, asmMem(dst, NO_REGISTER, SS_1, tpoff), dst); // dst = &CurrentThread
 }
 
 

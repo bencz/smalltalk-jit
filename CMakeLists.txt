@@ -41,10 +41,12 @@ endif()
 
 if(ST_ARCH STREQUAL "x64")
 	set(vmArchSources
+		vm/jit/x64/Abi.c
 		vm/jit/x64/CodeGeneratorX64.c
-		vm/jit/x64/FiberX64.c
 		vm/jit/x64/PrimitivesX64.c
 		vm/jit/x64/StubCodeX64.c)
+	# Golden-byte emission tests for this backend's ABI emitters (linked into st).
+	set(vmArchTestSources vm/tests/EmitGoldenX64.c)
 else()
 	message(FATAL_ERROR "Unknown ST_ARCH '${ST_ARCH}' (supported: x64)")
 endif()
@@ -73,6 +75,39 @@ if(ST_OS STREQUAL "linux")
 		vm/os/linux/OsTime.c)
 else()
 	message(FATAL_ERROR "Unknown ST_OS '${ST_OS}' (supported: linux)")
+endif()
+
+# ---- C-ABI selection --------------------------------------------------------
+# ST_ABI names the vm/jit/<arch>/abi/<abi>/ directory binding the platform C
+# ABI for the selected backend: C argument registers, callee-/caller-saved
+# sets, C-call frame shape (shadow space), the PrimitiveResult return
+# convention, TLS access and the fiber switch — an ops-struct (see
+# vm/jit/x64/Abi.h). Derived from (ST_ARCH, ST_OS); same link-time model as
+# ST_ARCH/ST_OS. Instance files are compilable on any host of the arch
+# (abi-suffixed symbols) so foreign ABIs can be golden-tested; exactly ONE
+# Abi<Abi>Bind.c links in and defines the generic names (gX64Abi, the
+# TargetFiber.h symbols). Porting checklist: PORTING.md.
+if(NOT ST_ABI)
+	if(ST_ARCH STREQUAL "x64" AND (ST_OS STREQUAL "linux" OR ST_OS STREQUAL "osx"))
+		set(ST_ABI sysv)
+	elseif(ST_ARCH STREQUAL "x64" AND ST_OS STREQUAL "windows")
+		set(ST_ABI win64)
+	else()
+		message(FATAL_ERROR
+			"No C-ABI binding for (ST_ARCH='${ST_ARCH}', ST_OS='${ST_OS}'). "
+			"Create vm/jit/${ST_ARCH}/abi/<abi>/ and register it here - see PORTING.md.")
+	endif()
+endif()
+
+if(ST_ARCH STREQUAL "x64" AND ST_ABI STREQUAL "sysv")
+	set(vmAbiSources
+		vm/jit/x64/abi/sysv/AbiSysV.c
+		vm/jit/x64/abi/sysv/AbiSysVBind.c
+		vm/jit/x64/abi/sysv/FiberSysV.c)
+else()
+	message(FATAL_ERROR
+		"Unknown ST_ABI '${ST_ABI}' for ST_ARCH '${ST_ARCH}' (implemented: x64+sysv). "
+		"The abi/ layout reserves win64 (and ppc64's elfv1/elfv2) - see PORTING.md.")
 endif()
 
 set(vmSources
@@ -112,6 +147,7 @@ set(vmSources
 	vm/tools/Repl.c
 	vm/tools/Snapshot.c
 	${vmArchSources}
+	${vmAbiSources}
 	${vmOsSources}
 )
 
@@ -119,7 +155,7 @@ find_package(Threads)
 add_library(CityHash SHARED cityhash/city.c)
 add_library(Linenoise SHARED linenoise/linenoise.c)
 add_library(VM SHARED ${vmSources})
-add_executable(st main.c vm/tests/SelfTests.c)
+add_executable(st main.c vm/tests/SelfTests.c ${vmArchTestSources})
 target_include_directories(st PRIVATE ${CMAKE_SOURCE_DIR})
 
 # Standalone C unit test for the tokenizer (own main(), not part of `st`):

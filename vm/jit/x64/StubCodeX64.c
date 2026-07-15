@@ -10,6 +10,7 @@
 #include "jit/CodeGenerator.h"
 #include "jit/CodeDescriptors.h"
 #include "jit/x64/AssemblerX64.h"
+#include "jit/x64/Abi.h"
 #include "core/Thread.h"
 #include "core/StackFrame.h"
 #include "core/Handle.h"
@@ -79,34 +80,37 @@ void generateStubCall(CodeGenerator *generator, StubCode *stubCode)
 }
 
 
-// RDI: compiled method
-// RSI: native code entry
-// RDX: arguments
-// RCX: thread
+// The C -> Smalltalk entry trampoline. Invoked as a C function pointer, so the
+// IN-args arrive in the platform ABI's argument registers (sysv:
+// RDI=method, RSI=nativeCode, RDX=args, RCX=thread) and the C callee-saved set
+// must be preserved — both come from gX64Abi. Everything else (the
+// EntryStackFrame prev/entry/exit protocol, the arg-copy loop, the post-call
+// TLS reload for fiber migration) is VM-internal and shared across ABIs.
 static void generateSmalltalkEntry(CodeGenerator *generator)
 {
 	AssemblerBuffer *buffer = &generator->buffer;
+	const X64Abi *abi = gX64Abi;
 	AssemblerLabel loop;
 	ptrdiff_t argsOffset = offsetof(RawCompiledMethod, header) + offsetof(CompiledCodeHeader, argsSize);
 
-	size_t savedRegsSize = 6 * sizeof(intptr_t);
+	Register regMethod = (Register) abi->argRegs[0];
+	Register regEntry = (Register) abi->argRegs[1];
+	Register regArgs = (Register) abi->argRegs[2];
+	Register regThread = (Register) abi->argRegs[3];
+
+	size_t savedRegsSize = (size_t) abi->entrySavedRegsSize;
 	size_t frameSize = align(savedRegsSize + sizeof(EntryStackFrame), 16);
 	frameSize -= savedRegsSize;
 
 	asmInitLabel(&loop);
 
-	asmPushq(buffer, RBP);
-	asmPushq(buffer, RBX);
-	asmPushq(buffer, R12);
-	asmPushq(buffer, R13);
-	asmPushq(buffer, R14);
-	asmPushq(buffer, R15);
+	abi->emitEntrySaveRegs(buffer); // lowers RSP by exactly entrySavedRegsSize
 
 	asmMovq(buffer, RSP, RBP);
 	asmSubqImm(buffer, RSP, frameSize);
 
 	// load previous entry frame
-	asmMovqMem(buffer, asmMem(RCX, NO_REGISTER, SS_1, offsetof(Thread, stackFramesTail)), TMP);
+	asmMovqMem(buffer, asmMem(regThread, NO_REGISTER, SS_1, offsetof(Thread, stackFramesTail)), TMP);
 	// setup it in current entry frame
 	asmMovqToMem(buffer, TMP, asmMem(RSP, NO_REGISTER, SS_1, offsetof(EntryStackFrame, prev)));
 	// setup RBP
@@ -115,46 +119,43 @@ static void generateSmalltalkEntry(CodeGenerator *generator)
 	asmXorq(buffer, TMP, TMP);
 	asmMovqToMem(buffer, TMP, asmMem(RSP, NO_REGISTER, SS_1, offsetof(EntryStackFrame, exit)));
 	// setup entry stack frame to thread
-	asmMovqToMem(buffer, RSP, asmMem(RCX, NO_REGISTER, SS_1, offsetof(Thread, stackFramesTail)));
+	asmMovqToMem(buffer, RSP, asmMem(regThread, NO_REGISTER, SS_1, offsetof(Thread, stackFramesTail)));
 
-	// load method argumnets size
-	asmMovzxbMemq(buffer, asmMem(RDI, NO_REGISTER, SS_1, argsOffset), RBX);
+	// load method argumnets size (RBX: VM-internal loop counter, inside the
+	// saved area — callee-saved in every supported ABI)
+	asmMovzxbMemq(buffer, asmMem(regMethod, NO_REGISTER, SS_1, argsOffset), RBX);
 	asmIncq(buffer, RBX); // there is alway 'self' argument
 	asmPushq(buffer, RBX);
 
 	// push arguments on stack
 	asmLabelBind(buffer, &loop, asmOffset(buffer));
-	asmPushqMem(buffer, asmMem(RDX, RBX, SS_8, -sizeof(intptr_t)));
+	asmPushqMem(buffer, asmMem(regArgs, RBX, SS_8, -sizeof(intptr_t)));
 	asmDecq(buffer, RBX);
 	asmJ(buffer, COND_NOT_ZERO, &loop);
 
 	// load context
-	asmMovqMem(buffer, asmMem(RCX, NO_REGISTER, SS_1, offsetof(Thread, context)), CTX);
+	asmMovqMem(buffer, asmMem(regThread, NO_REGISTER, SS_1, offsetof(Thread, context)), CTX);
 
 	// invoke method
-	asmMovq(buffer, RSI, R11); // Smalltalk methods expects native code entry in R11
-	asmCallq(buffer, RSI);
+	asmMovq(buffer, regEntry, R11); // Smalltalk methods expects native code entry in R11
+	asmCallq(buffer, regEntry);
 
 	// load the CURRENT worker's thread from TLS (the fiber may have migrated OS threads
-	// during the Smalltalk call, so CTX->thread could be stale)
-	asmLoadTls(buffer, RCX, gCurrentThreadTpoff);
+	// during the Smalltalk call, so CTX->thread could be stale); regThread doubles
+	// as the post-call scratch — it is volatile in every supported ABI
+	asmLoadTls(buffer, regThread, gCurrentThreadTpoff);
 	// load entry frame
-	asmMovqMem(buffer, asmMem(RCX, NO_REGISTER, SS_1, offsetof(Thread, stackFramesTail)), TMP);
+	asmMovqMem(buffer, asmMem(regThread, NO_REGISTER, SS_1, offsetof(Thread, stackFramesTail)), TMP);
 	// load previous entry frame
 	asmMovqMem(buffer, asmMem(TMP, NO_REGISTER, SS_1, offsetof(EntryStackFrame, prev)), TMP);
 	// setup entry stack frame to thread
-	asmMovqToMem(buffer, TMP, asmMem(RCX, NO_REGISTER, SS_1, offsetof(Thread, stackFramesTail)));
+	asmMovqToMem(buffer, TMP, asmMem(regThread, NO_REGISTER, SS_1, offsetof(Thread, stackFramesTail)));
 
 	// restore RSP
 	asmMovqMem(buffer, asmMem(RBP, NO_REGISTER, SS_1, -sizeof(intptr_t) - frameSize), RBX);
 	asmLeaq(buffer, asmMem(RSP, RBX, SS_8, sizeof(intptr_t) + frameSize), RSP);
 
-	asmPopq(buffer, R15);
-	asmPopq(buffer, R14);
-	asmPopq(buffer, R13);
-	asmPopq(buffer, R12);
-	asmPopq(buffer, RBX);
-	asmPopq(buffer, RBP);
+	abi->emitEntryRestoreRegs(buffer);
 	asmRet(buffer);
 }
 StubCode SmalltalkEntry = { .generator = generateSmalltalkEntry, .id = STUB_SMALLTALK_ENTRY };

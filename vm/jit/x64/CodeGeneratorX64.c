@@ -9,6 +9,7 @@
 #include "jit/CodeGenerator.h"
 #include "os/Os.h"
 #include "jit/x64/AssemblerX64.h"
+#include "jit/x64/Abi.h"
 #include "core/Object.h"
 #include "core/Class.h"
 #include "core/Smalltalk.h"
@@ -258,17 +259,11 @@ static void generateSafepointPoll(CodeGenerator *generator, _Bool atBackEdge)
 	asmCmpbMemImm(buffer, asmMem(TMP, NO_REGISTER, SS_1, offsetof(Heap, safepointRequested)), 0);
 	asmJ(buffer, COND_EQUAL, &noGc);
 
-	// Slow path (a peer is collecting): spill the caller-saved allocatable set +
-	// scratch, park in heapGcPoll(heap, thread), restore. Callee-saved RBX/R13-R15
-	// and CTX(R12) are preserved by the C ABI. Mirrors generateStoreCheck's grow path.
-	asmPushq(buffer, RAX);
-	asmPushq(buffer, RCX);
-	asmPushq(buffer, RDX);
-	asmPushq(buffer, RSI);
-	asmPushq(buffer, RDI);
-	asmPushq(buffer, R8);
-	asmPushq(buffer, R9);
-	asmPushq(buffer, R11);
+	// Slow path (a peer is collecting): spill the ABI's caller-saved live set
+	// (gX64Abi->callerSavedSpill), park in heapGcPoll(heap, thread), restore.
+	// Callee-saved RBX/R13-R15 and CTX(R12) are preserved by the C ABI. Mirrors
+	// generateStoreCheck's grow path.
+	abiEmitCallerSavedPush(gX64Abi, buffer);
 	// RSI = thread, RDI = thread->heap   (heapGcPoll(Heap *heap, Thread *self)). `self` sets
 	// this mutator's spAtSafepoint, so it MUST be the RUNNING worker (TLS), not CTX->thread
 	// which may be stale after a migration.
@@ -277,14 +272,7 @@ static void generateSafepointPoll(CodeGenerator *generator, _Bool atBackEdge)
 	generator->overapproxStackmap = atBackEdge;
 	generateCCall(generator, (intptr_t) heapGcPoll, 2, 1);
 	generator->overapproxStackmap = 0;
-	asmPopq(buffer, R11);
-	asmPopq(buffer, R9);
-	asmPopq(buffer, R8);
-	asmPopq(buffer, RDI);
-	asmPopq(buffer, RSI);
-	asmPopq(buffer, RDX);
-	asmPopq(buffer, RCX);
-	asmPopq(buffer, RAX);
+	abiEmitCallerSavedPop(gX64Abi, buffer);
 
 	asmLabelBind(buffer, &noGc, asmOffset(buffer));
 }
@@ -943,25 +931,11 @@ void generateStoreCheck(CodeGenerator *generator, Register object, Register valu
 	asmJ(buffer, COND_ABOVE, &notFull);             // end > current -> room, skip grow
 
 	// grow (rare: once per 1024 remembered objects) via the C helper, then reload
-	asmPushq(buffer, RAX);
-	asmPushq(buffer, RCX);
-	asmPushq(buffer, RDX);
-	asmPushq(buffer, RSI);
-	asmPushq(buffer, RDI);
-	asmPushq(buffer, R8);
-	asmPushq(buffer, R9);
-	asmPushq(buffer, R11);
+	abiEmitCallerSavedPush(gX64Abi, buffer);
 	asmLoadTls(buffer, TMP, gCurrentThreadTpoff);
 	asmLeaq(buffer, asmMem(TMP, NO_REGISTER, SS_1, rememberedSetOffset), RDI);
 	generateCCall(generator, (intptr_t) rememberedSetGrow, 1, 0);
-	asmPopq(buffer, R11);
-	asmPopq(buffer, R9);
-	asmPopq(buffer, R8);
-	asmPopq(buffer, RDI);
-	asmPopq(buffer, RSI);
-	asmPopq(buffer, RDX);
-	asmPopq(buffer, RCX);
-	asmPopq(buffer, RAX);
+	abiEmitCallerSavedPop(gX64Abi, buffer);
 	asmLoadTls(buffer, TMP, gCurrentThreadTpoff);
 	asmMovqMem(buffer, asmMem(TMP, NO_REGISTER, SS_1, blocksOffset), TMP);
 
@@ -1728,6 +1702,14 @@ void generateCCall(CodeGenerator *generator, intptr_t cFunction, size_t argsSize
 	asmMovq(buffer, RSP, RBP);
 	asmPushq(buffer, CTX); // spill current context
 	asmAndqImm(buffer, RSP, ~(16 - 1)); // ensure 16 bytes stack aligment
+	if (gX64Abi->shadowSpace != 0) {
+		// Win64 home space (32 preserves the 16-alignment); SysV (0) emits
+		// NOTHING. No matching add: RSP is restored from RBP on return. A real
+		// Win64 port also needs call-time stack args for >4-slot calls staged
+		// here — the (currently unread) argsSize parameter is the pre-drilled
+		// hole for that upgrade; see PORTING.md.
+		asmSubqImm(buffer, RSP, gX64Abi->shadowSpace);
+	}
 
 	// load the RUNNING worker's thread from TLS (per-mutator stackFramesTail), then set the
 	// exit frame for the C call — CTX->thread may be stale after a migration

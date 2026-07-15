@@ -5,6 +5,7 @@
 #endif
 
 #include "jit/x64/AssemblerX64.h"
+#include "jit/x64/Abi.h"
 #include "jit/TargetPrimitives.h"
 #include "core/Exception.h"
 #include "core/StackFrame.h"
@@ -23,13 +24,14 @@ void generateCCallPrimitive(CodeGenerator *generator, PrimitiveResult (*cFunctio
 	AssemblerLabel failed;
 	asmInitLabel(&failed);
 
-	for (size_t i = 0; i < argsSize; i++) {
-		movArg(buffer, i, ArgumentsRegisters[i]);
-	}
+	// Arg marshalling and PrimitiveResult decoding are C-ABI operations (SysV:
+	// register args + RAX:RDX struct return; Win64: sret pointer) — the hooks
+	// live in the selected abi/<abi>/ instance. The R11<->R13 native-code dance,
+	// the ret and the fail fall-through are VM protocol and stay shared.
+	gX64Abi->emitCCallPrimArgs(buffer, argsSize);
 	asmMovq(buffer, R11, R13);
 	generateCCall(generator, (intptr_t) cFunction, argsSize, 0);
-	asmTestq(buffer, RDX, RDX);
-	asmJ(buffer, COND_NOT_ZERO, &failed);
+	gX64Abi->emitPrimResultCheck(buffer, &failed);
 	asmRet(buffer);
 	asmLabelBind(buffer, &failed, asmOffset(buffer));
 	asmMovq(buffer, R13, R11);
