@@ -134,6 +134,17 @@ writeSharedTail() {
 	addi 1,1,8
 	mtctr 12
 	bctrl
+# case: smallfloat rotldi/rotrdi/mtvsrd/mfvsrd
+	rotldi 5,3,1
+	rotrdi 5,3,1
+	rotldi 0,4,63
+	.machine push
+	.machine power8
+	mtvsrd 0,5
+	mtvsrd 31,10
+	mfvsrd 5,0
+	mfvsrd 10,31
+	.machine pop
 EOF
 }
 

@@ -59,3 +59,42 @@ echo "== ST_SMALLFLOAT_TEST:"; ST_SMALLFLOAT_TEST=1 "$OUT/st" && echo OK
 # backend's Bind TU aliases ST_ABI_EMIT_TEST to its own golden.
 echo "== ST_ABI_EMIT_TEST:"; ST_ABI_EMIT_TEST=1 "$OUT/st" && echo OK
 echo "ALL $MODE TESTS PASSED ($TARGET_ARCH under qemu-user)"
+
+# ---- CPU feature-detection sanity on emulated models -----------------------
+# The decode must claim the right ISA level under each QEMU_CPU (see
+# checkCpuDecode for the fabricated-words golden; this is the END-TO-END check
+# through the real kernel hwcap words qemu reports), and the float suite must
+# pass on BOTH sides of the isPower8 (ISA 2.07) gate: mtvsrd/mfvsrd vs the
+# TLS memory path for GPR<->FPR moves.
+if [ "$MODE" = be ]; then
+	# NOTE: QEMU_CPU=970 cannot run this binary at all: the Debian cross glibc
+	# requires POWER7 (a rootfs constraint, not a JIT one). power7 is the
+	# oldest runnable model and exactly the case we need anyway: VSX present
+	# but NO ISA 2.07, so the GPR<->FPR moves MUST take the memory path.
+	echo "== ST_CPU_INFO (power7 must NOT claim ISA 2.07; power9 must):"
+	QEMU_CPU=power7 ST_CPU_INFO=1 ST_SMALLFLOAT_TEST=1 "$OUT/st" </dev/null | grep "ppc64 CPU"
+	QEMU_CPU=power7 ST_CPU_INFO=1 ST_SMALLFLOAT_TEST=1 "$OUT/st" </dev/null | grep -q "power8=0" \
+		|| { echo "FAIL: power7 claimed ISA 2.07"; exit 1; }
+	QEMU_CPU=power9 ST_CPU_INFO=1 ST_SMALLFLOAT_TEST=1 "$OUT/st" </dev/null | grep "ppc64 CPU"
+	QEMU_CPU=power9 ST_CPU_INFO=1 ST_SMALLFLOAT_TEST=1 "$OUT/st" </dev/null | grep -q "power8=1 power9=1" \
+		|| { echo "FAIL: power9 must imply ISA 2.07"; exit 1; }
+fi
+
+# ---- the .st test surface under qemu ----------------------------------------
+# Exactly the gap that let the boxed-result canonicity bug ship: the goldens
+# and C self-tests above never exercise Smalltalk semantics on the target.
+echo "== bootstrap + numeric .st tests under qemu ($TARGET_ARCH):"
+IMG="/tmp/st-cross-$TARGET_ARCH.img"
+"$OUT/st" -s "$IMG" -b smalltalk </dev/null >/dev/null
+if [ "$MODE" = be ]; then CPUS="power7 power9"; else CPUS="power8 power9"; fi
+for cpu in $CPUS; do
+	echo "==   QEMU_CPU=$cpu:"
+	for t in tests/FloatTest.st tests/FloatEdgeTest.st tests/FloatCrossRepTest.st \
+	         tests/SmallFloat64BoundaryTest.st tests/FloatHashTest.st \
+	         tests/ScaledDecimalTest.st tests/LargeIntegerTest.st; do
+		QEMU_CPU=$cpu timeout 900 "$OUT/st" -s "$IMG" -f "$t" </dev/null >/dev/null 2>&1 \
+			|| { echo "FAIL $t ($cpu)"; exit 1; }
+		echo "     pass $(basename "$t")"
+	done
+done
+echo "ALL $MODE .st TESTS PASSED under qemu"

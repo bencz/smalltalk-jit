@@ -681,6 +681,35 @@ static inline void asmClrldi(AssemblerBuffer *buffer, Register ra, Register rs, 
 	asmRldicl(buffer, ra, rs, 0, n);
 }
 
+
+// rotldi(ra,rs,n) == rldicl(ra,rs,n,0): pure 64-bit left rotate (the mask
+// keeps every bit); rotrdi rotates right via 64-n. Used by the SmallFloat64
+// immediate encode/decode in the inline Float intrinsic.
+static inline void asmRotldi(AssemblerBuffer *buffer, Register ra, Register rs, int n)
+{
+	asmRldicl(buffer, ra, rs, n & 63, 0);
+}
+
+static inline void asmRotrdi(AssemblerBuffer *buffer, Register ra, Register rs, int n)
+{
+	asmRldicl(buffer, ra, rs, (64 - n) & 63, 0);
+}
+
+// GPR <-> FPR raw bit moves, ISA 2.07 (POWER8) VSX-with-GPR forms: FPR f is
+// VSR f, so the TX/SX bit (word bit 31, our bit 0) stays 0 for f0-f31. Emit
+// ONLY behind the isPower8 CPU gate; the baseline goes through memory.
+// mtvsrd XT,RA (XO 179): moves RA into VSR XT.
+static inline void asmMtvsrd(AssemblerBuffer *buffer, int frt, Register ra)
+{
+	asmPpcEmitWord(buffer, ppcXForm((Register) frt, ra, (Register) 0, 179));
+}
+
+// mfvsrd RA,XS (XO 51): moves VSR XS into RA.
+static inline void asmMfvsrd(AssemblerBuffer *buffer, Register ra, int frs)
+{
+	asmPpcEmitWord(buffer, ppcXForm((Register) frs, ra, (Register) 0, 51));
+}
+
 // XS-form arithmetic shift right immediate (the untag shift).
 static inline void asmSradi(AssemblerBuffer *buffer, Register ra, Register rs, int sh)
 {

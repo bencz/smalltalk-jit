@@ -184,6 +184,20 @@ static void emitFloatXerCase(AssemblerBuffer *buffer)
 	asmCallReg(buffer, R12_PPC);
 }
 
+
+// The SmallFloat64 decode/encode building blocks: pure 64-bit rotates plus
+// the ISA 2.07 GPR<->VSR moves (emitted only behind the isPower8 gate).
+static void emitSmallFloatOpsCase(AssemblerBuffer *buffer)
+{
+	asmRotldi(buffer, R5, R3, 1);
+	asmRotrdi(buffer, R5, R3, 1);
+	asmRotldi(buffer, R0, R4, 63);
+	asmMtvsrd(buffer, 0, R5);
+	asmMtvsrd(buffer, 31, TMP2);
+	asmMfvsrd(buffer, R5, 0);
+	asmMfvsrd(buffer, TMP2, 31);
+}
+
 // ---- expected vectors -------------------------------------------------------
 // Validated against powerpc64-linux-gnu-as + objdump (the cross oracle) —
 // scripts/ppc64/golden-oracle.sh. Regenerate with ST_PPC64_EMIT_TEST=print.
@@ -219,6 +233,8 @@ static const GoldenCase Cases[] = {
 	  ExpectedPpcShiftCmp, sizeof(ExpectedPpcShiftCmp) },
 	{ "fadd/fsub/fmul/fdiv/fcmpu/xer/bcl/push/pop/callreg", emitFloatXerCase,
 	  ExpectedPpcFloatXer, sizeof(ExpectedPpcFloatXer) },
+	{ "smallfloat rotldi/rotrdi/mtvsrd/mfvsrd", emitSmallFloatOpsCase,
+	  ExpectedPpcSmallFloatOps, sizeof(ExpectedPpcSmallFloatOps) },
 };
 
 static const char *CaseArrayNames[] = {
@@ -227,7 +243,7 @@ static const char *CaseArrayNames[] = {
 	"ExpectedPpcLoadTlsNeg", "ExpectedPpcCallCFunction",
 	"ExpectedPpcEntrySave", "ExpectedPpcEntryRestore",
 	"ExpectedPpcSubWord", "ExpectedPpcXoArith", "ExpectedPpcShiftCmp",
-	"ExpectedPpcFloatXer",
+	"ExpectedPpcFloatXer", "ExpectedPpcSmallFloatOps",
 };
 
 static void hexdumpAsCArray(const char *name, const uint8_t *bytes, size_t size)

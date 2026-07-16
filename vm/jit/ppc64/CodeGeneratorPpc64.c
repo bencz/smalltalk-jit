@@ -17,6 +17,7 @@
 #include "jit/ppc64/AssemblerPpc64.h"
 #include "jit/ppc64/Abi.h"
 #include "jit/TargetCodePatch.h"
+#include "jit/ppc64/Cpu.h"
 #include "core/Object.h"
 #include "core/Class.h"
 #include "core/Smalltalk.h"
@@ -589,44 +590,125 @@ static void arithCompareBranch(int arithKind, int *bo, int *bi)
 }
 
 
+
+// Raw bit move GPR -> FPR. ISA 2.07 (POWER8) has mtvsrd; the baseline
+// (970/POWER7) goes through the per-thread scratch slot reached via TLS in
+// `tls` (straight-line code, no yield point, so fiber migration cannot split
+// the store from the load).
+static void generateBitsToFpr(AssemblerBuffer *buffer, Register src, int fpr, Register tls)
+{
+	if (gPpc64Cpu.isPower8) {
+		asmMtvsrd(buffer, fpr, src);
+		return;
+	}
+	asmStd(buffer, src, offsetof(Thread, jitFpuScratch), tls);
+	asmLfd(buffer, fpr, offsetof(Thread, jitFpuScratch), tls);
+}
+
+
+// Raw bit move FPR -> GPR (mfvsrd on ISA 2.07, TLS scratch on the baseline).
+static void generateFprToBits(AssemblerBuffer *buffer, int fpr, Register dst, Register tls)
+{
+	if (gPpc64Cpu.isPower8) {
+		asmMfvsrd(buffer, dst, fpr);
+		return;
+	}
+	asmStfd(buffer, fpr, offsetof(Thread, jitFpuScratch), tls);
+	asmLd(buffer, dst, offsetof(Thread, jitFpuScratch), tls);
+}
+
+
+// Load one already-guarded Float operand (SmallFloat64 immediate OR
+// BoxedFloat64 pointer) into an FPR; cannot miss after the guard phase.
+// offsetReg holds SMALLFLOAT_OFFSET and is preserved; R0 is the scratch;
+// reg itself stays intact.
+static void generateFloatOperandLoad(AssemblerBuffer *buffer, Register reg, int fpr,
+	Register offsetReg, Register tls)
+{
+	AssemblerLabel boxed, skipAdd, done;
+	asmInitLabel(&boxed);
+	asmInitLabel(&skipAdd);
+	asmInitLabel(&done);
+
+	asmAndiDot(buffer, R0, reg, 2);          // bit 1 set here means immediate (0b11)
+	asmBeq(buffer, &boxed);
+
+	// SmallFloat64 decode, the inverse of tagFloat (see Object.h): payload =
+	// value >> 2; bits = ROR64(payload <= 1 ? payload : payload + offset, 1)
+	asmSrdi(buffer, R0, reg, 2);
+	asmCmpldi(buffer, 0, R0, 1);
+	asmBle(buffer, &skipAdd);                // payloads 0/1 are +-0.0: no rebias
+	asmAdd(buffer, R0, R0, offsetReg);
+	asmPpcLabelBind(buffer, &skipAdd, asmOffset(buffer));
+	asmRotrdi(buffer, R0, R0, 1);
+	generateBitsToFpr(buffer, R0, fpr, tls);
+	asmB(buffer, &done);
+
+	asmPpcLabelBind(buffer, &boxed, asmOffset(buffer));
+	asmLfd(buffer, fpr, varOffset(RawFloat, value), reg);
+
+	asmPpcLabelBind(buffer, &done, asmOffset(buffer));
+}
+
+
 // Inline Float fast path — see the x64 original. Operands on the stack
 // (receiver at 0(r1), arg at 8(r1)), TMP still holds the receiver on every
-// fall-through-to-dispatch path. Scratch: r3/r4/r6 + f0/f1; the boxed result
-// lands in r3 (which is why the reloads use r4/r6, not r3 — DESIGN.md).
+// fall-through-to-dispatch path. Each operand may be a SmallFloat64 immediate
+// (decoded inline) or a BoxedFloat64 (lfd); an arithmetic result that fits the
+// immediate range is encoded inline with NO allocation, and only out-of-range
+// results take the allocate-first boxed path (which re-decodes the reloaded
+// operands: no FPR value survives the stub). GPR<->FPR moves use mtvsrd/mfvsrd
+// on ISA 2.07+, else the per-thread TLS scratch (970/POWER7 baseline). The
+// result lands in r3 on every committed path.
 static void generateFloatFastPath(CodeGenerator *generator, int arithKind, AssemblerLabel *arithMerge)
 {
 	AssemblerBuffer *buffer = &generator->buffer;
-	AssemblerLabel tagMissR, tagMissA, classMissR, classMissA;
+	AssemblerLabel tagMissR, tagMissA, immOkR, immOkA, classMissR, classMissA;
 	asmInitLabel(&tagMissR);
 	asmInitLabel(&tagMissA);
+	asmInitLabel(&immOkR);
+	asmInitLabel(&immOkA);
 	asmInitLabel(&classMissR);
 	asmInitLabel(&classMissA);
 
 	asmLd(buffer, R3, 0, R1);                    // receiver
 	asmLd(buffer, R4, sizeof(intptr_t), R1);     // arg
-	// both must be heap pointers (tag 0b01 exactly): bit 0 alone would accept
-	// a VALUE_FLOAT immediate (0b11) and dereference it as a box
-	asmAndiDot(buffer, R0, R3, 3);
-	asmCmpldi(buffer, 0, R0, VALUE_POINTER);
-	asmBne(buffer, &tagMissR);
-	asmAndiDot(buffer, R0, R4, 3);
-	asmCmpldi(buffer, 0, R0, VALUE_POINTER);
-	asmBne(buffer, &tagMissA);
+	// Guard phase, the ONLY phase that can fall to dispatch: each operand must
+	// be a SmallFloat64 immediate (both tag bits set) or a pointer whose class
+	// word is BoxedFloat64.
 	generateLoadObject(buffer, (RawObject *) Handles.BoxedFloat64->raw, R6, 0);  // BoxedFloat64 class (raw)
+	asmAndiDot(buffer, R0, R3, 1);
+	asmBeq(buffer, &tagMissR);               // 0b00/0b10: not a Float
+	asmAndiDot(buffer, R0, R3, 2);
+	asmBne(buffer, &immOkR);                 // 0b11: immediate
 	asmLdT(buffer, R0, varOffset(RawObject, class), R3);
 	asmCmpd(buffer, 0, R0, R6);
 	asmBne(buffer, &classMissR);
+	asmPpcLabelBind(buffer, &immOkR, asmOffset(buffer));
+	asmAndiDot(buffer, R0, R4, 1);
+	asmBeq(buffer, &tagMissA);
+	asmAndiDot(buffer, R0, R4, 2);
+	asmBne(buffer, &immOkA);
 	asmLdT(buffer, R0, varOffset(RawObject, class), R4);
 	asmCmpd(buffer, 0, R0, R6);
 	asmBne(buffer, &classMissA);
+	asmPpcLabelBind(buffer, &immOkA, asmOffset(buffer));
+
+	// Committed: decode both operands into f0/f1. R5 = SMALLFLOAT_OFFSET
+	// (0x6 << 60); TMP2 = TLS base for the baseline GPR<->FPR path.
+	asmLi(buffer, R5, 6);
+	asmSldi(buffer, R5, R5, 60);
+	if (!gPpc64Cpu.isPower8) {
+		asmLoadTls(buffer, TMP2, gCurrentThreadTpoff);
+	}
+	generateFloatOperandLoad(buffer, R3, 0, R5, TMP2);
+	generateFloatOperandLoad(buffer, R4, 1, R5, TMP2);
 
 	if (arithIsCompare(arithKind)) {
 		// No allocation: unbox both, fcmpu, load true/false. Unordered (NaN)
 		// is a DEDICATED cr0 bit (SO) on POWER: branch it to firstBlock
 		// (false for < <= > >= =, true for ~=), then branch the main
 		// condition to secondBlock.
-		asmLfd(buffer, 0, varOffset(RawFloat, value), R3);
-		asmLfd(buffer, 1, varOffset(RawFloat, value), R4);
 		asmFcmpu(buffer, 0, 0, 1);
 		AssemblerLabel firstBlock, secondBlock, cmpDone;
 		asmInitLabel(&firstBlock);
@@ -652,16 +734,56 @@ static void generateFloatFastPath(CodeGenerator *generator, int arithKind, Assem
 		generateLoadObject(buffer, secondValue, R3, 1);
 		asmPpcLabelBind(buffer, &cmpDone, asmOffset(buffer));
 	} else {
-		// Arithmetic: allocate FIRST, then compute into the new Float (the
-		// operands survive the possibly-scavenging allocation via the
-		// stub's stackmap; reloaded from the stack after).
+		// Arithmetic: compute FIRST, then try the immediate encode; results
+		// that fit the SmallFloat64 range allocate NOTHING.
+		switch (arithKind) {
+		case ARITH_ADD: asmFadd(buffer, 0, 0, 1); break;
+		case ARITH_SUB: asmFsub(buffer, 0, 0, 1); break;
+		case ARITH_MUL: asmFmul(buffer, 0, 0, 1); break;
+		default:        asmFdiv(buffer, 0, 0, 1); break;   // ARITH_DIV
+		}
+
+		AssemblerLabel payloadReady, boxA, boxB, fastDone;
+		asmInitLabel(&payloadReady);
+		asmInitLabel(&boxA);
+		asmInitLabel(&boxB);
+		asmInitLabel(&fastDone);
+
+		// SmallFloat64 encode (tagFloat, see Object.h): rot = ROL64(bits, 1);
+		// rot <= 1 is +-0.0 and IS the payload; otherwise payload =
+		// rot - offset and must land in [2, 2^62).
+		generateFprToBits(buffer, 0, R0, TMP2);
+		asmRotldi(buffer, R0, R0, 1);
+		asmCmpldi(buffer, 0, R0, 1);
+		asmBle(buffer, &payloadReady);
+		asmSubf(buffer, R0, R5, R0);             // payload = rot - offset
+		asmCmpldi(buffer, 0, R0, 1);
+		asmBle(buffer, &boxA);                   // +-2^-255: collides with +-0.0, box
+		asmSrdi(buffer, R6, R0, 62);
+		asmCmpldi(buffer, 0, R6, 0);
+		asmBne(buffer, &boxB);                   // out of range or underflow wrap: box
+		asmPpcLabelBind(buffer, &payloadReady, asmOffset(buffer));
+		asmSldi(buffer, R0, R0, 2);
+		asmOri(buffer, R3, R0, 3);               // tagged immediate result in r3
+		asmB(buffer, &fastDone);
+
+		// Out-of-range result: allocate FIRST (the operands survive the
+		// possibly-scavenging stub via its stackmap; FPR values do NOT), then
+		// re-decode the reloaded operands and redo the op into the new box.
+		asmPpcLabelBind(buffer, &boxA, asmOffset(buffer));
+		asmPpcLabelBind(buffer, &boxB, asmOffset(buffer));
 		generateLoadObject(buffer, (RawObject *) Handles.BoxedFloat64->raw, R4, 0);
 		asmLi(buffer, R5, 0);
 		generateStubCall(generator, &AllocateStub);   // r3 = new tagged Float
 		asmLd(buffer, R4, 0, R1);                     // reload receiver
 		asmLd(buffer, R6, sizeof(intptr_t), R1);      // reload arg
-		asmLfd(buffer, 0, varOffset(RawFloat, value), R4);
-		asmLfd(buffer, 1, varOffset(RawFloat, value), R6);
+		asmLi(buffer, R5, 6);                         // offset again (R5 was the stub arg)
+		asmSldi(buffer, R5, R5, 60);
+		if (!gPpc64Cpu.isPower8) {
+			asmLoadTls(buffer, TMP2, gCurrentThreadTpoff);
+		}
+		generateFloatOperandLoad(buffer, R4, 0, R5, TMP2);
+		generateFloatOperandLoad(buffer, R6, 1, R5, TMP2);
 		switch (arithKind) {
 		case ARITH_ADD: asmFadd(buffer, 0, 0, 1); break;
 		case ARITH_SUB: asmFsub(buffer, 0, 0, 1); break;
@@ -669,6 +791,7 @@ static void generateFloatFastPath(CodeGenerator *generator, int arithKind, Assem
 		default:        asmFdiv(buffer, 0, 0, 1); break;   // ARITH_DIV
 		}
 		asmStfd(buffer, 0, varOffset(RawFloat, value), R3);
+		asmPpcLabelBind(buffer, &fastDone, asmOffset(buffer));
 	}
 	asmB(buffer, arithMerge);
 

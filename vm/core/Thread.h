@@ -46,6 +46,10 @@ typedef struct Thread {
 	// B2.5 context rebind keeps CTX->thread pointing at the running worker.
 	Value exceptionHandler;
 	TLAB tlab; // per-OS-thread young allocation buffer (stays embedded, per-mutator)
+	// 8-byte scratch for the PPC baseline's GPR<->FPR raw bit moves (mtvsrd/
+	// mfvsrd only exist from ISA 2.07 on): the JIT stores and immediately
+	// reloads through here via TLS, straight-line. Never a GC root.
+	uint64_t jitFpuScratch;
 	RememberedSet rememberedSet; // per-mutator old->young log (merged at GC in the multicore model)
 	CodegenSites *codegenSites; // in-flight codegen buffers whose baked pointers the GC must fix
 	size_t lookupCacheEpoch; // last heap->gcEpoch this thread's TLS LookupCache was flushed at
