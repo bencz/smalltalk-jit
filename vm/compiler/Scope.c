@@ -28,6 +28,8 @@ static void analyzeAssigments(BlockScope *blockScope, ExpressionNode *node);
 static void analyzeAssigment(BlockScope *blockScope, LiteralNode *literal);
 static CompileError *createReadonlyVariableError(LiteralNode *node);
 static void analyzeMessageExpression(BlockScope *blockScope, MessageExpressionNode *node);
+static _Bool expressionIsInlinableWhile(ExpressionNode *node);
+static void analyzeInlinedBlock(BlockScope *blockScope, BlockNode *node);
 static void analyzeLiteral(BlockScope *blockScope, Object *literal);
 static void analyzeVar(BlockScope *blockScope, LiteralNode *name);
 static _Bool analyzeContextVar(BlockScope *blockScope, String *name);
@@ -161,6 +163,18 @@ static _Bool isDuplicateVariable(Dictionary *vars, String *name)
 static void analyzeExpression(BlockScope *blockScope, ExpressionNode *node)
 {
 	analyzeAssigments(blockScope, node);
+	if (expressionIsInlinableWhile(node)) {
+		// the condition and body blocks are spliced into THIS scope, exactly
+		// like the arg blocks of inlined conditionals
+		analyzeInlinedBlock(blockScope, (BlockNode *) expressionNodeGetReceiver(node));
+		if (blockScopeHasError(blockScope)) {
+			return;
+		}
+		MessageExpressionNode *m = (MessageExpressionNode *)
+			ordCollObjectAt(expressionNodeGetMessageExpressions(node), 0);
+		analyzeInlinedBlock(blockScope, (BlockNode *) ordCollObjectAt(messageExpressionNodeGetArgs(m), 0));
+		return;
+	}
 	analyzeLiteral(blockScope, (Object *) expressionNodeGetReceiver(node));
 	if (blockScopeHasError(blockScope)) {
 		return;
@@ -229,6 +243,38 @@ static _Bool isInlinableBlockNode(Object *node)
 	BlockNode *block = (BlockNode *) node;
 	return ordCollSize(blockNodeGetArgs(block)) == 0
 		&& ordCollSize(blockNodeGetTempVars(block)) == 0;
+}
+
+
+// `[cond] whileTrue: [body]` (or whileFalse:) with BOTH blocks literal and
+// arg-free/temp-free, as the expression's ONLY message: compiled as a native
+// loop with the two bodies spliced into the enclosing frame, no BlockContext
+// and no per-iteration block activation. Kept in sync with Compiler.c's
+// compileWhileKind.
+static _Bool expressionIsInlinableWhile(ExpressionNode *node)
+{
+	static int enabled = -1;
+	if (enabled < 0) {
+		enabled = getenv("ST_NO_INLINE_CF") == NULL;
+	}
+	if (!enabled) {
+		return 0;
+	}
+	if (ordCollSize(expressionNodeGetMessageExpressions(node)) != 1) {
+		return 0;
+	}
+	Object *receiver = (Object *) expressionNodeGetReceiver(node);
+	if (receiver->raw->class != Handles.BlockNode->raw || !isInlinableBlockNode(receiver)) {
+		return 0;
+	}
+	MessageExpressionNode *m = (MessageExpressionNode *)
+		ordCollObjectAt(expressionNodeGetMessageExpressions(node), 0);
+	String *selector = messageExpressionNodeGetSelector(m);
+	if (!(stringEqualsC(selector, "whileTrue:") || stringEqualsC(selector, "whileFalse:"))) {
+		return 0;
+	}
+	OrderedCollection *args = messageExpressionNodeGetArgs(m);
+	return ordCollSize(args) == 1 && isInlinableBlockNode(ordCollObjectAt(args, 0));
 }
 
 
@@ -345,12 +391,14 @@ static _Bool exprHasRealBlock(ExpressionNode *e)
 {
 	HandleScope scope;
 	openHandleScope(&scope);
+	_Bool whileInlined = expressionIsInlinableWhile(e);
 	_Bool found = nodeHasRealBlock((Object *) expressionNodeGetReceiver(e));
 	Iterator it;
 	initOrdCollIterator(&it, expressionNodeGetMessageExpressions(e), 0, 0);
 	while (!found && iteratorHasNext(&it)) {
 		MessageExpressionNode *m = (MessageExpressionNode *) iteratorNextObject(&it);
-		_Bool inlined = messageIsInlinableControlFlow(m) || messageIsInlinableLoop(m);
+		_Bool inlined = whileInlined
+			|| messageIsInlinableControlFlow(m) || messageIsInlinableLoop(m);
 		Iterator ai;
 		initOrdCollIterator(&ai, messageExpressionNodeGetArgs(m), 0, 0);
 		while (!found && iteratorHasNext(&ai)) {

@@ -105,10 +105,12 @@ NativeCode *generateMethodCode(CompiledMethod *method)
 	// init FIRST (it resets code.methodOrBlock), then bind the method's code
 	initCodeGenerator(&generator);
 	initMethodCompiledCode(&generator.code, method);
+	pinCompiledCodeBytes(&generator.code); // the method object may move mid-codegen
 	generator.descriptors = newOrdColl(32);
 	generateCode(&generator);
 
 	NativeCode *code = buildNativeCode(&generator);
+	unpinCompiledCodeBytes(&generator.code);
 	closeHandleScope(&scope, NULL);
 	freeCodeGenerator(&generator);
 	heapCodegenLockLeave(CurrentThread.heap);
@@ -121,10 +123,12 @@ static NativeCode *generateBlockCode(CompiledBlock *block, CodeGenerator *parent
 	CodeGenerator generator;
 	initCodeGenerator(&generator);
 	initBlockCompiledCode(&generator.code, block);
+	pinCompiledCodeBytes(&generator.code); // the method object may move mid-codegen
 	generator.descriptors = newOrdColl(32);
 	generateCode(&generator);
 
 	NativeCode *code = buildNativeCode(&generator);
+	unpinCompiledCodeBytes(&generator.code);
 	compiledBlockSetNativeCode(block, code);
 	freeCodeGenerator(&generator);
 	return code;
@@ -680,9 +684,16 @@ static void generateFloatFastPath(CodeGenerator *generator, int arithKind, Assem
 static void generateSend(CodeGenerator *generator, BytecodesIterator *iterator)
 {
 	AssemblerBuffer *buffer = &generator->buffer;
-	RawObject *selector = compiledCodeLiteralAt(&generator->code, bytecodeNextByte(iterator));
+	// Keep the literal INDEX, not the raw selector pointer: pushOperand of a
+	// BLOCK argument compiles the whole block right here, which allocates and
+	// can scavenge; a raw pointer captured before that would be baked stale
+	// below (see x64 generateSend). Classification runs BEFORE the pushes.
+	uint8_t selectorIndex = bytecodeNextByte(iterator);
 	uint8_t argsSize = bytecodeNextByte(iterator);
 	Operand receiver = bytecodeNextOperand(iterator);
+	int arithKind = argsSize == 1
+		? classifyArith(compiledCodeLiteralAt(&generator->code, selectorIndex)) : ARITH_NONE;
+	int identKind = classifyIdentity(compiledCodeLiteralAt(&generator->code, selectorIndex), argsSize);
 
 	for (uint8_t i = 0; i < argsSize; i++) {
 		pushOperand(generator, bytecodeNextOperand(iterator));
@@ -692,8 +703,6 @@ static void generateSend(CodeGenerator *generator, BytecodesIterator *iterator)
 	generator->frameSize++;
 
 	// --- inline arithmetic/comparison fast paths (see x64) ------------------
-	int arithKind = argsSize == 1 ? classifyArith(selector) : ARITH_NONE;
-	int identKind = classifyIdentity(selector, argsSize);
 	_Bool identityInline = identKind != IDENT_NONE;
 	_Bool intInline = arithKind != ARITH_NONE && arithKind != ARITH_DIV;
 	_Bool floatInline = arithKind != ARITH_NONE && !arithIsBitOp(arithKind) && floatInlineEnabled();
@@ -794,11 +803,13 @@ static void generateSend(CodeGenerator *generator, BytecodesIterator *iterator)
 	} else {
 		RawClass *class = compiledCodeResolveOperandClass(&generator->code, receiver);
 		if (class != NULL) {
-			asmLi64(buffer, TGT, (uint64_t) (uintptr_t) lookupNativeCode(class, (RawString *) selector));
+			asmLi64(buffer, TGT, (uint64_t) (uintptr_t) lookupNativeCode(class,
+				(RawString *) compiledCodeLiteralAt(&generator->code, selectorIndex)));
 		} else {
 			// Always recompute the receiver's class from TMP (see x64).
 			generateLoadClass(buffer, TMP, R3);
-			generateLoadObject(buffer, selector, R4, 0);
+			generateLoadObject(buffer,
+				compiledCodeLiteralAt(&generator->code, selectorIndex), R4, 0);
 			generateMethodLookup(generator);
 		}
 

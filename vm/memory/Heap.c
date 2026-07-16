@@ -10,6 +10,11 @@
 #include <stdlib.h>
 #include <pthread.h>
 
+// From core/Lookup.c (not via Lookup.h: that header pulls CompiledCode/JIT
+// types this TU does not need). Flushes the calling thread's TLS LookupCache
+// when heap->gcEpoch moved past Thread.lookupCacheEpoch.
+void lookupCacheOnGcResume(Thread *self);
+
 #define KB 1024
 #define MB (1024 * 1024)
 
@@ -55,6 +60,7 @@ void initHeap(Heap *heap, struct Thread *thread)
 	pthread_mutex_init(&heap->safepointLock, NULL);
 	pthread_cond_init(&heap->safepointCond, NULL);
 	heap->safepointRequested = 0;
+	heap->gcEpoch = 0;
 	heap->mutators = NULL;
 	initRememberedSet(&heap->rememberedSet); // consolidated old->young set (survives worker exit)
 	heap->sched = NULL; // allocated by schedulerInit, once per heap
@@ -145,6 +151,7 @@ void heapGcPoll(Heap *heap, Thread *self)
 		self->spAtSafepoint = 0;
 	}
 	pthread_mutex_unlock(&heap->safepointLock);
+	lookupCacheOnGcResume(self); // the collection may have moved cached classes/selectors
 }
 
 static int heapAllSafe(Heap *heap, Thread *exclude)
@@ -194,6 +201,7 @@ void heapGcLeaveBlocked(Heap *heap, Thread *self)
 	}
 	self->spBlocked = 0;
 	pthread_mutex_unlock(&heap->safepointLock);
+	lookupCacheOnGcResume(self); // a collection may have run while blocked
 }
 
 
@@ -484,6 +492,8 @@ static void heapCollectYoung(Heap *heap, size_t realSize)
 	if (heap->mutators == NULL || heap->mutators->nextMutator == NULL) {
 		scavengerScavenge(&heap->newSpace);
 		maybeFullGc(heap);
+		heap->gcEpoch++;
+		lookupCacheOnGcResume(&CurrentThread);
 	} else {
 		// A peer may have freed space while we waited for gcLock; only collect if
 		// still needed. Read newSpace.top under youngLock — the lock that guards the
@@ -496,7 +506,9 @@ static void heapCollectYoung(Heap *heap, size_t realSize)
 			heapGcBegin(heap, &CurrentThread); // park every other mutator
 			scavengerScavenge(&heap->newSpace);
 			maybeFullGc(heap);
+			heap->gcEpoch++; // peers flush their lookup caches on resume
 			heapGcEnd(heap);
+			lookupCacheOnGcResume(&CurrentThread);
 		}
 	}
 	pthread_mutex_unlock(&heap->gcLock);

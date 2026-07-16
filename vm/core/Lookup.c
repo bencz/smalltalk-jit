@@ -92,3 +92,18 @@ NativeCode *getNativeCode(Class *class, CompiledMethod *method)
 	heapCodegenLockLeave(heap);
 	return code;
 }
+
+
+// Called by a mutator on ITSELF whenever it resumes past a point where a
+// collection may have run (safepoint poll, leave-blocked, own collection).
+// A scavenge moves young classes/selectors; the TLS LookupCache would keep
+// dangling from-space pointers that, once that memory is reused, can FALSE-HIT
+// and dispatch the wrong native code. Epoch-gated so the memset only runs
+// once per actual collection.
+void lookupCacheOnGcResume(Thread *self)
+{
+	if (self->heap != NULL && self->lookupCacheEpoch != self->heap->gcEpoch) {
+		self->lookupCacheEpoch = self->heap->gcEpoch;
+		flushLookupCache();
+	}
+}

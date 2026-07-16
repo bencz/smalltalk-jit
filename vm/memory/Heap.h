@@ -32,6 +32,12 @@ typedef struct Heap {
 	PageSpace execSpace;
 	struct NativeCode *stubCode[STUB_COUNT]; // generated JIT stubs, shared by this heap's mutators
 	size_t oldGcThreshold; // run a full GC only once old space grows past this
+	// Bumped once per young collection (under STW/gcLock). Mutators compare it
+	// against their Thread.lookupCacheEpoch on resume and flush their TLS
+	// LookupCache: a scavenge MOVES young classes/selectors, so stale cache
+	// entries would otherwise dangle into from-space and, once that memory is
+	// reused, produce false HITS that dispatch the wrong native code.
+	size_t gcEpoch;
 	// Guards carving TLAB chunks out of the shared young space: the per-mutator
 	// bump inside a TLAB stays lock-free; only the (rare) refill takes this lock,
 	// so several worker OS threads can share one nursery.

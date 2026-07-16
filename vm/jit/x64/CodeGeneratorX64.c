@@ -70,10 +70,12 @@ NativeCode *generateMethodCode(CompiledMethod *method)
 	// init FIRST (it resets code.methodOrBlock), then bind the method's code
 	initCodeGenerator(&generator);
 	initMethodCompiledCode(&generator.code, method);
+	pinCompiledCodeBytes(&generator.code); // the method object may move mid-codegen
 	generator.descriptors = newOrdColl(32);
 	generateCode(&generator);
 
 	NativeCode *code = buildNativeCode(&generator);
+	unpinCompiledCodeBytes(&generator.code);
 	closeHandleScope(&scope, NULL);
 	freeCodeGenerator(&generator);
 	heapCodegenLockLeave(CurrentThread.heap);
@@ -86,10 +88,12 @@ static NativeCode *generateBlockCode(CompiledBlock *block, CodeGenerator *parent
 	CodeGenerator generator;
 	initCodeGenerator(&generator);
 	initBlockCompiledCode(&generator.code, block);
+	pinCompiledCodeBytes(&generator.code); // the method object may move mid-codegen
 	generator.descriptors = newOrdColl(32);
 	generateCode(&generator);
 
 	NativeCode *code = buildNativeCode(&generator);
+	unpinCompiledCodeBytes(&generator.code);
 	compiledBlockSetNativeCode(block, code);
 	freeCodeGenerator(&generator);
 	return code;
@@ -799,9 +803,20 @@ static void generateSend(CodeGenerator *generator, BytecodesIterator *iterator)
 	//spillRegs(generator, offset);
 
 	AssemblerBuffer *buffer = &generator->buffer;
-	RawObject *selector = compiledCodeLiteralAt(&generator->code, bytecodeNextByte(iterator));
+	// Keep the literal INDEX, not the raw selector pointer: pushOperand of a
+	// BLOCK argument compiles the whole block right here (generateLoadBlock ->
+	// generateBlockCode), which allocates and can scavenge, and a raw pointer
+	// captured before that would be baked stale below (root-caused as a
+	// poisoned selector reaching lookupNativeCode under actor stress). The
+	// literal frame is reached through a HANDLE, so a fresh read is always
+	// current. Classification happens BEFORE the pushes, while a raw read is
+	// still trivially valid.
+	uint8_t selectorIndex = bytecodeNextByte(iterator);
 	uint8_t argsSize = bytecodeNextByte(iterator);
 	Operand receiver = bytecodeNextOperand(iterator);
+	int arithKind = argsSize == 1
+		? classifyArith(compiledCodeLiteralAt(&generator->code, selectorIndex)) : ARITH_NONE;
+	int identKind = classifyIdentity(compiledCodeLiteralAt(&generator->code, selectorIndex), argsSize);
 
 	for (uint8_t i = 0; i < argsSize; i++) {
 		pushOperand(generator, bytecodeNextOperand(iterator));
@@ -817,8 +832,6 @@ static void generateSend(CodeGenerator *generator, BytecodesIterator *iterator)
 	// through to the normal dispatch (coercion via retry:). Both fast paths use
 	// only RAX/RSI/RDI(/RDX) as scratch and leave TMP (= receiver) untouched on
 	// the dispatch fall-through, so the class recompute below works.
-	int arithKind = argsSize == 1 ? classifyArith(selector) : ARITH_NONE;
-	int identKind = classifyIdentity(selector, argsSize);
 	_Bool identityInline = identKind != IDENT_NONE;
 	_Bool intInline = arithKind != ARITH_NONE && arithKind != ARITH_DIV;   // int has no inline '/'
 	_Bool floatInline = arithKind != ARITH_NONE && !arithIsBitOp(arithKind) && floatInlineEnabled();
@@ -923,7 +936,8 @@ static void generateSend(CodeGenerator *generator, BytecodesIterator *iterator)
 	} else {
 		RawClass *class = compiledCodeResolveOperandClass(&generator->code, receiver);
 		if (class != NULL) {
-			asmMovqImm(buffer, (int64_t) lookupNativeCode(class, (RawString *) selector), R11);
+			asmMovqImm(buffer, (int64_t) lookupNativeCode(class,
+				(RawString *) compiledCodeLiteralAt(&generator->code, selectorIndex)), R11);
 		} else {
 			// Always recompute the receiver's class from TMP. The old VAR_CLASS spill
 			// cache (keyed by the receiver variable) is UNSAFE once inlined control flow
@@ -931,7 +945,8 @@ static void generateSend(CodeGenerator *generator, BytecodesIterator *iterator)
 			// that is not always taken, and a later send would read the unpopulated slot
 			// as a garbage class. Recomputing per send is a few instructions and correct.
 			generateLoadClass(buffer, TMP, RDI);
-			generateLoadObject(buffer, selector, RSI, 0);
+			generateLoadObject(buffer,
+				compiledCodeLiteralAt(&generator->code, selectorIndex), RSI, 0);
 			generateMethodLookup(generator);
 		}
 

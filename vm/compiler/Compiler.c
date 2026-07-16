@@ -44,6 +44,8 @@ static void createTmpVar(Compiler *compiler, Operand *operand);
 static void compileAssigments(Compiler *compiler, OrderedCollection *assigments, Operand *result);
 static _Bool compareOperands(Operand *a, Operand *b);
 static void compileMessageExpression(Compiler *compiler, Operand *receiver, MessageExpressionNode *node, Operand *result);
+static _Bool compileWhileKind(Compiler *compiler, ExpressionNode *node);
+static void compileInlinedWhile(Compiler *compiler, ExpressionNode *node, Operand *result);
 static void compileLiteral(Compiler *compiler, LiteralNode *literal, Operand *operand);
 static Array *compileArray(LiteralNode *node);
 static void findVar(Compiler *compiler, LiteralNode *name, Operand *operand);
@@ -275,6 +277,15 @@ static void compileExpression(Compiler *compiler, ExpressionNode *node, _Bool st
 			if (!result->isValid) {
 				createTmpVar(compiler, result);
 			}
+		}
+
+		if (compileWhileKind(compiler, node)) {
+			// the receiver block is spliced by the loop, never compiled as a
+			// closure, so it must be intercepted before compileLiteral
+			compileInlinedWhile(compiler, node, result->isValid ? result : NULL);
+			compileAssigments(compiler, assigments, result);
+			closeHandleScope(&scope, NULL);
+			return;
 		}
 
 		Operand receiver;
@@ -598,6 +609,91 @@ static void compileInlinedLoop(Compiler *compiler, Operand *receiver, MessageExp
 
 	if (result != NULL) {
 		bytecodeCopy(buffer, receiver, result);                  // to:do: answers self
+	}
+}
+
+
+// True when this `[cond] whileTrue: [body]` / whileFalse: was inlined by
+// Scope.c into the current frame (both blocks' scopes point at the enclosing
+// scope). Mirrors expressionIsInlinableWhile plus those markers; on a
+// mismatch the expression compiles as a normal send.
+static _Bool compileWhileKind(Compiler *compiler, ExpressionNode *node)
+{
+	if (!inlineControlFlowEnabled()) {
+		return 0;
+	}
+	OrderedCollection *messages = expressionNodeGetMessageExpressions(node);
+	if (ordCollSize(messages) != 1) {
+		return 0;
+	}
+	Object *receiver = (Object *) expressionNodeGetReceiver(node);
+	if (receiver->raw->class != Handles.BlockNode->raw || !cfIsInlinableBlockNode(receiver)) {
+		return 0;
+	}
+	MessageExpressionNode *m = (MessageExpressionNode *) ordCollObjectAt(messages, 0);
+	String *selector = messageExpressionNodeGetSelector(m);
+	if (!(stringEqualsC(selector, "whileTrue:") || stringEqualsC(selector, "whileFalse:"))) {
+		return 0;
+	}
+	OrderedCollection *args = messageExpressionNodeGetArgs(m);
+	if (ordCollSize(args) != 1 || !cfIsInlinableBlockNode(ordCollObjectAt(args, 0))) {
+		return 0;
+	}
+	BlockNode *condBlk = (BlockNode *) receiver;
+	BlockNode *bodyBlk = (BlockNode *) ordCollObjectAt(args, 0);
+	return blockNodeGetScope(condBlk)->raw == compiler->scope->raw
+		&& blockNodeGetScope(bodyBlk)->raw == compiler->scope->raw;
+}
+
+
+// Emit `[cond] whileTrue: [body]` (or whileFalse:) as an inline native loop:
+// no BlockContext, no per-iteration block activation, both bodies spliced
+// into the current frame. The backward jump is a JIT back-edge, so it carries
+// the safepoint poll and the loop-carried stackmap extension. A non-boolean
+// condition sends #mustBeBoolean, like the inlined conditionals. Answers nil,
+// like the whileTrue: primitive.
+static void compileInlinedWhile(Compiler *compiler, ExpressionNode *node, Operand *result)
+{
+	AssemblerBuffer *buffer = &compiler->buffer;
+	BlockNode *condBlk = (BlockNode *) expressionNodeGetReceiver(node);
+	MessageExpressionNode *m = (MessageExpressionNode *)
+		ordCollObjectAt(expressionNodeGetMessageExpressions(node), 0);
+	BlockNode *bodyBlk = (BlockNode *) ordCollObjectAt(messageExpressionNodeGetArgs(m), 0);
+	_Bool isWhileTrue = stringEqualsC(messageExpressionNodeGetSelector(m), "whileTrue:");
+
+	Operand cond;
+	createTmpVar(compiler, &cond);
+	uint8_t contClassIdx = ordCollAddObjectIfNotExists(compiler->literals,
+		(Object *) (isWhileTrue ? Handles.True : Handles.False));
+	uint8_t exitClassIdx = ordCollAddObjectIfNotExists(compiler->literals,
+		(Object *) (isWhileTrue ? Handles.False : Handles.True));
+
+	AssemblerLabel loop, lNotCont, lNotBool, lEnd;
+	asmInitLabel(&loop);
+	asmInitLabel(&lNotCont);
+	asmInitLabel(&lNotBool);
+	asmInitLabel(&lEnd);
+
+	asmLabelBind(buffer, &loop, asmOffset(buffer));
+	compileInlinedBlockBody(compiler, condBlk, &cond);
+	bytecodeJumpNotMemberOf(buffer, &cond, contClassIdx, &lNotCont);
+	compileInlinedBlockBody(compiler, bodyBlk, NULL);
+	bytecodeJump(buffer, &loop);                                   // back-edge
+
+	// loop exit: the condition must be the OTHER boolean, else #mustBeBoolean
+	asmLabelBind(buffer, &lNotCont, asmOffset(buffer));
+	bytecodeJumpNotMemberOf(buffer, &cond, exitClassIdx, &lNotBool);
+	bytecodeJump(buffer, &lEnd);
+
+	asmLabelBind(buffer, &lNotBool, asmOffset(buffer));
+	uint8_t mbbIdx = ordCollAddObjectIfNotExists(compiler->literals,
+		(Object *) asSymbol(asString("mustBeBoolean")));
+	bytecodeSend(buffer, mbbIdx, &cond, NULL, 0);
+
+	asmLabelBind(buffer, &lEnd, asmOffset(buffer));
+	if (result != NULL) {
+		Operand nilOp = { .isValid = 1, .type = OPERAND_NIL };
+		bytecodeCopy(buffer, &nilOp, result);
 	}
 }
 

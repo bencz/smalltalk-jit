@@ -3,6 +3,7 @@
 
 #include "core/Assert.h"
 #include "core/Endian.h"
+#include "core/Thread.h"
 #include "jit/TargetCodePatch.h"
 #include <string.h>
 #include <stdlib.h>
@@ -51,6 +52,7 @@ typedef struct {
 	uint8_t fixupsSize;
 	uint16_t pointersOffsets[1024]; // TODO: get rid of fixed size buffer?
 	size_t pointersOffsetsSize;
+	CodegenSites sitesNode; // GC visibility of the baked pointers (see Thread.h)
 } AssemblerBuffer;
 
 static void asmInitBuffer(AssemblerBuffer *buffer, size_t size);
@@ -81,11 +83,28 @@ static void asmInitBuffer(AssemblerBuffer *buffer, size_t size)
 	buffer->instOffset = 0;
 	buffer->fixupsSize = 0;
 	buffer->pointersOffsetsSize = 0;
+	// Codegen runs GC-active and allocates (stackmaps, descriptors), so a
+	// scavenge can move objects whose addresses were already baked in here.
+	// Register the pointer sites so the collectors can fix them mid-flight
+	// (see CodegenSites in Thread.h). Harmless without a heap (golden tests).
+	buffer->sitesNode.insts = &buffer->buffer;
+	buffer->sitesNode.offsets = buffer->pointersOffsets;
+	buffer->sitesNode.count = &buffer->pointersOffsetsSize;
+	buffer->sitesNode.next = CurrentThread.codegenSites;
+	CurrentThread.codegenSites = &buffer->sitesNode;
 }
 
 
 static void asmFreeBuffer(AssemblerBuffer *buffer)
 {
+	// Unlink from the in-flight list (normally the head: buffers nest LIFO).
+	CodegenSites **link = &CurrentThread.codegenSites;
+	while (*link != NULL && *link != &buffer->sitesNode) {
+		link = &(*link)->next;
+	}
+	if (*link != NULL) {
+		*link = buffer->sitesNode.next;
+	}
 	free(buffer->buffer);
 }
 

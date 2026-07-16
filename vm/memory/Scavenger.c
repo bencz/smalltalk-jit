@@ -132,7 +132,7 @@ void scavengerScavenge(Scavenger *scavenger)
 #if SCRUB_ABANDONED_SEMISPACE
 	// (The pre-2026-07 line here had memset's size/value args swapped — it zeroed
 	// 0 bytes, so the scrub never actually ran anywhere.)
-	memset(scavenger->toSpace, 0, scavenger->size);
+	memset(scavenger->toSpace, 0x5A, scavenger->size); // poison: stale readers crash AT the culprit
 #endif
 
 	LastGCStats.scavengeCount++;
@@ -510,6 +510,27 @@ static void iterateRememberedSet(Scavenger *scavenger)
 }
 
 
+// Fix one run of baked-pointer sites: read each arch-encoded immediate,
+// forward it (tagged or raw), write it back. Shared by the published-code walk
+// and the in-flight codegen-buffer walk.
+static void processPointerSites(Scavenger *scavenger, uint8_t *insts, const uint16_t *offsets, size_t count)
+{
+	for (size_t i = 0; i < count; i++) {
+		// The baked immediate has no contiguous in-memory form on
+		// every arch (ppc64 splits it across instruction halfwords):
+		// read/patch through the per-arch seam — jit/TargetCodePatch.h.
+		uint8_t *site = insts + offsets[i];
+		Value value = (Value) targetReadCodePointer(site);
+		if (valueTypeOf(value, VALUE_POINTER)) {
+			processTaggedPointer(scavenger, &value);
+		} else {
+			processPointer(scavenger, (RawObject **) &value);
+		}
+		targetWriteCodePointer(site, (uint64_t) value);
+	}
+}
+
+
 static void iterateNativeCode(Scavenger *scavenger)
 {
 	PageSpaceIterator iterator;
@@ -530,20 +551,8 @@ static void iterateNativeCode(Scavenger *scavenger)
 			if (code->typeFeedback != NULL) {
 				processPointer(scavenger, (RawObject **) &code->typeFeedback);
 			}
-			for (size_t i = 0; i < code->pointersOffsetsSize; i++) {
-				uint16_t offset = ((uint16_t *) (code->insts + code->size))[i];
-				// The baked immediate has no contiguous in-memory form on
-				// every arch (ppc64 splits it across instruction halfwords):
-				// read/patch through the per-arch seam — jit/TargetCodePatch.h.
-				uint8_t *site = code->insts + offset;
-				Value value = (Value) targetReadCodePointer(site);
-				if (valueTypeOf(value, VALUE_POINTER)) {
-					processTaggedPointer(scavenger, &value);
-				} else {
-					processPointer(scavenger, (RawObject **) &value);
-				}
-				targetWriteCodePointer(site, (uint64_t) value);
-			}
+			processPointerSites(scavenger, code->insts,
+				(uint16_t *) (code->insts + code->size), code->pointersOffsetsSize);
 			if (code->pointersOffsetsSize > 0) {
 				// Baked object immediates INSIDE instructions may have been
 				// rewritten above (moved objects): republish to instruction
@@ -552,6 +561,19 @@ static void iterateNativeCode(Scavenger *scavenger)
 			}
 		}
 		code = (NativeCode *) pageSpaceIteratorNext(&iterator);
+	}
+
+	// IN-FLIGHT codegen buffers: codegen runs GC-active and allocates (a
+	// stackmap per send), so a scavenge can land BETWEEN baking a young
+	// object's address and publishing the NativeCode; the malloc'd buffer is
+	// invisible to the walk above. Fix the registered sites of every mutator
+	// (the world is stopped, the lists are stable). No icache flush: the
+	// bytes are copied into exec space only at publication. Root-caused from
+	// a FORWARDED #monitorEnter selector reaching dispatch (ActorStressTest).
+	for (Thread *m = scavenger->heap->mutators; m != NULL; m = m->nextMutator) {
+		for (CodegenSites *sites = m->codegenSites; sites != NULL; sites = sites->next) {
+			processPointerSites(scavenger, *sites->insts, sites->offsets, *sites->count);
+		}
 	}
 }
 

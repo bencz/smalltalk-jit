@@ -300,6 +300,28 @@ static RawObject *compiledCodeLiteralAt(CompiledCode *code, ptrdiff_t index)
 }
 
 
+// Codegen runs GC-active and allocates (a stackmap per send), and the
+// bytecodes are the INDEXED BYTES OF THE METHOD OBJECT itself, so a
+// mid-codegen scavenge can move them out from under the raw code->bytecodes
+// pointer captured at init (runtime-compiled methods are young). Bytecodes
+// are pure data with no object pointers, so a malloc'd pin for the
+// generator's lifetime is exact. literals/ownerClass/methodOrBlock are
+// HANDLES and stay valid on their own.
+static void pinCompiledCodeBytes(CompiledCode *code)
+{
+	uint8_t *copy = malloc(code->bytecodesSize);
+	memcpy(copy, code->bytecodes, code->bytecodesSize);
+	code->bytecodes = copy;
+}
+
+
+static void unpinCompiledCodeBytes(CompiledCode *code)
+{
+	free(code->bytecodes);
+	code->bytecodes = NULL;
+}
+
+
 static RawClass *compiledCodeResolveOperandClass(CompiledCode *code, Operand operand)
 {
 	switch (operand.type) {

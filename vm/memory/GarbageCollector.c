@@ -346,6 +346,23 @@ static void iterateNativeCode(MarkingQueue *queue, Thread *thread)
 		}
 		code = (NativeCode *) pageSpaceIteratorNext(&iterator);
 	}
+
+	// IN-FLIGHT codegen buffers (see CodegenSites in Thread.h and the fixup
+	// walk in Scavenger.c): mark-sweep does not move objects, so no patching,
+	// but the baked objects must stay ALIVE even if the literal frame that
+	// also references them is unreachable mid-codegen.
+	for (Thread *m = thread->heap->mutators; m != NULL; m = m->nextMutator) {
+		for (CodegenSites *sites = m->codegenSites; sites != NULL; sites = sites->next) {
+			for (size_t i = 0; i < *sites->count; i++) {
+				Value value = (Value) targetReadCodePointer(*sites->insts + sites->offsets[i]);
+				if (valueTypeOf(value, VALUE_POINTER)) {
+					markObject(queue, thread, asObject(value));
+				} else {
+					markObject(queue, thread, (RawObject *) value);
+				}
+			}
+		}
+	}
 }
 
 

@@ -17,6 +17,22 @@ typedef struct TLAB {
 	uint8_t *end;
 } TLAB;
 
+// The pointer sites of an IN-FLIGHT codegen buffer. Codegen runs GC-active and
+// allocates young objects (a stackmap per send), so a scavenge can move an
+// object whose address was already baked into the malloc'd assembler buffer,
+// which the collectors cannot see on their own: methods published with a stale
+// from-space immediate dispatch on forwarded garbage. Every live buffer
+// registers its sites here (asmInitBuffer/asmFreeBuffer, LIFO since block
+// codegen nests inside method codegen) and both collectors walk the list of
+// every registered mutator. Indirections, not copies: the buffer reallocs on
+// growth (insts) and keeps baking (count).
+typedef struct CodegenSites {
+	uint8_t **insts;              // &buffer->buffer
+	uint16_t *offsets;            // buffer->pointersOffsets (inline array, stable)
+	size_t *count;                // &buffer->pointersOffsetsSize
+	struct CodegenSites *next;
+} CodegenSites;
+
 typedef struct Thread {
 	Heap *heap; // heap-allocated; ONE heap per isolate, shared by its worker threads
 	struct Handle *handles;
@@ -31,6 +47,8 @@ typedef struct Thread {
 	Value exceptionHandler;
 	TLAB tlab; // per-OS-thread young allocation buffer (stays embedded, per-mutator)
 	RememberedSet rememberedSet; // per-mutator old->young log (merged at GC in the multicore model)
+	CodegenSites *codegenSites; // in-flight codegen buffers whose baked pointers the GC must fix
+	size_t lookupCacheEpoch; // last heap->gcEpoch this thread's TLS LookupCache was flushed at
 	struct Thread *nextMutator; // intrusive link in heap->mutators (GC root-scans every mutator)
 	int spBlocked;              // mutator is in a blocking native wait (counts as safe for GC)
 	int spAtSafepoint;          // mutator parked at a safepoint poll
