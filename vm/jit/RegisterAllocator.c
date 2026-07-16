@@ -38,7 +38,6 @@ typedef struct {
 static void printAllocation(Vars *vars);
 static void scanCode(Vars *vars, CompiledCode *code);
 static void examineCopyOperands(Vars *vars, Operand src, Operand dst, size_t offset);
-static void examineOperandClass(Vars *vars, Operand operand, size_t offset);
 static void examineOperand(Vars *vars, Operand operand, size_t offset);
 static void defineTmpVar(Vars *vars, uint8_t index, size_t offset);
 static Variable *defineSpecialVar(Vars *vars, uint8_t type, uint8_t index, size_t offset);
@@ -195,7 +194,6 @@ static void scanCode(Vars *vars, CompiledCode *code)
 			uint8_t argsSize = bytecodeNextByte(&iterator);
 
 			Operand receiver = bytecodeNextOperand(&iterator);
-			examineOperandClass(vars, receiver, bytecodeNumber(&iterator));
 			examineOperand(vars, receiver, bytecodeNumber(&iterator));
 
 			for (uint8_t i = 0; i < argsSize; i++) {
@@ -258,17 +256,17 @@ static void examineCopyOperands(Vars *vars, Operand src, Operand dst, size_t off
 }
 
 
-static void examineOperandClass(Vars *vars, Operand operand, size_t offset)
-{
-	switch (operand.type) {
-	case OPERAND_TEMP_VAR:
-	case OPERAND_ARG_VAR:
-		defineSpecialVar(vars, VAR_CLASS, operand.index, offset);
-		break;
-	default:
-		break;
-	}
-}
+// examineOperandClass() used to define a shadow VAR_CLASS variable for every send
+// receiver, to reserve it a home for the receiver's cached class. That cache is gone:
+// the backends recompute the class from the receiver at each send, because caching it
+// is unsafe once inlined control flow exists (a send inside a conditional arm would
+// populate the slot only on the taken path, and a later send would read the
+// unpopulated slot as a garbage class -- see generateSend in CodeGeneratorX64.c).
+//
+// Defining the variable outlived the cache, and it was not free: each one took a
+// register out of the same 9-entry pool, for a live range spanning first-to-last send
+// on that receiver. Every send receiver burned a register for a cache nobody read,
+// which is pure spill pressure -- and spill paths are where this JIT's bugs live.
 
 
 static void examineOperand(Vars *vars, Operand operand, size_t offset)
@@ -348,7 +346,9 @@ static Variable *defineVar(Vars *vars, uint8_t type, uint8_t index, size_t offse
 	var->index = index;
 	var->reg = SPILLED_REG;
 	var->start = var->end = var->gcEnd = offset;
-	if (type == VAR_TMP || type == VAR_CONTEXT || type == VAR_CLASS) {
+	// VAR_ASSOC gets no frame slot on purpose: a spilled association is rebuilt from
+	// the literal frame, never reloaded from the stack.
+	if (type == VAR_TMP || type == VAR_CONTEXT) {
 		var->frameOffset = vars->frameSize--;
 	}
 	*vars->last++ = var;
@@ -427,11 +427,17 @@ static void removeDeadVars(SortedVars *sortedVars, RegsPool *regsPool, size_t of
 {
 	Variable *var;
 
-	for (Variable **pVar = sortedVars->first; pVar < sortedVars->last; pVar++) {
+	for (Variable **pVar = sortedVars->first; pVar < sortedVars->last; ) {
 		var = *pVar;
 		if (var->end < offset) {
 			reuseVarReg(regsPool, var);
 			removeVar(sortedVars, pVar);
+			// Do NOT advance: removeVar slid the tail down, so the next entry is
+			// already at pVar. Advancing here skipped every run of consecutive dead
+			// variables, leaving them in the active list with their registers never
+			// returned to the pool, which spills more than necessary.
+		} else {
+			pVar++;
 		}
 	}
 }
@@ -439,13 +445,22 @@ static void removeDeadVars(SortedVars *sortedVars, RegsPool *regsPool, size_t of
 
 static void reuseVarReg(RegsPool *regsPool, Variable *var)
 {
+	// A spilled variable never took a register out of the pool, so it has none to
+	// give back. Pushing its SPILLED_REG (-1) would both hand -1 out again as if it
+	// were an allocatable register and drift `tmp` down without a matching nextReg(),
+	// walking it off the front of the array once enough spilled variables die.
+	if (var->reg == SPILLED_REG) {
+		return;
+	}
 	*--regsPool->tmp = var->reg;
 }
 
 
 static void removeVar(SortedVars *sortedVars, Variable **var)
 {
-	memmove(var, var + 1, (int8_t *) sortedVars->last - (int8_t *) var);
+	// Move the tail (var, last) down onto `var`. The count is measured from var + 1,
+	// not from var: the old form copied one entry too many and read one past `last`.
+	memmove(var, var + 1, (int8_t *) sortedVars->last - (int8_t *) (var + 1));
 	sortedVars->last--;
 }
 
@@ -459,12 +474,40 @@ static Variable *removeFirstVar(SortedVars *sortedVars)
 }
 
 
+// ST_JIT_REGS=<n> shrinks the allocatable pool to n registers. TEST ONLY: spilling
+// is where this JIT's bugs hide (a spilled variable owns no register, and handing its
+// SPILLED_REG (-1) to an emitter encodes a wild one), but at full width only unusually
+// fat methods ever spill, so the whole class stays latent. Shrinking the pool forces
+// ordinary code down the spill paths, which turns "latent" into a sweep:
+//
+//     for n in 3 4 5 6 7 8 9; do ST_JIT_REGS=$n ./run_tests.sh --all; done
+//
+// Read once and cached; unset (the default) means the full pool, so nothing changes
+// for a normal build. Backend-independent: the pool comes from AvailableRegs.
+static uint8_t availableRegsSize(AvailableRegs *regs)
+{
+	static int limit = -1;
+	if (limit < 0) {
+		const char *env = getenv("ST_JIT_REGS");
+		limit = env != NULL ? atoi(env) : 0;
+		if (limit < 1) {
+			limit = 0; // 0 = no limit; a pool of 0 could not compile anything
+		}
+	}
+	if (limit > 0 && limit < regs->regsSize) {
+		return (uint8_t) limit;
+	}
+	return regs->regsSize;
+}
+
+
 static void initRegsPool(RegsPool *regsPool, AvailableRegs *regs)
 {
 	// regsPool->available = regs;
-	memcpy(regsPool->regs, regs->regs, regs->regsSize);
+	uint8_t size = availableRegsSize(regs);
+	memcpy(regsPool->regs, regs->regs, size);
 	regsPool->tmp = regsPool->regs;
-	regsPool->end = regsPool->tmp + regs->regsSize;
+	regsPool->end = regsPool->tmp + size;
 }
 
 

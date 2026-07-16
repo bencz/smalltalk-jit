@@ -49,6 +49,7 @@ static _Bool operandMayBePointer(Operand operand);
 static void generateClassCheck(CodeGenerator *generator, Operand operand, RawClass *class, AssemblerLabel *label);
 static void generateLoadBlock(CodeGenerator *generator, Operand operand);
 static void fillContext(CodeGenerator *generator, uint8_t level);
+static Register fillContextToReg(CodeGenerator *generator, uint8_t level, Register scratch);
 static void fillAssoc(CodeGenerator *generator, uint8_t index);
 static void fillVar(CodeGenerator *generator, Variable *var);
 static Register fillVarToReg(CodeGenerator *generator, Variable *var, Register scratch);
@@ -860,18 +861,6 @@ static void generateSend(CodeGenerator *generator, BytecodesIterator *iterator)
 	}
 	asmAddqImm(buffer, RSP, (argsSize + 1) * sizeof(intptr_t));
 	invalidateRegs(&generator->regsAlloc);
-
-	// The dispatch path above computes the receiver's class and SPILLS it to the
-	// VAR_CLASS frame slot so later sends to the same variable can reuse it. Our
-	// fast path skips that spill at runtime (it jumps straight to the merge), so
-	// the slot would be left unpopulated. Forget the cached/spilled class for this
-	// receiver so the next send recomputes it from the receiver instead of reading
-	// the stale slot.
-	if (anyInline &&
-	    (receiver.type == OPERAND_TEMP_VAR || receiver.type == OPERAND_ARG_VAR)) {
-		Variable *classVar = specialVariableAt(generator, VAR_CLASS, receiver.index);
-		classVar->flags &= ~(VAR_ON_STACK | VAR_IN_REG);
-	}
 }
 
 
@@ -1145,10 +1134,9 @@ static void pushOperand(CodeGenerator *generator, Operand operand)
 	}
 
 	case OPERAND_CONTEXT_VAR: {
-		Variable *context = specialVariableAt(generator, VAR_CONTEXT, operand.level);
 		ptrdiff_t offset = varOffset(RawContext, vars) + operand.index * sizeof(Value);
-		fillContext(generator, operand.level);
-		asmPushqMem(buffer, asmMem(context->reg, NO_REGISTER, SS_1, offset));
+		asmPushqMem(buffer, asmMem(fillContextToReg(generator, operand.level, TMP),
+			NO_REGISTER, SS_1, offset));
 		break;
 	}
 
@@ -1218,10 +1206,11 @@ static void movOperand(CodeGenerator *generator, Operand operand, Register reg)
 		break;
 
 	case OPERAND_CONTEXT_VAR: {
-		Variable *context = specialVariableAt(generator, VAR_CONTEXT, operand.level);
 		ptrdiff_t offset = varOffset(RawContext, vars) + operand.index * sizeof(Value);
-		fillContext(generator, operand.level);
-		asmMovqMem(buffer, asmMem(context->reg, NO_REGISTER, SS_1, offset), reg);
+		// `reg` may itself be TMP: the staged context is consumed by this very load,
+		// so overwriting it with the loaded context var is fine.
+		asmMovqMem(buffer, asmMem(fillContextToReg(generator, operand.level, TMP),
+			NO_REGISTER, SS_1, offset), reg);
 		break;
 	}
 
@@ -1300,13 +1289,15 @@ static void movToOperand(CodeGenerator *generator, Register reg, Operand operand
 		break;
 
 	case OPERAND_CONTEXT_VAR: {
-		Variable *context = specialVariableAt(generator, VAR_CONTEXT, operand.level);
 		ptrdiff_t offset = varOffset(RawContext, vars) + operand.index * sizeof(Value);
-		fillContext(generator, operand.level);
+		// Not TMP: generateStoreCheck requires object != TMP and clobbers TMP and RDI.
+		// RSI is untouched by it, is not in the allocatable pool (so no variable lives
+		// there and `reg` can never be it), and is dead here.
+		Register contextReg = fillContextToReg(generator, operand.level, RSI);
 		if (valueMayBePointer) {
-			generateStoreCheck(generator, context->reg, reg);
+			generateStoreCheck(generator, contextReg, reg);
 		}
-		asmMovqToMem(buffer, reg, asmMem(context->reg, NO_REGISTER, SS_1, offset));
+		asmMovqToMem(buffer, reg, asmMem(contextReg, NO_REGISTER, SS_1, offset));
 		break;
 	}
 
@@ -1328,10 +1319,24 @@ static void movToOperand(CodeGenerator *generator, Register reg, Operand operand
 
 	case OPERAND_ASSOC: {
 		Variable *variable = specialVariableAt(generator, VAR_ASSOC, operand.index);
-		fillAssoc(generator, operand.index);
-		asmMovqToMem(buffer, reg, asmMem(variable->reg, NO_REGISTER, SS_1, varOffset(RawAssociation, value)));
+		// A spilled assoc has no register AND no frame slot to spill to (defineVar
+		// only hands one to VAR_TMP/VAR_CONTEXT/VAR_CLASS), so it must be
+		// rematerialized from the literal frame -- exactly what the read twin in
+		// movOperand does. That one reuses `reg` as its scratch because reg is its
+		// destination; here reg holds the value being stored, so use RSI:
+		// generateStoreCheck requires object != TMP and clobbers TMP and RDI, RSI is
+		// untouched by it and is not in the allocatable pool.
+		Register assocReg;
+		if (variable->reg == SPILLED_REG) {
+			assocReg = RSI;
+			generateLoadObject(buffer, compiledCodeLiteralAt(&generator->code, operand.index), assocReg, 1);
+		} else {
+			fillAssoc(generator, operand.index);
+			assocReg = variable->reg;
+		}
+		asmMovqToMem(buffer, reg, asmMem(assocReg, NO_REGISTER, SS_1, varOffset(RawAssociation, value)));
 		if (valueMayBePointer) {
-			generateStoreCheck(generator, variable->reg, reg);
+			generateStoreCheck(generator, assocReg, reg);
 		}
 		break;
 	}
@@ -1414,10 +1419,11 @@ static void generateClassCheck(CodeGenerator *generator, Operand operand, RawCla
 		break;
 
 	case OPERAND_CONTEXT_VAR: {
-		Variable *context = specialVariableAt(generator, VAR_CONTEXT, operand.level);
 		ptrdiff_t offset = varOffset(RawContext, vars) + operand.index * sizeof(Value);
-		fillContext(generator, operand.level);
-		asmMovqMem(buffer, asmMem(context->reg, NO_REGISTER, SS_1, offset), TMP);
+		// Staging in TMP is fine even though TMP is the destination: the context is
+		// consumed by this load, which then overwrites it with the context var.
+		asmMovqMem(buffer, asmMem(fillContextToReg(generator, operand.level, TMP),
+			NO_REGISTER, SS_1, offset), TMP);
 
 		if (class == Handles.SmallInteger->raw) {
 			asmTestqImm(buffer, TMP, 3);
@@ -1543,9 +1549,49 @@ static void generateLoadBlock(CodeGenerator *generator, Operand operand)
 }
 
 
+// Answer a register holding the context at `level`. Only the level-0 context is
+// pinned (to CTX, in scanRegisters), so a level>0 context is an ordinary pool
+// variable and CAN be spilled -- and any block reading an enclosing scope's variable
+// emits OPERAND_CONTEXT_VAR with level >= 1, so this is ordinary code, not a corner.
+//
+// A spilled context owns no register: emitting context->reg (-1) encodes a wild
+// register (in a ModRM reg field it is R15, which is IN the allocatable pool, so it
+// silently clobbers a live variable; as a memory base it is RIP, so the access goes
+// against the instruction stream). It also has no frame slot to reload from, because
+// fillContext deliberately never spills a level>0 context (its slot would be written
+// only on the path that walked it, and the GC stackmap would scan it as a bogus
+// root). So the only correct move is to re-walk the chain from level 0 into a
+// scratch. This mirrors ppc64's varReg() discipline.
+static Register fillContextToReg(CodeGenerator *generator, uint8_t level, Register scratch)
+{
+	Variable *context = specialVariableAt(generator, VAR_CONTEXT, level);
+	if (context->reg != SPILLED_REG) {
+		fillContext(generator, level);
+		return context->reg;
+	}
+
+	// Level 0 is pinned to CTX and never spilled, so a spilled context is level >= 1
+	// and this walk always runs at least once.
+	Variable *base = specialVariableAt(generator, VAR_CONTEXT, 0);
+	fillVar(generator, base);
+	Register cur = base->reg;
+	for (uint8_t i = 0; i < level; i++) {
+		asmMovqMem(&generator->buffer, asmMem(cur, NO_REGISTER, SS_1, varOffset(RawContext, outer)), scratch);
+		cur = scratch;
+	}
+	// Deliberately NOT VAR_IN_REG: the value lives in an ephemeral scratch, not in
+	// context->reg. Claiming otherwise is what made this corrupt silently -- every
+	// later use would read context->reg (-1) as a register and emit nothing to fix it.
+	return scratch;
+}
+
+
 static void fillContext(CodeGenerator *generator, uint8_t level)
 {
 	Variable *context = specialVariableAt(generator, VAR_CONTEXT, level);
+	// A spilled context has no register to fill; callers must go through
+	// fillContextToReg, which stages it in a scratch.
+	ASSERT(context->reg != SPILLED_REG);
 	if (context->flags & VAR_IN_REG) {
 		// nothing
 	} else if (level == 0 && (context->flags & VAR_ON_STACK)) {
@@ -1618,6 +1664,8 @@ static void fillVar(CodeGenerator *generator, Variable *var)
 
 static void spillVar(CodeGenerator *generator, Variable *var)
 {
+	// Mirrors fillVar: a spilled variable has no register to store FROM.
+	ASSERT(var->reg != SPILLED_REG);
 	ASSERT(var->flags & VAR_IN_REG);
 	ptrdiff_t offset = var->frameOffset * sizeof(intptr_t);
 	asmMovqToMem(&generator->buffer, var->reg, asmMem(RBP, NO_REGISTER, SS_1, offset));
@@ -1649,10 +1697,6 @@ static void movToVar(CodeGenerator *generator, Register reg, Variable *var)
 		var->flags |= VAR_IN_REG;
 		asmMovq(&generator->buffer, reg, var->reg);
 		spillVar(generator, var);
-	}
-	Variable *classVar = specialVariableAt(generator, VAR_CLASS, var->index);
-	if (classVar != NULL) {
-		classVar->flags &= ~(VAR_ON_STACK | VAR_IN_REG);
 	}
 }
 

@@ -821,14 +821,6 @@ static void generateSend(CodeGenerator *generator, BytecodesIterator *iterator)
 	}
 	asmDropStack(buffer, argsSize + 1);
 	invalidateRegs(&generator->regsAlloc);
-
-	// Forget the VAR_CLASS cache when a fast path may have skipped the spill
-	// (see x64).
-	if (anyInline &&
-	    (receiver.type == OPERAND_TEMP_VAR || receiver.type == OPERAND_ARG_VAR)) {
-		Variable *classVar = specialVariableAt(generator, VAR_CLASS, receiver.index);
-		classVar->flags &= ~(VAR_ON_STACK | VAR_IN_REG);
-	}
 }
 
 
@@ -1574,10 +1566,6 @@ static void movToVar(CodeGenerator *generator, Register reg, Variable *var)
 		var->flags |= VAR_IN_REG;
 		asmMr(&generator->buffer, varReg(var), reg);
 		spillVar(generator, var);
-	}
-	Variable *classVar = specialVariableAt(generator, VAR_CLASS, var->index);
-	if (classVar != NULL) {
-		classVar->flags &= ~(VAR_ON_STACK | VAR_IN_REG);
 	}
 }
 

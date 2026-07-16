@@ -7,11 +7,15 @@
 
 #define SPILLED_REG -1
 
+// Only VAR_CONTEXT and VAR_ASSOC index specialVars[], so it is sized for those two.
+// VAR_TMP is NOT a specialVars row: temps are addressed by their own operand index in
+// vars[]. (A VAR_CLASS shadow used to sit at 1, reserving a register per send receiver
+// for a class cache the backends no longer keep; see examineOperandClass's note in
+// RegisterAllocator.c.)
 typedef enum {
 	VAR_CONTEXT = 0,
-	VAR_CLASS = 1,
-	VAR_ASSOC = 2,
-	VAR_TMP = 3,
+	VAR_ASSOC = 1,
+	VAR_TMP = 2,
 } VariableType;
 
 typedef enum {
@@ -40,7 +44,7 @@ typedef struct {
 	AvailableRegs *regs;
 	uint8_t varsSize;
 	Variable vars[256];
-	Variable *specialVars[3][256];
+	Variable *specialVars[2][256]; // rows: VAR_CONTEXT, VAR_ASSOC
 	size_t frameSize;
 	_Bool frameLess;
 } RegsAlloc;
