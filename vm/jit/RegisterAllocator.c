@@ -97,6 +97,30 @@ void computeRegsAlloc(RegsAlloc *alloc, AvailableRegs *regs, CompiledCode *code)
 	scanCode(&vars, code);
 	scanRegisters(&vars, regs);
 
+	// A frameless method has no frame AT ALL: the backends skip generatePrologue, so
+	// RBP is never established and no spill area is reserved (or nil-initialised).
+	// scanCode decides frameLess from the bytecodes alone, but scanRegisters runs
+	// AFTER it and may spill -- and a spilled variable has nowhere to live. Every
+	// spill accessor except fillVar also addresses the slot off the frame pointer,
+	// which in a frameless method is still the CALLER's, so a spill there silently
+	// wrote through the caller's frame (losing the store, and corrupting the saved
+	// frame pointer and return address).
+	//
+	// So the two decisions are not independent: spilling REQUIRES a frame. Any method
+	// with more live variables than the register pool must be framed. This bites only
+	// methods that both are frameless (no send, block, context var or outer return)
+	// and outgrow the pool -- e.g. a pure setter with 10+ arguments -- so ordinary
+	// frameless accessors keep their fast frameless path and pay nothing.
+	if (vars.frameLess) {
+		for (Variable **pVar = vars.order; pVar < vars.last; pVar++) {
+			if ((*pVar)->reg == SPILLED_REG) {
+				vars.frameLess = 0;
+				break;
+			}
+		}
+	}
+
+	// NB: reads vars.frameLess, so it must come after the correction above.
 	for (int16_t i = code->header.argsSize; i >= 0 ; i--) {
 		alloc->vars[i + 1].frameOffset += (vars.frameLess ? 0 : 1) + 1; // +2 for return IC and saved BP
 	}
