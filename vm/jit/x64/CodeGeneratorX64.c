@@ -51,6 +51,7 @@ static void generateLoadBlock(CodeGenerator *generator, Operand operand);
 static void fillContext(CodeGenerator *generator, uint8_t level);
 static void fillAssoc(CodeGenerator *generator, uint8_t index);
 static void fillVar(CodeGenerator *generator, Variable *var);
+static Register fillVarToReg(CodeGenerator *generator, Variable *var, Register scratch);
 static void spillVar(CodeGenerator *generator, Variable *var);
 static void movVar(CodeGenerator *generator, Variable *var, Register reg);
 static void movToVar(CodeGenerator *generator, Register reg, Variable *var);
@@ -489,13 +490,21 @@ static void generateCopy(CodeGenerator *generator, BytecodesIterator *iterator)
 	Operand dst = bytecodeNextOperand(iterator);
 	if (src.type == OPERAND_TEMP_VAR || src.type == OPERAND_ARG_VAR) {
 		Variable *srcVar = variableAt(generator, src.index);
-		if (srcVar->flags & (VAR_IN_REG | VAR_ON_STACK)) {
-			fillVar(generator, srcVar);
+		// A spilled source owns no register: movVar() reads its frame slot (or
+		// materializes nil for a never-written variable) into a scratch instead.
+		Register srcReg = RAX;
+		if (srcVar->reg == SPILLED_REG) {
+			movVar(generator, srcVar, RAX);
 		} else {
-			generateLoadObject(&generator->buffer, Handles.nil->raw, srcVar->reg, 1);
-			srcVar->flags |= VAR_IN_REG;
+			if (srcVar->flags & (VAR_IN_REG | VAR_ON_STACK)) {
+				fillVar(generator, srcVar);
+			} else {
+				generateLoadObject(&generator->buffer, Handles.nil->raw, srcVar->reg, 1);
+				srcVar->flags |= VAR_IN_REG;
+			}
+			srcReg = srcVar->reg;
 		}
-		movToOperand(generator, srcVar->reg, dst, 1);
+		movToOperand(generator, srcReg, dst, 1);
 	} else if (dst.type == OPERAND_TEMP_VAR) {
 		Variable *dstVar = variableAt(generator, dst.index);
 		if (dstVar->reg == SPILLED_REG) {
@@ -1131,8 +1140,7 @@ static void pushOperand(CodeGenerator *generator, Operand operand)
 
 	case OPERAND_SUPER: {
 		Variable *self = variableAt(generator, SELF_INDEX);
-		fillVar(generator, self);
-		asmPushq(buffer, self->reg);
+		asmPushq(buffer, fillVarToReg(generator, self, TMP));
 		break;
 	}
 
@@ -1148,8 +1156,7 @@ static void pushOperand(CodeGenerator *generator, Operand operand)
 		Variable *self = variableAt(generator, SELF_INDEX);
 		InstanceShape shape = classGetInstanceShape(generator->code.ownerClass);
 		ptrdiff_t offset = varOffset(RawObject, body) + (shape.payloadSize + operand.index + shape.isIndexed) * sizeof(Value);
-		fillVar(generator, self);
-		asmPushqMem(buffer, asmMem(self->reg, NO_REGISTER, SS_1, offset));
+		asmPushqMem(buffer, asmMem(fillVarToReg(generator, self, TMP), NO_REGISTER, SS_1, offset));
 		break;
 	}
 
@@ -1222,8 +1229,9 @@ static void movOperand(CodeGenerator *generator, Operand operand, Register reg)
 		Variable *self = variableAt(generator, SELF_INDEX);
 		InstanceShape shape = classGetInstanceShape(generator->code.ownerClass);
 		ptrdiff_t offset = varOffset(RawObject, body) + (shape.payloadSize + operand.index + shape.isIndexed) * sizeof(Value);
-		fillVar(generator, self);
-		asmMovqMem(buffer, asmMem(self->reg, NO_REGISTER, SS_1, offset), reg);
+		// `reg` may itself be TMP: the staged receiver is consumed by this very load,
+		// so overwriting it with the loaded inst var is fine.
+		asmMovqMem(buffer, asmMem(fillVarToReg(generator, self, TMP), NO_REGISTER, SS_1, offset), reg);
 		break;
 	}
 
@@ -1307,11 +1315,14 @@ static void movToOperand(CodeGenerator *generator, Register reg, Operand operand
 		InstanceShape shape = classGetInstanceShape(generator->code.ownerClass);
 		ptrdiff_t offset = varOffset(RawObject, body) + (shape.payloadSize + operand.index + shape.isIndexed) * sizeof(Value);
 
-		fillVar(generator, self);
+		// Not TMP: generateStoreCheck requires object != TMP and clobbers TMP and
+		// RDI. RSI is untouched by it, is not in the allocatable pool (so no
+		// variable lives there and `reg` can never be it), and is dead here.
+		Register selfReg = fillVarToReg(generator, self, RSI);
 		if (valueMayBePointer) {
-			generateStoreCheck(generator, self->reg, reg);
+			generateStoreCheck(generator, selfReg, reg);
 		}
-		asmMovqToMem(buffer, reg, asmMem(self->reg, NO_REGISTER, SS_1, offset));
+		asmMovqToMem(buffer, reg, asmMem(selfReg, NO_REGISTER, SS_1, offset));
 		break;
 	}
 
@@ -1371,23 +1382,24 @@ static void generateClassCheck(CodeGenerator *generator, Operand operand, RawCla
 	case OPERAND_TEMP_VAR:
 	case OPERAND_ARG_VAR: {
 		Variable *var = variableAt(generator, operand.index);
+		// Spilling only starts once a method outgrows the register pool (5+ nested
+		// inlined conditionals will do it), which is why this stayed latent.
+		Register src = fillVarToReg(generator, var, TMP);
 
 		if (class == Handles.SmallInteger->raw) {
-			fillVar(generator, var);
-			asmTestqImm(buffer, var->reg, 3);
+			asmTestqImm(buffer, src, 3);
 			asmJ(buffer, COND_NOT_ZERO, label);
 		} else if (class == Handles.Character->raw) {
-			fillVar(generator, var);
-			asmTestqImm(buffer, var->reg, VALUE_CHAR);
+			asmTestqImm(buffer, src, VALUE_CHAR);
 			asmJ(buffer, COND_ZERO, label);
 		} else {
 			// Compute the receiver's class exactly like generateSend does
 			// (generateLoadClass: correct tag handling, tagged result) into scratch
 			// RAX, and compare to the tested class in TMP. The VAR_CLASS cache is
 			// deliberately NOT touched here — generateSend owns it and stores it in
-			// a form this path must not corrupt.
-			fillVar(generator, var);
-			generateLoadClass(buffer, var->reg, RAX);
+			// a form this path must not corrupt. `src` is consumed by
+			// generateLoadClass before TMP is reloaded, so src == TMP is fine.
+			generateLoadClass(buffer, src, RAX);
 			generateLoadObject(buffer, (RawObject *) class, TMP, 1);
 			asmCmpq(buffer, RAX, TMP);
 			asmJ(buffer, COND_NOT_EQUAL, label);
@@ -1425,9 +1437,8 @@ static void generateClassCheck(CodeGenerator *generator, Operand operand, RawCla
 		Variable *self = variableAt(generator, SELF_INDEX);
 		InstanceShape shape = classGetInstanceShape(generator->code.ownerClass);
 		ptrdiff_t offset = varOffset(RawObject, body) + (shape.payloadSize + operand.index + shape.isIndexed) * sizeof(Value);
-		fillVar(generator, self);
 
-		asmMovqMem(buffer, asmMem(self->reg, NO_REGISTER, SS_1, offset), TMP);
+		asmMovqMem(buffer, asmMem(fillVarToReg(generator, self, TMP), NO_REGISTER, SS_1, offset), TMP);
 
 		if (class == Handles.SmallInteger->raw) {
 			asmTestqImm(buffer, TMP, 3);
@@ -1521,10 +1532,9 @@ static void generateLoadBlock(CodeGenerator *generator, Operand operand)
 	generateLoadObject(buffer, (RawObject *) block->raw, TMP, 1);
 	asmMovqToMem(buffer, TMP, asmMem(RAX, NO_REGISTER, SS_1, varOffset(RawBlock, compiledBlock)));
 
-	// setup receiver
+	// setup receiver (RAX holds the new Block, so stage a spilled self in TMP)
 	Variable *self = variableAt(generator, SELF_INDEX);
-	fillVar(generator, self);
-	asmMovqToMem(buffer, self->reg, asmMem(RAX, NO_REGISTER, SS_1, varOffset(RawBlock, receiver)));
+	asmMovqToMem(buffer, fillVarToReg(generator, self, TMP), asmMem(RAX, NO_REGISTER, SS_1, varOffset(RawBlock, receiver)));
 
 	// setup outer context
 	asmMovqToMem(buffer, context->reg, asmMem(RAX, NO_REGISTER, SS_1, varOffset(RawBlock, outerContext)));
@@ -1575,8 +1585,28 @@ static void fillAssoc(CodeGenerator *generator, uint8_t index)
 }
 
 
+// Materialize `var` into a register the emitter can name, and answer it. A SPILLED
+// variable owns no register: fillVar() would emit var->reg (== SPILLED_REG, -1) as a
+// register NUMBER, which encodes a wild register, so read its frame slot into
+// `scratch` instead. Callers must pass a scratch that is dead at this point and that
+// the following instructions do not need (TMP is the usual choice).
+static Register fillVarToReg(CodeGenerator *generator, Variable *var, Register scratch)
+{
+	if (var->reg == SPILLED_REG) {
+		movVar(generator, var, scratch);
+		return scratch;
+	}
+	fillVar(generator, var);
+	return var->reg;
+}
+
+
 static void fillVar(CodeGenerator *generator, Variable *var)
 {
+	// Loading INTO var->reg is meaningless for a spilled variable, and emitting
+	// SPILLED_REG (-1) as a register number silently encodes a wild register.
+	// Callers must stage spilled variables in a scratch register (see fillVarToReg).
+	ASSERT(var->reg != SPILLED_REG);
 	if ((var->flags & VAR_IN_REG) == 0) {
 		ASSERT(var->flags & VAR_ON_STACK);
 		ptrdiff_t offset = var->frameOffset * sizeof(intptr_t);

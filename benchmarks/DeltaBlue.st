@@ -1,4 +1,4 @@
-"The Richards Benchmark in Smalltalk
+"The DeltaBlue Benchmark in Smalltalk
 
 Copyright 1996 John Maloney and Mario Wolczko
 
@@ -17,10 +17,20 @@ You should have received a copy of the GNU General Public License along with
 GNU Smalltalk; see the file COPYING.  If not, write to the Free Software
 Foundation, 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA."
 
+"Modified 2026-07-16 to run on smalltalk-jit. Changes:
+   1. Class definitions rewritten from `Super subclass: Name [...]' to this
+      VM's `Name := Super [...]' form. That was the only change needed.
+   2. This header used to read `The Richards Benchmark in Smalltalk', which is
+      the other file's title; the code below has always been DeltaBlue.
+   The constraint solver and its workload are untouched, so the reported figure
+   remains comparable with other DeltaBlue implementations. The timing already
+   used this VM's DateTime currentMicroTime rather than GNU Smalltalk's
+   `Time millisecondsToRun:' (see report:times:run: below)."
+
 
 "DB-DeltaBlue"
 
-Object subclass: Planner [
+Planner := Object [
 
 	"This benchmark is an implementation of the DeltaBlue Constraint Solver
 	described in `The DeltaBlue Algorithm: An Incremental Constraint
@@ -390,7 +400,7 @@ Object subclass: Planner [
 ]
 
 
-Object subclass: Strength [
+Strength := Object [
 
 	"Strengths are used to measure the relative importance of constraints. The
 	hierarchy of available strengths is determined by the class variable
@@ -525,7 +535,7 @@ Object subclass: Strength [
 ]
 
 
-Object subclass: AbstractConstraint [
+AbstractConstraint := Object [
 
 	"I am an abstract class representing a system-maintainable relationship (or
 	'constraint') between a set of variables. I supply a strength instance
@@ -745,7 +755,7 @@ Object subclass: AbstractConstraint [
 ]
 
 
-Object subclass: Variable [
+Variable := Object [
 
 	"I represent a constrained variable. In addition to my value, I maintain the
 	structure of the constraint graph, the current dataflow graph, and various
@@ -959,7 +969,7 @@ Object subclass: Variable [
 
 "DB-Constraints"
 
-AbstractConstraint subclass: UnaryConstraint [
+UnaryConstraint := AbstractConstraint [
 
 	"I am an abstract superclass for constraints having a single possible output
 	variable.
@@ -1061,7 +1071,7 @@ AbstractConstraint subclass: UnaryConstraint [
 ]
 
 
-UnaryConstraint subclass: EditConstraint [
+EditConstraint := UnaryConstraint [
 
 	"I am a unary input constraint used to mark a variable that the client
 	wishes to change."
@@ -1097,7 +1107,7 @@ UnaryConstraint subclass: EditConstraint [
 ]
 
 
-UnaryConstraint subclass: StayConstraint [
+StayConstraint := UnaryConstraint [
 
 	"I mark variables that should, with some level of preference, stay the same.
 	I have one method with zero inputs and one output, which does nothing. Planners
@@ -1124,7 +1134,7 @@ UnaryConstraint subclass: StayConstraint [
 ]
 
 
-AbstractConstraint subclass: BinaryConstraint [
+BinaryConstraint := AbstractConstraint [
 
 	"I am an abstract superclass for constraints having two possible output
 	variables.
@@ -1263,7 +1273,7 @@ AbstractConstraint subclass: BinaryConstraint [
 ]
 
 
-BinaryConstraint subclass: ScaleConstraint [
+ScaleConstraint := BinaryConstraint [
 
 	"I relate two variables by the linear scaling relationship:
 	'v2 = (v1 * scale) + offset'. Either v1 or v2 may be changed to maintain this
@@ -1381,7 +1391,7 @@ BinaryConstraint subclass: ScaleConstraint [
 ]
 
 
-BinaryConstraint subclass: EqualityConstraint [
+EqualityConstraint := BinaryConstraint [
 
 	"I constrain two variables to have the same value: 'v1 = v2'."
 
@@ -1413,7 +1423,7 @@ BinaryConstraint subclass: EqualityConstraint [
 
 "DB-DeltaBlue"
 
-OrderedCollection subclass: Plan [
+Plan := OrderedCollection [
 
 	"A Plan is an ordered list of constraints to be executed in sequence to
 	resatisfy all currently satisfiable constraints in the face of one or more

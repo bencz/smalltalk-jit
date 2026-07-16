@@ -93,4 +93,5 @@ License
 BSD 3-Clause, inherited from the upstream project. See `LICENSE.txt`.
 
 Copyright (c) 2013, Ladislav Marek
+
 Copyright (c) 2020-2026, Alexandre Bencz

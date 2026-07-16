@@ -1,22 +1,52 @@
-Object subclass: RBObject [
+"The Richards Benchmark in Smalltalk
+
+Copyright 1996 John Maloney and Mario Wolczko
+
+This file is part of GNU Smalltalk.
+
+GNU Smalltalk is free software; you can redistribute it and/or modify it
+under the terms of the GNU General Public License as published by the Free
+Software Foundation; either version 2, or (at your option) any later version.
+
+GNU Smalltalk is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more
+details.
+
+You should have received a copy of the GNU General Public License along with
+GNU Smalltalk; see the file COPYING.  If not, write to the Free Software
+Foundation, 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA."
+
+"Modified 2026-07-16 to run on smalltalk-jit. Changes:
+   1. Class definitions rewritten from `Super subclass: Name [...]' to this
+      VM's `Name := Super [...]' form.
+   2. RBObject's class variables (DeviceA, WorkPacketKind and friends) became
+      the globals below. This VM has no class variables, and the original
+      declaration was commented out anyway, so `class initialize' assigned to
+      undeclared variables and was never sent by the file. Globals are used
+      rather than class-side accessor methods so that reads stay a slot fetch:
+      turning them into sends would add a dispatch to the very hot paths this
+      benchmark exists to measure.
+   3. The `Worker' constant was renamed `RBWorker'. This VM ships a kernel
+      class named Worker, and a global `Worker := 2' silently replaced it.
+   The scheduler and its workload are otherwise untouched, so the reported
+   figure remains comparable with other Richards implementations."
+
+"Shared constants. See note 2 above."
+[
+	DeviceA := 5.
+	DeviceB := 6.
+	DevicePacketKind := 1.
+	HandlerA := 3.
+	HandlerB := 4.
+	Idler := 1.
+	RBWorker := 2.
+	WorkPacketKind := 2.
+]
+
+RBObject := Object [
 
 	"Examples-Richards"
-
-	"| DeviceA DeviceB DevicePacketKind HandlerA HandlerB Idler Worker WorkPacketKind |"
-
-	"initialize"
-
-	class initialize [
-		DeviceA := 5.
-		DeviceB := 6.
-		DevicePacketKind := 1.
-		HandlerA := 3.
-		HandlerB := 4.
-		Idler := 1.
-		Worker := 2.
-		WorkPacketKind := 2
-	]
-
 
 	"utilities"
 
@@ -32,7 +62,7 @@ Object subclass: RBObject [
 ]
 
 
-RBObject subclass: Packet [
+Packet := RBObject [
 
 	| link identity kind datum data |
 
@@ -102,7 +132,7 @@ RBObject subclass: Packet [
 ]
 
 
-RBObject subclass: RichardsBenchmark [
+RichardsBenchmark := RBObject [
 	| taskList currentTask currentTaskIdentity taskTable tracing layout queuePacketCount holdCount |
 
 	"Examples-Richards"
@@ -394,14 +424,14 @@ RBObject subclass: RichardsBenchmark [
 			state: TaskState running.
 		workQ := self
 					createPacket: nil
-					identity: Worker
+					identity: RBWorker
 					kind: WorkPacketKind.
 		workQ := self
 					createPacket: workQ
-					identity: Worker
+					identity: RBWorker
 					kind: WorkPacketKind.
 		self
-			createWorker: Worker
+			createWorker: RBWorker
 			priority: 1000
 			work: workQ
 			state: TaskState waitingWithPacket.
@@ -489,7 +519,7 @@ RBObject subclass: RichardsBenchmark [
 ]
 
 
-RBObject subclass: TaskState [
+TaskState := RBObject [
 
 	| packetPendingIV taskWaiting taskHolding |
 
@@ -593,7 +623,7 @@ RBObject subclass: TaskState [
 ]
 
 
-RBObject subclass: DeviceTaskDataRecord [
+DeviceTaskDataRecord := RBObject [
 
 	| pending |
 
@@ -626,7 +656,7 @@ RBObject subclass: DeviceTaskDataRecord [
 ]
 
 
-RBObject subclass: HandlerTaskDataRecord [
+HandlerTaskDataRecord := RBObject [
 
 	| workIn deviceIn |
 
@@ -680,7 +710,7 @@ RBObject subclass: HandlerTaskDataRecord [
 ]
 
 
-RBObject subclass: WorkerTaskDataRecord [
+WorkerTaskDataRecord := RBObject [
 
 	| destination count |
 
@@ -722,7 +752,7 @@ RBObject subclass: WorkerTaskDataRecord [
 ]
 
 
-TaskState subclass: TaskControlBlock [
+TaskControlBlock := TaskState [
 
 	| link identity priority input state function handle |
 
@@ -800,7 +830,7 @@ TaskState subclass: TaskControlBlock [
 ]
 
 
-RBObject subclass: IdleTaskDataRecord [
+IdleTaskDataRecord := RBObject [
 
 	| control count |
 

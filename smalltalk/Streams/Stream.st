@@ -38,6 +38,20 @@ Stream := Iterator [
 	]
 
 
+	show: aString [
+		^self nextPutAll: aString.
+	]
+
+
+	showCr: aString [
+		"Terminates the line with lf, not cr: on this platform a newline is lf,
+		 and #cr below emits a literal carriage return."
+		self nextPutAll: aString.
+		self lf.
+		^aString
+	]
+
+
 	cr [
 		self nextPut: Character cr.
 	]

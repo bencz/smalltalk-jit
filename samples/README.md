@@ -70,6 +70,7 @@ done
 | `08_decorator.st`               | **Decorator** — a coffee shop stacking condiments |
 | `09_chain_of_responsibility.st` | **Chain of Responsibility** — a support-desk escalation chain |
 | `10_game_of_life.st`            | Conway's **Game of Life** — a glider walking the grid |
+| `11_task_scheduler.st`          | A cooperative **task scheduler** driven purely by polymorphic dispatch: the pattern `benchmarks/Richards.st` measures |
 
 ## Concurrency & networking (`samples/concurrency/`)
 

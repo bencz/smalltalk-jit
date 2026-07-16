@@ -65,12 +65,17 @@ static Variable *variableAt(CodeGenerator *generator, ptrdiff_t index);
 static Variable *specialVariableAt(CodeGenerator *generator, uint8_t type, ptrdiff_t index);
 
 
-// A Variable whose register is SPILLED_REG (-1) still flows into emitters on
-// several x64 paths (e.g. generateCopy of a spilled source): x64 encodes
-// -1 & 7 = RDI and the copy works through that ACCIDENTAL volatile scratch.
-// On POWER -1 & 31 = r31 = FP — fatal. Make the accident an explicit
-// convention: spilled variables materialize in r4 (the RDI analog), one
-// fixed volatile scratch used consistently by every such path.
+// A Variable whose register is SPILLED_REG (-1) must never reach an emitter as a
+// register NUMBER. Spilled variables materialize in r4, one fixed volatile
+// scratch used consistently by every such path (fillVar loads into varReg(var),
+// and every caller reads varReg(var) back).
+//
+// This convention is why POWER is correct here while x64 was not: an earlier note
+// claimed x64 got away with it because -1 encodes as an accidental volatile
+// scratch. That was wrong. On x64 the wild register is a live allocatable one, so
+// 5+ nested inlined conditionals (enough to exhaust the pool and start spilling)
+// miscompiled into a garbage receiver; see the fillVarToReg staging in
+// CodeGeneratorX64.c, which brings x64 up to this same discipline.
 static Register varReg(Variable *var)
 {
 	return var->reg == SPILLED_REG ? R4 : (Register) var->reg;
