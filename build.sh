@@ -6,7 +6,7 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 BUILD_DIR="${BUILD_DIR:-$SCRIPT_DIR/build}"
 BUILD_TYPE="${BUILD_TYPE:-Release}"
 
-# Descobre o número de processadores de forma mais portátil.
+# Detects the number of processors in a more portable way.
 if command -v nproc >/dev/null 2>&1; then
     JOBS=$(nproc)
 elif command -v getconf >/dev/null 2>&1; then
@@ -15,17 +15,17 @@ else
     JOBS=1
 fi
 
-# Proteção básica antes do rm -rf.
+# Basic safety check before running rm -rf.
 case "$BUILD_DIR" in
     ""|"/")
-        printf 'Diretório de build inválido: %s\n' "$BUILD_DIR" >&2
+        printf 'Invalid build directory: %s\n' "$BUILD_DIR" >&2
         exit 1
         ;;
 esac
 
-printf 'Configurando build em: %s\n' "$BUILD_DIR"
-printf 'Tipo de build: %s\n' "$BUILD_TYPE"
-printf 'Compilação paralela: %s processos\n' "$JOBS"
+printf 'Configuring build in: %s\n' "$BUILD_DIR"
+printf 'Build type: %s\n' "$BUILD_TYPE"
+printf 'Parallel compilation: %s processes\n' "$JOBS"
 
 rm -rf -- "$BUILD_DIR"
 
