@@ -1,52 +1,96 @@
-SmallTalk-JIT
-========================
+smalltalk-jit
+=============
 
-… is Smalltalk Virtual Machine. It supports Smalltalk as described in Bluebook
-and partially ANSI Smalltalk with support for class definiton syntax.
+A Smalltalk virtual machine written in C. There is no interpreter: bytecode is
+only how compiled code is stored, and the JIT turns it into machine code before
+anything runs. The language is the Bluebook one, plus a good part of ANSI
+Smalltalk and a class definition syntax.
 
-… is written in C and contains bytecode compiler (used only for compiled code
-representation - not interpreted), JIT (currently only x86-64 is supported),
-generational GC with moving GC on new space and mark & sweep on old space.
+It started as a fork of Ladislav Marek's [yet-another-smalltalk-vm][upstream].
+I picked it up in 2020 to learn how a JIT and a garbage collector actually fit
+together, and I have been rebuilding pieces of it ever since. The object model
+and the compiler are still recognisably his. The JIT backends, the GC work, the
+multicore runtime and most of the class library are where my time went.
 
-… is tested on x86-64 Linux
+[upstream]: https://github.com/lm/yet-another-smalltalk-vm
 
-
-Usage
------
-
-For building VM you need: Clang or GCC and Cmake.
-
-```sh
-# within the VM root directory
-cmake -S . -B build
-cmake --build build -j
-LD_LIBRARY_PATH=build build/st -b smalltalk # compiles the kernel, writes ./snapshot
-./run_tests.sh --all                        # build + bootstrap + full test suite
-```
-
-Source layout
+What is in it
 -------------
 
-`vm/` is organized by domain; CPU- and OS-specific code is isolated behind
-link-time seams (see `PORTING.md` for the full porting contract):
+**Three JIT backends.** x86-64 (SysV) is the reference one. ppc64 big-endian
+(ELFv1) and ppc64le (ELFv2) are complete and pass the same suite. The big-endian
+port targets the base 64-bit PowerPC ISA, so it runs on hardware as old as a G5.
+CPU, OS and C ABI are chosen at link time, so a new port is a directory of its
+own instead of a spray of ifdefs. `PORTING.md` has the contract.
 
+**A generational GC.** Copying scavenger for the young space, mark and sweep for
+the old one, with write barriers, safepoints, and stackmaps emitted by the JIT.
+
+**Multicore.** One shared heap, N OS threads, per-thread allocation buffers, and
+collection coordinated by a safepoint handshake.
+
+**Fibers.** Stackful green threads on an epoll scheduler, with growable stacks
+that start at 64KB. Actors and a small HTTP server sit on top of them, written
+in Smalltalk.
+
+**A class library** that grew a lot: LargeInteger, Fraction and Float, the full
+exception protocol (signal:, return:, pass, ensure:, retry), sockets, JSON,
+streams, and the usual collections.
+
+Building
+--------
+
+Clang or GCC, and CMake. There are no dependencies worth the name: pthreads and
+libm, everything else is POSIX. Linux only, for now.
+
+```sh
+cmake -S . -B build
+cmake --build build -j
+LD_LIBRARY_PATH=build build/st -b smalltalk   # compiles the kernel, writes ./snapshot
 ```
-vm/core/         object model + runtime (objects, classes, lookup, threads)
-vm/memory/       heap, scavenger (young GC), mark-sweep (old GC), safepoints
-vm/compiler/     tokenizer, parser, AST, bytecode compiler, optimizer
-vm/jit/          arch-neutral JIT layer (assembler buffer, codegen API,
-                 register allocator, stackmaps) + Target*.h arch contracts
-vm/jit/x64/      the x86-64 backend (selected by CMake ST_ARCH); its
-                 abi/sysv/ subdirectory binds the platform C ABI (ST_ABI) —
-                 calling convention, TLS access, fiber switch — as an
-                 ops-struct, golden-byte-tested (ST_ABI_EMIT_TEST=1)
-vm/runtime/      built-in classes' C support (collections, strings, streams,
-                 sockets, JSON) + the primitives table
-vm/concurrency/  fiber scheduler (N workers over one heap) + fibers
-vm/os/           the OS seam (vm/os/Os.h contract); one directory per
-                 platform (vm/os/linux/ today, selected by CMake ST_OS),
-                 split by domain: OsTime, OsMemory, OsEvents, OsSignals, OsCpu
-vm/thirdparty/   vendored third-party code (cityhash, linenoise)
-vm/tools/        bootstrap, snapshot, REPL, CLI
-vm/tests/        C-level self-test battery (ST_*_TEST env vars) + unit tests
+
+The image is a frozen snapshot, so bootstrap again after touching the C VM or
+anything under `smalltalk/`.
+
+Running
+-------
+
+```sh
+export LD_LIBRARY_PATH=build
+
+build/st                                  # REPL
+build/st -e '(1 to: 10) inject: 0 into: [ :a :b | a + b ]'
+build/st -f samples/17_mandelbrot.st
 ```
+
+One quirk to know early: the value of the last top-level block becomes the
+process exit code, so the `inject:into:` line above both prints 55 and exits
+with 55.
+
+Tests
+-----
+
+```sh
+./run_tests.sh          # build, bootstrap, run tests/
+./run_tests.sh --all    # and every sample
+./build.sh              # clean release build plus all of the above
+```
+
+41 test files and 36 samples. `samples/README.md` walks through the samples and
+lists the syntax quirks worth knowing before writing any Smalltalk against this
+VM.
+
+Status
+------
+
+A hobby project, and not an attempt at being Pharo. The suite is green on all
+three architectures and I still find bugs in it regularly. What I wanted was a
+JIT and a GC small enough to hold in your head, and that is what it is.
+
+License
+-------
+
+BSD 3-Clause, inherited from the upstream project. See `LICENSE.txt`.
+
+Copyright (c) 2013, Ladislav Marek
+Copyright (c) 2020-2026, Alexandre Bencz
