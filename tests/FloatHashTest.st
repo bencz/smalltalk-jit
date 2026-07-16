@@ -14,7 +14,7 @@ still exits 0, only ^failCount is caught by run_tests.sh."
 
 	"truncated beyond the SmallInteger range builds the EXACT integer"
 	big := 1.0e300 truncated.
-	(big class == LargeInteger) ifFalse: [fails := fails + 8].
+	(big class == LargePositiveInteger) ifFalse: [fails := fails + 8].
 	(big asFloat = 1.0e300) ifFalse: [fails := fails + 16].
 	(1.0e300 hash = big hash) ifFalse: [fails := fails + 32].
 	((-1.5e300) truncated asFloat = -1.5e300) ifFalse: [fails := fails + 64].

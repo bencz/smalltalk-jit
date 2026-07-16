@@ -168,7 +168,13 @@ FloatEdgeTest := Object [
 
 		"beyond the SmallInteger range: the LargeInteger fallback is exact"
 		big := 1.0 timesTwoPower: 61.
-		f := f + (self check: '2^61 truncated is LargeInteger' is: big truncated class == LargeInteger).
+		f := f + (self check: '2^61 truncated is LargePositiveInteger' is: big truncated class == LargePositiveInteger).
+		"NOTE the asymmetric two's complement range: -2^61 still fits the
+		62-bit SmallInteger payload, +2^61 does not; only -2^62 promotes"
+		f := f + (self check: 'negative 2^61 truncated stays SmallInteger'
+			is: (0.0 - big) truncated class == SmallInteger).
+		f := f + (self check: 'negative 2^62 truncated is LargeNegativeInteger'
+			is: (0.0 - (1.0 timesTwoPower: 62)) truncated class == LargeNegativeInteger).
 		f := f + (self check: '2^61 truncated is exact' is: big truncated = (2 raisedToInteger: 61)).
 		f := f + (self check: '2^61 round-trips back' is: big truncated asFloat = big).
 		f := f + (self check: 'negative huge truncated exact'

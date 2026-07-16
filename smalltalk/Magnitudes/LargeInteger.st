@@ -1,27 +1,31 @@
-"Arbitrary precision integer.
+"Abstract arbitrary precision integer, Pharo style: the SIGN is encoded in
+the concrete class (LargePositiveInteger or LargeNegativeInteger) and the
+instances carry only the magnitude.
 
 The magnitude is stored in `digits`, an Array of base-2^16 limbs, least
-significant first, with no trailing zero limbs (size >= 1). The sign is held
-separately in `negative`. Results that fit in a SmallInteger are demoted back
-to SmallInteger by #normalize, so LargeInteger only ever holds values outside
-the SmallInteger range. Instances are produced automatically when SmallInteger
-arithmetic overflows (see SmallInteger)."
+significant first, with no trailing zero limbs (size >= 1). Results that fit
+in a SmallInteger are demoted back to SmallInteger by #normalize, so a
+LargeInteger only ever holds values outside the SmallInteger range. Instances
+are produced automatically when SmallInteger arithmetic overflows (see
+SmallInteger) and by big literals (built directly by the C parser, which
+picks the concrete class by sign)."
 
 LargeInteger := Integer [
 
-	| digits negative |
+	| digits |
 
 
 	"--- instance creation ---"
 
 	class digits: anArray negative: aBoolean [
-		^self new setDigits: anArray negative: aBoolean
+		"The single constructor: the sign picks the concrete class."
+		^(aBoolean ifTrue: [LargeNegativeInteger] ifFalse: [LargePositiveInteger]) new
+			setDigits: anArray
 	]
 
 
-	setDigits: anArray negative: aBoolean [
+	setDigits: anArray [
 		digits := anArray.
-		negative := aBoolean.
 		^self
 	]
 
@@ -34,7 +38,8 @@ LargeInteger := Integer [
 
 
 	negative [
-		^negative
+		"The concrete classes answer their sign."
+		SubClassResponsibility signal.
 	]
 
 
@@ -212,7 +217,7 @@ LargeInteger := Integer [
 		(n > 4 or: [n = 4 and: [(digits at: 4) >= 8192]]) ifTrue: [^self].
 		value := 0.
 		n to: 1 by: -1 do: [ :i | value := value * 65536 + (digits at: i)].
-		^negative ifTrue: [value negated] ifFalse: [value]
+		^self negative ifTrue: [value negated] ifFalse: [value]
 	]
 
 
@@ -235,7 +240,7 @@ LargeInteger := Integer [
 			| other |
 			other := aNumber asLargeInteger.
 			^self makeDigits: (LargeInteger multiplyMagnitude: digits and: other digits)
-				negative: negative ~= other negative].
+				negative: self negative ~= other negative].
 		^self retry: #* coercing: aNumber
 	]
 
@@ -274,15 +279,15 @@ LargeInteger := Integer [
 		"Signed addition of two LargeIntegers."
 		| mag cmp |
 
-		negative = aLarge negative ifTrue: [
+		self negative = aLarge negative ifTrue: [
 			^self makeDigits: (LargeInteger addMagnitude: digits and: aLarge digits)
-				negative: negative].
+				negative: self negative].
 
 		cmp := LargeInteger compareMagnitude: digits and: aLarge digits.
 		cmp = 0 ifTrue: [^0].
 		cmp > 0 ifTrue: [
 			^self makeDigits: (LargeInteger subtractMagnitude: digits and: aLarge digits)
-				negative: negative].
+				negative: self negative].
 		^self makeDigits: (LargeInteger subtractMagnitude: aLarge digits and: digits)
 			negative: aLarge negative
 	]
@@ -294,8 +299,8 @@ LargeInteger := Integer [
 
 		aLarge isZero ifTrue: [^self error: 'division by zero'].
 		dm := LargeInteger divModMagnitude: digits and: aLarge digits.
-		q := self makeDigits: (dm at: 1) negative: negative ~= aLarge negative.
-		r := self makeDigits: (dm at: 2) negative: negative.
+		q := self makeDigits: (dm at: 1) negative: self negative ~= aLarge negative.
+		r := self makeDigits: (dm at: 2) negative: self negative.
 		^Array with: q with: r
 	]
 
@@ -308,25 +313,25 @@ LargeInteger := Integer [
 		q := dr at: 1.
 		r := dr at: 2.
 		r = 0 ifTrue: [^dr].
-		(negative ~= aLarge negative) ifTrue: [^Array with: q - 1 with: r + aLarge].
+		(self negative ~= aLarge negative) ifTrue: [^Array with: q - 1 with: r + aLarge].
 		^dr
 	]
 
 
 	negated [
 		self isZero ifTrue: [^0].
-		^LargeInteger digits: digits negative: negative not
+		^LargeInteger digits: digits negative: self negative not
 	]
 
 
 	abs [
-		^negative ifTrue: [self negated] ifFalse: [self]
+		^self negative ifTrue: [self negated] ifFalse: [self]
 	]
 
 
 	sign [
 		self isZero ifTrue: [^0].
-		^negative ifTrue: [-1] ifFalse: [1]
+		^self negative ifTrue: [-1] ifFalse: [1]
 	]
 
 
@@ -335,9 +340,9 @@ LargeInteger := Integer [
 	compareLarge: aLarge [
 		| c |
 
-		negative ~= aLarge negative ifTrue: [^negative ifTrue: [-1] ifFalse: [1]].
+		self negative ~= aLarge negative ifTrue: [^self negative ifTrue: [-1] ifFalse: [1]].
 		c := LargeInteger compareMagnitude: digits and: aLarge digits.
-		^negative ifTrue: [c negated] ifFalse: [c]
+		^self negative ifTrue: [c negated] ifFalse: [c]
 	]
 
 
@@ -402,7 +407,7 @@ LargeInteger := Integer [
 
 		r := 0.0.
 		digits size to: 1 by: -1 do: [ :i | r := (r * 65536.0) + (digits at: i) asFloat].
-		^negative ifTrue: [r negated] ifFalse: [r]
+		^self negative ifTrue: [r negated] ifFalse: [r]
 	]
 
 
@@ -442,7 +447,7 @@ LargeInteger := Integer [
 		| groups mag first gs |
 
 		self isZero ifTrue: [^aStream nextPutAll: '0'].
-		negative ifTrue: [aStream nextPut: $-].
+		self negative ifTrue: [aStream nextPut: $-].
 
 		groups := OrderedCollection new.
 		mag := digits.

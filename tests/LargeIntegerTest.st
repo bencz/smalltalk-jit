@@ -2,13 +2,15 @@
 large-method limit."
 
 [
-	"promotion on overflow and large literals"
-	Assert true: (2 raisedTo: 62) class == LargeInteger.
+	"promotion on overflow and large literals: the sign is in the CLASS
+	(Pharo style), LargeInteger itself is abstract"
+	Assert true: (2 raisedTo: 62) class == LargePositiveInteger.
+	Assert true: ((2 raisedTo: 62) isKindOf: LargeInteger).
 	Assert true: 1000000000 class == SmallInteger.
 	Assert true: (1000000000 * 1000000000) class == SmallInteger.
-	Assert true: (10000000000 * 10000000000) class == LargeInteger.
+	Assert true: (10000000000 * 10000000000) class == LargePositiveInteger.
 	Assert true: (10000000000 * 10000000000) = 100000000000000000000.
-	Assert true: 2432902008176640000 class == LargeInteger.
+	Assert true: 2432902008176640000 class == LargePositiveInteger.
 	Assert true: 20 factorial = 2432902008176640000.
 	Assert true: 100000000000000000000000000000000 printString size = 33.
 	Assert true: 16rFFFFFFFFFFFFFFFFFFFF = 1208925819614629174706175.
@@ -31,6 +33,12 @@ large-method limit."
 [
 	"sign handling and floored division with mixed signs"
 	Assert true: (2 raisedTo: 70) negated < 0.
+	Assert true: (2 raisedTo: 70) negated class == LargeNegativeInteger.
+	Assert true: ((2 raisedTo: 70) negated isKindOf: LargeInteger).
+	Assert true: (2 raisedTo: 70) negated abs class == LargePositiveInteger.
+	Assert true: ((2 raisedTo: 70) negated * (2 raisedTo: 70) negated) class == LargePositiveInteger.
+	Assert true: ((2 raisedTo: 70) * (2 raisedTo: 70) negated) class == LargeNegativeInteger.
+	Assert true: (0 - 100000000000000000000) class == LargeNegativeInteger.
 	Assert true: (2 raisedTo: 70) negated abs = (2 raisedTo: 70).
 	Assert true: ((2 raisedTo: 70) negated) sign = -1.
 	Assert true: (0 - (2 raisedTo: 65)) + (2 raisedTo: 65) = 0.

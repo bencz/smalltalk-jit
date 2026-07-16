@@ -786,11 +786,12 @@ static Value buildIntegerLiteral(const char *str, int base, _Bool negative)
 		for (size_t j = 0; j < len; j++) {
 			digits->raw->vars[j] = tagInt(limbs[j]);
 		}
-		Class *cls = getClass("LargeInteger");
+		// the sign of a LargeInteger lives in its CLASS (Pharo style); the
+		// only instance variable is the limb Array
+		Class *cls = getClass(negative ? "LargeNegativeInteger" : "LargePositiveInteger");
 		Object *large = newObject(cls, 0);
 		Value *vars = getObjectVars(large);
 		objectStorePtr(large, &vars[0], (Object *) digits);
-		objectStorePtr(large, &vars[1], negative ? Handles.true : Handles.false);
 		result = getTaggedPtr(closeHandleScope(&scope, large));
 	}
 	free(limbs);
