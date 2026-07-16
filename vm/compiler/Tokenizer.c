@@ -399,6 +399,17 @@ static void readToken(Tokenizer *tokenizer, Token *token, _Bool isSeparated)
 					APPEND();
 				}
 				APPEND_WHILE(isNumeric(tokenizer->ch));
+			} else if (tokenizer->ch == 's'
+					&& !isIdentifierBegining(peekChar(tokenizer))) {
+				/* ScaledDecimal suffix: 3.14s2, 2.5s (scale inferred), 3s0. A
+				   letter after the s keeps the old lexing (number, then an
+				   identifier), and the exponent form excludes the suffix.
+				   APPEND_WHILE consumes one char BEFORE testing, so it needs
+				   the guard (the scale digits are optional). */
+				APPEND();
+				if (isNumeric(tokenizer->ch)) {
+					APPEND_WHILE(isNumeric(tokenizer->ch));
+				}
 			}
 		}
 

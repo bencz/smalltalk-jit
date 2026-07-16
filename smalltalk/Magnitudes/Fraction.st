@@ -201,6 +201,11 @@ Fraction := Number [
 	]
 
 
+	asScaledDecimal [
+		^ScaledDecimal basicNumerator: numerator denominator: denominator scale: 0
+	]
+
+
 	asFraction [
 		^self
 	]

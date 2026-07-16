@@ -247,6 +247,7 @@ static _Bool parseKernelFiles(char *kernelDir)
 		"Magnitudes/LargePositiveInteger.st",
 		"Magnitudes/LargeNegativeInteger.st",
 		"Magnitudes/Fraction.st",
+		"Magnitudes/ScaledDecimal.st",
 		"Magnitudes/Float.st",
 		"Magnitudes/SmallFloat64.st",
 		"Magnitudes/BoxedFloat64.st",

@@ -87,4 +87,9 @@ Integer := Number [
 		^self
 	]
 
+
+	asScaledDecimal [
+		^ScaledDecimal basicNumerator: self denominator: 1 scale: 0
+	]
+
 ]

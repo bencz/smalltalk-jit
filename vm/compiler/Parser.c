@@ -799,6 +799,69 @@ static Value buildIntegerLiteral(const char *str, int base, _Bool negative)
 }
 
 
+/*
+ * "3.14s2" style ScaledDecimal literal: the exact rational value (numerator
+ * over a power of ten, unreduced; Smalltalk reduces on use) plus the print
+ * scale. The scale defaults to the number of fraction digits. The numerator
+ * and denominator may be LargeIntegers, so both are built through
+ * buildIntegerLiteral and kept in handles across the allocations.
+ */
+static Value buildScaledDecimalLiteral(const char *str, _Bool negative)
+{
+	char mantissa[256];
+	char denStr[256];
+	size_t m = 0;
+	size_t fracDigits = 0;
+	_Bool inFraction = 0;
+	const char *p = str;
+
+	for (; *p != 's' && *p != '\0' && m < sizeof(mantissa) - 1; p++) {
+		if (*p == '.') {
+			inFraction = 1;
+			continue;
+		}
+		mantissa[m++] = *p;
+		if (inFraction) {
+			fracDigits++;
+		}
+	}
+	mantissa[m] = '\0';
+
+	size_t scale = fracDigits;
+	if (*p == 's' && p[1] != '\0') {
+		scale = strtoul(p + 1, NULL, 10);
+	}
+
+	denStr[0] = '1';
+	memset(denStr + 1, '0', fracDigits);
+	denStr[fracDigits + 1] = '\0';
+
+	HandleScope scope;
+	openHandleScope(&scope);
+
+	Value num = buildIntegerLiteral(mantissa, 10, negative);
+	Object *numHandle = valueTypeOf(num, VALUE_POINTER) ? scopeHandle(asObject(num)) : NULL;
+	Value den = buildIntegerLiteral(denStr, 10, 0);
+	Object *denHandle = valueTypeOf(den, VALUE_POINTER) ? scopeHandle(asObject(den)) : NULL;
+
+	Class *cls = getClass("ScaledDecimal");
+	Object *sd = newObject(cls, 0);
+	Value *vars = getObjectVars(sd);
+	if (numHandle != NULL) {
+		objectStorePtr(sd, &vars[0], numHandle);
+	} else {
+		vars[0] = num;
+	}
+	if (denHandle != NULL) {
+		objectStorePtr(sd, &vars[1], denHandle);
+	} else {
+		vars[1] = den;
+	}
+	vars[2] = tagInt((intptr_t) scale);
+	return getTaggedPtr(closeHandleScope(&scope, sd));
+}
+
+
 static LiteralNode *parseNumber(Parser *parser, int8_t sign)
 {
 	LiteralNode *literal = newObject(Handles.IntegerNode, 0);
@@ -823,7 +886,9 @@ static LiteralNode *parseNumber(Parser *parser, int8_t sign)
 	}
 
 	nextToken(&parser->tokenizer);
-	if (strpbrk(content, ".eE") != NULL) {
+	if (strchr(content, 's') != NULL) {
+		literalNodeSetRawValue(literal, buildScaledDecimalLiteral(content, sign < 0));
+	} else if (strpbrk(content, ".eE") != NULL) {
 		double value = strtod(content, NULL);
 		if (sign < 0) {
 			value = -value;
