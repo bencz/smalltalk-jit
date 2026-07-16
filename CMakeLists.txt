@@ -47,6 +47,7 @@ if(ST_ARCH STREQUAL "x64")
 	set(vmArchSources
 		vm/jit/x64/Abi.c
 		vm/jit/x64/CodeGeneratorX64.c
+		vm/jit/x64/CpuX64.c
 		vm/jit/x64/PrimitivesX64.c
 		vm/jit/x64/StubCodeX64.c)
 	# Golden-byte emission tests for this backend's ABI emitters (linked into
@@ -63,15 +64,19 @@ if(ST_ARCH STREQUAL "x64")
 		vm/tests/EmitGoldenPpc64.c
 		vm/tests/EmitGoldenPpc64HostStub.c
 		vm/jit/ppc64/abi/elfv1/AbiElfV1.c
+		vm/jit/ppc64/CpuPpc64.c
 		vm/tests/EmitGoldenPpc64le.c
 		vm/tests/EmitGoldenPpc64leHostStub.c
-		vm/jit/ppc64le/abi/elfv2/AbiElfV2.c)
+		vm/jit/ppc64le/abi/elfv2/AbiElfV2.c
+		vm/jit/ppc64le/CpuPpc64le.c)
 elseif(ST_ARCH STREQUAL "ppc64")
 	# Complete backend (big-endian, ELFv1): encoders, ABI instance and the full
 	# code generator are real; ./build.sh runs green in a native ppc64 BE
 	# rootfs. The mapping and the bring-up war stories: vm/jit/ppc64/DESIGN.md.
 	set(vmArchSources
 		vm/jit/ppc64/CodeGeneratorPpc64.c
+		vm/jit/ppc64/CpuPpc64.c
+		vm/jit/ppc64/CpuDetectPpc64.c
 		vm/jit/ppc64/PrimitivesPpc64.c
 		vm/jit/ppc64/StubCodePpc64.c)
 	set(vmArchTestSources
@@ -84,6 +89,8 @@ elseif(ST_ARCH STREQUAL "ppc64le")
 	# The deltas vs the BE spec: vm/jit/ppc64le/DESIGN.md.
 	set(vmArchSources
 		vm/jit/ppc64le/CodeGeneratorPpc64le.c
+		vm/jit/ppc64le/CpuPpc64le.c
+		vm/jit/ppc64le/CpuDetectPpc64le.c
 		vm/jit/ppc64le/PrimitivesPpc64le.c
 		vm/jit/ppc64le/StubCodePpc64le.c)
 	set(vmArchTestSources

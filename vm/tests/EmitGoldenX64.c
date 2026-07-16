@@ -22,6 +22,7 @@
 #include "vm/jit/StubCode.h"
 #include "vm/jit/TargetPrimitives.h"
 #include "vm/jit/x64/AssemblerX64.h"
+#include "vm/jit/x64/Cpu.h"
 #include "vm/jit/x64/Abi.h"
 #include "vm/core/Thread.h"
 #include "vm/core/Lookup.h"
@@ -181,11 +182,75 @@ static int checkAbiInvariants(const X64Abi *abi)
 	return errors;
 }
 
+// The CPU-model decode (jit/TargetCpu.h, jit/x64/Cpu.h) is a pure function of
+// the CPUID words, so it is checkable with fabricated inputs instead of
+// whatever chip happens to run the test.
+//
+// Two traps are guarded here. First, the raw bit values COLLIDE across leaves
+// (bit 5 is AVX2 in leaf 7 EBX and LZCNT in leaf 0x80000001 ECX), so feeding a
+// word from the wrong leaf silently produces a plausible wrong answer. Second,
+// CPUID ALONE LIES about AVX-class features: if the OS never enabled the YMM
+// state in XCR0, the instruction faults no matter what CPUID advertises.
+static int checkCpuDecode(void)
+{
+	X64Cpu cpu;
+	int errors = 0;
+
+#define CPU_CHECK(cond, what) \
+	if (!(cond)) { printf("CPU DECODE: %s\n", what); errors++; }
+
+	// The OS-enablement trap: CPUID says AVX/FMA/AVX2, but XCR0 says the OS
+	// never enabled the state. Executing them would fault, so they must decode
+	// to FALSE despite being advertised.
+	x64CpuDecode(&cpu, X64_CPUID1_ECX_AVX | X64_CPUID1_ECX_FMA | X64_CPUID1_ECX_OSXSAVE,
+		X64_CPUID7_EBX_AVX2, 0, /* xcr0 */ 0);
+	CPU_CHECK(!cpu.hasAvx, "AVX advertised but the OS never enabled YMM state");
+	CPU_CHECK(!cpu.hasAvx2, "AVX2 must follow the OS's answer, not CPUID's");
+	CPU_CHECK(!cpu.hasFma, "FMA is VEX-encoded: it needs the YMM state too");
+
+	// ... and with OSXSAVE missing, XGETBV is not even legal to execute, so a
+	// non-zero xcr0 must not be believed either.
+	x64CpuDecode(&cpu, X64_CPUID1_ECX_AVX, 0, 0, X64_XCR0_AVX_ENABLED);
+	CPU_CHECK(!cpu.hasAvx, "AVX without OSXSAVE must not be claimed");
+
+	// The same words WITH the OS's blessing.
+	x64CpuDecode(&cpu, X64_CPUID1_ECX_AVX | X64_CPUID1_ECX_FMA | X64_CPUID1_ECX_OSXSAVE,
+		X64_CPUID7_EBX_AVX2, 0, X64_XCR0_AVX_ENABLED);
+	CPU_CHECK(cpu.hasAvx && cpu.hasAvx2 && cpu.hasFma, "AVX-class features must decode when enabled");
+
+	// The leaf-collision trap: bit 5 means AVX2 in leaf 7 EBX and LZCNT in the
+	// extended leaf's ECX. Setting only the extended leaf must yield LZCNT and
+	// NOT AVX2.
+	x64CpuDecode(&cpu, 0, 0, X64_CPUIDX_ECX_LZCNT, 0);
+	CPU_CHECK(cpu.hasLzcnt, "LZCNT lives in the EXTENDED leaf's ECX");
+	CPU_CHECK(!cpu.hasAvx2, "the extended leaf must not be read as leaf 7");
+
+	// GPR-only features need no OS state.
+	x64CpuDecode(&cpu, 0, X64_CPUID7_EBX_BMI2, 0, 0);
+	CPU_CHECK(cpu.hasBmi2, "BMI2 is GPR-only: no XCR0 involved");
+
+	// The floor: nothing reported means nothing claimed.
+	x64CpuDecode(&cpu, 0, 0, 0, 0);
+	CPU_CHECK(!cpu.hasPopcnt && !cpu.hasAvx && !cpu.hasBmi2 && !cpu.hasFma,
+		"an empty CPUID must claim NOTHING");
+
+	for (const char *const *n = X64CpuNames; *n != NULL; n++) {
+		if (!x64CpuByName(&cpu, *n)) {
+			printf("CPU DECODE: advertised name '%s' does not decode\n", *n);
+			errors++;
+		}
+	}
+	CPU_CHECK(!x64CpuByName(&cpu, "x86-64-v42"), "an unknown name must be rejected");
+#undef CPU_CHECK
+	return errors;
+}
+
 int abiEmitGoldenSelfTest(const char *mode)
 {
 	pinTlsOffsets();
 
 	int failures = checkAbiInvariants(gX64Abi);
+	failures += checkCpuDecode();
 	_Bool print = mode != NULL && strcmp(mode, "print") == 0;
 
 	for (size_t i = 0; i < sizeof(Cases) / sizeof(Cases[0]); i++) {

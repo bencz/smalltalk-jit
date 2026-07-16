@@ -12,6 +12,7 @@
 #include "vm/core/Exception.h"
 #include "vm/os/Os.h"
 #include "vm/tools/Cli.h"
+#include "vm/jit/TargetCpu.h"
 #include "vm/tests/SelfTests.h"
 #include <unistd.h>
 #include <string.h>
@@ -60,6 +61,14 @@ int main(int argc, char **args)
 {
 	CliArgs cliArgs;
 	ProgramContext ctx = { .cliArgs = &cliArgs, .result = EXIT_SUCCESS };
+
+	// Which CPU MODEL of this architecture are we on (jit/TargetCpu.h). FIRST,
+	// before anything else: the JIT reads the answer while emitting, and the
+	// self-test dispatch below returns without ever reaching initThread, so
+	// anything later would leave the goldens and the JIT self-tests emitting
+	// against an undetected CPU. Read-only from here on, hence lock-free and
+	// TLS-free for every worker.
+	targetCpuDetect();
 
 	parseCliArgs(&cliArgs, argc, args);
 

@@ -143,6 +143,99 @@ volatile — that is what keeps a NEW ABI instance honest before any code runs.
    and `AL` zeroed before variadic C calls (none exist today — assert if one
    appears).
 
+## The CPU-MODEL axis (`vm/jit/<arch>/Cpu.h`)
+
+The fourth binding axis, and the only one NOT fixed at build time: which
+microarchitecture of the selected instruction set the process is running on.
+One ppc64le binary must serve POWER8 and POWER10; one x64 binary Zen and
+Skylake. So it can be neither a `#if`, nor a CMake file choice, nor a trait.
+
+Contract in `vm/jit/TargetCpu.h`: `targetCpuDetect()` runs ONCE, as the first
+statement of `main()` (before the self-test dispatch, which returns early and
+would otherwise leave the goldens emitting against an undetected CPU). After it
+returns, the arch's struct (`gX64Cpu`/`gPpc64Cpu`/`gPpc64leCpu`) is read-only,
+so every worker reads it with no lock and no TLS. It is consulted at EMIT time
+only: generated code never tests a feature flag, exactly like the ABI vtable.
+
+There is NO image hazard: JIT code is not persisted (the bootstrap image is
+byte-count identical across x64/ppc64/ppc64le precisely because it holds
+bytecode, not native code), so an image built on POWER10 runs on POWER8.
+
+**"Why not just CPUID?" We do, where it exists** — and note that ACQUIRING the
+features is an (arch x OS) fact, exactly like `ST_ABI`, even though the features
+themselves are architectural:
+- **x64**: `CPUID` is an unprivileged INSTRUCTION, so it needs no OS at all and
+  `CpuX64.c` executes it directly on any platform. But CPUID ALONE LIES: for any
+  VEX-encoded feature (AVX, AVX2, FMA) the silicon may advertise what the OS
+  never enabled, and the instruction then faults. The OS's answer is in XCR0 via
+  `XGETBV`, itself only legal once CPUID reports OSXSAVE. The decode takes XCR0
+  as an input for exactly this reason, and the golden pins it.
+- **POWER**: the CPUID equivalent is the PVR (SPR 287), but it is
+  supervisor-only (userspace access traps; Linux trap-and-emulates it) and it
+  reports the SILICON rather than what the OS enabled. So the kernel must hand
+  the answer over, and HOW it does that is an OS fact, NOT a PowerPC one:
+  `AT_HWCAP`/`AT_HWCAP2` are the **Linux/ELF auxiliary vector**. AIX has no auxv
+  at all (it answers through `_system_configuration.implementation`,
+  `<sys/systemcfg.h>`, `PV_970`/`PV_5`/`PV_6`/...; PASE follows AIX); FreeBSD
+  spells it `elf_aux_info()`; macOS uses `sysctlbyname`.
+  That is why acquisition lives behind `osCpuFeatureWords()` on the OS axis
+  (`vm/os/<os>/OsCpu.c`) and only the MEANING of the bits lives in the arch.
+  A non-Linux POWER port implements that one function; nothing in
+  `vm/jit/ppc64*/` changes.
+  WARNING: `AT_PLATFORM` (the model NAME) is not universally available
+  (measured: qemu-user returns NULL for it on every CPU model), so never branch
+  on the name, only on features.
+
+**Structure**, mirroring the ABI instance/Bind split, and for the same reason:
+- `Cpu.h` + `Cpu<Arch>.c`: the feature struct and the PURE DECODE of the feature
+  words. Host-independent, so the x86 box links the POWER decodes and the
+  goldens check them with fabricated inputs.
+- `CpuDetect<Arch>.c`: the one arch-only piece, deliberately boring: ask
+  `osCpuFeatureWords()`, decode, honour `ST_CPU`/`ST_CPU_INFO`. OS-NEUTRAL, so
+  it would compile on AIX untouched.
+- `vm/os/<os>/OsCpu.c`: the acquisition, plus the `_Static_assert`s pinning the
+  arch's private bit table against THAT platform's real `<bits/hwcap.h>` (the
+  header is Linux's, so the assert belongs on the OS axis too).
+
+That split exists because "read the wrong bit" is invisible end-to-end: a wrong
+feature flag silently loses an optimization or, worse, enables an instruction
+the CPU lacks. The raw values collide (bit 5 is AVX2 in leaf 7 EBX and LZCNT in
+leaf 0x80000001 ECX; AltiVec and POWER4 are different words on POWER), which is
+how the mistake gets made. Both goldens falsifiably catch it.
+
+Knobs: `ST_CPU_INFO=1` prints what was detected; `ST_CPU=<name>` forces a
+feature set through the SAME decode, so a POWER10 path can be emitted and
+inspected from an x86 box.
+
+**Baselines are per-backend facts, and they are not symmetric:**
+- **ppc64 (BE)** claims NOTHING by default, because its floor is the PowerPC
+  64-bit BASE ISA. That is measured, not assumed: all 186 instructions of the
+  golden's reference `.s` assemble at `-mppc64` with bytes identical to the
+  default build. **The JIT therefore runs on any 64-bit PowerPC, including an
+  Apple G5 (PowerPC 970) and a POWER5.** Anything gated on a feature flag must
+  keep a base-ISA fallback.
+- **ppc64le** assumes POWER8 + VSX, because the architecture has no earlier
+  member (the LE cross gcc agrees: `.machine power8`, where the BE one defaults
+  to `.machine power4`).
+- Vector support and ISA level are INDEPENDENT on BE: a 970 has AltiVec at
+  POWER4 level, while a POWER5 is NEWER and has none. Never infer one from the
+  other; the golden pins that case.
+
+**The Apple G5 (PowerPC 970) is a REAL, SUPPORTED target: Debian ppc64 runs on
+G5 hardware today**, and the BE backend is measured clean for it (the `-mppc64`
+result above). Detection identifies it correctly as `ppc970`
+(`altivec=1 vsx=0`), which is also the case that proves AltiVec and ISA level
+are independent axes.
+
+WARNING, a dead end recorded so nobody repeats it: **qemu-user's `970` and
+`power5+` CPU models are NOT a valid vehicle for this.** Under them even a
+static pthread hello-world containing none of our code segfaults, while the same
+binary works from `power7` up, and our non-allocating self-tests (and the CPU
+detection itself) still pass at `970`. That is an emulation artifact, not a
+statement about G5 hardware: it contradicts the real machine, and the real
+machine wins. Test G5 support on a G5, or on qemu-system, not with
+`QEMU_CPU=970` under qemu-user.
+
 ## Adding an OS (windows, osx, aix, ...)
 
 Create `vm/os/<os>/` implementing every function in `vm/os/Os.h`, one file per

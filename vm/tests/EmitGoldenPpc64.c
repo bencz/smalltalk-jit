@@ -18,6 +18,7 @@
 // and the ppc64 encoders directly.
 #include "vm/tests/SelfTests.h"
 #include "vm/jit/ppc64/Abi.h"
+#include "vm/jit/ppc64/Cpu.h"
 #include "vm/jit/ppc64/abi/elfv1/FiberElfV1.h"
 #include <stdio.h>
 #include <string.h>
@@ -359,11 +360,77 @@ static int checkAbiInvariants(const Ppc64Abi *abi)
 	return errors;
 }
 
+// The CPU-model decode (jit/TargetCpu.h, jit/ppc64/Cpu.h) is a pure function of
+// the kernel's hwcap words, so it is checkable HERE, natively, with fabricated
+// inputs. That matters because "read the wrong bit" is invisible end-to-end: a
+// wrong feature flag silently loses an optimization or, worse, wrongly enables
+// an instruction the CPU does not have. The raw values collide across the two
+// hwcap words, which is exactly how such a mistake gets made.
+static int checkCpuDecode(void)
+{
+	Ppc64Cpu cpu;
+	int errors = 0;
+
+#define CPU_CHECK(cond, what) \
+	if (!(cond)) { printf("CPU DECODE: %s\n", what); errors++; }
+
+	// An Apple G5 (PowerPC 970): AltiVec at POWER4 level. The case that proves
+	// vector support and ISA level are INDEPENDENT axes.
+	ppc64CpuByName(&cpu, "ppc970");
+	CPU_CHECK(cpu.hasAltivec, "ppc970 must have AltiVec");
+	CPU_CHECK(!cpu.hasVsx, "ppc970 must NOT have VSX");
+	CPU_CHECK(!cpu.isPower6 && !cpu.isPower7, "ppc970 is POWER4-class, not POWER6/7");
+	CPU_CHECK(strcmp(cpu.name, "ppc970") == 0, "ppc970 misnamed");
+
+	// A POWER5 is NEWER than the G5 and has NO AltiVec. Inferring one from the
+	// other is the trap.
+	ppc64CpuByName(&cpu, "power5");
+	CPU_CHECK(!cpu.hasAltivec, "power5 must NOT have AltiVec");
+	CPU_CHECK(!cpu.isPower6, "power5 is not POWER6");
+
+	ppc64CpuByName(&cpu, "power6");
+	CPU_CHECK(cpu.hasAltivec, "power6 has AltiVec again");
+	CPU_CHECK(cpu.isPower6 && !cpu.isPower7, "power6 level wrong");
+	CPU_CHECK(!cpu.hasVsx, "power6 predates VSX");
+
+	ppc64CpuByName(&cpu, "power7");
+	CPU_CHECK(cpu.hasVsx && cpu.isPower7 && !cpu.isPower8, "power7 level wrong");
+
+	ppc64CpuByName(&cpu, "power8");
+	CPU_CHECK(cpu.isPower8 && !cpu.isPower9, "power8 level wrong");
+
+	// Levels must be CUMULATIVE downward: an emit site asking "isPower7?" on a
+	// POWER10 must say yes even if a stingy reporter (qemu-user is measurably
+	// one) never set the lower bits.
+	ppc64CpuByName(&cpu, "power10");
+	CPU_CHECK(cpu.isPower10 && cpu.isPower9 && cpu.isPower8 && cpu.isPower7 && cpu.isPower6,
+		"power10 must imply every lower level");
+
+	// The floor: nothing reported means nothing claimed. This is what keeps a
+	// failed detection from emitting an illegal instruction.
+	ppc64CpuDecode(&cpu, 0, 0);
+	CPU_CHECK(!cpu.isPower6 && !cpu.isPower7 && !cpu.isPower8 && !cpu.isPower9
+		&& !cpu.isPower10 && !cpu.hasAltivec && !cpu.hasVsx,
+		"an empty hwcap must claim NOTHING");
+
+	// Every advertised name must decode, and to itself.
+	for (const char *const *n = Ppc64CpuNames; *n != NULL; n++) {
+		if (!ppc64CpuByName(&cpu, *n)) {
+			printf("CPU DECODE: advertised name '%s' does not decode\n", *n);
+			errors++;
+		}
+	}
+	CPU_CHECK(!ppc64CpuByName(&cpu, "power42"), "an unknown name must be rejected");
+#undef CPU_CHECK
+	return errors;
+}
+
 int ppc64EmitGoldenSelfTest(const char *mode)
 {
 	int failures = checkAbiInvariants(&AbiPpc64ElfV1);
 	failures += checkLi64Patch();
 	failures += checkFiberPrimeLayout();
+	failures += checkCpuDecode();
 	_Bool print = mode != NULL && strcmp(mode, "print") == 0;
 
 	for (size_t i = 0; i < sizeof(Cases) / sizeof(Cases[0]); i++) {

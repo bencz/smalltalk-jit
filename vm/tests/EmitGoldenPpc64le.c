@@ -24,6 +24,7 @@
 // them FAIL()-stubbed. See vm/jit/ppc64le/DESIGN.md.
 #include "vm/tests/SelfTests.h"
 #include "vm/jit/ppc64le/Abi.h"
+#include "vm/jit/ppc64le/Cpu.h"
 #include "vm/jit/ppc64le/abi/elfv2/FiberElfV2.h"
 #include <stdio.h>
 #include <string.h>
@@ -391,11 +392,61 @@ static int checkAbiInvariants(const Ppc64leAbi *abi)
 	return errors;
 }
 
+// The CPU-model decode (jit/TargetCpu.h, jit/ppc64le/Cpu.h) is a pure function
+// of the kernel's hwcap words, so it is checkable HERE, natively, with
+// fabricated inputs: "read the wrong bit" is invisible end-to-end, since a wrong
+// feature flag silently loses an optimization or wrongly enables an instruction
+// the CPU does not have.
+//
+// Deliberately shorter than the BE backend's: ppc64le has no pre-POWER8 member,
+// so there is no AltiVec-without-VSX or POWER5-without-AltiVec case to guard.
+static int checkCpuDecode(void)
+{
+	Ppc64leCpu cpu;
+	int errors = 0;
+
+#define CPU_CHECK(cond, what) \
+	if (!(cond)) { printf("CPU DECODE: %s\n", what); errors++; }
+
+	ppc64leCpuByName(&cpu, "power8");
+	CPU_CHECK(cpu.hasVsx && cpu.hasAltivec, "the ppc64le floor includes VSX and AltiVec");
+	CPU_CHECK(!cpu.isPower9 && !cpu.isPower10, "power8 level wrong");
+	CPU_CHECK(strcmp(cpu.name, "power8") == 0, "power8 misnamed");
+
+	ppc64leCpuByName(&cpu, "power9");
+	CPU_CHECK(cpu.isPower9 && !cpu.isPower10, "power9 level wrong");
+
+	// Levels must be CUMULATIVE downward, whatever a stingy reporter says.
+	ppc64leCpuByName(&cpu, "power10");
+	CPU_CHECK(cpu.isPower10 && cpu.isPower9, "power10 must imply power9");
+
+	// An under-reporting host must claim NOTHING rather than inherit the floor:
+	// the global starts at the baseline, but a decode is only ever what it read.
+	ppc64leCpuDecode(&cpu, 0, 0);
+	CPU_CHECK(!cpu.isPower9 && !cpu.isPower10 && !cpu.hasVsx && !cpu.hasAltivec,
+		"an empty hwcap must claim NOTHING");
+
+	// The default global, by contrast, IS the architecture's floor.
+	CPU_CHECK(gPpc64leCpu.hasVsx && gPpc64leCpu.hasAltivec,
+		"the ppc64le baseline global must assume POWER8");
+
+	for (const char *const *n = Ppc64leCpuNames; *n != NULL; n++) {
+		if (!ppc64leCpuByName(&cpu, *n)) {
+			printf("CPU DECODE: advertised name '%s' does not decode\n", *n);
+			errors++;
+		}
+	}
+	CPU_CHECK(!ppc64leCpuByName(&cpu, "power42"), "an unknown name must be rejected");
+#undef CPU_CHECK
+	return errors;
+}
+
 int ppc64leEmitGoldenSelfTest(const char *mode)
 {
 	int failures = checkAbiInvariants(&AbiPpc64leElfV2);
 	failures += checkLi64Patch();
 	failures += checkFiberPrimeLayout();
+	failures += checkCpuDecode();
 	_Bool print = mode != NULL && strcmp(mode, "print") == 0;
 
 	for (size_t i = 0; i < sizeof(Cases) / sizeof(Cases[0]); i++) {
