@@ -7,8 +7,19 @@
 #endif
 
 #include "vm/tests/SelfTests.h"
+#include <stdio.h>
 
 int abiEmitGoldenSelfTest(const char *mode)
 {
 	return ppc64EmitGoldenSelfTest(mode);
+}
+
+// SelfTests.c references all three golden entry points unconditionally, so
+// every build defines all three. The ppc64le golden TU is not linked here (a
+// separate backend, and its encoders are little-endian).
+int ppc64leEmitGoldenSelfTest(const char *mode)
+{
+	(void) mode;
+	printf("the ppc64le (little-endian) golden TU is not linked into a ppc64 build\n");
+	return 1;
 }

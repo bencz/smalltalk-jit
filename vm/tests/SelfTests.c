@@ -1106,6 +1106,14 @@ int selfTestFromEnv(char *snapshotFileName, char *bootstrapDir,
 		return ppc64EmitGoldenSelfTest(getenv("ST_PPC64_EMIT_TEST"));
 	}
 
+	// ppc64le (little-endian, ELFv2) emission golden test, host-independent for
+	// the same reason in the other byte order (explicitly little-endian words).
+	// A SEPARATE backend from ppc64, hence its own variable and vectors:
+	// ST_PPC64LE_EMIT_TEST=1 ./st (=print regenerates the expected vectors)
+	if (getenv("ST_PPC64LE_EMIT_TEST") != NULL) {
+		return ppc64leEmitGoldenSelfTest(getenv("ST_PPC64LE_EMIT_TEST"));
+	}
+
 	// Multicore safepoint handshake self-test (C-level): ST_SAFEPOINT_TEST=1 ./st
 	if (getenv("ST_SAFEPOINT_TEST") != NULL) {
 		return safepointSelfTest();

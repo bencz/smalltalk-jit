@@ -17,6 +17,10 @@
 // Encoder operand order mirrors the ASSEMBLY MNEMONIC (destination first):
 // asmAddi(b, rt, ra, si) == addi rt, ra, si; loads/stores read like
 // ld rt, disp(ra) == asmLd(b, rt, disp, ra).
+#ifdef ASSEMBLER_PPC64LE_H
+#error "AssemblerPpc64.h (BE) and AssemblerPpc64le.h (LE) are SEPARATE backends: each fixes the instruction word's byte order for the whole translation unit, so no TU may include both."
+#endif
+
 #include "jit/Assembler.h"
 #include "jit/ppc64/TraitsPpc64.h"
 #include "core/Assert.h"

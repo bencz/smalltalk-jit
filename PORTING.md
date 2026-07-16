@@ -73,8 +73,8 @@ big-endian). This is the third link-time axis, subordinate to the arch:
 |---|---|---|
 | x64 | linux, osx | sysv |
 | x64 | windows | win64 (reserved) |
-| ppc64le | linux | elfv2 (skeleton) |
-| ppc64 | aix / linux BE | elfv1 (skeleton) |
+| ppc64le | linux | elfv2 |
+| ppc64 | aix / linux BE | elfv1 |
 
 The binding is an **ops-struct (vtable)** — `X64Abi` in `vm/jit/x64/Abi.h`:
 data tables (arg registers, callee-saved map, caller-saved spill order, shadow
@@ -178,11 +178,21 @@ the suite's samples all pass under qemu-user, and `./build.sh` (cmake + full
 native compile + the whole test suite) runs green inside a native ppc64 BE
 debian-ports rootfs (`mmdebstrap --mode=chrootless` + `podman import`; the
 host's binfmt qemu makes the container transparently executable).
-`vm/jit/ppc64le/` remains a compiling, linking SKELETON (deliberately
-deferred); it inherits every shared-code fix listed in DESIGN.md. They are
-SEPARATE backends by design — the ecosystem treats them as distinct
-architectures and the codegen diverges beyond the ABI; shared POWER encoding
-helpers can be factored into a common header once the LE encoders land. The
+**The ppc64le (LE/ELFv2) port is COMPLETE too**: `./build.sh` runs green
+(`ALL PASSED`) inside the OFFICIAL `docker.io/library/debian --platform
+linux/ppc64le` container, which needs no hand-built rootfs at all, and under
+qemu-user the bootstrap produces a byte-count-identical image with `tests/`
+40/40 and all samples passing. Its deltas from this backend, and the ELFv2
+facts DERIVED FROM THE TOOLCHAIN rather than from the spec (with the BE cross
+as the control that validates the method), are in `vm/jit/ppc64le/DESIGN.md`.
+Read it before assuming anything about ELFv2.
+
+They are SEPARATE backends by design: the ecosystem treats them as distinct
+architectures and the codegen diverges beyond the ABI. `vm/jit/ppc64le/` is a
+deliberate COPY, not a refactor, and the two assemblers now `#error` if a
+translation unit tries to include both (each fixes the instruction word's byte
+order file-wide). Only SIX of the assembler's 101 functions actually differ;
+the other 95 pack bit-fields into a `uint32_t` and are byte-order-neutral. The
 endianness/portability hazards found by the deep audit are FIXED in generic
 code: snapshot format v2 is self-describing (magic/version/byte-order header,
 struct-layout-independent shape encoding, loud refusal of foreign images),
@@ -237,9 +247,19 @@ What exists (rung 1):
 
 ### Bring-up ladder (in order)
 
-1. **Golden emission, natively on x86 — DONE for BE** (see above; the LE
-   port repeats the recipe with its own explicitly-little-endian emitters
-   and vectors).
+0. **Derive the ABI facts from the TOOLCHAIN, not from the spec** (the step
+   that made the LE port land clean). Compile a probe `-O2 -S` with the target
+   cross gcc and read what it actually emits for the shapes you must
+   reproduce: how a 16-byte aggregate comes back, what frame an 8-argument
+   indirect call builds, where the TOC is saved, what the global entry does.
+   Then run the SAME probe through a cross whose ABI you already know (here:
+   ELFv1) and check it reproduces the facts you already trust. That control is
+   what makes the new answers evidence rather than recollection. Everything the
+   LE port assumed up front about "endianness deltas" in the codegen turned out
+   to be wrong; everything it derived from gcc was right.
+1. **Golden emission, natively on x86: DONE for BE and LE** (see above; each
+   port has its own explicitly-byte-ordered emitters, vectors and env var, and
+   `scripts/ppc64/golden-oracle.sh <be|le>` validates both against binutils).
 2. **Non-JIT tests under qemu-user** — `./scripts/ppc64/cross-test.sh be|le`
    (VALIDATED on both byte orders): cross-compiles STATIC test binaries at
    native speed inside an x86_64 debian container (debian's
@@ -247,17 +267,25 @@ What exists (rung 1):
    libc, unlike Fedora's kernel-only cross packages), then runs them directly
    on the host through binfmt/`qemu-user-static`. Covers TokenizerTest,
    ST_SAFEPOINT_TEST, ST_TLAB_TEST, ST_SNAPSHOT_FORMAT_TEST (the big-endian
-   fire test for the image format) and, on `be`, ST_ABI_EMIT_TEST — the same
-   pinned golden vectors re-checked on a genuinely big-endian target. Host
-   prerequisite (once): `sudo dnf install -y qemu-user-static-ppc`. Gotchas
+   fire test for the image format) and ST_ABI_EMIT_TEST, each backend's own
+   pinned golden vectors, re-checked on a genuinely big/little-endian target.
+   Host prerequisite (once): `sudo dnf install -y qemu-user-static-ppc`. Gotchas
    learned: pin `--platform` on every podman run (a cached foreign-arch image
    can hijack a tag) and mount shared volumes with `:z`, not `:Z` (concurrent
    containers relabel each other's access away).
-3. **Full JIT under qemu-system** — once codegen is real, boot a Debian
-   ports (BE) / Debian (LE) VM in `qemu-system-ppc64` for faithful signals,
-   RWX mappings and SMP behavior; only then trust the concurrency battery.
-   The fiber SWITCH asm assembles, links and disassembles correctly today,
-   but only executes at this rung.
+3. **Full build + suite on a native rootfs: DONE for both.** BE needs a
+   hand-built Debian ports rootfs (`mmdebstrap --mode=chrootless` +
+   `podman import`); LE just uses the OFFICIAL image
+   (`--platform linux/ppc64le docker.io/library/debian`), which is why LE is by
+   far the cheaper POWER target to keep green. The host's binfmt qemu makes
+   either container transparently executable, and `./build.sh` runs cmake, a
+   native compile, the bootstrap and the whole suite inside it.
+4. **Faithful signals/SMP under qemu-system**: still PENDING for both. qemu-user
+   is a syscall emulator: it delivers `si_addr = NULL` on guard faults (hence
+   `ST_FIBER_PRECOMMIT=1`) and does not model SMP memory ordering, so the
+   concurrency battery on real POWER hardware is not yet trustworthy. That, plus
+   the `PORT_ME(memory-model)` audit, is what stands between these ports and a
+   multi-worker deployment.
 
 ### ELFv1 (BE) facts the backend must implement
 
@@ -270,9 +298,11 @@ What exists (rung 1):
 - **PrimitiveResult sret** — PORT_ME(elfv1-sret): ELFv1 returns ALL structs
   (including the 16-byte PrimitiveResult) through a HIDDEN pointer in r3,
   shifting every argument right by one — the same class of silent break as
-  Win64 item 1. Owns `emitCCallPrimArgs`/`emitPrimResultCheck`, FAIL()-stubbed
-  until the ppc64 generateCCall frame design decides where the sret buffer
-  lives.
+  Win64 item 1. This is why ppc64's `generateCCallPrimitive` is a FUSED
+  CCall+marshal+decode sequence (the sret buffer lives inside the ABI frame and
+  must be read back BEFORE teardown) while ppc64le uses the plain x64
+  structure, the single biggest structural divergence between the two POWER
+  backends, and the reason they are separate files.
 - **TOC (r2)**: reserved; save/restore across cross-module calls per ABI
   (`emitCallCFunction` uses the 40(r1) slot).
 - **No push/pop**: frames are `stdu r1, -N(r1)` with a back-chain word; the

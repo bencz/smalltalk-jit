@@ -427,9 +427,14 @@ void generateHashPrimitive(CodeGenerator *generator)
 {
 	AssemblerBuffer *buffer = &generator->buffer;
 	movArg(buffer, 0, R4);
-	// hash is the u32 at byte offset 8; a 32-bit load at offsetof is
-	// endian-correct by construction (x64 masked a 64-bit load instead)
-	asmLwz(buffer, R3, sizeof(Value) - 1 + 1, R4);   // EA = (r4+1)+7 = obj+8
+	// hash is the u32 at byte offset 8 and is NOT endian-mirrored (only
+	// CompiledCodeHeader is), so a 32-bit load at its offset is endian-correct
+	// by construction (x64 masks a 64-bit load instead). r4 holds the TAGGED
+	// receiver, hence varOffset: EA = (obj+1) + 7 = obj+8, bytes 8-11.
+	// (This read used to be one byte high, at obj+9, which stayed invisible
+	// because a wrong-but-deterministic hash still behaves like a hash: it just
+	// dropped the top 8 bits of entropy and disagreed with C's obj->hash.)
+	asmLwz(buffer, R3, varOffset(RawObject, hash), R4);
 	asmSldi(buffer, R3, R3, 2);
 	asmBlr(buffer);
 }

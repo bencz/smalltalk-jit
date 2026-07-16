@@ -20,4 +20,13 @@ int abiEmitGoldenSelfTest(const char *mode);
 // get a stub (separate backend).
 int ppc64EmitGoldenSelfTest(const char *mode);
 
+// The ppc64le (little-endian, ELFv2) golden, same deal in the other byte
+// order: a SEPARATE backend with its own encoders and vectors, so it needs its
+// own entry point rather than sharing the BE one. On ppc64le builds
+// EmitGoldenPpc64leBind.c aliases abiEmitGoldenSelfTest to it; other arches
+// get a stub. Since this header's three entry points are referenced
+// unconditionally by SelfTests.c, EVERY build must define all three: see the
+// Bind TUs.
+int ppc64leEmitGoldenSelfTest(const char *mode);
+
 #endif

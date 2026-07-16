@@ -32,8 +32,10 @@ case "$TARGET_ARCH" in
 		;;
 	ppc64le)
 		ARCH_DIR="ppc64le"
-		ABI_SRCS="$ROOT/vm/jit/ppc64le/abi/elfv2/AbiElfV2Bind.c"
-		TEST_SRCS="$ROOT/vm/tests/EmitGoldenPpc64le.c"
+		ABI_SRCS="$ROOT/vm/jit/ppc64le/abi/elfv2/AbiElfV2.c
+			$ROOT/vm/jit/ppc64le/abi/elfv2/AbiElfV2Bind.c
+			$ROOT/vm/jit/ppc64le/abi/elfv2/FiberElfV2.c"
+		TEST_SRCS="$ROOT/vm/tests/EmitGoldenPpc64le.c $ROOT/vm/tests/EmitGoldenPpc64leBind.c"
 		CITYHASH_FLAGS=""
 		;;
 	*) echo "build-nocmake.sh targets ppc64/ppc64le (got $TARGET_ARCH)"; exit 1 ;;

@@ -1,37 +1,54 @@
-// ppc64le ELFv2 ABI binding SKELETON. When the real port begins this file
-// mirrors vm/jit/x64/abi/sysv/AbiSysVBind.c: it will define gPpc64Abi (a
-// Ppc64Abi ops-struct mirroring X64Abi) plus the real fiber pair. Until then
-// the generic contract names are FAIL() stubs so the tree links and every
-// non-JIT test runs; the first fiber spawn dies loudly here.
-//
-// ELFv1 (big-endian/AIX heritage) specifics to implement here: function
-// descriptors (.opd: {entry, TOC, environ}) — calling a C function pointer
-// means loading the entry AND r2 from the descriptor; TOC save/restore around
-// cross-module calls. ELFv2 (little-endian) uses local/global entry points
-// (localentry) instead. See PORTING.md.
+// Binds the GENERIC ABI names to the ELFv2 instance. This is the only file
+// that may define gPpc64leAbi, asmLoadTls and the jit/TargetFiber.h symbols:
+// CMake's ST_ABI links exactly one Abi<Abi>Bind.c into a REAL ppc64le build.
+// Foreign-host golden builds link the instance (AbiElfV2.c) WITHOUT this TU:
+// there the generic names belong to the host backend's own binding.
 #if !defined(__powerpc64__) || __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
-#error "vm/jit/ppc64le/ is LITTLE-ENDIAN ppc64 only (big-endian ppc64 has its own backend) - check ST_ARCH in CMakeLists.txt"
+#error "vm/jit/ppc64le/ is LITTLE-ENDIAN ppc64le only (big-endian ppc64 has its own backend) - check ST_ARCH in CMakeLists.txt"
 #endif
 
+#include "jit/ppc64le/Abi.h"
+#include "jit/ppc64le/abi/elfv2/FiberElfV2.h"
 #include "jit/TargetFiber.h"
-#include "jit/ppc64le/AssemblerPpc64le.h"
-#include "core/Assert.h"
+#include "jit/TargetEntry.h"
+#include "core/CompiledCode.h"
 
+const Ppc64leAbi *const gPpc64leAbi = &AbiPpc64leElfV2;
+
+// C -> JIT entry (jit/TargetEntry.h). ELFv2 has NO function descriptors, so
+// the stub's raw code address IS a callable C function pointer: this is the
+// plain x64-shaped cast (vm/jit/x64/Abi.c), with none of the ELFv1 sibling's
+// volatile-plus-asm-barrier dance, which existed only to stop GCC dead-storing
+// the descriptor it had to synthesize on the stack.
+//
+// The compiler frames this as an ELFv2 indirect call: it puts the target in
+// r12 and saves/restores its own r2 around the bctrl. JIT code is therefore
+// free to clobber r2, since it never uses it and C callees establish their own
+// TOC from r12 inside emitCallCFunction.
+Value targetCallSmalltalkEntry(void *entryStubInsts, void *arg0, void *arg1,
+	Value *args, struct Thread *thread)
+{
+	union PointerConverter converter;
+	converter.object_pointer = entryStubInsts;
+	return converter.function_pointer((Value) arg0, (Value) arg1, args, thread);
+}
+
+// TLS load delegate: same seam as x64 (emit-time only, no cost in generated
+// code, since the vtable is dereferenced while EMITTING, not while running).
+void asmLoadTls(AssemblerBuffer *buffer, Register dst, ptrdiff_t tpoff)
+{
+	gPpc64leAbi->emitLoadTls(buffer, dst, tpoff);
+}
+
+// The jit/TargetFiber.h contract names, statically bound to the ELFv2 pair:
+// at -O2 these compile to direct tail-calls, so there is no vtable dereference
+// on the context-switch path.
 void fiberSwitchAsm(void **saveSp, void *newSp)
 {
-	(void) saveSp; (void) newSp;
-	FAIL(); // PORT_ME: ppc64 elfv2 fiber switch (no push/pop - stdu/ld frames)
+	fiberSwitchElfV2(saveSp, newSp);
 }
 
 void *fiberTargetPrimeStack(void *top, void (*entry)(void))
 {
-	(void) top; (void) entry;
-	FAIL();
-	return NULL;
-}
-
-void asmLoadTls(AssemblerBuffer *buffer, Register dst, ptrdiff_t tpoff)
-{
-	(void) buffer; (void) dst; (void) tpoff;
-	FAIL(); // PORT_ME(tls): r13-relative load with the 0x7000 bias
+	return fiberPrimeStackElfV2(top, entry);
 }
