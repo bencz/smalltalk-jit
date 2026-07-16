@@ -10,8 +10,8 @@
 //                             kernel's hwcap words: host-independent, so the
 //                             x86 dev host links it and the golden checks the
 //                             decode against pinned fake hwcaps
-//   CpuDetectPpc64.c          the actual getauxval() call: ppc64-only, a thin
-//                             shim over the decode
+//   CpuDetectPpc64.c          the arch-only binding: a thin shim from the OS
+//                             feature-word provider to the pure decode
 // The bug class this split exists to catch is "read the wrong bit", which no
 // end-to-end test can see (a wrong feature flag just silently loses or, worse,
 // wrongly enables an instruction).
@@ -70,10 +70,10 @@ typedef struct {
 	_Bool hasVsx;          // POWER7+; also gates the v20-v31 fiber-switch decision
 
 	// DERIVED capabilities, so an emit site reads the FEATURE it needs rather
-	// than an ISA level. POWER has no per-instruction feature bits (unlike
-	// x86's CPUID): the kernel advertises ISA levels in hwcap2, and the level
-	// bit IS the feature bit for everything that level introduced.
-	_Bool hasGprVsrMoves;  // mtvsrd/mfvsrd (ISA 2.07 = ARCH_2_07 hwcap2 bit)
+	// than reconstructing the architectural and OS requirements itself. POWER
+	// has no per-instruction CPUID-style bits: the ISA level says the instruction
+	// exists, while facility bits say the OS makes the relevant state available.
+	_Bool hasGprVsrMoves;  // mtvsrd/mfvsrd: ISA 2.07 plus VSX availability
 
 	uint64_t hwcap;        // raw, for ST_CPU_INFO and post-mortems
 	uint64_t hwcap2;

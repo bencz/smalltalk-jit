@@ -1,0 +1,22 @@
+Estamos na Fase 4 do smalltalk-jit (otimizações do FloatBench guiadas por CPU features). Tudo até aqui está COMMITADO e com gates verdes; antes de qualquer edição, leia as memórias
+  whiletrue-inlining-gc-bug-hunt e smallfloat64-fase1 (a seção "Pendencias da Fase 4" da primeira é o backlog exato).
+
+  Estado atual: FloatBench 33ms (era 65ms), Richards 8-9ms; whileTrue:/whileFalse: inlinados no compilador; 5 bugs latentes de GC corrigidos (atenção especial à lição: nunca capturar RawObject* cru antes de
+  pushOperand no codegen, usar índice + releitura via literal frame); intrinsic float PPC canônico nos dois backends com o campo de capacidade hasGprVsrMoves; o gate PPC roda os testes .st sob QEMU_CPU
+  power7/power9 (BE) e power8/power9 (LE).
+
+  O que falta, em ordem:
+
+  1. Especialização de argumento literal float no generateSend x64: quando o arg é literal float imediato (OPERAND_VALUE com tag 0b11), pular o intInline (nunca pode acertar) e, no generateFloatFastPath, pular
+  guard e decode do arg materializando a constante direto (movabs dos bits IEEE + movq para XMM1). Cobre 5 dos 6 sends do kernel do FloatBench. Cuidados: AssemblerLabel aceita UMA referência forward; misses só
+  podem clobberar RAX/RSI/RDI; medir antes e depois.
+  2. Variantes BMI2 (rorx, e avaliar shlx) gated por gX64Cpu->hasBmi2 no decode/encode do SmallFloat64 do intrinsic x64, mais remover o mov redundante scratch==reg no decode. Testar a variante forçando ST_CPU
+  (x64CpuByName aceita nomes como x86-64-v3). Goldens para AMBAS as variantes no ST_ABI_EMIT_TEST (regenerar com =print; se algum campo de struct Thread mudar, o vetor do storeCheck muda legitimamente).
+  3. Medir cada item com benchmarks/FloatBench.st e perf stat; manter só o que mover ponteiro (honestidade: FMA não se aplica à granularidade de send). Richards/DeltaBlue devem ficar em delta zero.
+  4. Validação por passo: ./build.sh (já inclui benchmarks), sweep ST_JIT_REGS 3..9, ./scripts/ppc64/emu-test.sh be e le; ao final, self-tests de concorrência SANDBOXADOS (systemd-run --user --scope -p
+  AllowedCPUs=0-3), nunca soltos.
+
+  Regras duras: nada de emoji nem travessão em código, docs, commits e respostas; tabela Primitives[] só recebe append; commits são meus, me avise quando estiver commit-ready. ( o ultimo prompt havia pedido
+  para eu fazer um teste no ppc64 ... ao rodar o ./build.sh no debian-ppc64, bootstrapping image...
+  ./run_tests.sh: line 65:   980 Aborted                 "$BUILD/st" -s "$SNAP" -b smalltalk < /dev/null > /dev/null 2>&1
+   estamos recebendo esse abort ), no ppc64le funcionou corretamente

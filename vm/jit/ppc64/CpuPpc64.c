@@ -2,8 +2,8 @@
 // plus the process-wide feature struct. HOST-INDEPENDENT by design (no
 // syscalls, no getauxval, no POWER intrinsics), so the x86 dev host links this
 // TU into its own `st` and the golden checks the bit decode against fabricated
-// hwcaps: see vm/tests/EmitGoldenPpc64.c. The one arch-only piece, the
-// getauxval() call, lives in CpuDetectPpc64.c.
+// hwcaps: see vm/tests/EmitGoldenPpc64.c. The arch-only binding lives in
+// CpuDetectPpc64.c; acquisition of the words lives behind osCpuFeatureWords().
 //
 // Contract and rationale: jit/TargetCpu.h. Nothing here is consulted by the
 // code generator YET; this is the axis, not an optimization.
@@ -18,35 +18,65 @@ Ppc64Cpu gPpc64Cpu = {
 	.name = PPC64_CPU_BASELINE_NAME,
 };
 
+// Private representation of the highest reported ISA level. Keeping the
+// ordering in one place makes the public cumulative booleans mechanical and
+// prevents a newly added level from accidentally skipping an older one.
+typedef enum {
+	PPC64_ISA_BASELINE = 0,
+	PPC64_ISA_2_05,
+	PPC64_ISA_2_06,
+	PPC64_ISA_2_07,
+	PPC64_ISA_3_00,
+	PPC64_ISA_3_1,
+} Ppc64IsaLevel;
+
+static Ppc64IsaLevel highestIsaLevel(uint64_t hwcap, uint64_t hwcap2)
+{
+	if ((hwcap2 & PPC64_FEATURE2_ARCH_3_1) != 0)
+		return PPC64_ISA_3_1;
+	if ((hwcap2 & PPC64_FEATURE2_ARCH_3_00) != 0)
+		return PPC64_ISA_3_00;
+	if ((hwcap2 & PPC64_FEATURE2_ARCH_2_07) != 0)
+		return PPC64_ISA_2_07;
+	if ((hwcap & PPC64_FEATURE_ARCH_2_06) != 0)
+		return PPC64_ISA_2_06;
+	if ((hwcap & PPC64_FEATURE_ARCH_2_05) != 0)
+		return PPC64_ISA_2_05;
+	return PPC64_ISA_BASELINE;
+}
+
 void ppc64CpuDecode(Ppc64Cpu *cpu, uint64_t hwcap, uint64_t hwcap2)
 {
+	const Ppc64IsaLevel isa = highestIsaLevel(hwcap, hwcap2);
+
 	memset(cpu, 0, sizeof(*cpu));
 	cpu->hwcap = hwcap;
 	cpu->hwcap2 = hwcap2;
 
 	// Vector support is INDEPENDENT of the ISA level: a PowerPC 970 (G5) has
-	// AltiVec at POWER4 level, and a POWER5 is newer with none at all.
+	// AltiVec at POWER4 level, and a POWER5 is newer with none at all. These bits
+	// also describe whether the OS makes the corresponding register state usable.
 	cpu->hasAltivec = (hwcap & PPC64_FEATURE_HAS_ALTIVEC) != 0;
 	cpu->hasVsx = (hwcap & PPC64_FEATURE_HAS_VSX) != 0;
 
-	// Levels are made CUMULATIVE here rather than trusting the reporter to set
-	// every lower bit. Real kernels do, but qemu-user does NOT: emulating a 970
-	// it reports neither PPC_FEATURE_POWER4 nor ARCH_2_05, only 64|ALTIVEC|FPU
-	// (measured). An emit site asking "isPower7?" must never depend on the
-	// reporter's generosity.
-	cpu->isPower10 = (hwcap2 & PPC64_FEATURE2_ARCH_3_1) != 0;
-	cpu->isPower9 = cpu->isPower10 || (hwcap2 & PPC64_FEATURE2_ARCH_3_00) != 0;
-	cpu->isPower8 = cpu->isPower9 || (hwcap2 & PPC64_FEATURE2_ARCH_2_07) != 0;
-	cpu->isPower7 = cpu->isPower8 || (hwcap & PPC64_FEATURE_ARCH_2_06) != 0;
-	cpu->isPower6 = cpu->isPower7 || (hwcap & PPC64_FEATURE_ARCH_2_05) != 0;
+	// The public levels are cumulative even when a reporter supplies only its
+	// highest architectural bit. This is deliberate for kernels, hypervisors and
+	// qemu-user variants that omit lower-generation marker bits.
+	cpu->isPower6 = isa >= PPC64_ISA_2_05;
+	cpu->isPower7 = isa >= PPC64_ISA_2_06;
+	cpu->isPower8 = isa >= PPC64_ISA_2_07;
+	cpu->isPower9 = isa >= PPC64_ISA_3_00;
+	cpu->isPower10 = isa >= PPC64_ISA_3_1;
 
-	// Derived capabilities (see Cpu.h): the ISA level bit is the feature bit.
-	cpu->hasGprVsrMoves = cpu->isPower8;
+	// mtvsrd/mfvsrd require both ISA 2.07 and usable VSX state. Named profiles
+	// already contain both, so this only changes contradictory or under-reported
+	// inputs, where conservatively losing the optimization is the safe outcome.
+	cpu->hasGprVsrMoves = cpu->isPower8 && cpu->hasVsx;
 
 	// Best-effort model name, for humans only: never branch the codegen on it.
-	// AT_PLATFORM would be the authoritative source, but it is NOT available
-	// everywhere (measured: qemu-user returns NULL for it on every CPU model),
-	// so the name is inferred from the same bits the features come from.
+	// AT_PLATFORM is not available through every supported OS/provider and
+	// qemu-user may omit generation marker bits, so retain the historic AltiVec
+	// fallback that identifies the supported G5 floor as ppc970.
 	cpu->name = cpu->isPower10 ? "power10"
 		: cpu->isPower9 ? "power9"
 		: cpu->isPower8 ? "power8"
@@ -54,69 +84,80 @@ void ppc64CpuDecode(Ppc64Cpu *cpu, uint64_t hwcap, uint64_t hwcap2)
 		: cpu->isPower6 ? "power6"
 		: (hwcap & PPC64_FEATURE_POWER5_PLUS) ? "power5+"
 		: (hwcap & PPC64_FEATURE_POWER5) ? "power5"
-		// A 970 (G5) and a POWER4 are the same ISA level; AltiVec is what tells
-		// them apart, and it is the only signal qemu leaves us.
 		: cpu->hasAltivec ? "ppc970"
 		: (hwcap & PPC64_FEATURE_POWER4) ? "power4"
 		: PPC64_CPU_BASELINE_NAME;
 }
 
-// ST_CPU=<name>: synthesize the hwcaps a real chip of that generation reports
-// and run them through the SAME decode, so a forced set can never disagree with
-// a detected one. This is how a POWER10 path gets emitted and inspected from an
-// x86 dev box, and how the G5 floor stays testable without a G5.
+// ST_CPU=<name> uses canonical synthetic profiles and runs them through the
+// SAME decode, so a forced set cannot disagree with a detected one. The bit
+// patterns are intentionally unchanged: existing goldens and forced-codegen
+// inspection keep the same inputs. They are semantic test profiles, not a
+// promise to reproduce every OS's auxv word byte-for-byte.
 //
-// The table is deliberately ordered oldest to newest, and each row is
-// CUMULATIVE over the previous, which is the property the golden asserts.
+// ppc970 and power4 are sibling POWER4-class profiles because AltiVec is
+// independent. From power4 through power10, the generation markers are kept
+// cumulative for the existing golden property.
+#define PPC64_CPU_MODEL_LIST(X) \
+	X(PPC64_CPU_BASELINE_NAME, 0, 0) \
+	X("ppc970", PPC64_FEATURE_64 | PPC64_FEATURE_POWER4 \
+		| PPC64_FEATURE_HAS_ALTIVEC, 0) \
+	X("power4", PPC64_FEATURE_64 | PPC64_FEATURE_POWER4, 0) \
+	X("power5", PPC64_FEATURE_64 | PPC64_FEATURE_POWER4 \
+		| PPC64_FEATURE_POWER5, 0) \
+	X("power5+", PPC64_FEATURE_64 | PPC64_FEATURE_POWER4 \
+		| PPC64_FEATURE_POWER5 | PPC64_FEATURE_POWER5_PLUS, 0) \
+	X("power6", PPC64_FEATURE_64 | PPC64_FEATURE_POWER4 \
+		| PPC64_FEATURE_POWER5 | PPC64_FEATURE_POWER5_PLUS \
+		| PPC64_FEATURE_ARCH_2_05 | PPC64_FEATURE_HAS_DFP \
+		| PPC64_FEATURE_HAS_ALTIVEC, 0) \
+	X("power7", PPC64_FEATURE_64 | PPC64_FEATURE_POWER4 \
+		| PPC64_FEATURE_POWER5 | PPC64_FEATURE_POWER5_PLUS \
+		| PPC64_FEATURE_ARCH_2_05 | PPC64_FEATURE_HAS_DFP \
+		| PPC64_FEATURE_HAS_ALTIVEC | PPC64_FEATURE_ARCH_2_06 \
+		| PPC64_FEATURE_HAS_VSX, 0) \
+	X("power8", PPC64_FEATURE_64 | PPC64_FEATURE_POWER4 \
+		| PPC64_FEATURE_POWER5 | PPC64_FEATURE_POWER5_PLUS \
+		| PPC64_FEATURE_ARCH_2_05 | PPC64_FEATURE_HAS_DFP \
+		| PPC64_FEATURE_HAS_ALTIVEC | PPC64_FEATURE_ARCH_2_06 \
+		| PPC64_FEATURE_HAS_VSX, PPC64_FEATURE2_ARCH_2_07) \
+	X("power9", PPC64_FEATURE_64 | PPC64_FEATURE_POWER4 \
+		| PPC64_FEATURE_POWER5 | PPC64_FEATURE_POWER5_PLUS \
+		| PPC64_FEATURE_ARCH_2_05 | PPC64_FEATURE_HAS_DFP \
+		| PPC64_FEATURE_HAS_ALTIVEC | PPC64_FEATURE_ARCH_2_06 \
+		| PPC64_FEATURE_HAS_VSX, PPC64_FEATURE2_ARCH_2_07 \
+		| PPC64_FEATURE2_ARCH_3_00 | PPC64_FEATURE2_DARN) \
+	X("power10", PPC64_FEATURE_64 | PPC64_FEATURE_POWER4 \
+		| PPC64_FEATURE_POWER5 | PPC64_FEATURE_POWER5_PLUS \
+		| PPC64_FEATURE_ARCH_2_05 | PPC64_FEATURE_HAS_DFP \
+		| PPC64_FEATURE_HAS_ALTIVEC | PPC64_FEATURE_ARCH_2_06 \
+		| PPC64_FEATURE_HAS_VSX, PPC64_FEATURE2_ARCH_2_07 \
+		| PPC64_FEATURE2_ARCH_3_00 | PPC64_FEATURE2_DARN \
+		| PPC64_FEATURE2_ARCH_3_1 | PPC64_FEATURE2_MMA)
+
+#define PPC64_CPU_MODEL_ROW(name_, hwcap_, hwcap2_) { name_, hwcap_, hwcap2_ },
 static const struct {
 	const char *name;
 	uint64_t hwcap;
 	uint64_t hwcap2;
 } Ppc64CpuModels[] = {
-	{ PPC64_CPU_BASELINE_NAME, 0, 0 },
-	// A 970 (Apple G5) is POWER4-class WITH AltiVec.
-	{ "ppc970",  PPC64_FEATURE_64 | PPC64_FEATURE_POWER4 | PPC64_FEATURE_HAS_ALTIVEC, 0 },
-	{ "power4",  PPC64_FEATURE_64 | PPC64_FEATURE_POWER4, 0 },
-	// POWER5 is NEWER than the G5 and has NO AltiVec.
-	{ "power5",  PPC64_FEATURE_64 | PPC64_FEATURE_POWER4 | PPC64_FEATURE_POWER5, 0 },
-	{ "power5+", PPC64_FEATURE_64 | PPC64_FEATURE_POWER4 | PPC64_FEATURE_POWER5
-	             | PPC64_FEATURE_POWER5_PLUS, 0 },
-	// AltiVec is back with POWER6, which also brings decimal FP.
-	{ "power6",  PPC64_FEATURE_64 | PPC64_FEATURE_POWER4 | PPC64_FEATURE_POWER5
-	             | PPC64_FEATURE_POWER5_PLUS | PPC64_FEATURE_ARCH_2_05
-	             | PPC64_FEATURE_HAS_DFP | PPC64_FEATURE_HAS_ALTIVEC, 0 },
-	{ "power7",  PPC64_FEATURE_64 | PPC64_FEATURE_POWER4 | PPC64_FEATURE_POWER5
-	             | PPC64_FEATURE_POWER5_PLUS | PPC64_FEATURE_ARCH_2_05
-	             | PPC64_FEATURE_HAS_DFP | PPC64_FEATURE_HAS_ALTIVEC
-	             | PPC64_FEATURE_ARCH_2_06 | PPC64_FEATURE_HAS_VSX, 0 },
-	{ "power8",  PPC64_FEATURE_64 | PPC64_FEATURE_POWER4 | PPC64_FEATURE_POWER5
-	             | PPC64_FEATURE_POWER5_PLUS | PPC64_FEATURE_ARCH_2_05
-	             | PPC64_FEATURE_HAS_DFP | PPC64_FEATURE_HAS_ALTIVEC
-	             | PPC64_FEATURE_ARCH_2_06 | PPC64_FEATURE_HAS_VSX,
-	             PPC64_FEATURE2_ARCH_2_07 },
-	{ "power9",  PPC64_FEATURE_64 | PPC64_FEATURE_POWER4 | PPC64_FEATURE_POWER5
-	             | PPC64_FEATURE_POWER5_PLUS | PPC64_FEATURE_ARCH_2_05
-	             | PPC64_FEATURE_HAS_DFP | PPC64_FEATURE_HAS_ALTIVEC
-	             | PPC64_FEATURE_ARCH_2_06 | PPC64_FEATURE_HAS_VSX,
-	             PPC64_FEATURE2_ARCH_2_07 | PPC64_FEATURE2_ARCH_3_00
-	             | PPC64_FEATURE2_DARN },
-	{ "power10", PPC64_FEATURE_64 | PPC64_FEATURE_POWER4 | PPC64_FEATURE_POWER5
-	             | PPC64_FEATURE_POWER5_PLUS | PPC64_FEATURE_ARCH_2_05
-	             | PPC64_FEATURE_HAS_DFP | PPC64_FEATURE_HAS_ALTIVEC
-	             | PPC64_FEATURE_ARCH_2_06 | PPC64_FEATURE_HAS_VSX,
-	             PPC64_FEATURE2_ARCH_2_07 | PPC64_FEATURE2_ARCH_3_00
-	             | PPC64_FEATURE2_DARN | PPC64_FEATURE2_ARCH_3_1
-	             | PPC64_FEATURE2_MMA },
+	PPC64_CPU_MODEL_LIST(PPC64_CPU_MODEL_ROW)
 	{ NULL, 0, 0 },
 };
+#undef PPC64_CPU_MODEL_ROW
 
+#define PPC64_CPU_NAME_ROW(name_, hwcap_, hwcap2_) name_,
 const char *const Ppc64CpuNames[] = {
-	PPC64_CPU_BASELINE_NAME, "ppc970", "power4", "power5", "power5+",
-	"power6", "power7", "power8", "power9", "power10", NULL,
+	PPC64_CPU_MODEL_LIST(PPC64_CPU_NAME_ROW)
+	NULL,
 };
+#undef PPC64_CPU_NAME_ROW
 
 _Bool ppc64CpuByName(Ppc64Cpu *cpu, const char *name)
 {
+	if (cpu == NULL || name == NULL)
+		return 0;
+
 	for (size_t i = 0; Ppc64CpuModels[i].name != NULL; i++) {
 		if (strcmp(name, Ppc64CpuModels[i].name) == 0) {
 			ppc64CpuDecode(cpu, Ppc64CpuModels[i].hwcap, Ppc64CpuModels[i].hwcap2);
@@ -125,3 +166,5 @@ _Bool ppc64CpuByName(Ppc64Cpu *cpu, const char *name)
 	}
 	return 0;
 }
+
+#undef PPC64_CPU_MODEL_LIST
