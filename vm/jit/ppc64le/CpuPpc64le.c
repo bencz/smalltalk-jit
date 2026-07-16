@@ -23,6 +23,7 @@ Ppc64leCpu gPpc64leCpu = {
 	.name = PPC64LE_CPU_BASELINE_NAME,
 	.hasAltivec = 1,
 	.hasVsx = 1,
+	.hasGprVsrMoves = 1,
 	.hwcap = PPC64LE_FEATURE_64 | PPC64LE_FEATURE_HAS_ALTIVEC
 		| PPC64LE_FEATURE_ARCH_2_06 | PPC64LE_FEATURE_HAS_VSX,
 	.hwcap2 = PPC64LE_FEATURE2_ARCH_2_07,
@@ -43,6 +44,11 @@ void ppc64leCpuDecode(Ppc64leCpu *cpu, uint64_t hwcap, uint64_t hwcap2)
 	// must never depend on the reporter's generosity.
 	cpu->isPower10 = (hwcap2 & PPC64LE_FEATURE2_ARCH_3_1) != 0;
 	cpu->isPower9 = cpu->isPower10 || (hwcap2 & PPC64LE_FEATURE2_ARCH_3_00) != 0;
+
+	// Derived capability, from the words actually read (a decode never
+	// inherits the floor; only the baseline GLOBAL assumes it, see below):
+	// the ISA 2.07 level bit is the feature bit for mtvsrd/mfvsrd.
+	cpu->hasGprVsrMoves = cpu->isPower9 || (hwcap2 & PPC64LE_FEATURE2_ARCH_2_07) != 0;
 
 	// Best-effort model name, for humans only: never branch the codegen on it.
 	// AT_PLATFORM would be authoritative but is NOT available everywhere

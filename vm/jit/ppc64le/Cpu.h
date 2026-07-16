@@ -56,6 +56,9 @@ typedef struct {
 	// is visible rather than silently assumed away.
 	_Bool hasAltivec;
 	_Bool hasVsx;          // also gates the v20-v31 fiber-switch decision
+	_Bool hasGprVsrMoves;  // mtvsrd/mfvsrd, ISA 2.07: the ppc64le FLOOR, so
+	                       // always true; kept explicit so emit sites read the
+	                       // same capability on both POWER backends
 
 	uint64_t hwcap;        // raw, for ST_CPU_INFO and post-mortems
 	uint64_t hwcap2;

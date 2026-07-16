@@ -603,19 +603,27 @@ static void arithCompareBranch(int arithKind, int *bo, int *bi)
 // the store from the load).
 static void generateBitsToFpr(AssemblerBuffer *buffer, Register src, int fpr, Register tls)
 {
-	// The ppc64le floor IS ISA 2.07 (there is no isPower8 field on this
-	// backend, see Cpu.h): mtvsrd is always available. tls is unused here,
-	// kept for signature symmetry with the BE backend.
-	(void) tls;
-	asmMtvsrd(buffer, fpr, src);
+	// hasGprVsrMoves is ALWAYS true on this backend (ISA 2.07 is the ppc64le
+	// floor, see Cpu.h); the memory path below is kept for uniformity with the
+	// BE backend and folds away at codegen time.
+	if (gPpc64leCpu.hasGprVsrMoves) {
+		asmMtvsrd(buffer, fpr, src);
+		return;
+	}
+	asmStd(buffer, src, offsetof(Thread, jitFpuScratch), tls);
+	asmLfd(buffer, fpr, offsetof(Thread, jitFpuScratch), tls);
 }
 
 
 // Raw bit move FPR -> GPR (mfvsrd on ISA 2.07, TLS scratch on the baseline).
 static void generateFprToBits(AssemblerBuffer *buffer, int fpr, Register dst, Register tls)
 {
-	(void) tls; // ISA 2.07 floor: mfvsrd always available (see Cpu.h)
-	asmMfvsrd(buffer, dst, fpr);
+	if (gPpc64leCpu.hasGprVsrMoves) {
+		asmMfvsrd(buffer, dst, fpr);
+		return;
+	}
+	asmStfd(buffer, fpr, offsetof(Thread, jitFpuScratch), tls);
+	asmLd(buffer, dst, offsetof(Thread, jitFpuScratch), tls);
 }
 
 

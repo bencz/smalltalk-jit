@@ -426,6 +426,7 @@ static int checkCpuDecode(void)
 
 	ppc64leCpuByName(&cpu, "power8");
 	CPU_CHECK(cpu.hasVsx && cpu.hasAltivec, "the ppc64le floor includes VSX and AltiVec");
+	CPU_CHECK(cpu.hasGprVsrMoves, "power8 must have the ISA 2.07 GPR<->VSR moves");
 	CPU_CHECK(!cpu.isPower9 && !cpu.isPower10, "power8 level wrong");
 	CPU_CHECK(strcmp(cpu.name, "power8") == 0, "power8 misnamed");
 
@@ -439,11 +440,12 @@ static int checkCpuDecode(void)
 	// An under-reporting host must claim NOTHING rather than inherit the floor:
 	// the global starts at the baseline, but a decode is only ever what it read.
 	ppc64leCpuDecode(&cpu, 0, 0);
-	CPU_CHECK(!cpu.isPower9 && !cpu.isPower10 && !cpu.hasVsx && !cpu.hasAltivec,
+	CPU_CHECK(!cpu.isPower9 && !cpu.isPower10 && !cpu.hasVsx && !cpu.hasAltivec
+			&& !cpu.hasGprVsrMoves,
 		"an empty hwcap must claim NOTHING");
 
 	// The default global, by contrast, IS the architecture's floor.
-	CPU_CHECK(gPpc64leCpu.hasVsx && gPpc64leCpu.hasAltivec,
+	CPU_CHECK(gPpc64leCpu.hasVsx && gPpc64leCpu.hasAltivec && gPpc64leCpu.hasGprVsrMoves,
 		"the ppc64le baseline global must assume POWER8");
 
 	for (const char *const *n = Ppc64leCpuNames; *n != NULL; n++) {

@@ -40,6 +40,9 @@ void ppc64CpuDecode(Ppc64Cpu *cpu, uint64_t hwcap, uint64_t hwcap2)
 	cpu->isPower7 = cpu->isPower8 || (hwcap & PPC64_FEATURE_ARCH_2_06) != 0;
 	cpu->isPower6 = cpu->isPower7 || (hwcap & PPC64_FEATURE_ARCH_2_05) != 0;
 
+	// Derived capabilities (see Cpu.h): the ISA level bit is the feature bit.
+	cpu->hasGprVsrMoves = cpu->isPower8;
+
 	// Best-effort model name, for humans only: never branch the codegen on it.
 	// AT_PLATFORM would be the authoritative source, but it is NOT available
 	// everywhere (measured: qemu-user returns NULL for it on every CPU model),

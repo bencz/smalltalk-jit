@@ -591,13 +591,14 @@ static void arithCompareBranch(int arithKind, int *bo, int *bi)
 
 
 
-// Raw bit move GPR -> FPR. ISA 2.07 (POWER8) has mtvsrd; the baseline
-// (970/POWER7) goes through the per-thread scratch slot reached via TLS in
-// `tls` (straight-line code, no yield point, so fiber migration cannot split
-// the store from the load).
+// Raw bit move GPR -> FPR, branched on the CAPABILITY (hasGprVsrMoves =
+// the ARCH_2_07 hwcap2 feature bit, cumulative across P8/P9/P10 and future
+// levels): mtvsrd when present, else the per-thread scratch slot reached via
+// TLS in `tls` (straight-line code, no yield point, so fiber migration cannot
+// split the store from the load). 970/POWER7 take the memory path.
 static void generateBitsToFpr(AssemblerBuffer *buffer, Register src, int fpr, Register tls)
 {
-	if (gPpc64Cpu.isPower8) {
+	if (gPpc64Cpu.hasGprVsrMoves) {
 		asmMtvsrd(buffer, fpr, src);
 		return;
 	}
@@ -609,7 +610,7 @@ static void generateBitsToFpr(AssemblerBuffer *buffer, Register src, int fpr, Re
 // Raw bit move FPR -> GPR (mfvsrd on ISA 2.07, TLS scratch on the baseline).
 static void generateFprToBits(AssemblerBuffer *buffer, int fpr, Register dst, Register tls)
 {
-	if (gPpc64Cpu.isPower8) {
+	if (gPpc64Cpu.hasGprVsrMoves) {
 		asmMfvsrd(buffer, dst, fpr);
 		return;
 	}
@@ -698,7 +699,7 @@ static void generateFloatFastPath(CodeGenerator *generator, int arithKind, Assem
 	// (0x6 << 60); TMP2 = TLS base for the baseline GPR<->FPR path.
 	asmLi(buffer, R5, 6);
 	asmSldi(buffer, R5, R5, 60);
-	if (!gPpc64Cpu.isPower8) {
+	if (!gPpc64Cpu.hasGprVsrMoves) {
 		asmLoadTls(buffer, TMP2, gCurrentThreadTpoff);
 	}
 	generateFloatOperandLoad(buffer, R3, 0, R5, TMP2);
@@ -779,7 +780,7 @@ static void generateFloatFastPath(CodeGenerator *generator, int arithKind, Assem
 		asmLd(buffer, R6, sizeof(intptr_t), R1);      // reload arg
 		asmLi(buffer, R5, 6);                         // offset again (R5 was the stub arg)
 		asmSldi(buffer, R5, R5, 60);
-		if (!gPpc64Cpu.isPower8) {
+		if (!gPpc64Cpu.hasGprVsrMoves) {
 			asmLoadTls(buffer, TMP2, gCurrentThreadTpoff);
 		}
 		generateFloatOperandLoad(buffer, R4, 0, R5, TMP2);

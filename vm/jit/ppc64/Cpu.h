@@ -69,6 +69,12 @@ typedef struct {
 	_Bool hasAltivec;
 	_Bool hasVsx;          // POWER7+; also gates the v20-v31 fiber-switch decision
 
+	// DERIVED capabilities, so an emit site reads the FEATURE it needs rather
+	// than an ISA level. POWER has no per-instruction feature bits (unlike
+	// x86's CPUID): the kernel advertises ISA levels in hwcap2, and the level
+	// bit IS the feature bit for everything that level introduced.
+	_Bool hasGprVsrMoves;  // mtvsrd/mfvsrd (ISA 2.07 = ARCH_2_07 hwcap2 bit)
+
 	uint64_t hwcap;        // raw, for ST_CPU_INFO and post-mortems
 	uint64_t hwcap2;
 } Ppc64Cpu;

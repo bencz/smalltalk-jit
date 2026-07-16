@@ -411,9 +411,11 @@ static int checkCpuDecode(void)
 
 	ppc64CpuByName(&cpu, "power7");
 	CPU_CHECK(cpu.hasVsx && cpu.isPower7 && !cpu.isPower8, "power7 level wrong");
+	CPU_CHECK(!cpu.hasGprVsrMoves, "power7 has VSX but NOT the ISA 2.07 GPR<->VSR moves");
 
 	ppc64CpuByName(&cpu, "power8");
 	CPU_CHECK(cpu.isPower8 && !cpu.isPower9, "power8 level wrong");
+	CPU_CHECK(cpu.hasGprVsrMoves, "power8 must have the GPR<->VSR moves");
 
 	// Levels must be CUMULATIVE downward: an emit site asking "isPower7?" on a
 	// POWER10 must say yes even if a stingy reporter (qemu-user is measurably
@@ -421,6 +423,7 @@ static int checkCpuDecode(void)
 	ppc64CpuByName(&cpu, "power10");
 	CPU_CHECK(cpu.isPower10 && cpu.isPower9 && cpu.isPower8 && cpu.isPower7 && cpu.isPower6,
 		"power10 must imply every lower level");
+	CPU_CHECK(cpu.hasGprVsrMoves, "power10 must keep every derived capability");
 
 	// The floor: nothing reported means nothing claimed. This is what keeps a
 	// failed detection from emitting an illegal instruction.
