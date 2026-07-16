@@ -1,11 +1,9 @@
-"Double precision floating point number. The IEEE-754 double is stored in the
-object's (unscanned) payload word; all access goes through primitives. Instances
-are created from float literals (3.14, 1.5e-3) and by #asFloat coercion."
+"Abstract double precision floating point number. Concrete instances are
+BoxedFloat64 (heap allocated) or SmallFloat64 (immediate); the whole protocol
+lives here and the subclasses only fix the representation. Instances are
+created from float literals (3.14, 1.5e-3) and by #asFloat coercion."
 
 Float := Number [
-
-	<shape: FloatShape>
-
 
 	"instance creation"
 
@@ -78,6 +76,29 @@ Float := Number [
 	]
 
 
+	"IEEE-754 ordering: EVERY comparison against NaN answers false. Magnitude
+	derives >= as (self < x) not, which would answer true for NaN, so Float
+	overrides the derived comparisons. The JIT call-site intrinsic implements
+	the same semantics directly (unordered = false); these methods keep the
+	dispatch (mixed-type / intrinsic-miss) path consistent with it."
+
+	> aNumber [
+		^(aNumber isKindOf: Number)
+			ifTrue: [aNumber asFloat < self]
+			ifFalse: [self retryRelationalOp: #> coercing: aNumber]
+	]
+
+
+	>= aNumber [
+		^(self > aNumber) or: [self = aNumber]
+	]
+
+
+	<= aNumber [
+		^(self < aNumber) or: [self = aNumber]
+	]
+
+
 	= aNumber [
 		<primitive: FloatEqualsPrimitive>
 		(aNumber isKindOf: Number) ifTrue: [^self retryRelationalOp: #= coercing: aNumber].
@@ -86,6 +107,10 @@ Float := Number [
 
 
 	hash [
+		"Value-based, so hash(2.0) = hash(2) as required by 2.0 = 2 (via
+		retry:coercing:). Infinities and NaN cannot be truncated; give them a
+		fixed hash (Float infinity = Float infinity holds, NaN equals nothing)."
+		self isFinite ifFalse: [^0].
 		^self truncated hash
 	]
 
@@ -94,6 +119,23 @@ Float := Number [
 
 	isZero [
 		^self = 0.0
+	]
+
+
+	isNaN [
+		^self ~= self
+	]
+
+
+	isFinite [
+		"NaN and the infinities poison subtraction: x - x is 0.0 only for
+		finite x."
+		^(self - self) = 0.0
+	]
+
+
+	isInfinite [
+		^self isFinite not and: [self isNaN not]
 	]
 
 
@@ -156,29 +198,54 @@ Float := Number [
 	]
 
 
+	exponent [
+		"Base-2 exponent: 1.0 exponent = 0, 0.5 exponent = -1."
+		<primitive: FloatExponentPrimitive>
+		^self error: 'zero, Infinity and NaN have no exponent'
+	]
+
+
+	timesTwoPower: anInteger [
+		"self * 2^anInteger, exact (the mantissa is untouched)."
+		<primitive: FloatTimesTwoPowerPrimitive>
+		^self error: 'power must be a SmallInteger'
+	]
+
+
 	"truncation and rounding"
 
 	truncated [
 		<primitive: FloatTruncatedPrimitive>
-		^self error: 'Float is out of the integer range'
+		"The primitive only covers the SmallInteger range. Any finite double
+		beyond it is already integral (|x| >= 2^53 has no fraction bits), so
+		rebuild the exact integer from the 53-bit mantissa and the base-2
+		exponent; the multiplication promotes to LargeInteger."
+		| e m |
+		self isFinite ifFalse: [^self error: 'cannot truncate Infinity or NaN'].
+		e := self exponent.
+		m := (self timesTwoPower: 52 - e) truncated.
+		^m * (2 raisedToInteger: e - 52)
 	]
 
 
 	floor [
 		<primitive: FloatFloorPrimitive>
-		^self error: 'Float is out of the integer range'
+		"out of the primitive's range the value is integral: floor = truncated"
+		^self truncated
 	]
 
 
 	ceiling [
 		<primitive: FloatCeilingPrimitive>
-		^self error: 'Float is out of the integer range'
+		"out of the primitive's range the value is integral: ceiling = truncated"
+		^self truncated
 	]
 
 
 	rounded [
 		<primitive: FloatRoundedPrimitive>
-		^self error: 'Float is out of the integer range'
+		"out of the primitive's range the value is integral: rounded = truncated"
+		^self truncated
 	]
 
 

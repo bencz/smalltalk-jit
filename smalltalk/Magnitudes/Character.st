@@ -140,6 +140,13 @@ Character := Magnitude [
 		^0 - self codePoint
 	]
 
+
+	identityHash [
+		"Characters are immediates: the header-reading HashPrimitive that
+		Object>>identityHash uses would dereference the tagged word."
+		^self hash
+	]
+
 	< aCharacter [
 		^self codePoint < aCharacter codePoint
 	]

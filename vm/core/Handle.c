@@ -43,7 +43,7 @@ void *newObject(Class *class, size_t size)
 
 Float *newFloat(double value)
 {
-	Float *object = (Float *) scopeHandle(allocateObject(CurrentThread.heap, Handles.Float->raw, 0));
+	Float *object = (Float *) scopeHandle(allocateObject(CurrentThread.heap, Handles.BoxedFloat64->raw, 0));
 	object->raw->value = value;
 	return object;
 }

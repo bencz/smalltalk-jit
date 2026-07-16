@@ -1084,12 +1084,110 @@ static int snapshotFormatSelfTest(void)
 }
 
 
+// ---- SmallFloat64 encoding self-test (C-level, no image/heap) ---------------
+//
+// Proves the rotation encoding in Object.h bit-exact: every biased exponent is
+// swept with fixed and PRNG mantissa patterns, plus named edges and a raw PRNG
+// sweep. The ground truth is computed independently from the IEEE-754 fields,
+// NOT from the encoder under test, so a broken encoder cannot vouch for itself.
+
+static long smallFloatCheck(uint64_t bits)
+{
+	double value = bitsToDouble(bits);
+	uint64_t E = (bits >> 52) & 0x7FF;
+	uint64_t M = bits & 0xFFFFFFFFFFFFFULL;
+
+	_Bool wantFit;
+	if (E == 0 && M == 0) {
+		wantFit = 1;                       // +-0.0
+	} else if (E < 768 || E > 1279) {
+		wantFit = 0;                       // subnormal, tiny, huge, Inf, NaN
+	} else if (E == 768 && M == 0) {
+		wantFit = 0;                       // +-2^-255 exact: collides with +-0.0
+	} else {
+		wantFit = 1;
+	}
+
+	if (smallFloatFits(value) != wantFit) {
+		printf("smallfloat: fit mismatch bits=%016lx want=%d\n",
+			(unsigned long) bits, (int) wantFit);
+		return 1;
+	}
+	if (!wantFit) {
+		return 0;
+	}
+
+	Value tagged = tagFloat(value);
+	if ((tagged & 3) != VALUE_FLOAT) {
+		printf("smallfloat: bad tag bits=%016lx tagged=%016lx\n",
+			(unsigned long) bits, (unsigned long) tagged);
+		return 1;
+	}
+	if (doubleToBits(floatValueOf(tagged)) != bits) {
+		printf("smallfloat: roundtrip bits=%016lx back=%016lx\n",
+			(unsigned long) bits, (unsigned long) doubleToBits(floatValueOf(tagged)));
+		return 1;
+	}
+	return 0;
+}
+
+
+static int smallFloatSelfTest(void)
+{
+	long failures = 0;
+	uint64_t rng = 0x9E3779B97F4A7C15ULL;
+	const uint64_t mPatterns[] = { 0, 1, 2, 0xFFFFFFFFFFFFFULL, 0x8000000000000ULL,
+		0x5555555555555ULL, 0xAAAAAAAAAAAAAULL & 0xFFFFFFFFFFFFFULL };
+
+	// every biased exponent x mantissa/sign patterns + PRNG mantissas
+	for (uint64_t E = 0; E <= 2047; E++) {
+		for (unsigned m = 0; m < sizeof(mPatterns) / sizeof(mPatterns[0]); m++) {
+			for (uint64_t S = 0; S <= 1; S++) {
+				failures += smallFloatCheck((S << 63) | (E << 52) | mPatterns[m]);
+			}
+			rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+			failures += smallFloatCheck((rng & (1ULL << 63)) | (E << 52) | (rng & 0xFFFFFFFFFFFFFULL));
+		}
+	}
+
+	// raw PRNG sweep over arbitrary bit patterns
+	for (long i = 0; i < 2000000; i++) {
+		rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+		failures += smallFloatCheck(rng);
+	}
+
+	// named edges: literals in use, the range borders, specials
+	const double edges[] = { 0.0, -0.0, 1.0, -1.0, 3.14, 1.5e3, 2.5e-1,
+		3.141592653589793, 1.0e300, -1.0e300, 1.0e-300, 5e-324,
+		1.7976931348623157e308, 1.0 / 0.0, -1.0 / 0.0, 0.0 / 0.0 };
+	for (unsigned i = 0; i < sizeof(edges) / sizeof(edges[0]); i++) {
+		failures += smallFloatCheck(doubleToBits(edges[i]));
+	}
+
+	// classification spot checks (belt and suspenders over the sweep)
+	if (!smallFloatFits(3.14) || !smallFloatFits(0.0) || !smallFloatFits(-0.0)
+			|| smallFloatFits(1.0e300) || smallFloatFits(5e-324) || smallFloatFits(0.0 / 0.0)) {
+		printf("smallfloat: classification spot check failed\n");
+		failures++;
+	}
+
+	printf(failures == 0 ? "smallfloat encoding self-test PASSED\n"
+	                     : "smallfloat encoding self-test FAILED (%ld)\n", failures);
+	return failures == 0 ? 0 : 1;
+}
+
+
 int selfTestFromEnv(char *snapshotFileName, char *bootstrapDir,
 	void (*bootstrap)(char *snapshotFileName, char *bootstrapDir))
 {
 	// Snapshot format primitives (C-level, no image/heap): ST_SNAPSHOT_FORMAT_TEST=1 ./st
 	if (getenv("ST_SNAPSHOT_FORMAT_TEST") != NULL) {
 		return snapshotFormatSelfTest();
+	}
+
+	// SmallFloat64 rotation encoding (C-level, no image/heap): ST_SMALLFLOAT_TEST=1 ./st
+	if (getenv("ST_SMALLFLOAT_TEST") != NULL) {
+		return smallFloatSelfTest();
 	}
 
 	// ABI emission golden test (C-level, no image): ST_ABI_EMIT_TEST=1 ./st

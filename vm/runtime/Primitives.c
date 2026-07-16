@@ -113,6 +113,8 @@ static PrimitiveResult floatArcTanPrimitive(Value self);
 static PrimitiveResult floatArcTan2Primitive(Value self, Value arg);
 static PrimitiveResult floatAsStringPrimitive(Value self);
 static PrimitiveResult intAsFloatPrimitive(Value self);
+static PrimitiveResult floatExponentPrimitive(Value self);
+static PrimitiveResult floatTimesTwoPowerPrimitive(Value self, Value arg);
 
 // The GEN generators and the CCALL trampoline are provided by the CPU backend
 // selected at link time (CMake ST_ARCH -> vm/jit/<arch>/Primitives<Arch>.c);
@@ -309,6 +311,10 @@ Primitive Primitives[] = {
 	{"CompileMethodPrimitive", CCALL, .cFunction = compileMethodPrimitive, 3},
 	{"MethodSendPrimitive", GEN, generateMethodSendPrimitive},
 	{"MethodSendArgsPrimitive", GEN, generateMethodSendArgsPrimitive},
+
+	// APPEND ONLY: the snapshot bakes primitive indices, never reorder
+	{"FloatExponentPrimitive", CCALL, .cFunction = floatExponentPrimitive, 1},
+	{"FloatTimesTwoPowerPrimitive", CCALL, .cFunction = floatTimesTwoPowerPrimitive, 2},
 };
 
 
@@ -1105,7 +1111,21 @@ static PrimitiveResult printHeapPrimitive(Value receiver)
 
 static _Bool isFloatValue(Value v)
 {
-	return valueTypeOf(v, VALUE_POINTER) && asObject(v)->class == Handles.Float->raw;
+	// a Float is either an immediate SmallFloat64 or a boxed heap object
+	return valueTypeOf(v, VALUE_FLOAT)
+		|| (valueTypeOf(v, VALUE_POINTER) && asObject(v)->class == Handles.BoxedFloat64->raw);
+}
+
+
+// Decode a Float value (immediate or boxed) to its C double. Callers guarantee
+// isFloatValue(v), either via the arg guard or because the method is installed
+// on a Float class.
+static double toDouble(Value v)
+{
+	if (valueTypeOf(v, VALUE_FLOAT)) {
+		return floatValueOf(v);
+	}
+	return rawFloatValue(asObject(v));
 }
 
 
@@ -1149,12 +1169,25 @@ static Value floatResult(Float *object)
 }
 
 
+// The single choke point for a primitive's Float RESULT: an immediate when the
+// double fits, else a fresh box whose scoped handle is popped right away (see
+// floatResult above). Only for self-contained results: literal producers
+// (Parser.c, Json.c) must instead KEEP the box's handle alive.
+static Value fromDoubleResult(double d)
+{
+	if (smallFloatFits(d)) {
+		return tagFloat(d);
+	}
+	return floatResult(newFloat(d));
+}
+
+
 static PrimitiveResult floatAddPrimitive(Value self, Value arg)
 {
 	if (!isFloatValue(arg)) {
 		return primFailed();
 	}
-	return primSuccess(floatResult(newFloat(rawFloatValue(asObject(self)) + rawFloatValue(asObject(arg)))));
+	return primSuccess(fromDoubleResult(toDouble(self) + toDouble(arg)));
 }
 
 
@@ -1163,7 +1196,7 @@ static PrimitiveResult floatSubPrimitive(Value self, Value arg)
 	if (!isFloatValue(arg)) {
 		return primFailed();
 	}
-	return primSuccess(floatResult(newFloat(rawFloatValue(asObject(self)) - rawFloatValue(asObject(arg)))));
+	return primSuccess(fromDoubleResult(toDouble(self) - toDouble(arg)));
 }
 
 
@@ -1172,7 +1205,7 @@ static PrimitiveResult floatMulPrimitive(Value self, Value arg)
 	if (!isFloatValue(arg)) {
 		return primFailed();
 	}
-	return primSuccess(floatResult(newFloat(rawFloatValue(asObject(self)) * rawFloatValue(asObject(arg)))));
+	return primSuccess(fromDoubleResult(toDouble(self) * toDouble(arg)));
 }
 
 
@@ -1181,7 +1214,7 @@ static PrimitiveResult floatDivPrimitive(Value self, Value arg)
 	if (!isFloatValue(arg)) {
 		return primFailed();
 	}
-	return primSuccess(floatResult(newFloat(rawFloatValue(asObject(self)) / rawFloatValue(asObject(arg)))));
+	return primSuccess(fromDoubleResult(toDouble(self) / toDouble(arg)));
 }
 
 
@@ -1190,7 +1223,7 @@ static PrimitiveResult floatLessThanPrimitive(Value self, Value arg)
 	if (!isFloatValue(arg)) {
 		return primFailed();
 	}
-	return primSuccess(getTaggedPtr(asBool(rawFloatValue(asObject(self)) < rawFloatValue(asObject(arg)))));
+	return primSuccess(getTaggedPtr(asBool(toDouble(self) < toDouble(arg))));
 }
 
 
@@ -1199,85 +1232,85 @@ static PrimitiveResult floatEqualsPrimitive(Value self, Value arg)
 	if (!isFloatValue(arg)) {
 		return primFailed();
 	}
-	return primSuccess(getTaggedPtr(asBool(rawFloatValue(asObject(self)) == rawFloatValue(asObject(arg)))));
+	return primSuccess(getTaggedPtr(asBool(toDouble(self) == toDouble(arg))));
 }
 
 
 static PrimitiveResult floatTruncatedPrimitive(Value self)
 {
-	return floatToInteger(trunc(rawFloatValue(asObject(self))));
+	return floatToInteger(trunc(toDouble(self)));
 }
 
 
 static PrimitiveResult floatFloorPrimitive(Value self)
 {
-	return floatToInteger(floor(rawFloatValue(asObject(self))));
+	return floatToInteger(floor(toDouble(self)));
 }
 
 
 static PrimitiveResult floatCeilingPrimitive(Value self)
 {
-	return floatToInteger(ceil(rawFloatValue(asObject(self))));
+	return floatToInteger(ceil(toDouble(self)));
 }
 
 
 static PrimitiveResult floatRoundedPrimitive(Value self)
 {
-	return floatToInteger(round(rawFloatValue(asObject(self))));
+	return floatToInteger(round(toDouble(self)));
 }
 
 
 static PrimitiveResult floatSqrtPrimitive(Value self)
 {
-	return primSuccess(floatResult(newFloat(sqrt(rawFloatValue(asObject(self))))));
+	return primSuccess(fromDoubleResult(sqrt(toDouble(self))));
 }
 
 
 static PrimitiveResult floatSinPrimitive(Value self)
 {
-	return primSuccess(floatResult(newFloat(sin(rawFloatValue(asObject(self))))));
+	return primSuccess(fromDoubleResult(sin(toDouble(self))));
 }
 
 
 static PrimitiveResult floatCosPrimitive(Value self)
 {
-	return primSuccess(floatResult(newFloat(cos(rawFloatValue(asObject(self))))));
+	return primSuccess(fromDoubleResult(cos(toDouble(self))));
 }
 
 
 static PrimitiveResult floatExpPrimitive(Value self)
 {
-	return primSuccess(floatResult(newFloat(exp(rawFloatValue(asObject(self))))));
+	return primSuccess(fromDoubleResult(exp(toDouble(self))));
 }
 
 
 static PrimitiveResult floatLnPrimitive(Value self)
 {
-	return primSuccess(floatResult(newFloat(log(rawFloatValue(asObject(self))))));
+	return primSuccess(fromDoubleResult(log(toDouble(self))));
 }
 
 
 static PrimitiveResult floatTanPrimitive(Value self)
 {
-	return primSuccess(floatResult(newFloat(tan(rawFloatValue(asObject(self))))));
+	return primSuccess(fromDoubleResult(tan(toDouble(self))));
 }
 
 
 static PrimitiveResult floatArcSinPrimitive(Value self)
 {
-	return primSuccess(floatResult(newFloat(asin(rawFloatValue(asObject(self))))));
+	return primSuccess(fromDoubleResult(asin(toDouble(self))));
 }
 
 
 static PrimitiveResult floatArcCosPrimitive(Value self)
 {
-	return primSuccess(floatResult(newFloat(acos(rawFloatValue(asObject(self))))));
+	return primSuccess(fromDoubleResult(acos(toDouble(self))));
 }
 
 
 static PrimitiveResult floatArcTanPrimitive(Value self)
 {
-	return primSuccess(floatResult(newFloat(atan(rawFloatValue(asObject(self))))));
+	return primSuccess(fromDoubleResult(atan(toDouble(self))));
 }
 
 
@@ -1287,19 +1320,42 @@ static PrimitiveResult floatArcTan2Primitive(Value self, Value arg)
 	if (!isFloatValue(arg)) {
 		return primFailed();
 	}
-	return primSuccess(floatResult(newFloat(atan2(rawFloatValue(asObject(self)), rawFloatValue(asObject(arg))))));
+	return primSuccess(fromDoubleResult(atan2(toDouble(self), toDouble(arg))));
 }
 
 
 static PrimitiveResult intAsFloatPrimitive(Value self)
 {
-	return primSuccess(floatResult(newFloat((double) asCInt(self))));
+	return primSuccess(fromDoubleResult((double) asCInt(self)));
+}
+
+
+// Base-2 exponent (ilogb): 1.0 -> 0, 1.0e300 -> 996. Fails for zero, Inf and
+// NaN, whose exponent is undefined; the Smalltalk fallback raises.
+static PrimitiveResult floatExponentPrimitive(Value self)
+{
+	double x = toDouble(self);
+	if (x == 0.0 || isnan(x) || isinf(x)) {
+		return primFailed();
+	}
+	return primSuccess(tagInt((intptr_t) ilogb(x)));
+}
+
+
+// self * 2^arg, exact (ldexp): the mantissa is untouched, so together with
+// FloatExponentPrimitive this lets Smalltalk take a double apart losslessly.
+static PrimitiveResult floatTimesTwoPowerPrimitive(Value self, Value arg)
+{
+	if (!valueTypeOf(arg, VALUE_INT)) {
+		return primFailed();
+	}
+	return primSuccess(fromDoubleResult(ldexp(toDouble(self), (int) asCInt(arg))));
 }
 
 
 static PrimitiveResult floatAsStringPrimitive(Value self)
 {
-	double x = rawFloatValue(asObject(self));
+	double x = toDouble(self);
 	char buf[64];
 
 	if (isnan(x)) {

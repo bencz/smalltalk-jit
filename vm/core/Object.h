@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #define OBJECT_HANDLE(name) \
 	typedef union name { \
@@ -41,9 +42,10 @@ enum {
 } ObjectTag;
 
 typedef enum {
-	VALUE_INT = 0,
-	VALUE_POINTER = 1,
-	VALUE_CHAR = 2,
+	VALUE_INT = 0,      // 00: SmallInteger, 62-bit payload
+	VALUE_POINTER = 1,  // 01: heap object (asObject subtracts the tag)
+	VALUE_CHAR = 2,     // 10: Character
+	VALUE_FLOAT = 3,    // 11: SmallFloat64, immediate double (see tagFloat below)
 } ValueType;
 
 typedef uintptr_t Value;
@@ -312,6 +314,74 @@ static inline Value tagPtr(void *object)
 static inline _Bool valueTypeOf(Value value, ValueType type)
 {
 	return (value & 3) == type;
+}
+
+
+// ---- SmallFloat64: an immediate double in the tagged Value word ------------
+//
+// Spur-style rotation encoding with a 62-bit payload. ROL64(bits, 1) lines the
+// IEEE-754 double up as [exponent:11 at 63..53 | mantissa:52 at 52..1 | sign at 0];
+// subtracting the offset (768 << 53) keeps the full mantissa and drops the two
+// top exponent bits, so exactly the doubles with biased exponent 768..1279
+// (magnitude in 2^[-255, 256], about 1.7e-77 .. 2.3e77) fit unsigned below
+// 2^62. +-0.0 is special-cased to payloads 0 and 1; +-2^-255 with a zero
+// mantissa would collide with those payloads and stays boxed, as do
+// subnormals, infinities, NaN and out-of-range magnitudes (they underflow or
+// overflow the payload range). Decode is the exact inverse: add the offset
+// back (payloads 0/1 excepted) and rotate right once. The scheme is proven
+// bit-exact by the exhaustive ST_SMALLFLOAT_TEST self-test; keep that green
+// when touching any of this.
+#define SMALLFLOAT_OFFSET ((uint64_t) 768 << 53)
+
+static inline uint64_t doubleToBits(double value)
+{
+	uint64_t bits;
+	memcpy(&bits, &value, sizeof(bits));
+	return bits;
+}
+
+
+static inline double bitsToDouble(uint64_t bits)
+{
+	double value;
+	memcpy(&value, &bits, sizeof(value));
+	return value;
+}
+
+
+static inline _Bool smallFloatFits(double value)
+{
+	uint64_t bits = doubleToBits(value);
+	if ((bits & ~((uint64_t) 1 << 63)) == 0) {
+		return 1; // +-0.0
+	}
+	uint64_t payload = ((bits << 1) | (bits >> 63)) - SMALLFLOAT_OFFSET;
+	return payload >= 2 && payload < ((uint64_t) 1 << 62);
+}
+
+
+// Encode a double as a tagged immediate. Requires smallFloatFits(value).
+static inline Value tagFloat(double value)
+{
+	uint64_t bits = doubleToBits(value);
+	uint64_t payload;
+	if ((bits & ~((uint64_t) 1 << 63)) == 0) {
+		payload = bits >> 63;
+	} else {
+		payload = ((bits << 1) | (bits >> 63)) - SMALLFLOAT_OFFSET;
+		ASSERT(payload >= 2 && payload < ((uint64_t) 1 << 62));
+	}
+	return (payload << 2) | VALUE_FLOAT;
+}
+
+
+// Decode a tagged immediate back to its double. Requires the VALUE_FLOAT tag.
+static inline double floatValueOf(Value value)
+{
+	ASSERT((value & 3) == VALUE_FLOAT);
+	uint64_t payload = value >> 2;
+	uint64_t bits = payload <= 1 ? payload : payload + SMALLFLOAT_OFFSET;
+	return bitsToDouble((bits >> 1) | (bits << 63));
 }
 
 #endif

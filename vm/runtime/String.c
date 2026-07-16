@@ -79,6 +79,8 @@ void printValue(Value value)
 		printf("%c", asCChar(value));
 	} else if (valueTypeOf(value, VALUE_INT)) {
 		printf("%zi", asCInt(value));
+	} else if (valueTypeOf(value, VALUE_FLOAT)) {
+		printf("%g", floatValueOf(value));
 	} else {
 		printRawObject(asObject(value));
 	}

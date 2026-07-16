@@ -4,7 +4,9 @@
 #
 #   ./run_tests.sh              build, bootstrap, run tests/*.st
 #   ./run_tests.sh --all        also run every sample (samples + advanced + concurrency)
+#                               AND the benchmark suite (self-verifying)
 #   ./run_tests.sh --samples    run the samples instead of the tests
+#   ./run_tests.sh --bench      also run the benchmark suite
 #   ./run_tests.sh --no-build   skip the build/bootstrap step (reuse build/ image)
 #   BUILD=mybuild ./run_tests.sh   use a different build directory
 #
@@ -21,11 +23,13 @@ SNAP="$BUILD/test-snapshot.img"
 DO_BUILD=1
 RUN_TESTS=1
 RUN_SAMPLES=0
+RUN_BENCH=0
 
 for arg in "$@"; do
 	case "$arg" in
-		--all)      RUN_SAMPLES=1 ;;
+		--all)      RUN_SAMPLES=1; RUN_BENCH=1 ;;
 		--samples)  RUN_SAMPLES=1; RUN_TESTS=0 ;;
+		--bench)    RUN_BENCH=1 ;;
 		--no-build) DO_BUILD=0 ;;
 		*) echo "unknown option: $arg"; exit 2 ;;
 	esac
@@ -64,6 +68,20 @@ pass=0
 fail=0
 failed=""
 
+# C-level self-tests that gate every run (no image needed, milliseconds)
+echo ""
+echo "${B}self-tests${Z}"
+for st in ST_SMALLFLOAT_TEST ST_ABI_EMIT_TEST; do
+	if env "$st=1" "$BUILD/st" >/dev/null 2>&1; then
+		printf "  ${G}pass${Z}  %s\n" "$st"
+		pass=$((pass + 1))
+	else
+		printf "  ${R}FAIL${Z}  %s\n" "$st"
+		fail=$((fail + 1))
+		failed="$failed $st"
+	fi
+done
+
 run_group() {
 	local title="$1"; shift
 	echo ""
@@ -92,6 +110,19 @@ if [ "$RUN_SAMPLES" -eq 1 ]; then
 	run_group "samples" samples/*.st
 	run_group "samples/advanced" samples/advanced/*.st
 	run_group "samples/concurrency" samples/concurrency/*.st
+fi
+
+# Benchmarks self-verify their results (a wrong sum raises), so they are a
+# correctness gate too, not just a stopwatch. The build was done above.
+if [ "$RUN_BENCH" -eq 1 ]; then
+	echo ""
+	echo "${B}benchmarks${Z}"
+	if BUILD="$BUILD" "$ROOT/run_benchmarks.sh" --no-build; then
+		pass=$((pass + 1))
+	else
+		fail=$((fail + 1))
+		failed="$failed benchmarks"
+	fi
 fi
 
 echo ""

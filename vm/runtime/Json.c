@@ -269,9 +269,14 @@ static _Bool parseNumber(JsonParser *j, JsonValue *out)
 	if (isFloat) {
 		double d = strtod(start, NULL);
 		j->p = p;
-		Float *f = newFloat(d);
-		out->isImmediate = 0;
-		out->object = (Object *) f;
+		if (smallFloatFits(d)) {
+			out->isImmediate = 1;
+			out->immediate = tagFloat(d);
+		} else {
+			Float *f = newFloat(d);
+			out->isImmediate = 0;
+			out->object = (Object *) f;
+		}
 		return 1;
 	}
 
@@ -703,8 +708,14 @@ static _Bool encodeValue(JsonBuf *b, Value v, int depth)
 		int n = snprintf(num, sizeof(num), "%lld", (long long) asCInt(v));
 		return bufWrite(b, num, (size_t) n);
 	}
+	if (valueTypeOf(v, VALUE_FLOAT)) {
+		// immediates are never NaN/Inf (those stay boxed), so no JsonError guard
+		char num[64];
+		size_t n = jsonFormatDouble(floatValueOf(v), num);
+		return bufWrite(b, num, n);
+	}
 	if (!valueTypeOf(v, VALUE_POINTER)) {
-		return 0; // Characters (and any future immediate) take the Smalltalk path
+		return 0; // Characters (and any other immediate) take the Smalltalk path
 	}
 
 	RawObject *object = asObject(v);
@@ -722,7 +733,7 @@ static _Bool encodeValue(JsonBuf *b, Value v, int depth)
 	if (class == Handles.String->raw || class == Handles.Symbol->raw) {
 		return encodeStringBody(b, (RawString *) object);
 	}
-	if (class == Handles.Float->raw) {
+	if (class == Handles.BoxedFloat64->raw) {
 		double x = rawFloatValue(object);
 		if (isnan(x) || isinf(x)) {
 			return 0; // no JSON representation: Smalltalk raises JsonError

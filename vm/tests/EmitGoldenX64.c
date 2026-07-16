@@ -67,6 +67,23 @@ static void emitEntryStubCase(CodeGenerator *generator)
 	SmalltalkEntry.generator(generator);
 }
 
+// The SmallFloat64 decode/encode building blocks (rotates + raw GPR<->XMM bit
+// moves), including REX.B (r10) and REX.W coverage on every form.
+static void emitSmallFloatOpsCase(CodeGenerator *generator)
+{
+	AssemblerBuffer *buffer = &generator->buffer;
+	asmRolqImm(buffer, RDI, 1);
+	asmRorqImm(buffer, RDI, 1);
+	asmRolqImm(buffer, RAX, 63);
+	asmRorqImm(buffer, R10, 2);
+	asmMovqToXmm(buffer, RDI, XMM0);
+	asmMovqToXmm(buffer, RAX, XMM1);
+	asmMovqFromXmm(buffer, XMM0, RDI);
+	asmMovqFromXmm(buffer, XMM1, RAX);
+	asmMovqToXmm(buffer, R10, XMM1);
+	asmMovqFromXmm(buffer, XMM1, R10);
+}
+
 // ---- expected vectors -------------------------------------------------------
 // Captured with ST_ABI_EMIT_TEST=print from the pre-ABI-seam build (SysV).
 // Regenerate with print mode whenever an emitter legitimately changes.
@@ -84,6 +101,8 @@ static const GoldenCase Cases[] = {
 	  ExpectedCCallPrimitive, sizeof(ExpectedCCallPrimitive) },
 	{ "SmalltalkEntry stub", emitEntryStubCase,
 	  ExpectedEntryStub, sizeof(ExpectedEntryStub) },
+	{ "smallfloat rol/ror/movq GPR<->XMM", emitSmallFloatOpsCase,
+	  ExpectedSmallFloatOps, sizeof(ExpectedSmallFloatOps) },
 };
 
 static void hexdumpAsCArray(const char *name, const uint8_t *bytes, size_t size)
@@ -100,7 +119,7 @@ static void hexdumpAsCArray(const char *name, const uint8_t *bytes, size_t size)
 
 static const char *CaseArrayNames[] = {
 	"ExpectedLoadTls", "ExpectedCCall", "ExpectedStoreCheck",
-	"ExpectedCCallPrimitive", "ExpectedEntryStub",
+	"ExpectedCCallPrimitive", "ExpectedEntryStub", "ExpectedSmallFloatOps",
 };
 
 // Some sequences bake REAL C-function addresses (e.g. generateStoreCheck's

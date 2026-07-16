@@ -824,7 +824,13 @@ static LiteralNode *parseNumber(Parser *parser, int8_t sign)
 	nextToken(&parser->tokenizer);
 	if (strpbrk(content, ".eE") != NULL) {
 		double value = strtod(content, NULL);
-		literalNodeSetRawValue(literal, getTaggedPtr(newFloat(sign < 0 ? -value : value)));
+		if (sign < 0) {
+			value = -value;
+		}
+		// a fitting literal becomes an immediate SmallFloat64; a boxed literal
+		// keeps its scoped handle alive for the rest of the parse/compile
+		literalNodeSetRawValue(literal, smallFloatFits(value)
+			? tagFloat(value) : getTaggedPtr(newFloat(value)));
 	} else {
 		literalNodeSetRawValue(literal, buildIntegerLiteral(content, 10, sign < 0));
 	}

@@ -4,8 +4,14 @@ floating point rounding surprises."
 
 [
 	"literals and class"
-	Assert true: 3.14 class == Float.
-	Assert true: 1.0 class == Float.
+	Assert true: 3.14 class == SmallFloat64.
+	Assert true: 1.0 class == SmallFloat64.
+	Assert true: 1.0e300 class == BoxedFloat64.
+	Assert true: (3.14 isKindOf: Float).
+	Assert true: (1.0e300 isKindOf: Float).
+	Assert true: Float infinity class == BoxedFloat64.
+	Assert true: Float infinity = Float infinity.
+	Assert true: (2.0 + 3.5) class == SmallFloat64.
 	Assert true: 3 class == SmallInteger.
 	Assert true: 0.5 = 0.5.
 	Assert true: 1.5e3 = 1500.0.

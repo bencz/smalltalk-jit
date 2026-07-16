@@ -606,11 +606,15 @@ static void generateFloatFastPath(CodeGenerator *generator, int arithKind, Assem
 
 	asmLd(buffer, R3, 0, R1);                    // receiver
 	asmLd(buffer, R4, sizeof(intptr_t), R1);     // arg
-	asmAndiDot(buffer, R0, R3, VALUE_POINTER);
-	asmBeq(buffer, &tagMissR);
-	asmAndiDot(buffer, R0, R4, VALUE_POINTER);
-	asmBeq(buffer, &tagMissA);
-	generateLoadObject(buffer, (RawObject *) Handles.Float->raw, R6, 0);  // Float class (raw)
+	// both must be heap pointers (tag 0b01 exactly): bit 0 alone would accept
+	// a VALUE_FLOAT immediate (0b11) and dereference it as a box
+	asmAndiDot(buffer, R0, R3, 3);
+	asmCmpldi(buffer, 0, R0, VALUE_POINTER);
+	asmBne(buffer, &tagMissR);
+	asmAndiDot(buffer, R0, R4, 3);
+	asmCmpldi(buffer, 0, R0, VALUE_POINTER);
+	asmBne(buffer, &tagMissA);
+	generateLoadObject(buffer, (RawObject *) Handles.BoxedFloat64->raw, R6, 0);  // BoxedFloat64 class (raw)
 	asmLdT(buffer, R0, varOffset(RawObject, class), R3);
 	asmCmpd(buffer, 0, R0, R6);
 	asmBne(buffer, &classMissR);
@@ -653,7 +657,7 @@ static void generateFloatFastPath(CodeGenerator *generator, int arithKind, Assem
 		// Arithmetic: allocate FIRST, then compute into the new Float (the
 		// operands survive the possibly-scavenging allocation via the
 		// stub's stackmap; reloaded from the stack after).
-		generateLoadObject(buffer, (RawObject *) Handles.Float->raw, R4, 0);
+		generateLoadObject(buffer, (RawObject *) Handles.BoxedFloat64->raw, R4, 0);
 		asmLi(buffer, R5, 0);
 		generateStubCall(generator, &AllocateStub);   // r3 = new tagged Float
 		asmLd(buffer, R4, 0, R1);                     // reload receiver
@@ -850,8 +854,11 @@ void generateStoreCheck(CodeGenerator *generator, Register object, Register valu
 	// young, not-yet-remembered object needs recording.
 	asmAndiDot(buffer, R0, object, NEW_SPACE_TAG);
 	asmBne(buffer, &objectIsNew);
-	asmAndiDot(buffer, R0, value, VALUE_POINTER);
-	asmBeq(buffer, &valueIsNotPtr);
+	// value must be a heap pointer (tag 0b01 exactly): bit 0 alone would also
+	// remember a VALUE_FLOAT immediate (0b11)
+	asmAndiDot(buffer, R0, value, 3);
+	asmCmpldi(buffer, 0, R0, VALUE_POINTER);
+	asmBne(buffer, &valueIsNotPtr);
 	asmAndiDot(buffer, R0, value, NEW_SPACE_TAG);
 	asmBeq(buffer, &valueIsOld);
 	asmLbz(buffer, R0, tagsOffset, object);
@@ -962,33 +969,48 @@ void generateLoadObject(AssemblerBuffer *buffer, RawObject *object, Register dst
 
 void generateLoadClass(AssemblerBuffer *buffer, Register src, Register dst)
 {
+	// Four-way exact dispatch on the 2-bit tag. The old shortcut (above
+	// VALUE_POINTER means Character) would classify a VALUE_FLOAT immediate
+	// (0b11) as a Character. One end label per arm: a label takes a single
+	// forward reference.
 	AssemblerLabel pointer;
 	AssemblerLabel character;
-	AssemblerLabel end, end2;
+	AssemblerLabel floatImm;
+	AssemblerLabel endInt, endPtr, endChar;
 
 	asmInitLabel(&pointer);
 	asmInitLabel(&character);
-	asmInitLabel(&end);
-	asmInitLabel(&end2);
+	asmInitLabel(&floatImm);
+	asmInitLabel(&endInt);
+	asmInitLabel(&endPtr);
+	asmInitLabel(&endChar);
 
 	asmAndiDot(buffer, dst, src, 3);
 	asmCmpldi(buffer, 0, dst, VALUE_POINTER);
-	asmBgt(buffer, &character);
 	asmBeq(buffer, &pointer);
+	asmCmpldi(buffer, 0, dst, VALUE_CHAR);
+	asmBeq(buffer, &character);
+	asmCmpldi(buffer, 0, dst, VALUE_FLOAT);
+	asmBeq(buffer, &floatImm);
 
 	generateLoadObject(buffer, (RawObject *) Handles.SmallInteger->raw, dst, 1);
-	asmB(buffer, &end);
+	asmB(buffer, &endInt);
 
 	asmPpcLabelBind(buffer, &pointer, asmOffset(buffer));
 	asmLdT(buffer, dst, -1, src);   // class word of the tagged pointer
 	asmAddi(buffer, dst, dst, 1);   // tag the class
-	asmB(buffer, &end2);
+	asmB(buffer, &endPtr);
 
 	asmPpcLabelBind(buffer, &character, asmOffset(buffer));
 	generateLoadObject(buffer, (RawObject *) Handles.Character->raw, dst, 1);
+	asmB(buffer, &endChar);
 
-	asmPpcLabelBind(buffer, &end, asmOffset(buffer));
-	asmPpcLabelBind(buffer, &end2, asmOffset(buffer));
+	asmPpcLabelBind(buffer, &floatImm, asmOffset(buffer));
+	generateLoadObject(buffer, (RawObject *) Handles.SmallFloat64->raw, dst, 1);
+
+	asmPpcLabelBind(buffer, &endInt, asmOffset(buffer));
+	asmPpcLabelBind(buffer, &endPtr, asmOffset(buffer));
+	asmPpcLabelBind(buffer, &endChar, asmOffset(buffer));
 }
 
 
@@ -1331,9 +1353,18 @@ static void generateClassCheck(CodeGenerator *generator, Operand operand, RawCla
 			asmAndiDot(buffer, R0, varReg(var), 3);
 			asmBne(buffer, label);
 		} else if (class == Handles.Character->raw) {
+			// exact tag 0b10: a lone bit-1 test would accept a VALUE_FLOAT
+			// immediate (0b11); single compare + branch, the label takes one
+			// forward reference
 			fillVar(generator, var);
-			asmAndiDot(buffer, R0, varReg(var), VALUE_CHAR);
-			asmBeq(buffer, label);
+			asmAndiDot(buffer, R0, varReg(var), 3);
+			asmCmpldi(buffer, 0, R0, VALUE_CHAR);
+			asmBne(buffer, label);
+		} else if (class == Handles.SmallFloat64->raw) {
+			fillVar(generator, var);
+			asmAndiDot(buffer, R0, varReg(var), 3);
+			asmCmpldi(buffer, 0, R0, VALUE_FLOAT);
+			asmBne(buffer, label);
 		} else {
 			fillVar(generator, var);
 			generateLoadClass(buffer, varReg(var), R3);
@@ -1360,12 +1391,21 @@ static void generateClassCheck(CodeGenerator *generator, Operand operand, RawCla
 			asmAndiDot(buffer, R0, TMP, 3);
 			asmBne(buffer, label);
 		} else if (class == Handles.Character->raw) {
-			asmAndiDot(buffer, R0, TMP, VALUE_CHAR);
-			asmBeq(buffer, label);
+			// exact tag 0b10 (see the TEMP_VAR variant)
+			asmAndiDot(buffer, R0, TMP, 3);
+			asmCmpldi(buffer, 0, R0, VALUE_CHAR);
+			asmBne(buffer, label);
+		} else if (class == Handles.SmallFloat64->raw) {
+			asmAndiDot(buffer, R0, TMP, 3);
+			asmCmpldi(buffer, 0, R0, VALUE_FLOAT);
+			asmBne(buffer, label);
 		} else {
-			generateLoadObject(buffer, (RawObject *) class, R3, 0);
-			asmLdT(buffer, R0, varOffset(RawObject, class), TMP);
-			asmCmpd(buffer, 0, R3, R0);
+			// compute the class like generateSend does: generateLoadClass is
+			// immediate-safe and yields a tagged class, while the old raw
+			// class-word load dereferenced whatever non-pointer value was in TMP
+			generateLoadClass(buffer, TMP, R3);
+			generateLoadObject(buffer, (RawObject *) class, TMP, 1);
+			asmCmpd(buffer, 0, R3, TMP);
 			asmBne(buffer, label);
 		}
 		break;
@@ -1383,12 +1423,21 @@ static void generateClassCheck(CodeGenerator *generator, Operand operand, RawCla
 			asmAndiDot(buffer, R0, TMP, 3);
 			asmBne(buffer, label);
 		} else if (class == Handles.Character->raw) {
-			asmAndiDot(buffer, R0, TMP, VALUE_CHAR);
-			asmBeq(buffer, label);
+			// exact tag 0b10 (see the TEMP_VAR variant)
+			asmAndiDot(buffer, R0, TMP, 3);
+			asmCmpldi(buffer, 0, R0, VALUE_CHAR);
+			asmBne(buffer, label);
+		} else if (class == Handles.SmallFloat64->raw) {
+			asmAndiDot(buffer, R0, TMP, 3);
+			asmCmpldi(buffer, 0, R0, VALUE_FLOAT);
+			asmBne(buffer, label);
 		} else {
-			generateLoadObject(buffer, (RawObject *) class, R3, 0);
-			asmLdT(buffer, R0, varOffset(RawObject, class), TMP);
-			asmCmpd(buffer, 0, R3, R0);
+			// compute the class like generateSend does: generateLoadClass is
+			// immediate-safe and yields a tagged class, while the old raw
+			// class-word load dereferenced whatever non-pointer value was in TMP
+			generateLoadClass(buffer, TMP, R3);
+			generateLoadObject(buffer, (RawObject *) class, TMP, 1);
+			asmCmpd(buffer, 0, R3, TMP);
 			asmBne(buffer, label);
 		}
 		break;
@@ -1411,12 +1460,21 @@ static void generateClassCheck(CodeGenerator *generator, Operand operand, RawCla
 			asmAndiDot(buffer, R0, TMP, 3);
 			asmBne(buffer, label);
 		} else if (class == Handles.Character->raw) {
-			asmAndiDot(buffer, R0, TMP, VALUE_CHAR);
-			asmBeq(buffer, label);
+			// exact tag 0b10 (see the TEMP_VAR variant)
+			asmAndiDot(buffer, R0, TMP, 3);
+			asmCmpldi(buffer, 0, R0, VALUE_CHAR);
+			asmBne(buffer, label);
+		} else if (class == Handles.SmallFloat64->raw) {
+			asmAndiDot(buffer, R0, TMP, 3);
+			asmCmpldi(buffer, 0, R0, VALUE_FLOAT);
+			asmBne(buffer, label);
 		} else {
-			generateLoadObject(buffer, (RawObject *) class, R3, 0);
-			asmLdT(buffer, R0, varOffset(RawObject, class), TMP);
-			asmCmpd(buffer, 0, R3, R0);
+			// compute the class like generateSend does: generateLoadClass is
+			// immediate-safe and yields a tagged class, while the old raw
+			// class-word load dereferenced whatever non-pointer value was in TMP
+			generateLoadClass(buffer, TMP, R3);
+			generateLoadObject(buffer, (RawObject *) class, TMP, 1);
+			asmCmpd(buffer, 0, R3, TMP);
 			asmBne(buffer, label);
 		}
 		break;

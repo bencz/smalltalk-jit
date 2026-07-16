@@ -56,6 +56,8 @@ static RawClass *getClassOf(Value value)
 		return Handles.SmallInteger->raw;
 	case VALUE_CHAR:
 		return Handles.Character->raw;
+	case VALUE_FLOAT:
+		return Handles.SmallFloat64->raw;
 	case VALUE_POINTER:
 		return asObject(value)->class;
 	default:

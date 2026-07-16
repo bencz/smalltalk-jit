@@ -209,6 +209,8 @@ static void asmXorqMem(AssemblerBuffer *buffer, MemoryOperand operand, Register 
 static void asmSarqImm(AssemblerBuffer *buffer, Register dst, uint8_t imm);
 static void asmShlq(AssemblerBuffer *buffer, Register dst);
 static void asmShlqImm(AssemblerBuffer *buffer, Register dst, uint8_t imm);
+static void asmRolqImm(AssemblerBuffer *buffer, Register dst, uint8_t imm);
+static void asmRorqImm(AssemblerBuffer *buffer, Register dst, uint8_t imm);
 static void asmShrq(AssemblerBuffer *buffer, Register dst);
 static void asmShrqImm(AssemblerBuffer *buffer, Register dst, uint8_t imm);
 
@@ -812,6 +814,20 @@ static void asmShrqImm(AssemblerBuffer *buffer, Register dst, uint8_t imm)
 }
 
 
+static void asmRolqImm(AssemblerBuffer *buffer, Register dst, uint8_t imm)
+{
+	asmEnsureCapacity(buffer);
+	asmEmitShiftImm(buffer, 0, dst, imm);
+}
+
+
+static void asmRorqImm(AssemblerBuffer *buffer, Register dst, uint8_t imm)
+{
+	asmEnsureCapacity(buffer);
+	asmEmitShiftImm(buffer, 1, dst, imm);
+}
+
+
 static void asmEmitShift(AssemblerBuffer *buffer, uint8_t op, Register dst)
 {
 	Operands operands = {.mod = MOD_REG, .reg = op, .rm = dst};
@@ -1164,5 +1180,31 @@ static void asmMulsd(AssemblerBuffer *buffer, XmmRegister src, XmmRegister dst) 
 static void asmDivsd(AssemblerBuffer *buffer, XmmRegister src, XmmRegister dst) { asmSseRegReg(buffer, 0xF2, 0x5E, dst, src); }
 // ucomisd a, b : sets EFLAGS (CF/ZF/PF) from comparing a to b; unordered => CF=ZF=PF=1
 static void asmUcomisd(AssemblerBuffer *buffer, XmmRegister a, XmmRegister b) { asmSseRegReg(buffer, 0x66, 0x2E, a, b); }
+
+// movq xmm(dst), r64(src)   (66 REX.W 0F 6E /r) : raw bit move GPR -> XMM,
+// used by the SmallFloat64 immediate decode in the inline Float intrinsic
+static void asmMovqToXmm(AssemblerBuffer *buffer, Register src, XmmRegister dst)
+{
+	Operands operands = {.mod = MOD_REG, .reg = dst, .rm = src};
+	asmEnsureCapacity(buffer);
+	asmEmitUint8(buffer, 0x66);
+	asmEmitRexOperands(buffer, REX_W, &operands);
+	asmEmitUint8(buffer, 0x0F);
+	asmEmitUint8(buffer, 0x6E);
+	asmEmitOperands(buffer, &operands);
+}
+
+// movq r64(dst), xmm(src)   (66 REX.W 0F 7E /r) : raw bit move XMM -> GPR,
+// used by the SmallFloat64 immediate encode in the inline Float intrinsic
+static void asmMovqFromXmm(AssemblerBuffer *buffer, XmmRegister src, Register dst)
+{
+	Operands operands = {.mod = MOD_REG, .reg = src, .rm = dst};
+	asmEnsureCapacity(buffer);
+	asmEmitUint8(buffer, 0x66);
+	asmEmitRexOperands(buffer, REX_W, &operands);
+	asmEmitUint8(buffer, 0x0F);
+	asmEmitUint8(buffer, 0x7E);
+	asmEmitOperands(buffer, &operands);
+}
 
 #endif

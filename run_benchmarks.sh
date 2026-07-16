@@ -53,8 +53,10 @@ if [ ! -x "$BUILD/st" ]; then
 	echo "${R}no VM binary at $BUILD/st, build first (drop --no-build)${Z}"; exit 1
 fi
 
-# always bootstrap a fresh image so it matches the current kernel (cheap)
-if ! "$BUILD/st" -s "$SNAP" -b smalltalk >/dev/null 2>&1; then
+# always bootstrap a fresh image so it matches the current kernel (cheap).
+# stdin from /dev/null: with a terminal on stdin the VM falls through to the
+# REPL and waits for input instead of exiting (same reason as run_tests.sh)
+if ! "$BUILD/st" -s "$SNAP" -b smalltalk </dev/null >/dev/null 2>&1; then
 	echo "${R}BOOTSTRAP FAILED${Z}"; exit 1
 fi
 
@@ -64,8 +66,10 @@ failed=""
 for f in benchmarks/*.st; do
 	name="$(basename "$f")"
 	printf "  %-16s " "$name"
-	# stdbuf: the VM's assertion path aborts, which would discard a buffered message
-	out="$(stdbuf -o0 "$BUILD/st" -s "$SNAP" -f "$f" 2>&1)"
+	# stdbuf: the VM's assertion path aborts, which would discard a buffered
+	# message. timeout: a hung benchmark must fail the gate, not freeze it.
+	# stdin from /dev/null: a terminal on stdin would drop into the REPL.
+	out="$(timeout 300 stdbuf -o0 "$BUILD/st" -s "$SNAP" -f "$f" </dev/null 2>&1)"
 	if [ $? -ne 0 ] || [ -z "$out" ]; then
 		echo "${R}FAILED${Z}"
 		[ -n "$out" ] && echo "$out" | sed 's/^/      /'
@@ -75,7 +79,7 @@ for f in benchmarks/*.st; do
 	echo "${G}$out${Z}"
 
 	if [ "$COMPARE" -eq 1 ]; then
-		slow="$(ST_NO_INLINE_CF=1 stdbuf -o0 "$BUILD/st" -s "$SNAP" -f "$f" 2>&1)"
+		slow="$(ST_NO_INLINE_CF=1 timeout 300 stdbuf -o0 "$BUILD/st" -s "$SNAP" -f "$f" </dev/null 2>&1)"
 		printf "  %-16s ${D}%s   (ST_NO_INLINE_CF=1)${Z}\n" "" "$slow"
 	fi
 done

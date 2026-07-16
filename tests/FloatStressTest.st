@@ -43,3 +43,16 @@
 	Assert true: (big at: 1) = 'first'.
 	Assert true: (big at: 50000) = 'last'.
 ]
+
+
+"---- A hot loop FORCED onto the boxed path (magnitudes beyond the
+SmallFloat64 immediate range). Since immediates landed, the loops above
+allocate nothing, so this is what still regression-tests the boxed-result
+handle bookkeeping (fromDoubleResult's pop) under allocation pressure."
+[
+	| z |
+	z := 1.0e300.
+	1 to: 20000 do: [:i | z := (z + 1.0e290) - 1.0e290].
+	Assert true: z = 1.0e300.
+	Assert true: z class == BoxedFloat64.
+]

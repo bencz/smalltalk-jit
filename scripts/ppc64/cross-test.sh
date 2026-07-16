@@ -52,6 +52,8 @@ echo "== TokenizerTest:"; "$OUT/TokenizerTest" && echo OK
 echo "== ST_SAFEPOINT_TEST:"; ST_SAFEPOINT_TEST=1 "$OUT/st" && echo OK
 echo "== ST_TLAB_TEST:"; ST_TLAB_TEST=1 "$OUT/st" && echo OK
 echo "== ST_SNAPSHOT_FORMAT_TEST:"; ST_SNAPSHOT_FORMAT_TEST=1 "$OUT/st" && echo OK
+# SmallFloat64 rotation encoding, re-proven on a genuine big/little-endian target
+echo "== ST_SMALLFLOAT_TEST:"; ST_SMALLFLOAT_TEST=1 "$OUT/st" && echo OK
 # The arch's own emission golden: the same pinned vectors the x86 host runs
 # natively, re-checked on a genuinely big/little-endian target under qemu. Each
 # backend's Bind TU aliases ST_ABI_EMIT_TEST to its own golden.

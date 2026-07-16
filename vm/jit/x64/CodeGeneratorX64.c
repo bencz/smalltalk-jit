@@ -598,45 +598,100 @@ static _Bool floatInlineEnabled(void)
 }
 
 
+// Emit the load of one already-guarded Float operand (SmallFloat64 immediate
+// OR BoxedFloat64 pointer) into an XMM register. Dispatches on bit 1 alone,
+// which cannot miss after the guard phase in generateFloatFastPath. offsetReg
+// must hold SMALLFLOAT_OFFSET and is preserved; scratch may alias reg (the
+// operand register is dead once the double is in xmm).
+static void generateFloatOperandLoad(AssemblerBuffer *buffer, Register reg,
+	Register scratch, Register offsetReg, XmmRegister xmm)
+{
+	AssemblerLabel boxed, zero, done;
+	asmInitLabel(&boxed);
+	asmInitLabel(&zero);
+	asmInitLabel(&done);
+
+	asmTestqImm(buffer, reg, VALUE_CHAR);   // bit 1 set here means immediate (0b11)
+	asmJ(buffer, COND_ZERO, &boxed);
+
+	// SmallFloat64 decode, the inverse of tagFloat (see Object.h): payload =
+	// value >> 2; bits = ROR64(payload <= 1 ? payload : payload + offset, 1)
+	asmMovq(buffer, reg, scratch);
+	asmShrqImm(buffer, scratch, 2);
+	asmCmpqImm(buffer, scratch, 1);
+	asmJ(buffer, COND_BELOW_EQUAL, &zero);  // payloads 0/1 are +-0.0: no rebias
+	asmAddq(buffer, offsetReg, scratch);
+	asmLabelBind(buffer, &zero, asmOffset(buffer));
+	asmRorqImm(buffer, scratch, 1);
+	asmMovqToXmm(buffer, scratch, xmm);
+	asmJmpLabel(buffer, &done);
+
+	asmLabelBind(buffer, &boxed, asmOffset(buffer));
+	asmMovsdMem(buffer, asmMem(reg, NO_REGISTER, SS_1, varOffset(RawFloat, value)), xmm);
+
+	asmLabelBind(buffer, &done, asmOffset(buffer));
+}
+
+
 // Inline Float `+ - * /` and `< <= > >= = ~=` at the call site. Reached when the
 // SmallInteger fast path missed (or was skipped, for `/`); the operands are still
 // on the stack (receiver at [rsp], arg at [rsp+8]) and TMP still holds the
-// receiver. If BOTH operands are boxed Floats, do the SSE op inline and jump to
-// the shared merge; otherwise fall through to the normal dispatch (which coerces
-// mixed int/float via retry:coercing:). Scratch is RAX/RSI/RDI (all rebuilt by
-// dispatch) plus RDX + XMM0/XMM1 on the committed arithmetic path; TMP is left
-// untouched on every fall-through-to-dispatch path so the class recompute works.
+// receiver. Each operand may be a SmallFloat64 immediate (0b11, decoded inline)
+// or a BoxedFloat64 pointer (unboxed inline); anything else falls through to the
+// normal dispatch (which coerces mixed int/float via retry:coercing:). An
+// arithmetic result that fits the immediate range is encoded inline with NO
+// allocation; only an out-of-range result allocates a box, and only AFTER the
+// stub call are the operands re-decoded and the op redone (no XMM value survives
+// the stub). Misses touch only RAX/RSI/RDI (all rebuilt by dispatch); RDX and
+// XMM0/XMM1 are clobbered on the committed paths only; TMP is left untouched on
+// every fall-through-to-dispatch path so the class recompute works.
 static void generateFloatFastPath(CodeGenerator *generator, int arithKind, AssemblerLabel *arithMerge)
 {
 	AssemblerBuffer *buffer = &generator->buffer;
-	AssemblerLabel tagMissR, tagMissA, classMissR, classMissA;
+	AssemblerLabel tagMissR, tagMissA, immOkR, immOkA, classMissR, classMissA;
 	asmInitLabel(&tagMissR);
 	asmInitLabel(&tagMissA);
+	asmInitLabel(&immOkR);
+	asmInitLabel(&immOkA);
 	asmInitLabel(&classMissR);
 	asmInitLabel(&classMissA);
 
 	asmMovqMem(buffer, asmMem(RSP, NO_REGISTER, SS_1, 0), RAX);                     // receiver
 	asmMovqMem(buffer, asmMem(RSP, NO_REGISTER, SS_1, sizeof(intptr_t)), RSI);      // arg
-	// both must be heap pointers (only VALUE_POINTER has bit 0 set) of class Float
+
+	// Guard phase, the ONLY phase that can fall to dispatch: each operand must
+	// be a SmallFloat64 immediate (both tag bits set) or a pointer whose class
+	// word is BoxedFloat64. A bare bit-0 test would accept an immediate and
+	// dereference it as a box.
+	generateLoadObject(buffer, (RawObject *) Handles.BoxedFloat64->raw, RDI, 0);    // BoxedFloat64 class (raw)
 	asmTestqImm(buffer, RAX, VALUE_POINTER);
-	asmJ(buffer, COND_ZERO, &tagMissR);
-	asmTestqImm(buffer, RSI, VALUE_POINTER);
-	asmJ(buffer, COND_ZERO, &tagMissA);
-	generateLoadObject(buffer, (RawObject *) Handles.Float->raw, RDI, 0);           // Float class (raw)
+	asmJ(buffer, COND_ZERO, &tagMissR);           // 0b00/0b10: not a Float
+	asmTestqImm(buffer, RAX, VALUE_CHAR);
+	asmJ(buffer, COND_NOT_ZERO, &immOkR);         // 0b11: immediate
 	asmCmpqMem(buffer, asmMem(RAX, NO_REGISTER, SS_1, varOffset(RawObject, class)), RDI);
 	asmJ(buffer, COND_NOT_EQUAL, &classMissR);
+	asmLabelBind(buffer, &immOkR, asmOffset(buffer));
+	asmTestqImm(buffer, RSI, VALUE_POINTER);
+	asmJ(buffer, COND_ZERO, &tagMissA);
+	asmTestqImm(buffer, RSI, VALUE_CHAR);
+	asmJ(buffer, COND_NOT_ZERO, &immOkA);
 	asmCmpqMem(buffer, asmMem(RSI, NO_REGISTER, SS_1, varOffset(RawObject, class)), RDI);
 	asmJ(buffer, COND_NOT_EQUAL, &classMissA);
+	asmLabelBind(buffer, &immOkA, asmOffset(buffer));
+
+	// Committed: decode both operands into XMM0/XMM1. RDI/RDX become scratch
+	// from here on; nothing below falls to dispatch.
+	asmMovqImm(buffer, (int64_t) SMALLFLOAT_OFFSET, RDX);
+	generateFloatOperandLoad(buffer, RAX, RAX, RDX, XMM0);
+	generateFloatOperandLoad(buffer, RSI, RSI, RDX, XMM1);
 
 	if (arithIsCompare(arithKind)) {
-		// No allocation: unbox both, ucomisd, load true/false. ucomisd sets CF/ZF/PF
+		// No allocation: ucomisd, load true/false. ucomisd sets CF/ZF/PF
 		// like an unsigned compare, with unordered (NaN) => CF=ZF=PF=1. Branch on
 		// FRESH flags (the true/false loads clobber flags). NaN follows C: unordered
 		// is false for < <= > >= = and true for ~=. Each label is referenced exactly
 		// once (asmEmitLabel32 allows only one reference): `jp` and the fall-through
 		// both reach firstBlock, the main condition reaches secondBlock.
-		asmMovsdMem(buffer, asmMem(RAX, NO_REGISTER, SS_1, varOffset(RawFloat, value)), XMM0);
-		asmMovsdMem(buffer, asmMem(RSI, NO_REGISTER, SS_1, varOffset(RawFloat, value)), XMM1);
 		asmUcomisd(buffer, XMM0, XMM1);
 		AssemblerLabel firstBlock, secondBlock, cmpDone;
 		asmInitLabel(&firstBlock);
@@ -668,17 +723,53 @@ static void generateFloatFastPath(CodeGenerator *generator, int arithKind, Assem
 		generateLoadObject(buffer, secondValue, RAX, 1);
 		asmLabelBind(buffer, &cmpDone, asmOffset(buffer));
 	} else {
-		// Arithmetic: box the result. Allocate FIRST, then compute into the new
-		// Float. The operands stay live across the (possibly scavenging) allocation
-		// via the stub's stackmap, and the result never crosses a C call, so no XMM
-		// value has to survive the allocation.
-		generateLoadObject(buffer, (RawObject *) Handles.Float->raw, RSI, 0);       // class for AllocateStub
+		// Arithmetic: compute FIRST, then try the immediate encode; results
+		// that fit the SmallFloat64 range allocate NOTHING.
+		switch (arithKind) {
+		case ARITH_ADD: asmAddsd(buffer, XMM1, XMM0); break;
+		case ARITH_SUB: asmSubsd(buffer, XMM1, XMM0); break;
+		case ARITH_MUL: asmMulsd(buffer, XMM1, XMM0); break;
+		default:        asmDivsd(buffer, XMM1, XMM0); break;   // ARITH_DIV
+		}
+
+		AssemblerLabel payloadReady, boxSlowA, boxSlowB, fastDone;
+		asmInitLabel(&payloadReady);
+		asmInitLabel(&boxSlowA);
+		asmInitLabel(&boxSlowB);
+		asmInitLabel(&fastDone);
+
+		// SmallFloat64 encode (tagFloat, see Object.h): rot = ROL64(bits, 1);
+		// rot <= 1 is +-0.0 and IS the payload; otherwise the payload is
+		// rot - offset and must land in [2, 2^62).
+		asmMovqFromXmm(buffer, XMM0, RDI);
+		asmRolqImm(buffer, RDI, 1);
+		asmCmpqImm(buffer, RDI, 1);
+		asmJ(buffer, COND_BELOW_EQUAL, &payloadReady);
+		asmSubq(buffer, RDX, RDI);                    // payload = rot - offset (RDX holds it)
+		asmCmpqImm(buffer, RDI, 1);
+		asmJ(buffer, COND_BELOW_EQUAL, &boxSlowA);    // +-2^-255: collides with +-0.0, box
+		asmMovq(buffer, RDI, RSI);
+		asmShrqImm(buffer, RSI, 62);
+		asmJ(buffer, COND_NOT_ZERO, &boxSlowB);       // out of range or underflow wrap: box
+		asmLabelBind(buffer, &payloadReady, asmOffset(buffer));
+		asmShlqImm(buffer, RDI, 2);
+		asmAddqImm(buffer, RDI, VALUE_FLOAT);         // low bits are 00, add == or
+		asmMovq(buffer, RDI, RAX);
+		asmJmpLabel(buffer, &fastDone);
+
+		// Out-of-range result: allocate FIRST (the operands survive the
+		// possibly-scavenging stub via its stackmap; XMM values do NOT), then
+		// re-decode the reloaded operands and redo the op into the new box.
+		asmLabelBind(buffer, &boxSlowA, asmOffset(buffer));
+		asmLabelBind(buffer, &boxSlowB, asmOffset(buffer));
+		generateLoadObject(buffer, (RawObject *) Handles.BoxedFloat64->raw, RSI, 0); // class for AllocateStub
 		asmMovqImm(buffer, 0, RDX);                                                 // no indexed slots
 		generateStubCall(generator, &AllocateStub);                                // RAX = new tagged Float
 		asmMovqMem(buffer, asmMem(RSP, NO_REGISTER, SS_1, 0), RSI);                 // reload receiver (GC-updated)
 		asmMovqMem(buffer, asmMem(RSP, NO_REGISTER, SS_1, sizeof(intptr_t)), RDI);  // reload arg
-		asmMovsdMem(buffer, asmMem(RSI, NO_REGISTER, SS_1, varOffset(RawFloat, value)), XMM0);
-		asmMovsdMem(buffer, asmMem(RDI, NO_REGISTER, SS_1, varOffset(RawFloat, value)), XMM1);
+		asmMovqImm(buffer, (int64_t) SMALLFLOAT_OFFSET, RDX);
+		generateFloatOperandLoad(buffer, RSI, RSI, RDX, XMM0);
+		generateFloatOperandLoad(buffer, RDI, RDI, RDX, XMM1);
 		switch (arithKind) {
 		case ARITH_ADD: asmAddsd(buffer, XMM1, XMM0); break;
 		case ARITH_SUB: asmSubsd(buffer, XMM1, XMM0); break;
@@ -686,6 +777,7 @@ static void generateFloatFastPath(CodeGenerator *generator, int arithKind, Assem
 		default:        asmDivsd(buffer, XMM1, XMM0); break;   // ARITH_DIV
 		}
 		asmMovsdToMem(buffer, XMM0, asmMem(RAX, NO_REGISTER, SS_1, varOffset(RawFloat, value)));
+		asmLabelBind(buffer, &fastDone, asmOffset(buffer));
 	}
 	asmJmpLabel(buffer, arithMerge);
 
@@ -873,12 +965,14 @@ void generateStoreCheck(CodeGenerator *generator, Register object, Register valu
 	// needs its own label; the skips are all bound to the exit point below.
 	AssemblerLabel objectIsNew;
 	AssemblerLabel valueIsNotPtr;
+	AssemblerLabel valueIsImmFloat;
 	AssemblerLabel valueIsOld;
 	AssemblerLabel alreadyInSet;
 	AssemblerLabel notFull;
 
 	asmInitLabel(&objectIsNew);
 	asmInitLabel(&valueIsNotPtr);
+	asmInitLabel(&valueIsImmFloat);
 	asmInitLabel(&valueIsOld);
 	asmInitLabel(&alreadyInSet);
 	asmInitLabel(&notFull);
@@ -892,8 +986,12 @@ void generateStoreCheck(CodeGenerator *generator, Register object, Register valu
 	// that is not already remembered needs recording.
 	asmTestqImm(buffer, object, NEW_SPACE_TAG);   // object is young -> nothing to do
 	asmJ(buffer, COND_NOT_ZERO, &objectIsNew);
-	asmTestqImm(buffer, value, VALUE_POINTER);    // value is not a pointer
+	// value must be a heap pointer (tag 0b01 exactly): bit 0 set is not enough,
+	// a VALUE_FLOAT immediate (0b11) shares it and must not be remembered
+	asmTestqImm(buffer, value, VALUE_POINTER);    // bit 0 clear -> int/char
 	asmJ(buffer, COND_ZERO, &valueIsNotPtr);
+	asmTestqImm(buffer, value, VALUE_CHAR);       // bit 1 set too -> immediate float
+	asmJ(buffer, COND_NOT_ZERO, &valueIsImmFloat);
 	asmTestqImm(buffer, value, NEW_SPACE_TAG);    // value is old
 	asmJ(buffer, COND_ZERO, &valueIsOld);
 	asmTestbMemImm(buffer, tags, TAG_REMEMBERED); // object already remembered
@@ -936,6 +1034,7 @@ void generateStoreCheck(CodeGenerator *generator, Register object, Register valu
 
 	asmLabelBind(buffer, &objectIsNew, asmOffset(buffer));
 	asmLabelBind(buffer, &valueIsNotPtr, asmOffset(buffer));
+	asmLabelBind(buffer, &valueIsImmFloat, asmOffset(buffer));
 	asmLabelBind(buffer, &valueIsOld, asmOffset(buffer));
 	asmLabelBind(buffer, &alreadyInSet, asmOffset(buffer));
 }
@@ -1002,34 +1101,49 @@ void generateLoadObject(AssemblerBuffer *buffer, RawObject *object, Register dst
 
 void generateLoadClass(AssemblerBuffer *buffer, Register src, Register dst)
 {
+	// Four-way exact dispatch on the 2-bit tag. The old shortcut (above
+	// VALUE_POINTER means Character) would classify a VALUE_FLOAT immediate
+	// (0b11) as a Character. Each label takes a single forward reference, so
+	// every arm exits through its own end label.
 	AssemblerLabel pointer;
 	AssemblerLabel character;
-	AssemblerLabel end, end2;
+	AssemblerLabel floatImm;
+	AssemblerLabel endInt, endPtr, endChar;
 
 	asmInitLabel(&pointer);
 	asmInitLabel(&character);
-	asmInitLabel(&end);
-	asmInitLabel(&end2);
+	asmInitLabel(&floatImm);
+	asmInitLabel(&endInt);
+	asmInitLabel(&endPtr);
+	asmInitLabel(&endChar);
 
 	asmMovq(buffer, src, dst);
 	asmAndqImm(buffer, dst, 3);
 	asmCmpqImm(buffer, dst, VALUE_POINTER);
-	asmJ(buffer, COND_ABOVE, &character);
 	asmJ(buffer, COND_EQUAL, &pointer);
+	asmCmpqImm(buffer, dst, VALUE_CHAR);
+	asmJ(buffer, COND_EQUAL, &character);
+	asmCmpqImm(buffer, dst, VALUE_FLOAT);
+	asmJ(buffer, COND_EQUAL, &floatImm);
 
 	generateLoadObject(buffer, (RawObject *) Handles.SmallInteger->raw, dst, 1);
-	asmJmpLabel(buffer, &end);
+	asmJmpLabel(buffer, &endInt);
 
 	asmLabelBind(buffer, &pointer, asmOffset(buffer));
 	asmMovqMem(buffer, asmMem(src, NO_REGISTER, SS_1, -1), dst);
 	asmIncq(buffer, dst);
-	asmJmpLabel(buffer, &end2);
+	asmJmpLabel(buffer, &endPtr);
 
 	asmLabelBind(buffer, &character, asmOffset(buffer));
 	generateLoadObject(buffer, (RawObject *) Handles.Character->raw, dst, 1);
+	asmJmpLabel(buffer, &endChar);
 
-	asmLabelBind(buffer, &end, asmOffset(buffer));
-	asmLabelBind(buffer, &end2, asmOffset(buffer));
+	asmLabelBind(buffer, &floatImm, asmOffset(buffer));
+	generateLoadObject(buffer, (RawObject *) Handles.SmallFloat64->raw, dst, 1);
+
+	asmLabelBind(buffer, &endInt, asmOffset(buffer));
+	asmLabelBind(buffer, &endPtr, asmOffset(buffer));
+	asmLabelBind(buffer, &endChar, asmOffset(buffer));
 }
 
 
@@ -1395,8 +1509,18 @@ static void generateClassCheck(CodeGenerator *generator, Operand operand, RawCla
 			asmTestqImm(buffer, src, 3);
 			asmJ(buffer, COND_NOT_ZERO, label);
 		} else if (class == Handles.Character->raw) {
-			asmTestqImm(buffer, src, VALUE_CHAR);
-			asmJ(buffer, COND_ZERO, label);
+			// exact tag 0b10 via scratch RAX: a lone bit-1 test would accept a
+			// VALUE_FLOAT immediate (0b11), and the label takes a single
+			// forward reference, so the compare must fold into one jump
+			asmMovq(buffer, src, RAX);
+			asmAndqImm(buffer, RAX, 3);
+			asmCmpqImm(buffer, RAX, VALUE_CHAR);
+			asmJ(buffer, COND_NOT_EQUAL, label);
+		} else if (class == Handles.SmallFloat64->raw) {
+			asmMovq(buffer, src, RAX);
+			asmAndqImm(buffer, RAX, 3);
+			asmCmpqImm(buffer, RAX, VALUE_FLOAT);
+			asmJ(buffer, COND_NOT_EQUAL, label);
 		} else {
 			// Compute the receiver's class exactly like generateSend does
 			// (generateLoadClass: correct tag handling, tagged result) into scratch
@@ -1429,11 +1553,23 @@ static void generateClassCheck(CodeGenerator *generator, Operand operand, RawCla
 			asmTestqImm(buffer, TMP, 3);
 			asmJ(buffer, COND_NOT_ZERO, label);
 		} else if (class == Handles.Character->raw) {
-			asmTestqImm(buffer, TMP, VALUE_CHAR);
-			asmJ(buffer, COND_ZERO, label);
+			// exact tag 0b10 via scratch RAX (see the TEMP_VAR variant)
+			asmMovq(buffer, TMP, RAX);
+			asmAndqImm(buffer, RAX, 3);
+			asmCmpqImm(buffer, RAX, VALUE_CHAR);
+			asmJ(buffer, COND_NOT_EQUAL, label);
+		} else if (class == Handles.SmallFloat64->raw) {
+			asmMovq(buffer, TMP, RAX);
+			asmAndqImm(buffer, RAX, 3);
+			asmCmpqImm(buffer, RAX, VALUE_FLOAT);
+			asmJ(buffer, COND_NOT_EQUAL, label);
 		} else {
-			generateLoadObject(buffer, (RawObject *) class, RAX, 0);
-			asmCmpqMem(buffer, asmMem(TMP, NO_REGISTER, SS_1, varOffset(RawObject, class)), RAX);
+			// compute the class like generateSend does: generateLoadClass is
+			// immediate-safe and yields a tagged class, while the old raw
+			// class-word load dereferenced whatever non-pointer value was in TMP
+			generateLoadClass(buffer, TMP, RAX);
+			generateLoadObject(buffer, (RawObject *) class, TMP, 1);
+			asmCmpq(buffer, RAX, TMP);
 			asmJ(buffer, COND_NOT_EQUAL, label);
 		}
 		break;
@@ -1450,11 +1586,23 @@ static void generateClassCheck(CodeGenerator *generator, Operand operand, RawCla
 			asmTestqImm(buffer, TMP, 3);
 			asmJ(buffer, COND_NOT_ZERO, label);
 		} else if (class == Handles.Character->raw) {
-			asmTestqImm(buffer, TMP, VALUE_CHAR);
-			asmJ(buffer, COND_ZERO, label);
+			// exact tag 0b10 via scratch RAX (see the TEMP_VAR variant)
+			asmMovq(buffer, TMP, RAX);
+			asmAndqImm(buffer, RAX, 3);
+			asmCmpqImm(buffer, RAX, VALUE_CHAR);
+			asmJ(buffer, COND_NOT_EQUAL, label);
+		} else if (class == Handles.SmallFloat64->raw) {
+			asmMovq(buffer, TMP, RAX);
+			asmAndqImm(buffer, RAX, 3);
+			asmCmpqImm(buffer, RAX, VALUE_FLOAT);
+			asmJ(buffer, COND_NOT_EQUAL, label);
 		} else {
-			generateLoadObject(buffer, (RawObject *) class, RAX, 0);
-			asmCmpqMem(buffer, asmMem(TMP, NO_REGISTER, SS_1, varOffset(RawObject, class)), RAX);
+			// compute the class like generateSend does: generateLoadClass is
+			// immediate-safe and yields a tagged class, while the old raw
+			// class-word load dereferenced whatever non-pointer value was in TMP
+			generateLoadClass(buffer, TMP, RAX);
+			generateLoadObject(buffer, (RawObject *) class, TMP, 1);
+			asmCmpq(buffer, RAX, TMP);
 			asmJ(buffer, COND_NOT_EQUAL, label);
 		}
 		break;
@@ -1482,11 +1630,23 @@ static void generateClassCheck(CodeGenerator *generator, Operand operand, RawCla
 			asmTestqImm(buffer, TMP, 3);
 			asmJ(buffer, COND_NOT_ZERO, label);
 		} else if (class == Handles.Character->raw) {
-			asmTestqImm(buffer, TMP, VALUE_CHAR);
-			asmJ(buffer, COND_ZERO, label);
+			// exact tag 0b10 via scratch RAX (see the TEMP_VAR variant)
+			asmMovq(buffer, TMP, RAX);
+			asmAndqImm(buffer, RAX, 3);
+			asmCmpqImm(buffer, RAX, VALUE_CHAR);
+			asmJ(buffer, COND_NOT_EQUAL, label);
+		} else if (class == Handles.SmallFloat64->raw) {
+			asmMovq(buffer, TMP, RAX);
+			asmAndqImm(buffer, RAX, 3);
+			asmCmpqImm(buffer, RAX, VALUE_FLOAT);
+			asmJ(buffer, COND_NOT_EQUAL, label);
 		} else {
-			generateLoadObject(buffer, (RawObject *) class, RAX, 0);
-			asmCmpqMem(buffer, asmMem(TMP, NO_REGISTER, SS_1, varOffset(RawObject, class)), RAX);
+			// compute the class like generateSend does: generateLoadClass is
+			// immediate-safe and yields a tagged class, while the old raw
+			// class-word load dereferenced whatever non-pointer value was in TMP
+			generateLoadClass(buffer, TMP, RAX);
+			generateLoadObject(buffer, (RawObject *) class, TMP, 1);
+			asmCmpq(buffer, RAX, TMP);
 			asmJ(buffer, COND_NOT_EQUAL, label);
 		}
 		break;

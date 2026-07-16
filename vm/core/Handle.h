@@ -44,6 +44,8 @@ typedef struct SmalltalkHandles {
 	Class *Symbol;
 	Class *Character;
 	Class *Float;
+	Class *SmallFloat64;
+	Class *BoxedFloat64;
 	Class *String;
 	Class *Array;
 	Class *ByteArray;
