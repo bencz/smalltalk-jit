@@ -121,11 +121,19 @@ Block := Object [
 
 	on: anExceptionClass do: aHandlerBlock [
 		"Evaluate the receiver; if it signals an exception handled by
-		anExceptionClass, evaluate aHandlerBlock with the exception. The handler
-		may answer a value, or send #return:/#retry/#pass to the exception."
-		^self basicOn: anExceptionClass do: [:ex |
-			ex setRetryProtected: self class: anExceptionClass handler: aHandlerBlock.
-			aHandlerBlock value: ex]
+		anExceptionClass, evaluate aHandlerBlock with the exception ON TOP of
+		the signaling frames (see Exception>>runHandledBy:). The handler may
+		answer a value (unwinds and becomes this expression's value), or send
+		#resume:/#return:/#retry/#retryUsing:/#pass/#outer/#resignalAs: to the
+		exception. retry/retryUsing: arrive here as a RetryRequest after the
+		unwind, and re-evaluate under the same protection."
+		| result |
+
+		result := self basicOn: anExceptionClass do: aHandlerBlock.
+		result class == RetryRequest ifTrue: [
+			^(result block isNil ifTrue: [self] ifFalse: [result block])
+				on: anExceptionClass do: aHandlerBlock].
+		^result
 	]
 
 

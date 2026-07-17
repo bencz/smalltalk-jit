@@ -5,7 +5,7 @@
 #include "core/Handle.h"
 #include "core/StackFrame.h"
 
-Value unwindExceptionHandler(RawObject *rawException)
+Value findExceptionHandler(RawObject *rawException)
 {
 	if (CurrentExceptionHandler == 0) {
 		return 0;
@@ -16,7 +16,7 @@ Value unwindExceptionHandler(RawObject *rawException)
 
 	Object *exception = scopeHandle(rawException);
 	ExceptionHandler *handler = scopeHandle(asObject(CurrentExceptionHandler));
-	CurrentExceptionHandler = 0;
+	Object *originalHead = scopeHandle(asObject(CurrentExceptionHandler));
 
 	do {
 		RawContext *context = (RawContext *) asObject(handler->raw->context);
@@ -25,20 +25,23 @@ Value unwindExceptionHandler(RawObject *rawException)
 			EntryArgs args = { .size = 0 };
 			entryArgsAddObject(&args, exceptionClass);
 			entryArgsAddObject(&args, exception);
-			if (isTaggedTrue(sendMessage(Handles.handlesSymbol, &args))) {
-				CurrentExceptionHandler = handler->raw->parent;
-				// The handler has decided: run the pending ensure:/ifCurtailed:
-				// cleanups of the frames the jump to the handler will cut. The
-				// signaling frames stay walkable while the cleanups run (the
-				// signal primitive still re-reads its frame after this returns);
-				// the C-side records of the cut region (nested entries/scopes)
-				// are dropped by the signal primitive AT the cut, via
-				// unwindThreadStateTo, after its last read of a dying frame.
-				runUnwindHandlersBelow((uint8_t *) ((RawContext *) asObject(handler->raw->context))->frame);
+			// While handles: runs, exclude this candidate and everything inside
+			// it, so a signal raised by handles: itself searches strictly
+			// outward (the pre-M2 code zeroed the whole chain instead, which
+			// also wiped it for the unhandled case).
+			CurrentExceptionHandler = handler->raw->parent;
+			_Bool handles = isTaggedTrue(sendMessage(Handles.handlesSymbol, &args));
+			if (handles) {
+				// Leave the head at the matched handler's parent: the handler
+				// is now in progress. NO unwinding here (milestone 2): the
+				// signal primitive runs the handler on top of the signaling
+				// frames; cleanups run only if and when the handler decides
+				// to unwind (normal completion / return: / retry).
 				Value found = getTaggedPtr(handler);
 				closeHandleScope(&scope, NULL);
 				return found;
 			}
+			CurrentExceptionHandler = getTaggedPtr(originalHead);
 		}
 		if (handler->raw->parent == 0) {
 			closeHandleScope(&scope, NULL);
@@ -104,26 +107,28 @@ void runUnwindHandlerChain(Value head)
 }
 
 
-Value nlrRunUnwindHandlers(Value result, uint8_t *homeFrame)
+Value unwindReturning(Value result, uint8_t *targetFrame)
 {
 	HandleScope scope;
 	openHandleScope(&scope);
 
-	// The non-local return value must survive GCs triggered by the cleanups.
+	// The carried result must survive GCs triggered by the cleanups.
 	Object *resultHandle = NULL;
 	if (valueTypeOf(result, VALUE_POINTER)) {
 		resultHandle = scopeHandle(asObject(result));
 	}
 
-	// The home frame itself dies too (the return leaves the home method), but
-	// ensure frames are always strict callees of it, so `below home` covers all.
-	runUnwindHandlersBelow(homeFrame);
+	// Non-local return: the home frame itself dies too, but ensure frames are
+	// always strict callees of it, so `below target` covers all. Handler
+	// completion: the on:do: frame survives; everything the cut abandons
+	// (protected-block frames, signal frames, handler frames) is below it.
+	runUnwindHandlersBelow(targetFrame);
 
 	if (resultHandle != NULL) {
 		result = getTaggedPtr(resultHandle);
 	}
 	closeHandleScope(&scope, NULL);
-	unwindThreadStateTo(homeFrame);
+	unwindThreadStateTo(targetFrame);
 	return result;
 }
 

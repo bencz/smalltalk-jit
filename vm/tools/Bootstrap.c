@@ -102,6 +102,7 @@ static void initSmalltalkStubs(void)
 	Handles.cannotReturnSymbol = persistHandle(getSymbol("cannotReturn:"));
 	Handles.handlesSymbol = persistHandle(getSymbol("handles:"));
 	Handles.generateBacktraceSymbol = persistHandle(getSymbol("generateBacktrace"));
+	Handles.runHandledBySymbol = persistHandle(getSymbol("runHandledBy:"));
 
 	setGlobalObject("UndefinedObject", (Object *) Handles.UndefinedObject);
 	setGlobalObject("nil", Handles.nil);
@@ -332,7 +333,9 @@ static _Bool parseKernelFiles(char *kernelDir)
 		"Actors/ActorSystem.st",
 
 		"Exception.st",
+		"HandlerEscape.st",
 		"Error.st",
+		"Warning.st",
 		"MessageNotUnderstood.st",
 		"OutOfRangeError.st",
 		"NotFoundError.st",

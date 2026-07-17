@@ -1247,7 +1247,7 @@ static void generateOuterReturn(CodeGenerator *generator, BytecodesIterator *ite
 	// this frame's context slot, which the GC keeps fresh (the raw home-frame
 	// address itself is stable, but the context objects can move).
 	asmMr(buffer, R4, TMP); // home frame
-	generateCCall(generator, (intptr_t) nlrRunUnwindHandlers, 2, 1);
+	generateCCall(generator, (intptr_t) unwindReturning, 2, 1);
 	asmLd(buffer, varReg(context), -2 * (ptrdiff_t) sizeof(intptr_t), FP);
 	asmLdT(buffer, varReg(context), varOffset(RawContext, home), varReg(context));
 	asmLdT(buffer, TMP, varOffset(RawContext, frame), varReg(context));

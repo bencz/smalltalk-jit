@@ -30,7 +30,15 @@ OBJECT_HANDLE(UnwindHandler);
 // uses keep working through this alias.
 #define CurrentExceptionHandler (CurrentThread.exceptionHandler)
 
-Value  unwindExceptionHandler(RawObject *exception);
+// Search the running fiber's on:do: chain for a handler whose exception class
+// answers true to handles: anException. NO unwinding happens here (milestone 2:
+// the handler runs on top of the signaling frames). On a match the chain head
+// is left at the matched handler's parent (the handler is "in progress"; the
+// signal primitive saves and restores the full head across the handler run);
+// on no match the head is left untouched. During each handles: send the head
+// temporarily excludes the candidates already reached, so a signal from inside
+// handles: searches strictly outward instead of recursing.
+Value  findExceptionHandler(RawObject *exception);
 
 // Run pending ensure:/ifCurtailed: cleanups whose frames lie below `targetFrame`
 // (both ports grow the stack down: a dying frame has a LOWER address than the
@@ -47,10 +55,14 @@ void runAllUnwindHandlers(void);
 // fiber's own chain.
 void runUnwindHandlerChain(Value head);
 
-// Called from JIT code on the non-local-return slow path (pending unwind
-// handlers exist): runs the cleanups below the home frame and answers the
-// (possibly GC-moved) return value.
-Value nlrRunUnwindHandlers(Value result, uint8_t *homeFrame);
+// The shared unwind engine for value-carrying stack cuts: runs the pending
+// ensure:/ifCurtailed: cleanups below `targetFrame` (which itself survives or
+// dies with the caller's cut, indifferent to this function), repairs the
+// C-side thread records of the region, and answers the (possibly GC-moved)
+// result. Called from JIT code on the non-local-return slow path (target =
+// the home frame) and on the handler-completion path of the exception signal
+// (target = the on:do: frame).
+Value unwindReturning(Value result, uint8_t *targetFrame);
 
 // A stack cut (exception jump / non-local return) that crosses C frames must
 // drop the per-thread records living in the region being cut: nested

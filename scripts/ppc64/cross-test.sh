@@ -124,7 +124,7 @@ for cpu in $CPUS; do
 	         tests/SmallFloat64BoundaryTest.st tests/FloatHashTest.st \
 	         tests/ScaledDecimalTest.st tests/LargeIntegerTest.st \
 	         tests/ExceptionTest.st tests/ExceptionProtocolTest.st \
-	         tests/UnwindTest.st; do
+	         tests/UnwindTest.st tests/ResumableTest.st; do
 		QEMU_CPU=$cpu timeout 900 "$OUT/st" -s "$IMG" -f "$t" </dev/null >/dev/null 2>&1 \
 			|| { echo "FAIL $t ($cpu)"; exit 1; }
 		echo "     pass $(basename "$t")"

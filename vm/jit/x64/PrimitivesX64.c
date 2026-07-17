@@ -1200,25 +1200,19 @@ void generateBlockOnExceptionPrimitive(CodeGenerator *generator)
 	asmPopq(buffer, RBP);
 	asmRet(buffer);
 
-	// jumped from exception signal
-	// RBP, RSP are restored by exception signal
+	// jumped from exception signal AFTER the handler ran and decided to unwind
+	// (milestone 2: the handler runs on top of the signaling frames inside the
+	// signal primitive; this entry is only the return path). RBP was restored
+	// to this on:do: frame and RAX holds the on:do: result; the intermediate
+	// cleanups already ran on the signal side.
 	ip->value = asmOffset(buffer) - ip->offset;
-	generator->frameSize = 5; // native code + context + backtrace + exception + block
 
 	// restore context
 	asmMovqMem(buffer, asmMem(RBP, NO_REGISTER, SS_1, -2 * sizeof(intptr_t)), CTX);
 
-	// value exception block
-	asmPushqMem(buffer, asmMem(RBP, NO_REGISTER, SS_1, 4 * sizeof(intptr_t)));
-	generateLoadObject(buffer, (RawObject *) Handles.Block->raw, RDI, 1);
-	generateMethodLookup(generator);
-	generator->frameSize -= 3;
-	asmCallq(buffer, R11);
-	generateStackmap(generator);
-
 	// epilogue
 	asmMovqMem(&generator->buffer, asmMem(CTX, NO_REGISTER, SS_1, varOffset(RawContext, parent)), CTX);
-	asmAddqImm(buffer, RSP, 5 * sizeof(intptr_t));
+	asmMovq(buffer, RBP, RSP);
 	asmPopq(buffer, RBP);
 	asmRet(buffer);
 }
@@ -1292,111 +1286,112 @@ void generateExceptionSignalPrimitive(CodeGenerator *generator)
 {
 	AssemblerBuffer *buffer = &generator->buffer;
 	AssemblerLabel handlerNotFound;
-	AssemblerLabel skipBacktrace;
+	AssemblerLabel unwindPath;
 	asmInitLabel(&handlerNotFound);
-	asmInitLabel(&skipBacktrace);
+	asmInitLabel(&unwindPath);
+
+	// Resumable protocol: find a handler WITHOUT unwinding, run it on top of
+	// the signaling frames via the Smalltalk hook runHandledBy: (which also
+	// implements the resume:/return:/retry escape machinery, see Exception.st),
+	// then either answer the resumption value from this very frame or unwind
+	// to the on:do: frame with the handler's answer.
+	generator->frameSize = 4;
 
 	// prologue
 	asmPushq(buffer, RBP);
 	asmMovq(buffer, RSP, RBP);
 
-	// save native code
+	// save native code                                        [RBP-8]
 	asmPushq(buffer, R11);
+	// context slot for the frame walker                       [RBP-16]
 	generatePushDummyContext(buffer);
+	// the caller's context, GC-covered: reloaded (fresh) to parent the hook's
+	// context and again for the resumption return             [RBP-24]
+	asmPushq(buffer, CTX);
 
-	asmMovq(buffer, R11, R13);
+	asmMovq(buffer, R11, R13); // survives the C call (for the fallthrough path)
 
+	// save the full handler-chain head: the search leaves it at the matched
+	// handler's parent while the handler runs; a resumption restores it
+	//                                                         [RBP-32]
+	asmLoadTls(buffer, RDI, gCurrentThreadTpoff);
+	asmPushqMem(buffer, asmMem(RDI, NO_REGISTER, SS_1, offsetof(Thread, exceptionHandler)));
+
+	// find a handler (sends handles: from C; NO unwinding, chain kept intact
+	// when nothing matches)
 	asmMovqMem(buffer, asmMem(RBP, NO_REGISTER, SS_1, 2 * sizeof(intptr_t)), RDI);
 	asmDecq(buffer, RDI);
-
-	generateCCall(generator, (intptr_t) unwindExceptionHandler, 1, 1);
+	generateCCall(generator, (intptr_t) findExceptionHandler, 1, 1);
 	asmTestq(buffer, RAX, RAX);
 	asmJ(buffer, COND_ZERO, &handlerNotFound);
 
-	// load context
-	asmMovqMem(buffer, asmMem(RAX, NO_REGISTER, SS_1, varOffset(RawExceptionHandler, context)), CTX);
-	// load handler frame
-	asmMovqMem(buffer, asmMem(CTX, NO_REGISTER, SS_1, varOffset(RawContext, frame)), TMP);
-	// load handler block
-	asmMovqMem(buffer, asmMem(TMP, NO_REGISTER, SS_1, 4 * sizeof(intptr_t)), TMP);
-	// load compiled block
-	asmMovqMem(buffer, asmMem(TMP, NO_REGISTER, SS_1, varOffset(RawBlock, compiledBlock)), TMP);
-	// check if block accepts backtrace in second argument
-	ptrdiff_t argsSizeOffset = varOffset(RawCompiledBlock, header) + offsetof(CompiledCodeHeader, argsSize);
-	asmCmpbMemImm(buffer, asmMem(TMP, NO_REGISTER, SS_1, argsSizeOffset), 2);
-	asmJ(buffer, COND_LESS, &skipBacktrace);
-
+	// spill the handler record                                [RBP-40]
 	asmPushq(buffer, RAX);
 	generator->frameSize++;
 
-	// generate backtrace
+	// invoke the hook on top of this frame: exception runHandledBy: block
+	// (the handler block is argument 2 of the still-live on:do: frame)
+	asmMovqMem(buffer, asmMem(RAX, NO_REGISTER, SS_1, varOffset(RawExceptionHandler, context)), TMP);
+	asmMovqMem(buffer, asmMem(TMP, NO_REGISTER, SS_1, varOffset(RawContext, frame)), TMP);
+	asmMovqMem(buffer, asmMem(TMP, NO_REGISTER, SS_1, 4 * sizeof(intptr_t)), TMP);
+	asmPushq(buffer, TMP);                                                     // argument: the handler block
+	asmPushqMem(buffer, asmMem(RBP, NO_REGISTER, SS_1, 2 * sizeof(intptr_t))); // receiver: the exception (last push = args[0])
+	generator->frameSize += 2;
+	// parent the hook's context to the caller's (GC-fresh from the slot)
+	asmMovqMem(buffer, asmMem(RBP, NO_REGISTER, SS_1, -3 * sizeof(intptr_t)), CTX);
 	asmMovqMem(buffer, asmMem(RBP, NO_REGISTER, SS_1, 2 * sizeof(intptr_t)), TMP);
-	asmPushq(buffer, TMP);
-	generator->frameSize++;
 	generateLoadClass(buffer, TMP, RDI);
-	generateLoadObject(buffer, (RawObject *) Handles.generateBacktraceSymbol->raw, RSI, 0);
+	generateLoadObject(buffer, (RawObject *) Handles.runHandledBySymbol->raw, RSI, 0);
 	generateMethodLookup(generator);
-	generator->frameSize--;
 	asmCallq(buffer, R11);
 	generateStackmap(generator);
-
-	asmAddqImm(buffer, RSP, sizeof(intptr_t));
-	asmPopq(buffer, RDI);
-	generator->frameSize--;
-
-	// load signaled exception as this stack frame is later destroyed
-	asmMovqMem(buffer, asmMem(RBP, NO_REGISTER, SS_1, 2 * sizeof(intptr_t)), R9);
-	// load context
-	asmMovqMem(buffer, asmMem(RDI, NO_REGISTER, SS_1, varOffset(RawExceptionHandler, context)), CTX);
-	// restore SP and BP
-	asmMovqMem(buffer, asmMem(CTX, NO_REGISTER, SS_1, varOffset(RawContext, frame)), RBP);
-	asmLeaq(buffer, asmMem(RBP, NO_REGISTER, SS_1, -2 * sizeof(intptr_t)), RSP);
-	// the jump into the handler abandons everything below the handler frame,
-	// including nested C entry records / handle scopes created since (a cleanup
-	// that signals is the common source): drop them NOW, after the last read of
-	// a dying frame. unwindThreadStateTo never allocates, so the raw pushes of
-	// heap pointers around it are safe.
-	asmPushq(buffer, RDI); // handler
-	asmPushq(buffer, RAX); // backtrace
-	asmPushq(buffer, R9);  // exception
-	asmMovq(buffer, RBP, RDI);
-	generateCCall(generator, (intptr_t) unwindThreadStateTo, 1, 0);
-	asmPopq(buffer, R9);
-	asmPopq(buffer, RAX);
-	asmPopq(buffer, RDI);
-	asmPushq(buffer, RAX); // push generated backtrace
-	asmPushq(buffer, R9); // push signaled exception
-	// load #value:value: as backtrace is not passed to the handler block
-	generateLoadObject(buffer, (RawObject *) Handles.valueValueSymbol->raw, RSI, 0);
-	// jump to handler
-	asmMovqMem(buffer, asmMem(RDI, NO_REGISTER, SS_1, varOffset(RawExceptionHandler, ip)), TMP);
-	asmJmpq(buffer, TMP);
-
-	asmLabelBind(buffer, &skipBacktrace, asmOffset(buffer));
-
-	// load signaled exception as this stack frame is later destroyed
-	asmMovqMem(buffer, asmMem(RBP, NO_REGISTER, SS_1, 2 * sizeof(intptr_t)), R9);
-	// restore SP and BP
-	asmMovqMem(buffer, asmMem(CTX, NO_REGISTER, SS_1, varOffset(RawContext, frame)), RBP);
-	asmLeaq(buffer, asmMem(RBP, NO_REGISTER, SS_1, -2 * sizeof(intptr_t)), RSP);
-	// drop the C-side records of the region being cut (see the backtrace path)
-	asmPushq(buffer, RAX); // handler
-	asmPushq(buffer, R9);  // exception
-	asmMovq(buffer, RBP, RDI);
-	generateCCall(generator, (intptr_t) unwindThreadStateTo, 1, 0);
-	asmPopq(buffer, R9);
-	asmPopq(buffer, RAX);
-	asmPushq(buffer, R9); // not used argument
-	asmPushq(buffer, R9); // push signaled exception
-	// load #value: as backtrace is not passed to the handler block
-	generateLoadObject(buffer, (RawObject *) Handles.value_Symbol->raw, RSI, 0);
-	// jump to handler
-	asmMovqMem(buffer, asmMem(RAX, NO_REGISTER, SS_1, varOffset(RawExceptionHandler, ip)), TMP);
-	asmJmpq(buffer, TMP);
-
-	// return to smalltalk code
-	asmLabelBind(buffer, &handlerNotFound, asmOffset(buffer));
 	asmAddqImm(buffer, RSP, 2 * sizeof(intptr_t));
+	generator->frameSize -= 2;
+
+	// RAX = response Association: key true = unwind to the on:do: with value,
+	// key false = resume this signal with value
+	asmMovqMem(buffer, asmMem(RAX, NO_REGISTER, SS_1, varOffset(RawAssociation, key)), TMP);
+	generateLoadObject(buffer, Handles.true->raw, RDI, 1);
+	asmCmpq(buffer, TMP, RDI);
+	asmJ(buffer, COND_EQUAL, &unwindPath);
+
+	// RESUME: restore the full handler chain (re-arming the matched handler and
+	// any inner ones that were skipped) and answer the value from this frame
+	asmMovqMem(buffer, asmMem(RAX, NO_REGISTER, SS_1, varOffset(RawAssociation, value)), RAX);
+	asmMovqMem(buffer, asmMem(RBP, NO_REGISTER, SS_1, -4 * sizeof(intptr_t)), TMP);
+	asmLoadTls(buffer, RDI, gCurrentThreadTpoff);
+	asmMovqToMem(buffer, TMP, asmMem(RDI, NO_REGISTER, SS_1, offsetof(Thread, exceptionHandler)));
+	asmMovqMem(buffer, asmMem(RBP, NO_REGISTER, SS_1, -3 * sizeof(intptr_t)), CTX);
+	asmAddqImm(buffer, RSP, 5 * sizeof(intptr_t));
+	asmPopq(buffer, RBP);
+	asmRet(buffer);
+
+	// UNWIND: run the pending ensure:/ifCurtailed: cleanups below the on:do:
+	// frame (the value rides through the C helper, handle-protected, and the
+	// C-side records of the region are dropped there), then cut the stack to
+	// the on:do: frame and enter its return path
+	asmLabelBind(buffer, &unwindPath, asmOffset(buffer));
+	asmMovqMem(buffer, asmMem(RAX, NO_REGISTER, SS_1, varOffset(RawAssociation, value)), RDI);
+	asmMovqMem(buffer, asmMem(RBP, NO_REGISTER, SS_1, -5 * sizeof(intptr_t)), TMP); // handler record
+	asmMovqMem(buffer, asmMem(TMP, NO_REGISTER, SS_1, varOffset(RawExceptionHandler, context)), TMP);
+	asmMovqMem(buffer, asmMem(TMP, NO_REGISTER, SS_1, varOffset(RawContext, frame)), RSI);
+	generateCCall(generator, (intptr_t) unwindReturning, 2, 1);
+	// re-derive the on:do: frame and re-entry ip through the GC-fresh record
+	// (the raw frame address is stable, the objects can move); RAX carries the
+	// on:do: result into the re-entry
+	asmMovqMem(buffer, asmMem(RBP, NO_REGISTER, SS_1, -5 * sizeof(intptr_t)), TMP);
+	asmMovqMem(buffer, asmMem(TMP, NO_REGISTER, SS_1, varOffset(RawExceptionHandler, context)), RDI);
+	asmMovqMem(buffer, asmMem(RDI, NO_REGISTER, SS_1, varOffset(RawContext, frame)), RDI);
+	asmMovqMem(buffer, asmMem(TMP, NO_REGISTER, SS_1, varOffset(RawExceptionHandler, ip)), TMP);
+	asmMovq(buffer, RDI, RBP);
+	asmLeaq(buffer, asmMem(RBP, NO_REGISTER, SS_1, -2 * sizeof(intptr_t)), RSP);
+	asmJmpq(buffer, TMP);
+
+	// no handler: fall through to the Smalltalk body (defaultAction). The
+	// search left the chain intact, so a default action that answers (a
+	// resumable default, e.g. Warning) continues with its handlers live.
+	asmLabelBind(buffer, &handlerNotFound, asmOffset(buffer));
+	asmAddqImm(buffer, RSP, 4 * sizeof(intptr_t));
 	asmPopq(buffer, RBP);
 	asmMovq(buffer, R13, R11);
 }

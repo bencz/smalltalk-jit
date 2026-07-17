@@ -96,6 +96,7 @@ typedef struct SmalltalkHandles {
 	String *cannotReturnSymbol;
 	String *handlesSymbol;
 	String *generateBacktraceSymbol;
+	String *runHandledBySymbol;
 } SmalltalkHandles;
 
 // The well-known handles are per-HEAP (shared by all worker OS threads of a heap),

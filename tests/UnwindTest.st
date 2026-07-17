@@ -200,10 +200,12 @@ UnwindTest := Object [
 
 
 	class exceptionOrder [
-		"FAILS pre-fix: the handler DECISION (class-side handles: match) must
-		 come before the cleanup; the emulation ran cleanup first. The handler
-		 BODY position is not pinned here: milestone 2 (signal without unwind)
-		 legitimately moves the body before the cleanup."
+		"ANSI order, final since milestone 2 (signal without unwind): the
+		 handler DECISION (class-side handles: match) comes first, then the
+		 handler BODY runs on top of the signaling frames, and the ensure:
+		 cleanup runs last, during the unwind the handler's completion
+		 triggers. (The pre-milestone-1 emulation ran cleanup before either;
+		 milestone 1 ran it between decision and body.)"
 		| fails result |
 		fails := 0.
 		UnwindDecisionLog := OrderedCollection new.
@@ -213,15 +215,17 @@ UnwindTest := Object [
 		(UnwindDecisionLog size = 3) ifFalse: [fails := fails + 1].
 		(UnwindDecisionLog size = 3) ifTrue: [
 			((UnwindDecisionLog at: 1) == #decision) ifFalse: [fails := fails + 1].
-			((UnwindDecisionLog at: 2) == #cleanup) ifFalse: [fails := fails + 1]].
+			((UnwindDecisionLog at: 2) == #handler) ifFalse: [fails := fails + 1].
+			((UnwindDecisionLog at: 3) == #cleanup) ifFalse: [fails := fails + 1]].
 		UnwindDecisionLog := nil.
 		^fails
 	]
 
 
 	class exceptionNestedOrder [
-		"pinned regression: exception unwind runs nested cleanups inside-out,
-		 exactly once each (same visible order pre-fix, kept to protect M2)"
+		"nested cleanups run inside-out, exactly once each. ANSI order, final
+		 since milestone 2: the handler body runs FIRST (no unwind at signal
+		 time), the cleanups run when its completion unwinds."
 		| fails log result |
 		fails := 0.
 		log := OrderedCollection new.
@@ -230,9 +234,9 @@ UnwindTest := Object [
 		(result == #h) ifFalse: [fails := fails + 1].
 		(log size = 3) ifFalse: [fails := fails + 1].
 		(log size = 3) ifTrue: [
-			((log at: 1) == #inner) ifFalse: [fails := fails + 1].
-			((log at: 2) == #outer) ifFalse: [fails := fails + 1].
-			((log at: 3) == #handler) ifFalse: [fails := fails + 1]].
+			((log at: 1) == #handler) ifFalse: [fails := fails + 1].
+			((log at: 2) == #inner) ifFalse: [fails := fails + 1].
+			((log at: 3) == #outer) ifFalse: [fails := fails + 1]].
 		^fails
 	]
 

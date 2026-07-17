@@ -1205,22 +1205,15 @@ void generateBlockOnExceptionPrimitive(CodeGenerator *generator)
 	primFramedEpilogue(buffer);
 	asmBlr(buffer);
 
-	// jumped from exception signal (FP/r1 rebuilt by the signal path)
+	// jumped from exception signal AFTER the handler ran and decided to unwind
+	// (resumable protocol: the handler runs on top of the signaling frames
+	// inside the signal primitive; this entry is only the return path). FP/r1
+	// were rebuilt at this on:do: frame and r3 holds the on:do: result; the
+	// intermediate cleanups already ran on the signal side.
 	ip->value = asmOffset(buffer) - ip->offset;
-	generator->frameSize = 5; // native code + context + handler + backtrace + exception
 
 	// restore context
 	asmLd(buffer, CTX, -2 * (ptrdiff_t) sizeof(intptr_t), FP);
-
-	// value the exception block (the signal path pre-loaded r4 with the
-	// #value:/#value:value: selector and pushed the handler args)
-	asmLd(buffer, R0, 4 * sizeof(intptr_t), FP);
-	asmPush(buffer, R0);
-	generateLoadObject(buffer, (RawObject *) Handles.Block->raw, R3, 1);
-	generateMethodLookup(generator);
-	generator->frameSize -= 3;
-	asmCallReg(buffer, TGT);
-	generateStackmap(generator);
 
 	// epilogue
 	asmLdT(buffer, CTX, varOffset(RawContext, parent), CTX);
@@ -1296,103 +1289,110 @@ void generateExceptionSignalPrimitive(CodeGenerator *generator)
 {
 	AssemblerBuffer *buffer = &generator->buffer;
 	AssemblerLabel handlerNotFound;
-	AssemblerLabel skipBacktrace;
+	AssemblerLabel unwindPath;
 	asmInitLabel(&handlerNotFound);
-	asmInitLabel(&skipBacktrace);
+	asmInitLabel(&unwindPath);
+
+	// Resumable protocol: find a handler WITHOUT unwinding, run it on top of
+	// the signaling frames via the Smalltalk hook runHandledBy: (which also
+	// implements the resume:/return:/retry escape machinery, see Exception.st),
+	// then either answer the resumption value from this very frame or unwind
+	// to the on:do: frame with the handler's answer. Mirror of the x64 layout:
+	// [FP-8] native code, [FP-16] dummy context (frame walker slot), [FP-24]
+	// the caller's context, [FP-32] the saved handler-chain head, [FP-40] the
+	// matched handler record.
+	generator->frameSize = 4;
 
 	primFramedPrologue(buffer);
 
-	// save native code + dummy context
+	// save native code                                        [FP-8]
 	asmPush(buffer, TGT);
+	// context slot for the frame walker                       [FP-16]
 	generatePushDummyContext(buffer);
+	// the caller's context, GC-covered                        [FP-24]
+	asmPush(buffer, CTX);
 
-	asmMr(buffer, R15_PPC, TGT);   // survives the C call (x64 R13)
+	asmMr(buffer, R15_PPC, TGT);   // survives the C call (for the fallthrough)
 
+	// save the full handler-chain head                        [FP-32]
+	asmLoadTls(buffer, R6, gCurrentThreadTpoff);
+	asmLd(buffer, R6, offsetof(Thread, exceptionHandler), R6);
+	asmPush(buffer, R6);
+
+	// find a handler (sends handles: from C; NO unwinding, chain kept intact
+	// when nothing matches)
 	asmLd(buffer, R3, 2 * sizeof(intptr_t), FP);
 	asmAddi(buffer, R3, R3, -1);
-
-	generateCCall(generator, (intptr_t) unwindExceptionHandler, 1, 1);
+	generateCCall(generator, (intptr_t) findExceptionHandler, 1, 1);
 	asmCmpdi(buffer, 0, R3, 0);
 	asmBeq(buffer, &handlerNotFound);
 
-	// handler found: r3 = handler (raw). Load its context and the handler
-	// block, decide whether the block wants a backtrace argument.
-	asmLdT(buffer, CTX, varOffset(RawExceptionHandler, context), R3);
-	asmLdT(buffer, TMP, varOffset(RawContext, frame), CTX);
+	// spill the handler record                                [FP-40]
+	asmPush(buffer, R3);
+	generator->frameSize++;
+
+	// invoke the hook on top of this frame: exception runHandledBy: block
+	// (the handler block is argument 2 of the still-live on:do: frame)
+	asmLdT(buffer, TMP, varOffset(RawExceptionHandler, context), R3);
+	asmLdT(buffer, TMP, varOffset(RawContext, frame), TMP);
 	asmLd(buffer, TMP, 4 * sizeof(intptr_t), TMP);
-	asmLdT(buffer, TMP, varOffset(RawBlock, compiledBlock), TMP);
-	ptrdiff_t argsSizeOffset = varOffset(RawCompiledBlock, header) + offsetof(CompiledCodeHeader, argsSize);
-	asmLbz(buffer, R0, argsSizeOffset, TMP);
-	asmCmpldi(buffer, 0, R0, 2);
-	asmBlt(buffer, &skipBacktrace);
-
-	asmPush(buffer, R3);           // spill the handler
-	generator->frameSize++;
-
-	// generate the backtrace: exception generateBacktrace
+	asmPush(buffer, TMP);          // argument: the handler block
+	asmLd(buffer, R0, 2 * sizeof(intptr_t), FP);
+	asmPush(buffer, R0);           // receiver: the exception (last push = args[0])
+	generator->frameSize += 2;
+	// parent the hook's context to the caller's (GC-fresh from the slot)
+	asmLd(buffer, CTX, -3 * (ptrdiff_t) sizeof(intptr_t), FP);
 	asmLd(buffer, TMP, 2 * sizeof(intptr_t), FP);
-	asmPush(buffer, TMP);
-	generator->frameSize++;
 	generateLoadClass(buffer, TMP, R3);
-	generateLoadObject(buffer, (RawObject *) Handles.generateBacktraceSymbol->raw, R4, 0);
+	generateLoadObject(buffer, (RawObject *) Handles.runHandledBySymbol->raw, R4, 0);
 	generateMethodLookup(generator);
-	generator->frameSize--;
 	asmCallReg(buffer, TGT);
 	generateStackmap(generator);
-
-	asmDropStack(buffer, 1);
-	asmPop(buffer, R6);            // the spilled handler
-	generator->frameSize--;
-
-	// load the signaled exception (this frame is about to be destroyed)
-	asmLd(buffer, R8_PPC, 2 * sizeof(intptr_t), FP);
-	// rebuild FP/r1 at the handler's frame
-	asmLdT(buffer, CTX, varOffset(RawExceptionHandler, context), R6);
-	asmLdT(buffer, FP, varOffset(RawContext, frame), CTX);
-	asmAddi(buffer, R1, FP, -2 * (ptrdiff_t) sizeof(intptr_t));
-	// the jump into the handler abandons everything below the handler frame,
-	// including nested C entry records / handle scopes created since (a cleanup
-	// that signals is the common source): drop them NOW, after the last read of
-	// a dying frame. unwindThreadStateTo never allocates, so the raw pushes of
-	// heap pointers around it are safe.
-	asmPush(buffer, R6);           // handler
-	asmPush(buffer, R8_PPC);       // exception
-	asmPush(buffer, R3);           // backtrace
-	asmMr(buffer, R3, FP);
-	generateCCall(generator, (intptr_t) unwindThreadStateTo, 1, 0);
-	asmPop(buffer, R3);
-	asmPop(buffer, R8_PPC);
-	asmPop(buffer, R6);
-	asmPush(buffer, R3);           // generated backtrace
-	asmPush(buffer, R8_PPC);       // signaled exception
-	// #value:value: (backtrace not passed to the handler block itself)
-	generateLoadObject(buffer, (RawObject *) Handles.valueValueSymbol->raw, R4, 0);
-	// jump into on:do: at the handler's return IP
-	asmLdT(buffer, TMP, varOffset(RawExceptionHandler, ip), R6);
-	asmJumpReg(buffer, TMP);
-
-	asmPpcLabelBind(buffer, &skipBacktrace, asmOffset(buffer));
-
-	// load the signaled exception, rebuild FP/r1 at the handler's frame
-	asmLd(buffer, R8_PPC, 2 * sizeof(intptr_t), FP);
-	asmLdT(buffer, FP, varOffset(RawContext, frame), CTX);
-	asmAddi(buffer, R1, FP, -2 * (ptrdiff_t) sizeof(intptr_t));
-	// drop the C-side records of the region being cut (see the backtrace path)
-	asmPush(buffer, R3);           // handler
-	asmPush(buffer, R8_PPC);       // exception
-	asmMr(buffer, R3, FP);
-	generateCCall(generator, (intptr_t) unwindThreadStateTo, 1, 0);
-	asmPop(buffer, R8_PPC);
-	asmPop(buffer, R3);
-	asmPush(buffer, R8_PPC);       // unused second argument slot
-	asmPush(buffer, R8_PPC);       // signaled exception
-	generateLoadObject(buffer, (RawObject *) Handles.value_Symbol->raw, R4, 0);
-	asmLdT(buffer, TMP, varOffset(RawExceptionHandler, ip), R3);
-	asmJumpReg(buffer, TMP);
-
-	// no handler: return to the Smalltalk fallback
-	asmPpcLabelBind(buffer, &handlerNotFound, asmOffset(buffer));
 	asmDropStack(buffer, 2);
+	generator->frameSize -= 2;
+
+	// r3 = response Association: key true = unwind to the on:do: with value,
+	// key false = resume this signal with value
+	asmLdT(buffer, TMP, varOffset(RawAssociation, key), R3);
+	generateLoadObject(buffer, Handles.true->raw, R6, 1);
+	asmCmpd(buffer, 0, TMP, R6);
+	asmBeq(buffer, &unwindPath);
+
+	// RESUME: restore the full handler chain (re-arming the matched handler and
+	// any inner ones that were skipped) and answer the value from this frame
+	asmLdT(buffer, R3, varOffset(RawAssociation, value), R3);
+	asmLd(buffer, TMP, -4 * (ptrdiff_t) sizeof(intptr_t), FP);
+	asmLoadTls(buffer, R6, gCurrentThreadTpoff);
+	asmStd(buffer, TMP, offsetof(Thread, exceptionHandler), R6);
+	asmLd(buffer, CTX, -3 * (ptrdiff_t) sizeof(intptr_t), FP);
+	primFramedEpilogue(buffer);
+	asmBlr(buffer);
+
+	// UNWIND: run the pending ensure:/ifCurtailed: cleanups below the on:do:
+	// frame (the value rides through the C helper, handle-protected, and the
+	// C-side records of the region are dropped there), then cut the stack to
+	// the on:do: frame and enter its return path
+	asmPpcLabelBind(buffer, &unwindPath, asmOffset(buffer));
+	asmLdT(buffer, R4, varOffset(RawAssociation, value), R3);
+	asmMr(buffer, R3, R4);
+	asmLd(buffer, TMP, -5 * (ptrdiff_t) sizeof(intptr_t), FP); // handler record
+	asmLdT(buffer, TMP, varOffset(RawExceptionHandler, context), TMP);
+	asmLdT(buffer, R4, varOffset(RawContext, frame), TMP);
+	generateCCall(generator, (intptr_t) unwindReturning, 2, 1);
+	// re-derive the on:do: frame and re-entry ip through the GC-fresh record
+	// (the raw frame address is stable, the objects can move); r3 carries the
+	// on:do: result into the re-entry
+	asmLd(buffer, TMP, -5 * (ptrdiff_t) sizeof(intptr_t), FP);
+	asmLdT(buffer, R6, varOffset(RawExceptionHandler, context), TMP);
+	asmLdT(buffer, FP, varOffset(RawContext, frame), R6);
+	asmLdT(buffer, TMP, varOffset(RawExceptionHandler, ip), TMP);
+	asmAddi(buffer, R1, FP, -2 * (ptrdiff_t) sizeof(intptr_t));
+	asmJumpReg(buffer, TMP);
+
+	// no handler: fall through to the Smalltalk body (defaultAction). The
+	// search left the chain intact, so a default action that answers (a
+	// resumable default, e.g. Warning) continues with its handlers live.
+	asmPpcLabelBind(buffer, &handlerNotFound, asmOffset(buffer));
 	primFramedEpilogue(buffer);
 	asmMr(buffer, TGT, R15_PPC);
 }

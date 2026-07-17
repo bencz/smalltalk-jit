@@ -1268,7 +1268,7 @@ static void generateOuterReturn(CodeGenerator *generator, BytecodesIterator *ite
 	// address itself is stable, but the context objects can move).
 	asmMovq(buffer, RAX, RDI); // result
 	asmMovq(buffer, TMP, RSI); // home frame
-	generateCCall(generator, (intptr_t) nlrRunUnwindHandlers, 2, 1);
+	generateCCall(generator, (intptr_t) unwindReturning, 2, 1);
 	asmMovqMem(buffer, asmMem(RBP, NO_REGISTER, SS_1, -2 * sizeof(intptr_t)), context->reg);
 	asmMovqMem(buffer, asmMem(context->reg, NO_REGISTER, SS_1, varOffset(RawContext, home)), context->reg);
 	asmMovqMem(buffer, asmMem(context->reg, NO_REGISTER, SS_1, varOffset(RawContext, frame)), TMP);
