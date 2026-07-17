@@ -321,6 +321,13 @@ static void generateTierCheck(CodeGenerator *generator)
 	if (!tierEnabled() || generator->tierFeedback != NULL) {
 		return; // ST_NO_TIER (exactly the pre-tier prologue), or already tier 1
 	}
+	// Skip a method with no dynamic send (see the x64 original): no feedback to
+	// act on, so the check is pure overhead. Frozen at tier 0.
+	if (!tierMethodHasDynamicSend(&generator->code)) {
+		gTierStats.filteredMethods++;
+		return;
+	}
+	gTierStats.countedMethods++;
 	AssemblerBuffer *buffer = &generator->buffer;
 	AssemblerLabel noFire;
 	asmInitLabel(&noFire);

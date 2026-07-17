@@ -315,6 +315,14 @@ static void generateTierCheck(CodeGenerator *generator)
 	if (!tierEnabled() || generator->tierFeedback != NULL) {
 		return; // ST_NO_TIER (exactly the pre-tier prologue), or already tier 1
 	}
+	// Skip the counter entirely for a method with no dynamic send: tier 1 has
+	// no feedback to promote or inline there, so the recompile would discard,
+	// and the per-call decrement would be pure overhead. Frozen at tier 0.
+	if (!tierMethodHasDynamicSend(&generator->code)) {
+		gTierStats.filteredMethods++;
+		return;
+	}
+	gTierStats.countedMethods++;
 	AssemblerBuffer *buffer = &generator->buffer;
 	AssemblerLabel noFire;
 	asmInitLabel(&noFire);

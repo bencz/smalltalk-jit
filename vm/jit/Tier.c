@@ -1,6 +1,8 @@
 #include "jit/Tier.h"
 #include "jit/CodeGenerator.h"
+#include "jit/SendClassify.h"
 #include "compiler/Optimizer.h"
+#include "compiler/Bytecodes.h"
 #include "core/CompiledCode.h"
 #include "core/Lookup.h"
 #include "core/Thread.h"
@@ -18,6 +20,65 @@ size_t *tierAllocCounter(void)
 	size_t *cell = malloc(sizeof(size_t));
 	*cell = tierThreshold();
 	return cell;
+}
+
+
+// Does this method contain at least one DYNAMIC send site? A method with none
+// can never promote or inline anything at tier 1 (there is no IC feedback to
+// act on), so it is pointless to give it an invocation counter and a prologue
+// tier check. A dynamic send is exactly what generateSend turns into an IC
+// cell: a non-identity selector whose receiver's class is not statically
+// resolvable. Identity sends (==/~~/isNil/notNil) emit no dispatch, and
+// static-receiver sends (nil/true/false/literal/super/block/thisContext) bake
+// their target -- neither creates a cell. Pure bytecode analysis, sound and
+// runtime-independent, mirroring the send classification the codegen and the
+// inliner both use (jit/SendClassify.h).
+_Bool tierMethodHasDynamicSend(CompiledCode *code)
+{
+	BytecodesIterator iterator;
+	bytecodeInitIterator(&iterator, code->bytecodes, code->bytecodesSize);
+	while (bytecodeHasNext(&iterator)) {
+		Bytecode bytecode = bytecodeNext(&iterator);
+		switch (bytecode) {
+		case BYTECODE_COPY:
+			bytecodeNextOperand(&iterator);
+			bytecodeNextOperand(&iterator);
+			break;
+		case BYTECODE_SEND:
+		case BYTECODE_SEND_WITH_STORE: {
+			uint8_t selectorIndex = bytecodeNextByte(&iterator);
+			uint8_t argsSize = bytecodeNextByte(&iterator);
+			Operand receiver = bytecodeNextOperand(&iterator);
+			for (uint8_t i = 0; i < argsSize; i++) {
+				bytecodeNextOperand(&iterator);
+			}
+			if (bytecode == BYTECODE_SEND_WITH_STORE) {
+				bytecodeNextOperand(&iterator);
+			}
+			RawObject *selector = compiledCodeLiteralAt(code, selectorIndex);
+			if (classifyIdentity(selector, argsSize) == IDENT_NONE
+					&& compiledCodeResolveOperandClass(code, receiver) == NULL) {
+				return 1;
+			}
+			break;
+		}
+		case BYTECODE_RETURN:
+		case BYTECODE_OUTER_RETURN:
+			bytecodeNextOperand(&iterator);
+			break;
+		case BYTECODE_JUMP:
+			bytecodeNextInt32(&iterator);
+			break;
+		case BYTECODE_JUMP_NOT_MEMBER_OF:
+			bytecodeNextByte(&iterator);
+			bytecodeNextOperand(&iterator);
+			bytecodeNextInt32(&iterator);
+			break;
+		default:
+			FAIL();
+		}
+	}
+	return 0;
 }
 
 
@@ -93,6 +154,8 @@ void tierRecompile(uint8_t *insts)
 
 void tierPrintStats(void)
 {
+	printf("[TIER] countedMethods      %zu\n", gTierStats.countedMethods);
+	printf("[TIER] filteredMethods     %zu\n", gTierStats.filteredMethods);
 	printf("[TIER] triggerCalls        %zu\n", gTierStats.triggerCalls);
 	printf("[TIER] recompiles          %zu\n", gTierStats.recompiles);
 	printf("[TIER] discardedRecompiles %zu\n", gTierStats.discardedRecompiles);

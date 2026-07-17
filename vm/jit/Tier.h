@@ -38,6 +38,8 @@
 #define TIER_TAG_FIRED (1 << 6)
 
 typedef struct {
+	size_t countedMethods;      // framed tier-0 methods given a counter + check
+	size_t filteredMethods;     // framed methods with no dynamic send, check elided
 	size_t triggerCalls;        // C trigger invocations (races echo; idempotent)
 	size_t recompiles;          // tier-1 recompilations published, once per method
 	size_t discardedRecompiles; // recompiles thrown away: zero sites promoted
@@ -53,6 +55,11 @@ extern TierStats gTierStats;
 // of the method whose invocation counter just hit zero.
 void tierRecompile(uint8_t *insts);
 void tierPrintStats(void);
+
+// Whether a tier-0 framed method is worth a counter + prologue check: true iff
+// it has at least one dynamic send (an IC-cell site the recompile could
+// promote or inline). Methods with none are frozen at tier 0.
+_Bool tierMethodHasDynamicSend(CompiledCode *code);
 
 // One malloc'd countdown word per tier-0 framed method, allocated at emission
 // and baked into the prologue check as a plain immediate. The counter is
