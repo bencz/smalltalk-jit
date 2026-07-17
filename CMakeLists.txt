@@ -189,6 +189,7 @@ set(vmSources
 	vm/jit/InlineCache.c
 	vm/jit/RegisterAllocator.c
 	vm/jit/StubCode.c
+	vm/jit/Tier.c
 	vm/memory/FreeList.c
 	vm/memory/GarbageCollector.c
 	vm/memory/Heap.c

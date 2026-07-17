@@ -21,6 +21,7 @@
 #include "compiler/Bytecodes.h"
 #include "compiler/Compiler.h"
 #include "jit/CodeDescriptors.h"
+#include "jit/Tier.h"
 #include "core/Thread.h"
 #include "core/Exception.h"
 #include "core/Assert.h"
@@ -33,6 +34,8 @@ typedef struct {
 
 static NativeCode *generateBlockCode(CompiledBlock *block, CodeGenerator *parentGenerator);
 static void generateSafepointPoll(CodeGenerator *generator, _Bool atBackEdge);
+static void generateTierCheck(CodeGenerator *generator);
+static void generateIcSendPromoted(CodeGenerator *generator, uint8_t selectorIndex);
 static void generateCode(CodeGenerator *generator);
 static void freeCodeGenerator(CodeGenerator *generator);
 static void generatePrologue(CodeGenerator *generator, size_t frameSize);
@@ -63,6 +66,12 @@ static Variable *specialVariableAt(CodeGenerator *generator, uint8_t type, ptrdi
 
 NativeCode *generateMethodCode(CompiledMethod *method)
 {
+	return generateMethodCodeTiered(method, NULL);
+}
+
+
+NativeCode *generateMethodCodeTiered(CompiledMethod *method, NativeCode *feedback)
+{
 	heapCodegenLockEnter(CurrentThread.heap); // serialize codegen across worker threads
 	HandleScope scope;
 	openHandleScope(&scope);
@@ -73,6 +82,7 @@ NativeCode *generateMethodCode(CompiledMethod *method)
 	initMethodCompiledCode(&generator.code, method);
 	pinCompiledCodeBytes(&generator.code); // the method object may move mid-codegen
 	generator.descriptors = newOrdColl(32);
+	generator.tierFeedback = feedback;
 	generateCode(&generator);
 
 	NativeCode *code = buildNativeCode(&generator);
@@ -91,6 +101,12 @@ static NativeCode *generateBlockCode(CompiledBlock *block, CodeGenerator *parent
 	initBlockCompiledCode(&generator.code, block);
 	pinCompiledCodeBytes(&generator.code); // the method object may move mid-codegen
 	generator.descriptors = newOrdColl(32);
+	// A tier-1 method recompiles its blocks with it: each block's feedback is
+	// its own superseded NativeCode (blocks were compiled with the method, so
+	// it exists whenever the method's does).
+	if (parentGenerator->tierFeedback != NULL) {
+		generator.tierFeedback = compiledBlockGetNativeCode(block);
+	}
 	generateCode(&generator);
 
 	NativeCode *code = buildNativeCode(&generator);
@@ -130,6 +146,7 @@ static void generateCode(CodeGenerator *generator)
 		// allocation and its context setup differs.
 		if (!generator->code.isBlock) {
 			generateSafepointPoll(generator, 0);
+			generateTierCheck(generator);
 		}
 	} else if (generator->code.isBlock) {
 		variableAt(generator, CONTEXT_INDEX)->flags |= VAR_IN_REG;
@@ -275,6 +292,44 @@ static void generateSafepointPoll(CodeGenerator *generator, _Bool atBackEdge)
 }
 
 
+// Tier-1 trigger check, framed method prologues only (jit/Tier.h). The fast
+// path is three instructions: materialize the method's malloc'd countdown
+// cell (a plain baked immediate: the cell exists before emission), decrement
+// it, and skip while nonzero. The cell deliberately lives OUTSIDE the code
+// allocation: NativeCode.counter at insts-8 shares a cache line with the
+// method's first instructions, and a per-invocation store there trips x86's
+// self-modifying-code detector for a full pipeline clear (measured 4x on
+// Richards). The counter reaches zero once; the decrement is deliberately
+// non-atomic (racing workers can echo the zero or lose a count, never
+// corrupt), and tierRecompile is idempotent under codegenLock. The slow path
+// mirrors the entry safepoint poll one line above: caller-saved spill, C call
+// with a stackmap (the recompile allocates and can park this fiber in a peer
+// GC); its argument is this code's entry, recovered RIP-relative (the lea is
+// a 7-byte instruction, so insts+0 = RIP - (emitOffset + 7)).
+static void generateTierCheck(CodeGenerator *generator)
+{
+	if (!tierEnabled() || generator->tierFeedback != NULL) {
+		return; // ST_NO_TIER (exactly the pre-tier prologue), or already tier 1
+	}
+	AssemblerBuffer *buffer = &generator->buffer;
+	AssemblerLabel noFire;
+	asmInitLabel(&noFire);
+
+	asmMovqImm(buffer, (int64_t) tierAllocCounter(), TMP);
+	asmDecqMem(buffer, asmMem(TMP, NO_REGISTER, SS_1, 0));
+	asmJ(buffer, COND_NOT_ZERO, &noFire);
+
+	abiEmitCallerSavedPush(gX64Abi, buffer);
+	// RDI = this code's entry (tierRecompile derives the NativeCode from it)
+	asmLeaq(buffer, asmMem(RIP, NO_REGISTER, SS_1,
+		-(ptrdiff_t) (asmOffset(buffer) + 7)), RDI);
+	generateCCall(generator, (intptr_t) tierRecompile, 1, 1);
+	abiEmitCallerSavedPop(gX64Abi, buffer);
+
+	asmLabelBind(buffer, &noFire, asmOffset(buffer));
+}
+
+
 static void generateBody(CodeGenerator *generator)
 {
 	BytecodesIterator iterator;
@@ -350,6 +405,19 @@ static void generateBody(CodeGenerator *generator)
 		openHandleScope(&scope);
 
 		ptrdiff_t offset = bytecodeOffset(&iterator);
+		// Align loop headers (backward-jump targets) to 16 bytes with NOPs,
+		// executed only on the fall-in path. Without this the hot-loop layout
+		// is a lottery decided by every byte emitted before it (prologue
+		// growth such as the tier check shifted FloatBench's loop across a
+		// fetch boundary for a reproducible ~4% swing with IDENTICAL executed
+		// instructions); with it, loop bodies decode from stable fetch
+		// windows in every configuration. x64-only: a frontend/uop-cache
+		// concern, meaningless under qemu on the POWER backend.
+		if (isBackwardTarget[offset]) {
+			while (asmOffset(&generator->buffer) % 16 != 0) {
+				asmEmitUint8(&generator->buffer, 0x90);
+			}
+		}
 		machineOffsetAt[offset] = asmOffset(&generator->buffer);
 		_Bool isJumpTarget = isBackwardTarget[offset];
 		BytecodeLabel *label = labels;
@@ -896,6 +964,73 @@ static void generateIcSend(CodeGenerator *generator, uint8_t selectorIndex)
 }
 
 
+// RDI: receiver class (tagged, from generateLoadClass)
+// R11: native code target out
+// Tier-1 speculative promotion of one dynamic send (jit/Tier.h): if the
+// SUPERSEDED code's IC cell for this site is bound (mono, or a pic whose
+// way 0 is the header pair), emit an exact-class guard against the baked
+// tagged class (a pointersOffsets entry, so the STW collectors keep it
+// current when the class moves) and, on the hit, load the baked entry
+// directly, skipping the cell load and its data-dependent chain. The miss
+// falls back to the full generateIcSend: the floor is exactly today's send.
+//
+// Site identity is POSITIONAL: the i-th dynamic send emitted here pairs with
+// the i-th IC cell of the old code, because tier-1 emission walks the SAME
+// pinned bytecodes with the same process-constant flags, and generateIcSend
+// is the only creator of IC sites, in both tiers (the fallback below creates
+// this site's own cell, keeping the numbering aligned). The cell is read AT
+// EMISSION with nothing allocating between the read and the bake: no
+// safepoint can interleave, so the state cannot be freed nor its class moved
+// under us (the same no-poll window the PicProbeStub walk relies on).
+static void generateIcSendPromoted(CodeGenerator *generator, uint8_t selectorIndex)
+{
+	AssemblerBuffer *buffer = &generator->buffer;
+	IcState *state = NULL;
+	if (generator->tierFeedback != NULL
+			&& buffer->icSitesSize < generator->tierFeedback->icCellsSize) {
+		IcCell *cells = nativeCodeIcCells(generator->tierFeedback);
+		IcState *seen = __atomic_load_n(&cells[buffer->icSitesSize].state, __ATOMIC_ACQUIRE);
+		if (seen->kind == IC_KIND_MONO || seen->kind == IC_KIND_PIC) {
+			state = seen;
+		}
+	}
+	if (state == NULL) {
+		// Unlinked (a fresh STW reset), mega, or out of feedback: plain IC send.
+		if (generator->tierFeedback != NULL) {
+			gTierStats.unpromotedSites++;
+		}
+		generateIcSend(generator, selectorIndex);
+		return;
+	}
+	gTierStats.promotedSites++;
+
+	AssemblerLabel fallback, done;
+	asmInitLabel(&fallback);
+	asmInitLabel(&done);
+
+	generateLoadObject(buffer, asObject(state->class), RAX, 1);
+	asmCmpq(buffer, RDI, RAX);
+	asmJ(buffer, COND_NOT_EQUAL, &fallback);
+	if (tierStatsEnabled()) {
+		asmMovqImm(buffer, (int64_t) &gTierStats.directCalls, RDX);
+		asmIncqMem(buffer, asmMem(RDX, NO_REGISTER, SS_1, 0));
+	}
+	// The baked entry is immortal (exec space never moves nor frees); it may
+	// go stale if the callee itself recompiles, which is the documented
+	// staleness of every baked entry, not a correctness hazard.
+	asmMovqImm(buffer, (int64_t) state->target, R11);
+	asmJmpLabel(buffer, &done);
+
+	asmLabelBind(buffer, &fallback, asmOffset(buffer));
+	if (tierStatsEnabled()) {
+		asmMovqImm(buffer, (int64_t) &gTierStats.guardFails, RDX);
+		asmIncqMem(buffer, asmMem(RDX, NO_REGISTER, SS_1, 0));
+	}
+	generateIcSend(generator, selectorIndex);
+	asmLabelBind(buffer, &done, asmOffset(buffer));
+}
+
+
 // TMP: receiver
 // RDI: receiver class
 // RSI: selector
@@ -1069,7 +1204,7 @@ static void generateSend(CodeGenerator *generator, BytecodesIterator *iterator)
 			// as a garbage class. Recomputing per send is a few instructions and correct.
 			generateLoadClass(buffer, TMP, RDI);
 			if (icEnabled()) {
-				generateIcSend(generator, selectorIndex);
+				generateIcSendPromoted(generator, selectorIndex);
 			} else {
 				// ST_NO_IC: exactly the pre-IC sequence
 				generateLoadObject(buffer,

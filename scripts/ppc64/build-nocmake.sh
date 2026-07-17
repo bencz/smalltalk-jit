@@ -48,6 +48,7 @@ esac
 
 SOURCES=$(ls "$ROOT"/vm/compiler/*.c "$ROOT"/vm/concurrency/*.c "$ROOT"/vm/core/*.c \
 	"$ROOT"/vm/jit/InlineCache.c "$ROOT"/vm/jit/RegisterAllocator.c "$ROOT"/vm/jit/StubCode.c \
+	"$ROOT"/vm/jit/Tier.c \
 	"$ROOT"/vm/jit/$ARCH_DIR/*.c "$ROOT"/vm/memory/*.c "$ROOT"/vm/os/linux/*.c \
 	"$ROOT"/vm/runtime/*.c "$ROOT"/vm/tools/*.c)
 SOURCES="$SOURCES $ABI_SRCS $ROOT/vm/thirdparty/cityhash/city.c $ROOT/vm/thirdparty/linenoise/linenoise.c"

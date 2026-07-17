@@ -28,12 +28,18 @@ typedef struct CodeGenerator {
 	// linear-scan liveness would otherwise omit a loop-carried, body-only pointer
 	// that is live into the next iteration — see generateSafepointPoll.
 	_Bool overapproxStackmap;
+	// Tier-1 recompilation (jit/Tier.h): the superseded NativeCode whose IC
+	// cells feed the speculative send promotion, or NULL for a plain tier-0
+	// compile. Non-NULL also suppresses the invocation-counter check (a method
+	// recompiles exactly once).
+	NativeCode *tierFeedback;
 } CodeGenerator;
 
 // Neutral initializer (jit/StubCode.c) — fresh buffer + zeroed frame state.
 void initCodeGenerator(CodeGenerator *generator);
 
 NativeCode *generateMethodCode(CompiledMethod *method);
+NativeCode *generateMethodCodeTiered(CompiledMethod *method, NativeCode *feedback);
 void generateLoadObject(AssemblerBuffer *buffer, RawObject *object, Register dst, _Bool tag);
 void generateLoadClass(AssemblerBuffer *buffer, Register src, Register dst);
 void generateStoreCheck(CodeGenerator *generator, Register object, Register value);

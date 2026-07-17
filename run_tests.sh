@@ -113,6 +113,26 @@ else
 	failed="$failed ST_IC_STATS_TEST(ST_NO_IC)"
 fi
 
+# Tier stats self-test (needs the image): first run proves the hot-method
+# recompile fires once and promoted guards carry the dispatches; the
+# ST_NO_TIER run proves the kill-switch zeroes the whole apparatus.
+if ST_TIER_STATS_TEST=1 "$BUILD/st" -s "$SNAP" </dev/null >/dev/null 2>&1; then
+	printf "  ${G}pass${Z}  %s\n" "ST_TIER_STATS_TEST"
+	pass=$((pass + 1))
+else
+	printf "  ${R}FAIL${Z}  %s\n" "ST_TIER_STATS_TEST"
+	fail=$((fail + 1))
+	failed="$failed ST_TIER_STATS_TEST"
+fi
+if ST_NO_TIER=1 ST_TIER_STATS_TEST=1 "$BUILD/st" -s "$SNAP" </dev/null >/dev/null 2>&1; then
+	printf "  ${G}pass${Z}  %s\n" "ST_TIER_STATS_TEST(ST_NO_TIER)"
+	pass=$((pass + 1))
+else
+	printf "  ${R}FAIL${Z}  %s\n" "ST_TIER_STATS_TEST(ST_NO_TIER)"
+	fail=$((fail + 1))
+	failed="$failed ST_TIER_STATS_TEST(ST_NO_TIER)"
+fi
+
 run_group() {
 	local title="$1"; shift
 	echo ""
@@ -123,6 +143,7 @@ run_group() {
 		base="$(basename "$f")"
 		[ "$base" = "CompilerTestFile.st" ] && continue   # included by CompilerTest, not standalone
 		[ "$base" = "IcHammerTest.st" ] && continue   # OS-thread stress: sandboxed group below
+		[ "$base" = "TierHammerTest.st" ] && continue   # OS-thread stress: sandboxed group below
 		[ "$base" = "06_business_card_server.st" ] && continue   # standalone server, runs forever
 		out="$(timeout 120 "$BUILD/st" -s "$SNAP" -f "$f" </dev/null 2>&1)"
 		if [ $? -eq 0 ]; then
@@ -137,33 +158,36 @@ run_group() {
 	done
 }
 
-# The IC hammer drives Worker parallel: (real OS threads); project rule after
-# the 2026-07-13 desktop freeze: run it PINNED inside a resource sandbox, never
-# loose. Falls back to bare taskset (or a plain run) where systemd-run is
-# unavailable.
+# The hammers drive Worker parallel: (real OS threads); project rule after
+# the 2026-07-13 desktop freeze: run them PINNED inside a resource sandbox,
+# never loose. Falls back to bare taskset (or a plain run) where systemd-run
+# is unavailable.
 run_sandboxed_hammer() {
-	local f="tests/IcHammerTest.st" out
+	local f base out
 	echo ""
 	echo "${B}tests (sandboxed)${Z}"
-	if command -v systemd-run >/dev/null 2>&1; then
-		out="$(systemd-run --user --scope -q -p MemoryMax=6G -p TasksMax=300 \
-			-- taskset -c 0-3 env LD_LIBRARY_PATH="$BUILD" \
-			timeout 120 "$BUILD/st" -s "$SNAP" -f "$f" </dev/null 2>&1)"
-	elif command -v taskset >/dev/null 2>&1; then
-		out="$(taskset -c 0-3 env LD_LIBRARY_PATH="$BUILD" \
-			timeout 120 "$BUILD/st" -s "$SNAP" -f "$f" </dev/null 2>&1)"
-	else
-		out="$(timeout 120 "$BUILD/st" -s "$SNAP" -f "$f" </dev/null 2>&1)"
-	fi
-	if [ $? -eq 0 ]; then
-		printf "  ${G}pass${Z}  %s\n" "IcHammerTest.st"
-		pass=$((pass + 1))
-	else
-		printf "  ${R}FAIL${Z}  %s\n" "IcHammerTest.st"
-		echo "$out" | sed 's/^/        /'
-		fail=$((fail + 1))
-		failed="$failed IcHammerTest.st"
-	fi
+	for f in tests/IcHammerTest.st tests/TierHammerTest.st; do
+		base="$(basename "$f")"
+		if command -v systemd-run >/dev/null 2>&1; then
+			out="$(systemd-run --user --scope -q -p MemoryMax=6G -p TasksMax=300 \
+				-- taskset -c 0-3 env LD_LIBRARY_PATH="$BUILD" \
+				timeout 120 "$BUILD/st" -s "$SNAP" -f "$f" </dev/null 2>&1)"
+		elif command -v taskset >/dev/null 2>&1; then
+			out="$(taskset -c 0-3 env LD_LIBRARY_PATH="$BUILD" \
+				timeout 120 "$BUILD/st" -s "$SNAP" -f "$f" </dev/null 2>&1)"
+		else
+			out="$(timeout 120 "$BUILD/st" -s "$SNAP" -f "$f" </dev/null 2>&1)"
+		fi
+		if [ $? -eq 0 ]; then
+			printf "  ${G}pass${Z}  %s\n" "$base"
+			pass=$((pass + 1))
+		else
+			printf "  ${R}FAIL${Z}  %s\n" "$base"
+			echo "$out" | sed 's/^/        /'
+			fail=$((fail + 1))
+			failed="$failed $base"
+		fi
+	done
 }
 
 [ "$RUN_TESTS" -eq 1 ] && run_group "tests" tests/*.st

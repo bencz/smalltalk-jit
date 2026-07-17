@@ -195,6 +195,7 @@ static void asmNegb(AssemblerBuffer *buffer, ByteRegister dst);
 static void asmIncq(AssemblerBuffer *buffer, Register dst);
 static void asmIncqMem(AssemblerBuffer *buffer, MemoryOperand operand);
 static void asmDecq(AssemblerBuffer *buffer, Register dst);
+static void asmDecqMem(AssemblerBuffer *buffer, MemoryOperand operand);
 
 static void asmAndq(AssemblerBuffer *buffer, Register src, Register dst);
 static void asmAndqImm(AssemblerBuffer *buffer, Register dst, int32_t imm);
@@ -675,6 +676,17 @@ static void asmIncqMem(AssemblerBuffer *buffer, MemoryOperand operand)
 static void asmDecq(AssemblerBuffer *buffer, Register dst)
 {
 	Operands operands = {.mod = MOD_REG, .reg = 1, .rm = dst};
+	asmEnsureCapacity(buffer);
+	asmEmitRexOperands(buffer, REX_W, &operands);
+	asmEmitUint8(buffer, 0xFF);
+	asmEmitOperands(buffer, &operands);
+}
+
+
+static void asmDecqMem(AssemblerBuffer *buffer, MemoryOperand operand)
+{
+	Operands operands = {.reg = 1};
+	asmInitMemoryOperand(&operands, operand);
 	asmEnsureCapacity(buffer);
 	asmEmitRexOperands(buffer, REX_W, &operands);
 	asmEmitUint8(buffer, 0xFF);

@@ -658,8 +658,10 @@ void verifyHeap(Heap *heap)
 				if (state == &gIcUnlinked || state == &gIcMega) {
 					continue;
 				}
+				// A malloc'd IC_KIND_UNLINKED state is a RETIRED cell
+				// (icRetireCellsTargeting) awaiting the next sweep's free.
 				ASSERT(state->kind == IC_KIND_MONO || state->kind == IC_KIND_PIC
-					|| state->kind == IC_KIND_MEGA);
+					|| state->kind == IC_KIND_MEGA || state->kind == IC_KIND_UNLINKED);
 				if (state->kind == IC_KIND_MONO) {
 					ASSERT(valueTypeOf(state->class, VALUE_POINTER));
 					verifyPointer(heap, asObject(state->class));

@@ -3,6 +3,9 @@
 #include "core/Lookup.h"
 #include "core/Handle.h"
 #include "core/Class.h"
+#include "core/Thread.h"
+#include "memory/Heap.h"
+#include "memory/HeapPage.h"
 #include <stdio.h>
 
 IcState gIcUnlinked = { 0, NULL, IC_KIND_UNLINKED, 0, NULL };
@@ -44,8 +47,11 @@ uint8_t *inlineCacheMiss(Value taggedClass, RawString *selector, IcCell *cell)
 	// before it is published. Address dependence is not a C-level guarantee
 	// (unlike in the emitted probe), hence the explicit acquire.
 	IcState *seen = __atomic_load_n(&cell->state, __ATOMIC_ACQUIRE);
-	if (seen == &gIcUnlinked) {
-		IcState *fresh = icAllocState(IC_KIND_MONO, 1, NULL);
+	if (seen == &gIcUnlinked || seen->kind == IC_KIND_UNLINKED) {
+		// Either the shared sentinel or a malloc'd RETIRED state left by
+		// icRetireCellsTargeting; the latter is chained for the STW sweep.
+		IcState *fresh = icAllocState(IC_KIND_MONO, 1,
+			seen == &gIcUnlinked ? NULL : seen);
 		fresh->class = current;
 		fresh->target = target;
 		if (icPublish(cell, seen, fresh)) {
@@ -185,6 +191,53 @@ void icResetNativeCodeCells(struct NativeCode *code)
 }
 
 
+// NON-STW retirement of every cell that dispatches into `oldCode`, called by
+// the tier-1 recompiler (jit/Tier.c) right after it republishes a method, so
+// callers rebind to the fresh code without waiting for the next scavenge.
+// Runs under codegenLock, which serializes ALL NativeCode creation: the exec
+// space cannot grow mid-walk, so the page iteration is stable without a
+// stop-the-world. Retirement follows the cell invariants to the letter: the
+// swing is a CAS to a FRESH immutable state (kind unlinked, class 0, so the
+// inline guard misses and the PicProbeStub falls through to the C handler,
+// which knows how to bind over it) that chains the superseded state on
+// `prev`; only the STW sweep ever frees. A lost CAS means a peer rebound
+// concurrently and is simply skipped (the next sweep evens it out). Peers
+// with a stale TLS LookupCache may rebind a retired cell back to the old
+// entry until their next epoch flush: documented staleness, not corruption.
+void icRetireCellsTargeting(struct NativeCode *oldCode)
+{
+	uint8_t *entry = ((NativeCode *) oldCode)->insts;
+	PageSpaceIterator iterator;
+	pageSpaceIteratorInit(&iterator, &CurrentThread.heap->execSpace);
+	NativeCode *code = (NativeCode *) pageSpaceIteratorNext(&iterator);
+
+	gIcStats.retireWalks++;
+	while (code != NULL) {
+		if ((code->tags & TAG_FREESPACE) == 0) {
+			IcCell *cells = nativeCodeIcCells(code);
+			for (size_t i = 0; i < code->icCellsSize; i++) {
+				IcState *seen = __atomic_load_n(&cells[i].state, __ATOMIC_ACQUIRE);
+				if (seen == &gIcUnlinked || seen == &gIcMega
+						|| seen->kind == IC_KIND_UNLINKED || seen->kind == IC_KIND_MEGA) {
+					continue;
+				}
+				_Bool targets = 0;
+				for (uintptr_t w = 0; w < seen->size; w++) {
+					targets |= seen->kind == IC_KIND_MONO
+						? seen->target == entry
+						: seen->ways[w].target == entry;
+				}
+				if (targets && icPublish(&cells[i],
+						seen, icAllocState(IC_KIND_UNLINKED, 0, seen))) {
+					gIcStats.cellsRetired++;
+				}
+			}
+		}
+		code = (NativeCode *) pageSpaceIteratorNext(&iterator);
+	}
+}
+
+
 void icPrintStats(void)
 {
 	printf("[IC] sites          %zu\n", gIcStats.sites);
@@ -201,4 +254,6 @@ void icPrintStats(void)
 	printf("[IC] cellsReset     %zu\n", gIcStats.cellsReset);
 	printf("[IC] megaCells      %zu\n", gIcStats.megaCells);
 	printf("[IC] stateBytesLive %zu\n", gIcStats.stateBytesLive);
+	printf("[IC] retireWalks    %zu\n", gIcStats.retireWalks);
+	printf("[IC] cellsRetired   %zu\n", gIcStats.cellsRetired);
 }

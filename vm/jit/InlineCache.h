@@ -83,11 +83,14 @@ typedef struct {
 	size_t cellsReset;     // mono/pic cells returned to unlinked by the sweeps
 	size_t megaCells;      // cells currently parked on the mega sentinel
 	size_t stateBytesLive; // gauge: malloc'd IcState bytes currently reachable
+	size_t retireWalks;    // exec-space walks by icRetireCellsTargeting
+	size_t cellsRetired;   // cells CAS-swung to a retired unlinked state
 } IcStats;
 extern IcStats gIcStats;
 
 uint8_t *inlineCacheMiss(Value taggedClass, RawString *selector, IcCell *cell);
 void icResetNativeCodeCells(struct NativeCode *code); // STW collectors only
+void icRetireCellsTargeting(struct NativeCode *oldCode); // codegenLock holders only
 void icPrintStats(void);
 
 

@@ -14,6 +14,7 @@
 #include "vm/tools/Cli.h"
 #include "vm/jit/TargetCpu.h"
 #include "vm/jit/InlineCache.h"
+#include "vm/jit/Tier.h"
 #include "vm/tests/SelfTests.h"
 #include <unistd.h>
 #include <string.h>
@@ -112,6 +113,10 @@ int main(int argc, char **args)
 	// increments; without it those two stay zero and the rest still counts).
 	if (icStatsEnabled()) {
 		icPrintStats();
+	}
+	// Tier observability (jit/Tier.h): same contract under ST_TIER_STATS=1.
+	if (tierStatsEnabled()) {
+		tierPrintStats();
 	}
 
 	freeHandles();

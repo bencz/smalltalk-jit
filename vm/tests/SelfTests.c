@@ -16,6 +16,7 @@
 #include "vm/core/Exception.h"
 #include "vm/os/Os.h"
 #include "vm/jit/InlineCache.h"
+#include "vm/jit/Tier.h"
 #include <unistd.h>
 #include <string.h>
 #include <stdio.h>
@@ -120,6 +121,111 @@ static int icStatsSelfTest(void)
 static void runIcStatsTest(void *arg)
 {
 	*(int *) arg = icStatsSelfTest();
+}
+
+
+// ---- tier stats self-test (ST_TIER_STATS_TEST=1 -s snap) -------------------
+// Falsifiability harness for the tier-1 adaptive recompiler (jit/Tier.h). The
+// dispatcher forces ST_TIER_STATS=1 and a low ST_TIER_THRESHOLD before any
+// codegen, so the workloads cross the invocation threshold in the MIDDLE of
+// their loops: a hot method must recompile exactly once, its monomorphic
+// callee sites must dispatch through the promoted exact-class guard (counted
+// directCalls), a receiver of another class must take the counted IC fallback
+// (guardFails) and still answer correctly, and under ST_NO_TIER=1 the whole
+// apparatus must vanish. Counter deltas are taken around each measured run;
+// the compiler's own recompiled methods add noise, so assertions are lower
+// bounds and coarse ratios, like the IC test above.
+
+// TierHost>>double: holds TWO monomorphic dynamic sends to bump:. Answers are
+// asserted per iteration inside the loop (any old/new-code divergence counts),
+// each eval returns the number of WRONG iterations. A fresh eval per phase
+// gives a fresh unlinked call site, which binds to the CURRENT (post-recompile)
+// code without needing a GC to reset old cells. Class definitions are a
+// top-level construct: they go through parseSourceAndInitialize, not evalCode.
+#define TIER_DEFS \
+	"TierHost := Object [ bump: x [ ^x + 3 ] double: x [ ^(self bump: x) + (self bump: x) ] ]\n" \
+	"TierHostSub := TierHost [ bump: x [ ^x + 7 ] ]\n"
+#define TIER_MONO_WORKLOAD \
+	"[ | h wrong | h := TierHost new. wrong := 0." \
+	" 1 to: 5000 do: [:i | (h double: i) = (i * 2 + 6) ifFalse: [wrong := wrong + 1]]. wrong ] value"
+#define TIER_SUB_WORKLOAD \
+	"[ | h wrong | h := TierHostSub new. wrong := 0." \
+	" 1 to: 200 do: [:i | (h double: i) = (i * 2 + 14) ifFalse: [wrong := wrong + 1]]. wrong ] value"
+
+static int tierStatsFailures;
+
+static void tierStatsCheck(_Bool ok, const char *what)
+{
+	if (!ok) {
+		printf("tier stats self-test FAILED: %s\n", what);
+		tierStatsFailures++;
+	}
+}
+
+static int tierStatsSelfTest(void)
+{
+	tierStatsFailures = 0;
+
+	Value defsResult;
+	tierStatsCheck(parseSourceAndInitialize(TIER_DEFS, &defsResult), "class defs failed to parse");
+	// Warmup: crosses the threshold mid-loop (the site keeps calling the
+	// superseded code afterwards, which stays valid forever; correctness across
+	// the crossing is the assertion).
+	tierStatsCheck(asCInt(evalCode(TIER_MONO_WORKLOAD)) == 0, "mono warmup wrong answers");
+
+	if (getenv("ST_NO_TIER") != NULL) {
+		// Kill-switch: no counters emitted, no trigger reachable, nothing fires.
+		tierStatsCheck(gTierStats.triggerCalls == 0 && gTierStats.recompiles == 0
+			&& gTierStats.promotedSites == 0 && gTierStats.unpromotedSites == 0
+			&& gTierStats.directCalls == 0 && gTierStats.guardFails == 0,
+			"ST_NO_TIER left nonzero counters");
+		tierStatsCheck(asCInt(evalCode(TIER_SUB_WORKLOAD)) == 0, "ST_NO_TIER sub wrong answers");
+		return tierStatsFailures;
+	}
+
+	// The warmup invoked double: well past the threshold: it recompiled once
+	// (idempotent trigger) and both bump: sites were bound mono -> promoted.
+	tierStatsCheck(gTierStats.recompiles >= 1, "no recompiles after hot warmup");
+	tierStatsCheck(gTierStats.triggerCalls >= gTierStats.recompiles, "triggers < recompiles");
+	tierStatsCheck(gTierStats.promotedSites >= 2, "double:'s bump: sites not promoted");
+
+	// Adoption gate: republishing does NOT touch bound IC cells nor the TLS
+	// LookupCache (both by design, the documented staleness), so a full GC
+	// stands in for the scavenges of a real workload: it resets every cell and
+	// bumps gcEpoch, and the next miss rebinds through getNativeCode to the
+	// tier-1 code.
+	evalCode("GarbageCollector collectGarbage");
+
+	// Measured mono run: a fresh call site binds to the tier-1 double:, whose
+	// promoted guards must carry ~all 2x5000 bump: dispatches; the fallback
+	// must stay rare (compiler noise only).
+	TierStats base = gTierStats;
+	tierStatsCheck(asCInt(evalCode(TIER_MONO_WORKLOAD)) == 0, "mono run wrong answers");
+	size_t direct = gTierStats.directCalls - base.directCalls;
+	size_t fails = gTierStats.guardFails - base.guardFails;
+	tierStatsCheck(direct > 9000, "promoted guards not taken (~2 per iteration expected)");
+	tierStatsCheck(fails < direct / 10, "stable mono site failing its guard");
+
+	// Guard-fail run: TierHostSub inherits double: (the same tier-1 code), so
+	// the promoted exact-TierHost guard must MISS for every send and the IC
+	// fallback must dispatch TierHostSub>>bump: correctly.
+	base = gTierStats;
+	tierStatsCheck(asCInt(evalCode(TIER_SUB_WORKLOAD)) == 0, "sub run wrong answers");
+	tierStatsCheck(gTierStats.guardFails - base.guardFails >= 300,
+		"subclass receiver did not take the guard-fail fallback (~400 expected)");
+
+	// A recompile happens once per method: a method whose counter fired keeps
+	// running (old frames) and decrementing, but never re-recompiles. With the
+	// compiler itself tiering up there is no exact global equality to assert;
+	// the once-only latch is asserted structurally: every trigger echo beyond
+	// the first left recompiles untouched.
+	tierStatsCheck(gTierStats.recompiles <= gTierStats.triggerCalls, "recompiles exceed triggers");
+	return tierStatsFailures;
+}
+
+static void runTierStatsTest(void *arg)
+{
+	*(int *) arg = tierStatsSelfTest();
 }
 
 
@@ -1345,6 +1451,28 @@ int selfTestFromEnv(char *snapshotFileName, char *bootstrapDir,
 		freeHandles();
 		freeThread(&CurrentThread);
 		return icResult;
+	}
+
+	// Tier stats self-test (needs the image): ST_TIER_STATS_TEST=1 -s snap
+	// (optionally with ST_NO_TIER=1 to prove the kill-switch zeroes everything)
+	if (getenv("ST_TIER_STATS_TEST") != NULL) {
+		// The JIT emits the guard-hit/fail increments only under ST_TIER_STATS,
+		// and a low threshold makes the workloads cross mid-loop: both must be
+		// set BEFORE any codegen. The threshold stays overridable from outside.
+		setenv("ST_TIER_STATS", "1", 1);
+		setenv("ST_TIER_THRESHOLD", "50", 0);
+		initThread(&CurrentThread);
+		bootstrap(snapshotFileName, bootstrapDir);
+		schedulerInit();
+		// Starts at 1 (fail): an uncaught Smalltalk error terminates the test
+		// fiber BEFORE the runner stores its verdict, and main.c would report
+		// success (the known Assert-exits-0 trap, see run_tests.sh notes).
+		int tierResult = 1;
+		schedulerSpawnC(runTierStatsTest, &tierResult, 0);
+		schedulerRun();
+		freeHandles();
+		freeThread(&CurrentThread);
+		return tierResult;
 	}
 
 	// Worker-thread Smalltalk execution self-test (needs the image): ST_WORKER_TEST=1 -s snap
