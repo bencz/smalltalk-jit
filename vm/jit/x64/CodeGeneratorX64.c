@@ -845,6 +845,73 @@ static void generateFloatFastPath(CodeGenerator *generator, int arithKind,
 }
 
 
+// The IC hit path, shared with the emit-golden harness (which pins its bytes):
+// cell-address placeholder, state load, tagged-class guard, and on the hit the
+// address-dependent target load into R11. `miss` is bound by the caller.
+void generateIcGuard(AssemblerBuffer *buffer, AssemblerLabel *miss)
+{
+	// Cell address: imm64 placeholder, baked exactly once with the final cell
+	// address in buildNativeCodeFromAssembler, never patched after publication
+	// (NOT a pointersOffsets entry: the GC must not forward it).
+	asmMovqImm(buffer, 0, TMP);
+	asmAddIcSite(buffer, asmOffset(buffer) - (ptrdiff_t) sizeof(int64_t));
+	asmMovqMem(buffer, asmMem(TMP, NO_REGISTER, SS_1, offsetof(IcCell, state)), RAX);
+	asmCmpqMem(buffer, asmMem(RAX, NO_REGISTER, SS_1, offsetof(IcState, class)), RDI);
+	asmJ(buffer, COND_NOT_EQUAL, miss);
+	asmMovqMem(buffer, asmMem(RAX, NO_REGISTER, SS_1, offsetof(IcState, target)), R11);
+}
+
+
+// RDI: receiver class (tagged, from generateLoadClass)
+// R11: native code target out
+// Per-site inline cache for the dynamic send: one aligned load of the cell
+// picks the published IcState (immutable; swung only by the miss handler's CAS
+// and the STW reset sweep, see jit/InlineCache.h); a tagged-class match takes
+// the target through a load off that state; an UNLINKED cell (state->class 0)
+// binds once through the shared IcMissStub; a cell bound to ANOTHER class is
+// never rebound here and falls through to today's global-cache probe, the
+// performance floor. The selector load is miss-only: the hit path, like the
+// static-send path, dispatches without it.
+static void generateIcSend(CodeGenerator *generator, uint8_t selectorIndex)
+{
+	AssemblerBuffer *buffer = &generator->buffer;
+	AssemblerLabel miss, poly, callFromHit, callFromCold;
+	asmInitLabel(&miss);
+	asmInitLabel(&poly);
+	asmInitLabel(&callFromHit);
+	asmInitLabel(&callFromCold);
+
+	generateIcGuard(buffer, &miss);
+	if (icStatsEnabled()) {
+		asmMovqImm(buffer, (int64_t) &gIcStats.hits, RDX);
+		asmIncqMem(buffer, asmMem(RDX, NO_REGISTER, SS_1, 0));
+	}
+	asmJmpLabel(buffer, &callFromHit);
+
+	asmLabelBind(buffer, &miss, asmOffset(buffer));
+	generateLoadObject(buffer,
+		compiledCodeLiteralAt(&generator->code, selectorIndex), RSI, 0);
+	asmMovqMem(buffer, asmMem(RAX, NO_REGISTER, SS_1, offsetof(IcState, class)), RDX);
+	asmTestq(buffer, RDX, RDX);
+	asmJ(buffer, COND_NOT_ZERO, &poly);
+	asmDecq(buffer, RDI);                     // raw class for the C handler
+	asmMovq(buffer, TMP, RDX);                // cell = 3rd sysv arg
+	generateStubCall(generator, &IcMissStub); // returns the entry in R11
+	asmJmpLabel(buffer, &callFromCold);
+
+	asmLabelBind(buffer, &poly, asmOffset(buffer));
+	if (icStatsEnabled()) {
+		asmMovqImm(buffer, (int64_t) &gIcStats.polyFallbacks, RDX);
+		asmIncqMem(buffer, asmMem(RDX, NO_REGISTER, SS_1, 0));
+	}
+	generateMethodLookup(generator);          // expects RDI tagged, RSI selector
+
+	ptrdiff_t callOffset = asmOffset(buffer);
+	asmLabelBind(buffer, &callFromHit, callOffset);
+	asmLabelBind(buffer, &callFromCold, callOffset);
+}
+
+
 // TMP: receiver
 // RDI: receiver class
 // RSI: selector
@@ -1017,9 +1084,14 @@ static void generateSend(CodeGenerator *generator, BytecodesIterator *iterator)
 			// that is not always taken, and a later send would read the unpopulated slot
 			// as a garbage class. Recomputing per send is a few instructions and correct.
 			generateLoadClass(buffer, TMP, RDI);
-			generateLoadObject(buffer,
-				compiledCodeLiteralAt(&generator->code, selectorIndex), RSI, 0);
-			generateMethodLookup(generator);
+			if (icEnabled()) {
+				generateIcSend(generator, selectorIndex);
+			} else {
+				// ST_NO_IC: exactly the pre-IC sequence
+				generateLoadObject(buffer,
+					compiledCodeLiteralAt(&generator->code, selectorIndex), RSI, 0);
+				generateMethodLookup(generator);
+			}
 		}
 
 		generator->frameSize -= argsSize + 1;
@@ -2189,7 +2261,8 @@ NativeCode *buildNativeCode(CodeGenerator *generator)
 NativeCode *buildNativeCodeFromAssembler(AssemblerBuffer *buffer)
 {
 	size_t size = asmOffset(buffer);
-	NativeCode *code = allocateNativeCode(CurrentThread.heap, size, buffer->pointersOffsetsSize);
+	NativeCode *code = allocateNativeCode(CurrentThread.heap, size,
+		buffer->pointersOffsetsSize, buffer->icSitesSize);
 	code->compiledCode = NULL;
 	code->argsSize = 0;
 	code->descriptors = NULL;
@@ -2197,6 +2270,16 @@ NativeCode *buildNativeCodeFromAssembler(AssemblerBuffer *buffer)
 	code->typeFeedback = NULL;
 	code->counter = 0;
 	asmBindFixups(buffer, code->insts);
+	// Bake each IC site's cell address (known only now: the cells live inside
+	// this allocation) into the still-private buffer, and start every cell
+	// unlinked. This is the ONLY time these immediates are written; published
+	// code is never patched again (the mutable word is the cell, data not code).
+	IcCell *cells = nativeCodeIcCells(code);
+	for (size_t i = 0; i < buffer->icSitesSize; i++) {
+		targetWriteCodePointer(buffer->buffer + buffer->icSites[i], (uint64_t) &cells[i]);
+		cells[i].state = &gIcUnlinked;
+	}
+	gIcStats.sites += buffer->icSitesSize;
 	asmCopyBuffer(buffer, code->insts, size);
 	asmCopyPointersOffsets(buffer, nativeCodePointersOffsets(code));
 	// Single funnel for ALL code creation (methods, blocks, stubs): make the

@@ -6,6 +6,7 @@
 #include "core/Class.h"
 #include "jit/CodeDescriptors.h"
 #include "jit/TargetCodePatch.h"
+#include "jit/InlineCache.h"
 #include "core/Entry.h"
 #include "core/StackFrame.h"
 #include "core/Thread.h"
@@ -334,8 +335,14 @@ static void iterateNativeCode(MarkingQueue *queue, Thread *thread)
 	pageSpaceIteratorInit(&iterator, &thread->heap->execSpace);
 	NativeCode *code = (NativeCode *) pageSpaceIteratorNext(&iterator);
 
+	gIcStats.resetSweeps++;
 	while (code != NULL) {
 		if ((code->tags & TAG_FREESPACE) == 0) {
+			// IC states are weak (deliberately NOT marked): the sweep can free
+			// a dead class and hand its address to a future allocation, so all
+			// bound cells reset to unlinked under this stop-the-world. Usually
+			// a no-op: the scavenge that precedes every full GC already swept.
+			icResetNativeCodeCells(code);
 			if (code->compiledCode != NULL) {
 				markObject(queue, thread, (RawObject *) code->compiledCode);
 			}

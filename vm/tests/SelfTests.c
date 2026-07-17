@@ -15,6 +15,7 @@
 #include "vm/memory/Heap.h"
 #include "vm/core/Exception.h"
 #include "vm/os/Os.h"
+#include "vm/jit/InlineCache.h"
 #include <unistd.h>
 #include <string.h>
 #include <stdio.h>
@@ -25,6 +26,92 @@
 static void runMessageTest(void *arg)
 {
 	*(int *) arg = messageSelfTest();
+}
+
+
+// ---- inline-cache stats self-test (ST_IC_STATS_TEST=1 -s snap) -------------
+// Falsifiability harness for the per-site inline caches (jit/InlineCache.h):
+// a monomorphic site must prove a ~100% hit rate through the counters, a
+// polymorphic site must take the global-probe fallback (counted) instead of
+// rebinding, and under ST_NO_IC=1 the whole apparatus must vanish (every
+// counter zero). Counter deltas are taken around each measured run so the
+// bootstrap's own sends do not pollute the assertion; counts stay exact
+// because the workload runs on a single fiber and the C-side counters are
+// only touched from it (plus GC sweeps, which never add hits).
+
+// One dynamic `add:` site hit 200000 times by one receiver class. Big on
+// purpose: each evalCode COMPILES its doit first, and the compiler itself has
+// honestly polymorphic sites (AST node dispatch), so the assertions below are
+// ratios over deltas large enough to dominate that fixed noise. 200000 result.
+#define IC_MONO_WORKLOAD \
+	"[ | c | c := OrderedCollection new. 1 to: 200000 do: [:i | c add: i]. c size ] value"
+// One dynamic `size` site alternating String and Array receivers. 80000 result.
+#define IC_POLY_WORKLOAD \
+	"[ | things n | things := Array with: 'hello' with: #(1 2 3). n := 0." \
+	" 1 to: 20000 do: [:i | n := n + (things at: i \\\\ 2 + 1) size]. n ] value"
+
+static int icStatsFailures;
+
+static void icStatsCheck(_Bool ok, const char *what)
+{
+	if (!ok) {
+		printf("IC stats self-test FAILED: %s\n", what);
+		icStatsFailures++;
+	}
+}
+
+static int icStatsSelfTest(void)
+{
+	icStatsFailures = 0;
+
+	// Warm up: compile the workload methods/blocks and bind their sites.
+	icStatsCheck(asCInt(evalCode(IC_MONO_WORKLOAD)) == 200000, "mono warmup result");
+	icStatsCheck(asCInt(evalCode(IC_POLY_WORKLOAD)) == 80000, "poly warmup result");
+
+	if (getenv("ST_NO_IC") != NULL) {
+		// Kill-switch: no cells, no misses, no counters. sites == 0 proves the
+		// emitted sequence is the pre-IC one (cells are created per emitted site).
+		icStatsCheck(gIcStats.sites == 0, "ST_NO_IC left sites");
+		icStatsCheck(gIcStats.hits == 0 && gIcStats.polyFallbacks == 0
+			&& gIcStats.missCold == 0 && gIcStats.binds == 0
+			&& gIcStats.bindRaces == 0 && gIcStats.polyPending == 0
+			&& gIcStats.cellsReset == 0 && gIcStats.stateBytesLive == 0,
+			"ST_NO_IC left nonzero counters");
+		return icStatsFailures;
+	}
+
+	// The lazily-loaded image compiles on demand: only the warmup's code exists,
+	// but that already means dozens of sites with cells.
+	icStatsCheck(gIcStats.sites > 10, "no IC sites created");
+
+	// Mono stability: the measured run's sends must be ~100% hits. Mid-run
+	// scavenges may reset and rebind (missCold), and the doit compilation adds
+	// a fixed few hundred poly fallbacks from the compiler's own sites, so the
+	// assertion is a ratio over deltas that dwarf both.
+	IcStats base = gIcStats;
+	icStatsCheck(asCInt(evalCode(IC_MONO_WORKLOAD)) == 200000, "mono run result");
+	size_t monoHits = gIcStats.hits - base.hits;
+	size_t monoCold = gIcStats.missCold - base.missCold;
+	size_t monoPoly = gIcStats.polyFallbacks - base.polyFallbacks;
+	icStatsCheck(monoHits > 190000, "mono site not ~100% hit");
+	icStatsCheck(monoCold + monoPoly < monoHits / 50,
+		"mono workload missed more than ~2%");
+
+	// Poly floor: the alternating class must fall through to the global probe
+	// (counted), never rebind the mono state; the bound class keeps hitting.
+	base = gIcStats;
+	icStatsCheck(asCInt(evalCode(IC_POLY_WORKLOAD)) == 80000, "poly run result");
+	icStatsCheck(gIcStats.polyFallbacks - base.polyFallbacks > 9000,
+		"poly site did not take the fallback");
+	icStatsCheck(gIcStats.hits - base.hits > 9000, "poly site's bound class stopped hitting");
+
+	icStatsCheck(gIcStats.binds >= 1, "no binds recorded");
+	return icStatsFailures;
+}
+
+static void runIcStatsTest(void *arg)
+{
+	*(int *) arg = icStatsSelfTest();
 }
 
 
@@ -1233,6 +1320,23 @@ int selfTestFromEnv(char *snapshotFileName, char *bootstrapDir,
 		freeHandles();
 		freeThread(&CurrentThread);
 		return msgResult;
+	}
+
+	// Inline-cache stats self-test (needs the image): ST_IC_STATS_TEST=1 -s snap
+	// (optionally with ST_NO_IC=1 to prove the kill-switch zeroes everything)
+	if (getenv("ST_IC_STATS_TEST") != NULL) {
+		// The JIT emits the hit/poly increments only under ST_IC_STATS: force
+		// it on BEFORE any codegen so the counters exist in the emitted code.
+		setenv("ST_IC_STATS", "1", 1);
+		initThread(&CurrentThread);
+		bootstrap(snapshotFileName, bootstrapDir);
+		schedulerInit();
+		int icResult = 0;
+		schedulerSpawnC(runIcStatsTest, &icResult, 0);
+		schedulerRun();
+		freeHandles();
+		freeThread(&CurrentThread);
+		return icResult;
 	}
 
 	// Worker-thread Smalltalk execution self-test (needs the image): ST_WORKER_TEST=1 -s snap

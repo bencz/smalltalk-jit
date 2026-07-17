@@ -186,6 +186,7 @@ set(vmSources
 	vm/core/Smalltalk.c
 	vm/core/StackFrame.c
 	vm/core/Thread.c
+	vm/jit/InlineCache.c
 	vm/jit/RegisterAllocator.c
 	vm/jit/StubCode.c
 	vm/memory/FreeList.c

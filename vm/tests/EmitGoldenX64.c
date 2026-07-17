@@ -67,6 +67,20 @@ static void emitEntryStubCase(CodeGenerator *generator)
 	SmalltalkEntry.generator(generator);
 }
 
+// The inline-cache hit-path guard (generateIcGuard, jit/InlineCache.h): the
+// cell-address movabs (masked: the zero placeholder is patched per site at
+// build time), the state load, the tagged-class compare and the
+// address-dependent target load; the miss label binds right past the end so
+// the jne displacement is pinned too.
+static void emitIcGuardCase(CodeGenerator *generator)
+{
+	AssemblerBuffer *buffer = &generator->buffer;
+	AssemblerLabel miss;
+	asmInitLabel(&miss);
+	generateIcGuard(buffer, &miss);
+	asmLabelBind(buffer, &miss, asmOffset(buffer));
+}
+
 // The SmallFloat64 decode/encode building blocks (rotates + raw GPR<->XMM bit
 // moves), including REX.B (r10) and REX.W coverage on every form.
 static void emitSmallFloatOpsCase(CodeGenerator *generator)
@@ -103,6 +117,8 @@ static const GoldenCase Cases[] = {
 	  ExpectedEntryStub, sizeof(ExpectedEntryStub) },
 	{ "smallfloat rol/ror/movq GPR<->XMM", emitSmallFloatOpsCase,
 	  ExpectedSmallFloatOps, sizeof(ExpectedSmallFloatOps) },
+	{ "generateIcGuard(miss)", emitIcGuardCase,
+	  ExpectedIcGuard, sizeof(ExpectedIcGuard) },
 };
 
 static void hexdumpAsCArray(const char *name, const uint8_t *bytes, size_t size)
@@ -120,6 +136,7 @@ static void hexdumpAsCArray(const char *name, const uint8_t *bytes, size_t size)
 static const char *CaseArrayNames[] = {
 	"ExpectedLoadTls", "ExpectedCCall", "ExpectedStoreCheck",
 	"ExpectedCCallPrimitive", "ExpectedEntryStub", "ExpectedSmallFloatOps",
+	"ExpectedIcGuard",
 };
 
 // Some sequences bake REAL C-function addresses (e.g. generateStoreCheck's

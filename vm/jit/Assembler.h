@@ -52,6 +52,14 @@ typedef struct {
 	uint8_t fixupsSize;
 	uint32_t pointersOffsets[1024]; // TODO: get rid of fixed size buffer?
 	size_t pointersOffsetsSize;
+	// Offsets of inline-cache cell-address immediates (same per-arch encoding
+	// convention as pointersOffsets: x64 = the imm64, ppc64 = first byte of the
+	// li64 shape). Deliberately NOT in pointersOffsets: a cell address is not a
+	// heap pointer, so the GC must not forward it, and the in-flight CodegenSites
+	// walk must skip the zero placeholders. Patched exactly once, with the cell
+	// array's final address, in buildNativeCodeFromAssembler before publication.
+	uint32_t icSites[1024];
+	size_t icSitesSize;
 	CodegenSites sitesNode; // GC visibility of the baked pointers (see Thread.h)
 } AssemblerBuffer;
 
@@ -83,6 +91,7 @@ static void asmInitBuffer(AssemblerBuffer *buffer, size_t size)
 	buffer->instOffset = 0;
 	buffer->fixupsSize = 0;
 	buffer->pointersOffsetsSize = 0;
+	buffer->icSitesSize = 0;
 	// Codegen runs GC-active and allocates (stackmaps, descriptors), so a
 	// scavenge can move objects whose addresses were already baked in here.
 	// Register the pointer sites so the collectors can fix them mid-flight
@@ -241,6 +250,14 @@ static void asmAddPointerOffset(AssemblerBuffer *buffer, ptrdiff_t offset)
 static void asmCopyPointersOffsets(AssemblerBuffer *buffer, uint32_t *dest)
 {
 	memcpy(dest, buffer->pointersOffsets, buffer->pointersOffsetsSize * sizeof(*dest));
+}
+
+
+static void asmAddIcSite(AssemblerBuffer *buffer, ptrdiff_t offset)
+{
+	ASSERT(0 <= offset && offset <= UINT32_MAX);
+	ASSERT(buffer->icSitesSize < 1024);
+	buffer->icSites[buffer->icSitesSize++] = (uint32_t) offset;
 }
 
 

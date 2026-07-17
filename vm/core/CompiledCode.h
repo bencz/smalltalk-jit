@@ -8,6 +8,7 @@
 #include "runtime/Collection.h"
 #include "runtime/String.h"
 #include "compiler/Parser.h"
+#include "jit/InlineCache.h"
 
 typedef Value (*NativeCodeEntry)();
 
@@ -16,6 +17,7 @@ typedef struct NativeCode {
 	uintptr_t size:56;
 	uint8_t tags;
 	size_t pointersOffsetsSize;
+	size_t icCellsSize;
 	size_t argsSize;
 	RawArray *stackmaps;
 	RawArray *descriptors;
@@ -23,6 +25,7 @@ typedef struct NativeCode {
 	size_t counter;
 	uint8_t insts[];
 	// uint32_t pointersOffsets[]; 4-byte aligned, see nativeCodePointersOffsets
+	// IcCell icCells[];           8-byte aligned, see nativeCodeIcCells
 } NativeCode;
 
 // The baked-pointer patch offsets sit inline after the code bytes. insts+size
@@ -33,6 +36,32 @@ typedef struct NativeCode {
 static inline uint32_t *nativeCodePointersOffsets(NativeCode *code)
 {
 	return (uint32_t *) (code->insts + (((size_t) code->size + 3) & ~(size_t) 3));
+}
+
+// The inline-cache cells sit after the patch offsets, base rounded up to 8:
+// a cell is one naturally aligned pointer word swung by the miss handler's CAS
+// (ldarx/stdcx on POWER strictly requires the alignment) and read by a single
+// load in the JIT guard. insts is 8-aligned (fixed header of 8-byte fields),
+// so aligning the offset aligns the base.
+static inline size_t nativeCodeIcCellsOffset(size_t instsSize, size_t pointersOffsetsSize)
+{
+	size_t offset = ((instsSize + 3) & ~(size_t) 3) + pointersOffsetsSize * sizeof(uint32_t);
+	return (offset + 7) & ~(size_t) 7;
+}
+
+static inline IcCell *nativeCodeIcCells(NativeCode *code)
+{
+	return (IcCell *) (code->insts + nativeCodeIcCellsOffset((size_t) code->size, code->pointersOffsetsSize));
+}
+
+// Single source of truth for everything after the NativeCode header: the code
+// bytes, the patch-offset array and the IC cells. allocateNativeCode (sizing),
+// computeNativeCodeSize (the exec-space walkers' stride) and nativeCodeIcCells
+// (the base) MUST agree; a one-term divergence desynchronizes every exec-space
+// walk (pageSpaceIteratorNext strides by computeNativeCodeSize).
+static inline size_t nativeCodePayloadSize(size_t instsSize, size_t pointersOffsetsSize, size_t icCellsSize)
+{
+	return nativeCodeIcCellsOffset(instsSize, pointersOffsetsSize) + icCellsSize * sizeof(IcCell);
 }
 
 // The header is stored INSIDE the scanned vars area of CompiledMethod/Block
@@ -359,8 +388,8 @@ static RawClass *compiledCodeResolveOperandClass(CompiledCode *code, Operand ope
 
 static size_t computeNativeCodeSize(NativeCode *code)
 {
-	return sizeof(NativeCode) + (((size_t) code->size + 3) & ~(size_t) 3)
-		+ code->pointersOffsetsSize * sizeof(uint32_t);
+	return sizeof(NativeCode)
+		+ nativeCodePayloadSize((size_t) code->size, code->pointersOffsetsSize, code->icCellsSize);
 }
 
 #endif

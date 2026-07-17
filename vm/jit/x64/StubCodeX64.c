@@ -272,6 +272,20 @@ static void generateLookup(CodeGenerator *generator)
 StubCode LookupStub = { .generator = generateLookup, .id = STUB_LOOKUP };
 
 
+// Shared inline-cache miss handler: the send site only calls it when the cell
+// is UNLINKED (bound-to-another-class misses fall through to the inline global
+// probe instead). inlineCacheMiss(class, selector, cell): args pre-placed in
+// RDI/RSI/RDX by the send sequence; the entry to call comes back in R11.
+static void generateIcMiss(CodeGenerator *generator)
+{
+	AssemblerBuffer *buffer = &generator->buffer;
+	generateCCall(generator, (intptr_t) inlineCacheMiss, 3, 0);
+	asmMovq(buffer, RAX, R11);
+	asmRet(buffer);
+}
+StubCode IcMissStub = { .generator = generateIcMiss, .id = STUB_IC_MISS };
+
+
 static void generateDoesNotUnderstandStub(CodeGenerator *generator)
 {
 	AssemblerBuffer *buffer = &generator->buffer;

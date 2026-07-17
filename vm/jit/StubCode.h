@@ -12,6 +12,7 @@ typedef enum {
 	STUB_ALLOCATE,
 	STUB_LOOKUP,
 	STUB_DNU,
+	STUB_IC_MISS,
 } StubId;
 
 // A stub DESCRIPTOR: pure (isolate-independent) — just how to generate the stub and
@@ -26,6 +27,7 @@ extern StubCode SmalltalkEntry;
 extern StubCode AllocateStub;
 extern StubCode LookupStub;
 extern StubCode DoesNotUnderstandStub;
+extern StubCode IcMissStub;
 
 NativeCode *getStubNativeCode(StubCode *stub);
 void generateStubCall(CodeGenerator *generator, StubCode *stubCode);

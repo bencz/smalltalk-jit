@@ -13,6 +13,7 @@
 #include "vm/os/Os.h"
 #include "vm/tools/Cli.h"
 #include "vm/jit/TargetCpu.h"
+#include "vm/jit/InlineCache.h"
 #include "vm/tests/SelfTests.h"
 #include <unistd.h>
 #include <string.h>
@@ -105,6 +106,13 @@ int main(int argc, char **args)
 	// it forked) are done.
 	schedulerSpawnC(runProgram, &ctx, 0);
 	schedulerRun();
+
+	// Inline-cache observability (jit/InlineCache.h): dump the counters at exit
+	// under ST_IC_STATS=1 (the same flag that makes the JIT emit the hit/poly
+	// increments; without it those two stay zero and the rest still counts).
+	if (icStatsEnabled()) {
+		icPrintStats();
+	}
 
 	freeHandles();
 	freeThread(&CurrentThread);

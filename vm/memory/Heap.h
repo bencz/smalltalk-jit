@@ -17,7 +17,7 @@ struct SmalltalkHandles;
 // so a stub is generated once per heap instead of once per worker. Kept in sync with
 // the StubId enum in StubCode.h. Per-heap (not global) keeps isolates independent —
 // each heap's stub `insts` live in that heap's execSpace.
-#define STUB_COUNT 4
+#define STUB_COUNT 5
 
 typedef struct Heap {
 	struct Thread *thread;
@@ -123,7 +123,7 @@ void initHeap(Heap *heap, struct Thread *thread);
 void freeHeap(Heap *heap);
 RawObject *allocateObject(Heap *heap, RawClass *class, size_t size);
 void freeObject(PageSpace *space, RawObject *object);
-struct NativeCode *allocateNativeCode(Heap *heap, size_t size, size_t pointersOffsetsSize);
+struct NativeCode *allocateNativeCode(Heap *heap, size_t size, size_t pointersOffsetsSize, size_t icCellsSize);
 uint8_t *allocate(Heap *heap, size_t size);
 uint8_t *tryAllocateOld(Heap *heap, size_t size, _Bool grow);
 void collectGarbage(struct Thread *thread);

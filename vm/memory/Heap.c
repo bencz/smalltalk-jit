@@ -354,18 +354,19 @@ void freeObject(PageSpace *space, RawObject *object)
 }
 
 
-NativeCode *allocateNativeCode(Heap *heap, size_t size, size_t pointersOffsetsSize)
+NativeCode *allocateNativeCode(Heap *heap, size_t size, size_t pointersOffsetsSize, size_t icCellsSize)
 {
-	// Room for the inline offsets array at its 4-byte aligned base (the code
-	// byte count has arbitrary parity): mirror nativeCodePointersOffsets.
-	size_t realSize = align(sizeof(NativeCode) + ((size + 3) & ~(size_t) 3)
-		+ pointersOffsetsSize * sizeof(uint32_t), HEAP_OBJECT_ALIGN);
+	// Sizing MUST agree with computeNativeCodeSize (the exec-space walkers'
+	// stride): both go through nativeCodePayloadSize.
+	size_t realSize = align(sizeof(NativeCode)
+		+ nativeCodePayloadSize(size, pointersOffsetsSize, icCellsSize), HEAP_OBJECT_ALIGN);
 	// Serialize concurrent exec-space carving across worker threads (see execLock).
 	pthread_mutex_lock(&heap->execLock);
 	NativeCode *code = (NativeCode *) pageSpaceAllocate(&heap->execSpace, realSize);
 	pthread_mutex_unlock(&heap->execLock);
 	code->size = size;
 	code->pointersOffsetsSize = pointersOffsetsSize;
+	code->icCellsSize = icCellsSize;
 	code->tags = 0;
 	return code;
 }
@@ -569,6 +570,14 @@ void collectGarbage(Thread *thread)
 {
 	scavengerScavenge(&thread->heap->newSpace);
 	markAndSweep(thread);
+	// This raw path (GCPrimitive) moved young objects like any scavenge: bump
+	// the epoch and flush the caller's TLS LookupCache, exactly like
+	// heapCollectYoung does on the allocation-driven path. Without it a stale
+	// entry false-hits once the abandoned semispace is reused. (Known gap, out
+	// of scope here: this path still runs without the multi-mutator STW
+	// handshake.)
+	thread->heap->gcEpoch++;
+	lookupCacheOnGcResume(thread);
 }
 
 
@@ -629,6 +638,31 @@ void verifyHeap(Heap *heap)
 			verifyObject(heap, object);
 		}
 		object = pageSpaceIteratorNext(&iterator);
+	}
+
+	// Exec space: the iterator strides by computeNativeCodeSize, so this walk
+	// terminating cleanly proves the sizing chain (allocateNativeCode vs the
+	// walkers) stayed in sync; a divergent term makes it misparse an IcCell or
+	// padding as a header. Also check every IC cell: after a collection all
+	// cells must be back at the unlinked sentinel (the STW reset sweep ran),
+	// and a bound cell seen outside that window must hold a plausible state.
+	pageSpaceIteratorInit(&iterator, &heap->execSpace);
+	NativeCode *code = (NativeCode *) pageSpaceIteratorNext(&iterator);
+	while (code != NULL) {
+		if ((code->tags & TAG_FREESPACE) == 0) {
+			ASSERT(code->size > 0);
+			IcCell *cells = nativeCodeIcCells(code);
+			for (size_t i = 0; i < code->icCellsSize; i++) {
+				IcState *state = cells[i].state;
+				ASSERT(state != NULL);
+				if (state != &gIcUnlinked) {
+					ASSERT(valueTypeOf(state->class, VALUE_POINTER));
+					verifyPointer(heap, asObject(state->class));
+					ASSERT(state->target != NULL);
+				}
+			}
+		}
+		code = (NativeCode *) pageSpaceIteratorNext(&iterator);
 	}
 }
 

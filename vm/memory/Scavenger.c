@@ -1,6 +1,7 @@
 #include "memory/Scavenger.h"
 #include "memory/Heap.h"
 #include "jit/TargetCodePatch.h"
+#include "jit/InlineCache.h"
 #include "core/StackFrame.h"
 #include "jit/CodeDescriptors.h"
 #include "core/Thread.h"
@@ -558,8 +559,15 @@ static void iterateNativeCode(Scavenger *scavenger)
 	pageSpaceIteratorInit(&iterator, &scavenger->heap->execSpace);
 	NativeCode *code = (NativeCode *) pageSpaceIteratorNext(&iterator);
 
+	gIcStats.resetSweeps++;
 	while (code != NULL) {
 		if ((code->tags & TAG_FREESPACE) == 0) {
+			// Inline caches key on class ADDRESSES: a scavenge moves young
+			// classes and lets the abandoned semispace be reused, so every
+			// bound cell is reset to unlinked (and its state freed) under this
+			// stop-the-world. See icResetNativeCodeCells for why the reset must
+			// stay total, not selective.
+			icResetNativeCodeCells(code);
 			if (code->compiledCode != NULL) {
 				processPointer(scavenger, (RawObject **) &code->compiledCode);
 			}

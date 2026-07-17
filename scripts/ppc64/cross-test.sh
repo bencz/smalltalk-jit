@@ -119,12 +119,16 @@ for cpu in $CPUS; do
 	echo "==   QEMU_CPU=$cpu:"
 	# The exception/unwind machinery is per-backend GEN code (ExceptionSignal,
 	# BlockOnException, BlockUnwind + the outer-return unwind hook), so its
-	# tests gate here too, not only on x64.
+	# tests gate here too, not only on x64. Same for the per-site inline caches
+	# (generateIcSend is per-backend emission; the Ic* tests cover bind, DNU,
+	# GC reset and the multi-worker hammer on the POWER code paths).
 	for t in tests/FloatTest.st tests/FloatEdgeTest.st tests/FloatCrossRepTest.st \
 	         tests/SmallFloat64BoundaryTest.st tests/FloatHashTest.st \
 	         tests/ScaledDecimalTest.st tests/LargeIntegerTest.st \
 	         tests/ExceptionTest.st tests/ExceptionProtocolTest.st \
-	         tests/UnwindTest.st tests/ResumableTest.st; do
+	         tests/UnwindTest.st tests/ResumableTest.st \
+	         tests/IcPolymorphicSiteTest.st tests/IcDnuTest.st \
+	         tests/IcGcPressureTest.st tests/IcHammerTest.st; do
 		QEMU_CPU=$cpu timeout 900 "$OUT/st" -s "$IMG" -f "$t" </dev/null >/dev/null 2>&1 \
 			|| { echo "FAIL $t ($cpu)"; exit 1; }
 		echo "     pass $(basename "$t")"

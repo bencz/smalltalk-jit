@@ -304,6 +304,19 @@ static void generateLookup(CodeGenerator *generator)
 StubCode LookupStub = { .generator = generateLookup, .id = STUB_LOOKUP };
 
 
+// Shared inline-cache miss handler (see the x64 twin): called only for an
+// UNLINKED cell. inlineCacheMiss(class, selector, cell): args pre-placed in
+// r3/r4/r5 by the send sequence; the entry to call comes back in TGT.
+static void generateIcMiss(CodeGenerator *generator)
+{
+	AssemblerBuffer *buffer = &generator->buffer;
+	generateCCall(generator, (intptr_t) inlineCacheMiss, 3, 0);
+	asmMr(buffer, TGT, R3);
+	asmBlr(buffer);
+}
+StubCode IcMissStub = { .generator = generateIcMiss, .id = STUB_IC_MISS };
+
+
 static void generateDoesNotUnderstandStub(CodeGenerator *generator)
 {
 	AssemblerBuffer *buffer = &generator->buffer;

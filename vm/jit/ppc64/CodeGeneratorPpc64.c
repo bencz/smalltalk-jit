@@ -854,6 +854,66 @@ static void generateFloatFastPath(CodeGenerator *generator, int arithKind,
 }
 
 
+// r3: receiver class (tagged, from generateLoadClass)
+// TGT: native code target out
+// Per-site inline cache for the dynamic send (see the x64 twin and
+// jit/InlineCache.h). The cell is DATA reached by ordinary ld: the li64
+// non-atomicity never matters (baked once, pre-publication) and no icache
+// flush is involved. state->class and state->target are address-dependent
+// loads off the state pointer, which POWER orders for free against the miss
+// handler's CAS-release publish; no isync needed.
+static void generateIcSend(CodeGenerator *generator, uint8_t selectorIndex)
+{
+	AssemblerBuffer *buffer = &generator->buffer;
+	AssemblerLabel miss, poly, callFromHit, callFromCold;
+	asmInitLabel(&miss);
+	asmInitLabel(&poly);
+	asmInitLabel(&callFromHit);
+	asmInitLabel(&callFromCold);
+
+	// Cell address: li64 placeholder (fixed 5-instruction shape), baked exactly
+	// once in buildNativeCodeFromAssembler, never patched after publication
+	// (NOT a pointersOffsets entry: the GC must not forward it).
+	asmLi64(buffer, TMP2, 0);
+	asmAddIcSite(buffer, asmOffset(buffer) - 20);
+	asmLd(buffer, R7, offsetof(IcCell, state), TMP2);      // state
+	asmLd(buffer, R0, offsetof(IcState, class), R7);       // state->class
+	asmCmpd(buffer, 0, R0, R3);
+	asmBne(buffer, &miss);
+	if (icStatsEnabled()) {
+		asmLi64(buffer, R6, (uint64_t) (uintptr_t) &gIcStats.hits);
+		asmLd(buffer, R5, 0, R6);
+		asmAddi(buffer, R5, R5, 1);
+		asmStd(buffer, R5, 0, R6);
+	}
+	asmLd(buffer, TGT, offsetof(IcState, target), R7);
+	asmB(buffer, &callFromHit);
+
+	asmPpcLabelBind(buffer, &miss, asmOffset(buffer));
+	generateLoadObject(buffer,
+		compiledCodeLiteralAt(&generator->code, selectorIndex), R4, 0);
+	asmCmpdi(buffer, 0, R0, 0);                // r0 still = state->class
+	asmBne(buffer, &poly);
+	asmAddi(buffer, R3, R3, -1);               // raw class for the C handler
+	asmMr(buffer, R5, TMP2);                   // cell = 3rd C arg
+	generateStubCall(generator, &IcMissStub);  // clobbers TMP; entry back in TGT
+	asmB(buffer, &callFromCold);
+
+	asmPpcLabelBind(buffer, &poly, asmOffset(buffer));
+	if (icStatsEnabled()) {
+		asmLi64(buffer, R6, (uint64_t) (uintptr_t) &gIcStats.polyFallbacks);
+		asmLd(buffer, R5, 0, R6);
+		asmAddi(buffer, R5, R5, 1);
+		asmStd(buffer, R5, 0, R6);
+	}
+	generateMethodLookup(generator);           // expects r3 tagged, r4 selector
+
+	ptrdiff_t callOffset = asmOffset(buffer);
+	asmPpcLabelBind(buffer, &callFromHit, callOffset);
+	asmPpcLabelBind(buffer, &callFromCold, callOffset);
+}
+
+
 // TMP: receiver | r3: receiver class (lookup arg) | r4: selector | r3: result
 static void generateSend(CodeGenerator *generator, BytecodesIterator *iterator)
 {
@@ -1002,9 +1062,14 @@ static void generateSend(CodeGenerator *generator, BytecodesIterator *iterator)
 		} else {
 			// Always recompute the receiver's class from TMP (see x64).
 			generateLoadClass(buffer, TMP, R3);
-			generateLoadObject(buffer,
-				compiledCodeLiteralAt(&generator->code, selectorIndex), R4, 0);
-			generateMethodLookup(generator);
+			if (icEnabled()) {
+				generateIcSend(generator, selectorIndex);
+			} else {
+				// ST_NO_IC: exactly the pre-IC sequence
+				generateLoadObject(buffer,
+					compiledCodeLiteralAt(&generator->code, selectorIndex), R4, 0);
+				generateMethodLookup(generator);
+			}
 		}
 
 		generator->frameSize -= argsSize + 1;
@@ -2064,7 +2129,8 @@ NativeCode *buildNativeCode(CodeGenerator *generator)
 NativeCode *buildNativeCodeFromAssembler(AssemblerBuffer *buffer)
 {
 	size_t size = asmOffset(buffer);
-	NativeCode *code = allocateNativeCode(CurrentThread.heap, size, buffer->pointersOffsetsSize);
+	NativeCode *code = allocateNativeCode(CurrentThread.heap, size,
+		buffer->pointersOffsetsSize, buffer->icSitesSize);
 	code->compiledCode = NULL;
 	code->argsSize = 0;
 	code->descriptors = NULL;
@@ -2072,6 +2138,17 @@ NativeCode *buildNativeCodeFromAssembler(AssemblerBuffer *buffer)
 	code->typeFeedback = NULL;
 	code->counter = 0;
 	asmBindFixups(buffer, code->insts);
+	// Bake each IC site's cell address into the still-private buffer (the li64
+	// halfword split goes through targetWriteCodePointer) and start every cell
+	// unlinked. The ONLY write to these immediates ever: published code is not
+	// patched again, the mutable word is the cell (data, ld-reachable, so the
+	// li64 non-atomicity never matters).
+	IcCell *cells = nativeCodeIcCells(code);
+	for (size_t i = 0; i < buffer->icSitesSize; i++) {
+		targetWriteCodePointer(buffer->buffer + buffer->icSites[i], (uint64_t) &cells[i]);
+		cells[i].state = &gIcUnlinked;
+	}
+	gIcStats.sites += buffer->icSitesSize;
 	asmCopyBuffer(buffer, code->insts, size);
 	asmCopyPointersOffsets(buffer, nativeCodePointersOffsets(code));
 	// Single funnel for ALL code creation: publish to instruction fetch

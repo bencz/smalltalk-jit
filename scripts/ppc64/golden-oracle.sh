@@ -145,6 +145,17 @@ writeSharedTail() {
 	mfvsrd 5,0
 	mfvsrd 10,31
 	.machine pop
+# case: ic guard (li64 cell placeholder + state/class loads + guard + target)
+	lis 10,0
+	ori 10,10,0
+	rldicr 10,10,32,31
+	oris 10,10,0
+	ori 10,10,0
+	ld 7,0(10)
+	ld 0,0(7)
+	cmpd 0,0,3
+	bne .+8
+	ld 12,8(7)
 EOF
 }
 
@@ -267,16 +278,9 @@ EOF
 	mtctr 12
 	bctrl
 	ld 2,24(1)
-# case: elfv2 emitCCallPrimArgs(5)  [frameless prim: arg i at i*8(r1), no +8]
-	ld 3,0(1)
-	ld 4,8(1)
-	ld 5,16(1)
-	ld 6,24(1)
-	ld 7,32(1)
-# case: elfv2 emitPrimResultCheck (r3:r4)
-	cmpdi 0,4,0
-	bne .Lprimfail
-.Lprimfail:
+# (the emitCCallPrimArgs/emitPrimResultCheck cases were dropped from the LE
+#  harness; their reference blocks lingered here and misaligned the whole
+#  byte-stream comparison from this point on)
 # case: elfv2 entry save regs
 	mflr 0
 	std 0,16(1)

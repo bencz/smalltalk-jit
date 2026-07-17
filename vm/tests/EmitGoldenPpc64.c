@@ -22,6 +22,7 @@
 #include "vm/jit/ppc64/Abi.h"
 #include "vm/jit/ppc64/Cpu.h"
 #include "vm/jit/ppc64/abi/elfv1/FiberElfV1.h"
+#include "vm/jit/InlineCache.h" // IcCell/IcState offsets for the ic-guard case
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -200,6 +201,24 @@ static void emitSmallFloatOpsCase(AssemblerBuffer *buffer)
 	asmMfvsrd(buffer, TMP2, 31);
 }
 
+// The inline-cache hit-path guard: byte-level twin of generateIcSend's fast
+// path (CodeGeneratorPpc64.c, not linkable on a foreign host): li64 cell
+// placeholder (zero, patched once per site at build), state load off the
+// cell, tagged-class compare against r3, bne miss, and the address-dependent
+// target load into TGT.
+static void emitIcGuardCase(AssemblerBuffer *buffer)
+{
+	AssemblerLabel miss;
+	asmInitLabel(&miss);
+	asmLi64(buffer, TMP2, 0);
+	asmLd(buffer, R7, offsetof(IcCell, state), TMP2);
+	asmLd(buffer, R0, offsetof(IcState, class), R7);
+	asmCmpd(buffer, 0, R0, R3);
+	asmBne(buffer, &miss);
+	asmLd(buffer, TGT, offsetof(IcState, target), R7);
+	asmPpcLabelBind(buffer, &miss, asmOffset(buffer));
+}
+
 // ---- expected vectors -------------------------------------------------------
 // Validated against powerpc64-linux-gnu-as + objdump (the cross oracle) ,
 // scripts/ppc64/golden-oracle.sh. Regenerate with ST_PPC64_EMIT_TEST=print.
@@ -237,6 +256,8 @@ static const GoldenCase Cases[] = {
 	  ExpectedPpcFloatXer, sizeof(ExpectedPpcFloatXer) },
 	{ "smallfloat rotldi/rotrdi/mtvsrd/mfvsrd", emitSmallFloatOpsCase,
 	  ExpectedPpcSmallFloatOps, sizeof(ExpectedPpcSmallFloatOps) },
+	{ "ic guard (li64 cell/ld/ld/cmpd/bne/ld)", emitIcGuardCase,
+	  ExpectedPpcIcGuard, sizeof(ExpectedPpcIcGuard) },
 };
 
 static const char *CaseArrayNames[] = {
@@ -245,7 +266,7 @@ static const char *CaseArrayNames[] = {
 	"ExpectedPpcLoadTlsNeg", "ExpectedPpcCallCFunction",
 	"ExpectedPpcEntrySave", "ExpectedPpcEntryRestore",
 	"ExpectedPpcSubWord", "ExpectedPpcXoArith", "ExpectedPpcShiftCmp",
-	"ExpectedPpcFloatXer", "ExpectedPpcSmallFloatOps",
+	"ExpectedPpcFloatXer", "ExpectedPpcSmallFloatOps", "ExpectedPpcIcGuard",
 };
 
 static void hexdumpAsCArray(const char *name, const uint8_t *bytes, size_t size)
