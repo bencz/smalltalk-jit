@@ -655,10 +655,23 @@ void verifyHeap(Heap *heap)
 			for (size_t i = 0; i < code->icCellsSize; i++) {
 				IcState *state = cells[i].state;
 				ASSERT(state != NULL);
-				if (state != &gIcUnlinked) {
+				if (state == &gIcUnlinked || state == &gIcMega) {
+					continue;
+				}
+				ASSERT(state->kind == IC_KIND_MONO || state->kind == IC_KIND_PIC
+					|| state->kind == IC_KIND_MEGA);
+				if (state->kind == IC_KIND_MONO) {
 					ASSERT(valueTypeOf(state->class, VALUE_POINTER));
 					verifyPointer(heap, asObject(state->class));
 					ASSERT(state->target != NULL);
+				} else if (state->kind == IC_KIND_PIC) {
+					ASSERT(2 <= state->size && state->size <= IC_PIC_CAPACITY);
+					ASSERT(state->class == state->ways[0].class);
+					for (uintptr_t w = 0; w < state->size; w++) {
+						ASSERT(valueTypeOf(state->ways[w].class, VALUE_POINTER));
+						verifyPointer(heap, asObject(state->ways[w].class));
+						ASSERT(state->ways[w].target != NULL);
+					}
 				}
 			}
 		}

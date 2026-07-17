@@ -865,21 +865,19 @@ void generateIcGuard(AssemblerBuffer *buffer, AssemblerLabel *miss)
 // RDI: receiver class (tagged, from generateLoadClass)
 // R11: native code target out
 // Per-site inline cache for the dynamic send: one aligned load of the cell
-// picks the published IcState (immutable; swung only by the miss handler's CAS
-// and the STW reset sweep, see jit/InlineCache.h); a tagged-class match takes
-// the target through a load off that state; an UNLINKED cell (state->class 0)
-// binds once through the shared IcMissStub; a cell bound to ANOTHER class is
-// never rebound here and falls through to today's global-cache probe, the
-// performance floor. The selector load is miss-only: the hit path, like the
-// static-send path, dispatches without it.
+// picks the published IcState (immutable; swung only by the CAS transitions
+// and the STW reset sweep, see jit/InlineCache.h); a way-0 tagged-class match
+// takes the target straight off the state; ANY other case (unlinked, another
+// class on a mono, deeper pic ways, mega) goes through the shared
+// PicProbeStub, which walks the pic, runs the mega global probe, or resolves
+// and transitions through C. The selector load is miss-only: the hit path,
+// like the static-send path, dispatches without it.
 static void generateIcSend(CodeGenerator *generator, uint8_t selectorIndex)
 {
 	AssemblerBuffer *buffer = &generator->buffer;
-	AssemblerLabel miss, poly, callFromHit, callFromCold;
+	AssemblerLabel miss, callFromHit;
 	asmInitLabel(&miss);
-	asmInitLabel(&poly);
 	asmInitLabel(&callFromHit);
-	asmInitLabel(&callFromCold);
 
 	generateIcGuard(buffer, &miss);
 	if (icStatsEnabled()) {
@@ -891,24 +889,10 @@ static void generateIcSend(CodeGenerator *generator, uint8_t selectorIndex)
 	asmLabelBind(buffer, &miss, asmOffset(buffer));
 	generateLoadObject(buffer,
 		compiledCodeLiteralAt(&generator->code, selectorIndex), RSI, 0);
-	asmMovqMem(buffer, asmMem(RAX, NO_REGISTER, SS_1, offsetof(IcState, class)), RDX);
-	asmTestq(buffer, RDX, RDX);
-	asmJ(buffer, COND_NOT_ZERO, &poly);
-	asmDecq(buffer, RDI);                     // raw class for the C handler
-	asmMovq(buffer, TMP, RDX);                // cell = 3rd sysv arg
-	generateStubCall(generator, &IcMissStub); // returns the entry in R11
-	asmJmpLabel(buffer, &callFromCold);
+	asmMovq(buffer, TMP, RDX);                  // cell = 3rd sysv arg (class stays tagged)
+	generateStubCall(generator, &PicProbeStub); // entry back in R11
 
-	asmLabelBind(buffer, &poly, asmOffset(buffer));
-	if (icStatsEnabled()) {
-		asmMovqImm(buffer, (int64_t) &gIcStats.polyFallbacks, RDX);
-		asmIncqMem(buffer, asmMem(RDX, NO_REGISTER, SS_1, 0));
-	}
-	generateMethodLookup(generator);          // expects RDI tagged, RSI selector
-
-	ptrdiff_t callOffset = asmOffset(buffer);
-	asmLabelBind(buffer, &callFromHit, callOffset);
-	asmLabelBind(buffer, &callFromCold, callOffset);
+	asmLabelBind(buffer, &callFromHit, asmOffset(buffer));
 }
 
 

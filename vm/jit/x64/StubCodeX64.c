@@ -272,18 +272,74 @@ static void generateLookup(CodeGenerator *generator)
 StubCode LookupStub = { .generator = generateLookup, .id = STUB_LOOKUP };
 
 
-// Shared inline-cache miss handler: the send site only calls it when the cell
-// is UNLINKED (bound-to-another-class misses fall through to the inline global
-// probe instead). inlineCacheMiss(class, selector, cell): args pre-placed in
-// RDI/RSI/RDX by the send sequence; the entry to call comes back in R11.
-static void generateIcMiss(CodeGenerator *generator)
+// The shared PIC probe and dispatch stub, the "shared loop" of the per-site
+// inline caches (jit/InlineCache.h): ONE stub per heap, never per-site code.
+// In: RDI = TAGGED receiver class, RSI = selector, RDX = cell.
+// Out: R11 = entry to call.
+// The site's inline guard already missed way 0, so route on the state's kind:
+// a pic walks ways[1..size-1] right here; mega runs the plain global probe
+// (generateMethodLookup, the pre-IC floor); unlinked, mono-with-another-class
+// and an exhausted walk resolve through C (inlineCacheMiss binds/transitions).
+// The state is read ONCE into RAX and is immutable; a peer's CAS swings the
+// cell to a fresh state and never touches this one, and the STW sweep that
+// frees it cannot run mid-walk (no safepoint poll in here).
+static void generatePicProbe(CodeGenerator *generator)
 {
 	AssemblerBuffer *buffer = &generator->buffer;
+	AssemblerLabel walk, mega, wayHit, loop;
+	asmInitLabel(&walk);
+	asmInitLabel(&mega);
+	asmInitLabel(&wayHit);
+	asmInitLabel(&loop);
+
+	asmMovqMem(buffer, asmMem(RDX, NO_REGISTER, SS_1, offsetof(IcCell, state)), RAX);
+	asmMovqMem(buffer, asmMem(RAX, NO_REGISTER, SS_1, offsetof(IcState, kind)), TMP);
+	asmCmpqImm(buffer, TMP, IC_KIND_PIC);
+	asmJ(buffer, COND_EQUAL, &walk);
+	asmJ(buffer, COND_GREATER, &mega);                     // IC_KIND_MEGA
+	// unlinked or mono-with-another-class: C binds or builds the pic
 	generateCCall(generator, (intptr_t) inlineCacheMiss, 3, 0);
 	asmMovq(buffer, RAX, R11);
 	asmRet(buffer);
+
+	// pic: walk ways[1..size-1] (way 0 is the header the site already tested).
+	// RAX = cursor, TMP = end; RDI/RSI/RDX stay intact for the exhausted path.
+	asmLabelBind(buffer, &walk, asmOffset(buffer));
+	asmMovqMem(buffer, asmMem(RAX, NO_REGISTER, SS_1, offsetof(IcState, size)), TMP);
+	asmShlqImm(buffer, TMP, 4);                            // size * sizeof(IcWay)
+	asmLeaq(buffer, asmMem(RAX, TMP, SS_1, offsetof(IcState, ways)), TMP);
+	asmLeaq(buffer, asmMem(RAX, NO_REGISTER, SS_1,
+		offsetof(IcState, ways) + sizeof(IcWay)), RAX);
+	asmLabelBind(buffer, &loop, asmOffset(buffer));
+	asmCmpqMem(buffer, asmMem(RAX, NO_REGISTER, SS_1, offsetof(IcWay, class)), RDI);
+	asmJ(buffer, COND_EQUAL, &wayHit);
+	asmAddqImm(buffer, RAX, sizeof(IcWay));
+	asmCmpq(buffer, RAX, TMP);
+	asmJ(buffer, COND_BELOW, &loop);
+	// exhausted: C extends the pic or promotes to mega
+	generateCCall(generator, (intptr_t) inlineCacheMiss, 3, 0);
+	asmMovq(buffer, RAX, R11);
+	asmRet(buffer);
+
+	asmLabelBind(buffer, &wayHit, asmOffset(buffer));
+	if (icStatsEnabled()) {
+		asmMovqImm(buffer, (int64_t) &gIcStats.picHits, RDX);
+		asmIncqMem(buffer, asmMem(RDX, NO_REGISTER, SS_1, 0));
+	}
+	asmMovqMem(buffer, asmMem(RAX, NO_REGISTER, SS_1, offsetof(IcWay, target)), R11);
+	asmRet(buffer);
+
+	// mega (permanent): the class-independent global-cache probe, exactly the
+	// pre-IC sequence, shared here instead of bloating every site.
+	asmLabelBind(buffer, &mega, asmOffset(buffer));
+	if (icStatsEnabled()) {
+		asmMovqImm(buffer, (int64_t) &gIcStats.megaProbes, RDX);
+		asmIncqMem(buffer, asmMem(RDX, NO_REGISTER, SS_1, 0));
+	}
+	generateMethodLookup(generator);                       // RDI tagged, RSI selector
+	asmRet(buffer);
 }
-StubCode IcMissStub = { .generator = generateIcMiss, .id = STUB_IC_MISS };
+StubCode PicProbeStub = { .generator = generatePicProbe, .id = STUB_PIC_PROBE };
 
 
 static void generateDoesNotUnderstandStub(CodeGenerator *generator)

@@ -56,6 +56,20 @@ IcSite := Object [
 	"Phase 5: back to a single class; the site must still answer correctly."
 	drive value: (Array with: IcTagC new) value: (Array with: 3) value: 2000.
 
+	"Phase 6: force at least one scavenge (~80MB of garbage against the 64MB
+	 young space) so every lookup cache is flushed while the now-megamorphic
+	 site keeps its state, then drive all 7 classes again: the first sends
+	 after the flush take the mega path with a COLD global cache, the exact
+	 route where a broken link-register/return discipline in the shared probe
+	 stub would hang or misdispatch."
+	1 to: 10000 do: [:i | Array new: 1024].
+	drive value: (OrderedCollection new
+			add: IcTagA new; add: IcTagB new; add: IcTagC new; add: IcTagD new;
+			add: IcTagE new; add: IcTagF new; add: IcTagG new; yourself)
+		value: (OrderedCollection new
+			add: 1; add: 2; add: 3; add: 4; add: 5; add: 6; add: 7; yourself)
+		value: 500.
+
 	fails = 0 ifTrue: [Transcript nextPutAll: 'IcPolymorphicSiteTest: OK'; lf].
 	^fails
 ]

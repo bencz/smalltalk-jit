@@ -860,16 +860,15 @@ static void generateFloatFastPath(CodeGenerator *generator, int arithKind,
 // jit/InlineCache.h). The cell is DATA reached by ordinary ld: the li64
 // non-atomicity never matters (baked once, pre-publication) and no icache
 // flush is involved. state->class and state->target are address-dependent
-// loads off the state pointer, which POWER orders for free against the miss
-// handler's CAS-release publish; no isync needed.
+// loads off the state pointer, which POWER orders for free against the
+// CAS-release publishes; no isync needed. Any way-0 miss goes through the
+// shared PicProbeStub (pic walk, mega global probe, or C transition).
 static void generateIcSend(CodeGenerator *generator, uint8_t selectorIndex)
 {
 	AssemblerBuffer *buffer = &generator->buffer;
-	AssemblerLabel miss, poly, callFromHit, callFromCold;
+	AssemblerLabel miss, callFromHit;
 	asmInitLabel(&miss);
-	asmInitLabel(&poly);
 	asmInitLabel(&callFromHit);
-	asmInitLabel(&callFromCold);
 
 	// Cell address: li64 placeholder (fixed 5-instruction shape), baked exactly
 	// once in buildNativeCodeFromAssembler, never patched after publication
@@ -892,25 +891,10 @@ static void generateIcSend(CodeGenerator *generator, uint8_t selectorIndex)
 	asmPpcLabelBind(buffer, &miss, asmOffset(buffer));
 	generateLoadObject(buffer,
 		compiledCodeLiteralAt(&generator->code, selectorIndex), R4, 0);
-	asmCmpdi(buffer, 0, R0, 0);                // r0 still = state->class
-	asmBne(buffer, &poly);
-	asmAddi(buffer, R3, R3, -1);               // raw class for the C handler
-	asmMr(buffer, R5, TMP2);                   // cell = 3rd C arg
-	generateStubCall(generator, &IcMissStub);  // clobbers TMP; entry back in TGT
-	asmB(buffer, &callFromCold);
+	asmMr(buffer, R5, TMP2);                    // cell = 3rd C arg (class stays tagged)
+	generateStubCall(generator, &PicProbeStub); // clobbers TMP; entry back in TGT
 
-	asmPpcLabelBind(buffer, &poly, asmOffset(buffer));
-	if (icStatsEnabled()) {
-		asmLi64(buffer, R6, (uint64_t) (uintptr_t) &gIcStats.polyFallbacks);
-		asmLd(buffer, R5, 0, R6);
-		asmAddi(buffer, R5, R5, 1);
-		asmStd(buffer, R5, 0, R6);
-	}
-	generateMethodLookup(generator);           // expects r3 tagged, r4 selector
-
-	ptrdiff_t callOffset = asmOffset(buffer);
-	asmPpcLabelBind(buffer, &callFromHit, callOffset);
-	asmPpcLabelBind(buffer, &callFromCold, callOffset);
+	asmPpcLabelBind(buffer, &callFromHit, asmOffset(buffer));
 }
 
 

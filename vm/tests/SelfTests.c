@@ -72,38 +72,46 @@ static int icStatsSelfTest(void)
 		// Kill-switch: no cells, no misses, no counters. sites == 0 proves the
 		// emitted sequence is the pre-IC one (cells are created per emitted site).
 		icStatsCheck(gIcStats.sites == 0, "ST_NO_IC left sites");
-		icStatsCheck(gIcStats.hits == 0 && gIcStats.polyFallbacks == 0
-			&& gIcStats.missCold == 0 && gIcStats.binds == 0
-			&& gIcStats.bindRaces == 0 && gIcStats.polyPending == 0
-			&& gIcStats.cellsReset == 0 && gIcStats.stateBytesLive == 0,
+		icStatsCheck(gIcStats.hits == 0 && gIcStats.picHits == 0
+			&& gIcStats.megaProbes == 0 && gIcStats.missCold == 0
+			&& gIcStats.binds == 0 && gIcStats.picBuilds == 0
+			&& gIcStats.picExtends == 0 && gIcStats.megaPromotes == 0
+			&& gIcStats.bindRaces == 0 && gIcStats.cellsReset == 0
+			&& gIcStats.megaCells == 0 && gIcStats.stateBytesLive == 0,
 			"ST_NO_IC left nonzero counters");
 		return icStatsFailures;
 	}
 
 	// The lazily-loaded image compiles on demand: only the warmup's code exists,
-	// but that already means dozens of sites with cells.
+	// but that already means dozens of sites with cells. The warmup's poly site
+	// must already have been promoted to a pic (never rebound in place).
 	icStatsCheck(gIcStats.sites > 10, "no IC sites created");
+	icStatsCheck(gIcStats.picBuilds >= 1, "poly warmup built no pic");
 
-	// Mono stability: the measured run's sends must be ~100% hits. Mid-run
-	// scavenges may reset and rebind (missCold), and the doit compilation adds
-	// a fixed few hundred poly fallbacks from the compiler's own sites, so the
-	// assertion is a ratio over deltas that dwarf both.
+	// Mono stability: the measured run's sends must be ~100% way-0 hits.
+	// Mid-run scavenges may reset and rebind (missCold), and the doit
+	// compilation adds a fixed few hundred stub-path events from the
+	// compiler's own poly sites, so the assertion is a ratio over deltas
+	// that dwarf both.
 	IcStats base = gIcStats;
 	icStatsCheck(asCInt(evalCode(IC_MONO_WORKLOAD)) == 200000, "mono run result");
 	size_t monoHits = gIcStats.hits - base.hits;
-	size_t monoCold = gIcStats.missCold - base.missCold;
-	size_t monoPoly = gIcStats.polyFallbacks - base.polyFallbacks;
+	size_t monoStub = (gIcStats.missCold - base.missCold)
+		+ (gIcStats.picHits - base.picHits)
+		+ (gIcStats.megaProbes - base.megaProbes);
 	icStatsCheck(monoHits > 190000, "mono site not ~100% hit");
-	icStatsCheck(monoCold + monoPoly < monoHits / 50,
-		"mono workload missed more than ~2%");
+	icStatsCheck(monoStub < monoHits / 50, "mono workload missed more than ~2%");
 
-	// Poly floor: the alternating class must fall through to the global probe
-	// (counted), never rebind the mono state; the bound class keeps hitting.
+	// Poly: the site's first-bound class keeps hitting way 0 inline while the
+	// alternating class hits its pic way in the stub walk: both counters must
+	// carry the workload, and NO mega promotion may happen at 2 classes.
 	base = gIcStats;
 	icStatsCheck(asCInt(evalCode(IC_POLY_WORKLOAD)) == 80000, "poly run result");
-	icStatsCheck(gIcStats.polyFallbacks - base.polyFallbacks > 9000,
-		"poly site did not take the fallback");
-	icStatsCheck(gIcStats.hits - base.hits > 9000, "poly site's bound class stopped hitting");
+	icStatsCheck(gIcStats.picHits - base.picHits > 9000,
+		"poly site's second class did not hit the pic walk");
+	icStatsCheck(gIcStats.hits - base.hits > 9000, "poly site's way 0 stopped hitting");
+	icStatsCheck(gIcStats.megaPromotes == base.megaPromotes,
+		"a 2-class site must not go mega");
 
 	icStatsCheck(gIcStats.binds >= 1, "no binds recorded");
 	return icStatsFailures;

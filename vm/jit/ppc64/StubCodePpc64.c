@@ -1,4 +1,4 @@
-// ppc64 backend (BOTH byte orders), the four JIT stubs. A mechanical
+// ppc64 backend (BOTH byte orders), the five JIT stubs. A mechanical
 // translation of vm/jit/x64/StubCodeX64.c under the register/frame mapping
 // pinned in vm/jit/ppc64/DESIGN.md (read that first: FP=r31, CTX=r30,
 // TGT=r12, TMP=r11, TMP2=r10, r3=result/argA, LR discipline, tagged-base
@@ -304,17 +304,82 @@ static void generateLookup(CodeGenerator *generator)
 StubCode LookupStub = { .generator = generateLookup, .id = STUB_LOOKUP };
 
 
-// Shared inline-cache miss handler (see the x64 twin): called only for an
-// UNLINKED cell. inlineCacheMiss(class, selector, cell): args pre-placed in
-// r3/r4/r5 by the send sequence; the entry to call comes back in TGT.
-static void generateIcMiss(CodeGenerator *generator)
+// The shared PIC probe and dispatch stub (see the x64 twin for the full
+// story). In: r3 = TAGGED receiver class, r4 = selector, r5 = cell.
+// Out: TGT = entry to call. The site's inline guard already missed way 0:
+// pic walks ways[1..size-1] here; mega runs the plain global probe
+// (generateMethodLookup); unlinked/mono-other/exhausted resolve through C.
+static void generatePicProbe(CodeGenerator *generator)
 {
 	AssemblerBuffer *buffer = &generator->buffer;
+	AssemblerLabel walk, mega, wayHit, loop;
+	asmInitLabel(&walk);
+	asmInitLabel(&mega);
+	asmInitLabel(&wayHit);
+	asmInitLabel(&loop);
+
+	asmLd(buffer, R7, offsetof(IcCell, state), R5);        // state (read once)
+	asmLd(buffer, R0, offsetof(IcState, kind), R7);
+	asmCmpdi(buffer, 0, R0, IC_KIND_PIC);
+	asmBeq(buffer, &walk);
+	asmBgt(buffer, &mega);                                 // IC_KIND_MEGA
+	// unlinked or mono-with-another-class: C binds or builds the pic
 	generateCCall(generator, (intptr_t) inlineCacheMiss, 3, 0);
 	asmMr(buffer, TGT, R3);
 	asmBlr(buffer);
+
+	// pic: walk ways[1..size-1]. r6 = cursor, r8 = end; r3/r4/r5 stay intact
+	// for the exhausted path's C call.
+	asmPpcLabelBind(buffer, &walk, asmOffset(buffer));
+	asmLd(buffer, R8_PPC, offsetof(IcState, size), R7);
+	asmSldi(buffer, R8_PPC, R8_PPC, 4);                            // size * sizeof(IcWay)
+	asmAdd(buffer, R8_PPC, R8_PPC, R7);
+	asmAddi(buffer, R8_PPC, R8_PPC, offsetof(IcState, ways));      // end
+	asmAddi(buffer, R6, R7, offsetof(IcState, ways) + sizeof(IcWay));
+	asmPpcLabelBind(buffer, &loop, asmOffset(buffer));
+	asmLd(buffer, R0, offsetof(IcWay, class), R6);
+	asmCmpd(buffer, 0, R0, R3);
+	asmBeq(buffer, &wayHit);
+	asmAddi(buffer, R6, R6, sizeof(IcWay));
+	asmCmpld(buffer, 0, R6, R8_PPC);
+	asmBlt(buffer, &loop);
+	// exhausted: C extends the pic or promotes to mega
+	generateCCall(generator, (intptr_t) inlineCacheMiss, 3, 0);
+	asmMr(buffer, TGT, R3);
+	asmBlr(buffer);
+
+	asmPpcLabelBind(buffer, &wayHit, asmOffset(buffer));
+	if (icStatsEnabled()) {
+		asmLi64(buffer, R5, (uint64_t) (uintptr_t) &gIcStats.picHits);
+		asmLd(buffer, R0, 0, R5);
+		asmAddi(buffer, R0, R0, 1);
+		asmStd(buffer, R0, 0, R5);
+	}
+	asmLd(buffer, TGT, offsetof(IcWay, target), R6);
+	asmBlr(buffer);
+
+	// mega (permanent): the class-independent global-cache probe, exactly the
+	// pre-IC sequence, shared here instead of bloating every site. The probe's
+	// own miss calls LookupStub via bctrl, which CLOBBERS LR (the return into
+	// the send site), so save/restore it around the sequence: without this the
+	// final blr would loop back into this stub. The C paths above do not need
+	// it (generateCCall preserves the call-site LR itself); the DNU stub saves
+	// LR in its prologue for the same reason.
+	asmPpcLabelBind(buffer, &mega, asmOffset(buffer));
+	if (icStatsEnabled()) {
+		asmLi64(buffer, R6, (uint64_t) (uintptr_t) &gIcStats.megaProbes);
+		asmLd(buffer, R0, 0, R6);
+		asmAddi(buffer, R0, R0, 1);
+		asmStd(buffer, R0, 0, R6);
+	}
+	asmMflr(buffer, R0);
+	asmPush(buffer, R0);
+	generateMethodLookup(generator);                       // r3 tagged, r4 selector
+	asmPop(buffer, R0);
+	asmMtlr(buffer, R0);
+	asmBlr(buffer);
 }
-StubCode IcMissStub = { .generator = generateIcMiss, .id = STUB_IC_MISS };
+StubCode PicProbeStub = { .generator = generatePicProbe, .id = STUB_PIC_PROBE };
 
 
 static void generateDoesNotUnderstandStub(CodeGenerator *generator)
