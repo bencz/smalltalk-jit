@@ -200,6 +200,9 @@ SequenceableCollection := Collection [
 
 
 	copyFrom: start to: stop [
+		"C fast path for plain Strings (allocate + memcpy). Symbol/Array/other
+		 species fall through to the generic species/replaceFrom: path below."
+		<primitive: StringCopyFromToPrimitive>
 		| newSize |
 
 		newSize := stop - start + 1.

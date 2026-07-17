@@ -108,6 +108,9 @@ String := ArrayedCollection [
 
 
 	asNumber [
+		"C fast path for a plain base-10 SmallInteger; falls back to the full
+		 stream parser for signs/floats/exponents/large values/trailing text."
+		<primitive: StringToIntegerPrimitive>
 		^Number readFrom: (CollectionStream on: self)
 	]
 

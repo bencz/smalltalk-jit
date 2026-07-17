@@ -48,6 +48,8 @@ static PrimitiveResult stringAsciiUppercasePrimitive(Value receiver);
 static PrimitiveResult stringTrimSeparatorsPrimitive(Value receiver);
 static PrimitiveResult stringAsciiCaseEqualsPrimitive(Value self, Value other);
 static PrimitiveResult stringStartsWithAsciiCasePrimitive(Value self, Value prefix);
+static PrimitiveResult stringCopyFromToPrimitive(Value self, Value start, Value stop);
+static PrimitiveResult stringToIntegerPrimitive(Value self);
 static PrimitiveResult becomePrimitive(Value object, Value other);
 static PrimitiveResult workerParallelPrimitive(Value self, Value blocks);
 static PrimitiveResult contextPositionDescriptorPrimitive(Value vContext);
@@ -326,6 +328,8 @@ Primitive Primitives[] = {
 	{"StringTrimSeparatorsPrimitive", CCALL, .cFunction = stringTrimSeparatorsPrimitive, 1},
 	{"StringAsciiCaseEqualsPrimitive", CCALL, .cFunction = stringAsciiCaseEqualsPrimitive, 2},
 	{"StringStartsWithAsciiCasePrimitive", CCALL, .cFunction = stringStartsWithAsciiCasePrimitive, 2},
+	{"StringCopyFromToPrimitive", CCALL, .cFunction = stringCopyFromToPrimitive, 3},
+	{"StringToIntegerPrimitive", CCALL, .cFunction = stringToIntegerPrimitive, 1},
 };
 
 
@@ -580,6 +584,76 @@ static PrimitiveResult stringStartsWithAsciiCasePrimitive(Value vSelf, Value vPr
 	}
 	_Bool match = asciiCaseEqualBytes(getRawObjectIndexedVars(a), getRawObjectIndexedVars(b), nb);
 	return primSuccess(getTaggedPtr(match ? Handles.true : Handles.false));
+}
+
+// `copyFrom: start to: stop` for plain Strings: allocate + memcpy in one step
+// instead of species/new:/replaceFrom: sends. Guarded to Handles.String so
+// Symbol/Array/Interval/OrderedCollection keep their .st copyFrom: (species /
+// write barrier). Defers to .st for any out-of-range request (same behaviour).
+static PrimitiveResult stringCopyFromToPrimitive(Value vSelf, Value vStart, Value vStop)
+{
+	RawObject *rawSelf = asObject(vSelf);
+	if (rawSelf->class != Handles.String->raw) {
+		return primFailed();
+	}
+	intptr_t start = asCInt(vStart);
+	intptr_t stop = asCInt(vStop);
+	intptr_t size = (intptr_t) rawObjectSize(rawSelf);
+	intptr_t newSize = stop - start + 1;
+	if (newSize < 0 || start < 1 || stop > size) {
+		return primFailed();   // let the .st path decide (empty / error), unchanged
+	}
+	HandleScope scope;
+	openHandleScope(&scope);
+	String *src = scopeHandle(rawSelf);
+	String *dst = newString((size_t) newSize);        // may GC; src handle stays valid
+	if (newSize > 0) {
+		memcpy(dst->raw->contents, src->raw->contents + (start - 1), (size_t) newSize);
+	}
+	Value result = getTaggedPtr(dst);
+	closeHandleScope(&scope, NULL);
+	return primSuccess(result);
+}
+
+// `asNumber` fast path for a plain base-10 integer that fits SmallInteger.
+// Conservative on purpose: parses an optional leading '-' then digits, and FAILS
+// (deferring to `Number readFrom:`) on anything else -- empty, a lone sign, '+',
+// a '.', an exponent, any trailing non-digit, or an out-of-range magnitude -- so
+// float / lenient-trailing / LargeInteger cases keep the exact old behaviour.
+static PrimitiveResult stringToIntegerPrimitive(Value vSelf)
+{
+	RawObject *raw = asObject(vSelf);
+	if (!raw->class->instanceShape.isBytes) {
+		return primFailed();
+	}
+	intptr_t size = (intptr_t) rawObjectSize(raw);
+	if (size == 0) {
+		return primFailed();
+	}
+	uint8_t *s = getRawObjectIndexedVars(raw);
+	intptr_t i = 0;
+	int64_t sign = 1;
+	if (s[0] == '-') {   // note: readFrom: does NOT accept a leading '+', so we don't either
+		sign = -1;
+		i = 1;
+	}
+	if (i >= size) {
+		return primFailed();
+	}
+	const int64_t smiMax = (int64_t) (UINT64_MAX >> 2);   // tagInt payload is 62-bit
+	int64_t val = 0;
+	for (; i < size; i++) {
+		uint8_t c = s[i];
+		if (c < '0' || c > '9') {
+			return primFailed();
+		}
+		int d = c - '0';
+		if (val > (smiMax - d) / 10) {
+			return primFailed();   // overflows SmallInteger -> LargeInteger path in .st
+		}
+		val = val * 10 + d;
+	}
+	return primSuccess(tagInt((intptr_t) (sign * val)));
 }
 
 
