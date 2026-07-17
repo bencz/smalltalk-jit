@@ -333,7 +333,7 @@ static void iterateNativeCode(MarkingQueue *queue, Thread *thread)
 				markObject(queue, thread, (RawObject *) code->typeFeedback);
 			}
 			for (size_t i = 0; i < code->pointersOffsetsSize; i++) {
-				uint16_t offset = ((uint16_t *) (code->insts + code->size))[i];
+				uint32_t offset = nativeCodePointersOffsets(code)[i];
 				// Read-only walk, but the immediate is still arch-encoded
 				// (ppc64 splits it across halfwords) — jit/TargetCodePatch.h.
 				Value value = (Value) targetReadCodePointer(code->insts + offset);

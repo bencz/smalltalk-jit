@@ -22,8 +22,18 @@ typedef struct NativeCode {
 	RawOrderedCollection *typeFeedback;
 	size_t counter;
 	uint8_t insts[];
-	// uint16_t pointersOffsets;
+	// uint32_t pointersOffsets[]; 4-byte aligned, see nativeCodePointersOffsets
 } NativeCode;
+
+// The baked-pointer patch offsets sit inline after the code bytes. insts+size
+// has arbitrary parity, so the array base is rounded up to 4: uint32 access
+// must never be misaligned (-pedantic UB, and POWER penalizes it). Every
+// producer and reader (codegen publish, Scavenger, GarbageCollector, Heap
+// sizing) goes through this helper or aligns the same way.
+static inline uint32_t *nativeCodePointersOffsets(NativeCode *code)
+{
+	return (uint32_t *) (code->insts + (((size_t) code->size + 3) & ~(size_t) 3));
+}
 
 // The header is stored INSIDE the scanned vars area of CompiledMethod/Block
 // objects, so the GC and the snapshot walker read this 8-byte struct as a
@@ -349,7 +359,8 @@ static RawClass *compiledCodeResolveOperandClass(CompiledCode *code, Operand ope
 
 static size_t computeNativeCodeSize(NativeCode *code)
 {
-	return sizeof(NativeCode) + code->size + code->pointersOffsetsSize * sizeof(uint16_t);
+	return sizeof(NativeCode) + (((size_t) code->size + 3) & ~(size_t) 3)
+		+ code->pointersOffsetsSize * sizeof(uint32_t);
 }
 
 #endif

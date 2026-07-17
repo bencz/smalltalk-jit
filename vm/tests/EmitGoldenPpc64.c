@@ -413,9 +413,21 @@ static int checkCpuDecode(void)
 	CPU_CHECK(cpu.hasVsx && cpu.isPower7 && !cpu.isPower8, "power7 level wrong");
 	CPU_CHECK(!cpu.hasGprVsrMoves, "power7 has VSX but NOT the ISA 2.07 GPR<->VSR moves");
 
+	// power7+ is an accepted alias (a real qemu model): same words as power7.
+	ppc64CpuByName(&cpu, "power7+");
+	CPU_CHECK(cpu.hasVsx && cpu.isPower7 && !cpu.isPower8, "power7+ must decode like power7");
+	CPU_CHECK(!cpu.hasGprVsrMoves, "power7+ must NOT claim the GPR<->VSR moves");
+
 	ppc64CpuByName(&cpu, "power8");
 	CPU_CHECK(cpu.isPower8 && !cpu.isPower9, "power8 level wrong");
 	CPU_CHECK(cpu.hasGprVsrMoves, "power8 must have the GPR<->VSR moves");
+
+	// The other half of the derived capability: the ISA level alone is NOT
+	// enough. A kernel that disables VSX clears the facility bit, and mtvsrd
+	// would trap despite ISA 2.07 being there.
+	ppc64CpuDecode(&cpu, PPC64_FEATURE_64, PPC64_FEATURE2_ARCH_2_07);
+	CPU_CHECK(cpu.isPower8 && !cpu.hasVsx && !cpu.hasGprVsrMoves,
+		"ISA 2.07 without the VSX facility must NOT claim the GPR<->VSR moves");
 
 	// Levels must be CUMULATIVE downward: an emit site asking "isPower7?" on a
 	// POWER10 must say yes even if a stingy reporter (qemu-user is measurably

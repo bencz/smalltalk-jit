@@ -1981,7 +1981,7 @@ NativeCode *buildNativeCodeFromAssembler(AssemblerBuffer *buffer)
 	code->counter = 0;
 	asmBindFixups(buffer, code->insts);
 	asmCopyBuffer(buffer, code->insts, size);
-	asmCopyPointersOffsets(buffer, (uint16_t *) (code->insts + size));
+	asmCopyPointersOffsets(buffer, nativeCodePointersOffsets(code));
 	// Single funnel for ALL code creation: publish to instruction fetch
 	// (dcbst/sync/icbi/isync via __builtin___clear_cache — REQUIRED on POWER).
 	osFlushICache(code->insts, size);

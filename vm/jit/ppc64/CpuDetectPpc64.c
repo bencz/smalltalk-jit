@@ -26,11 +26,14 @@
 
 static void printCpu(const Ppc64Cpu *cpu, const char *how)
 {
+	// gprvsr is the DERIVED capability the emitter actually branches on
+	// (generateBitsToFpr/generateFprToBits): print it, or the one bit that
+	// decides the emission is invisible in the post-mortem.
 	printf("ppc64 CPU (%s): %s [hwcap=0x%llX hwcap2=0x%llX]"
-		" power6=%d power7=%d power8=%d power9=%d power10=%d altivec=%d vsx=%d\n",
+		" power6=%d power7=%d power8=%d power9=%d power10=%d altivec=%d vsx=%d gprvsr=%d\n",
 		how, cpu->name, (unsigned long long) cpu->hwcap, (unsigned long long) cpu->hwcap2,
 		cpu->isPower6, cpu->isPower7, cpu->isPower8, cpu->isPower9, cpu->isPower10,
-		cpu->hasAltivec, cpu->hasVsx);
+		cpu->hasAltivec, cpu->hasVsx, cpu->hasGprVsrMoves);
 }
 
 void targetCpuDetect(void)

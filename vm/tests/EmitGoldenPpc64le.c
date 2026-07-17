@@ -437,6 +437,14 @@ static int checkCpuDecode(void)
 	ppc64leCpuByName(&cpu, "power10");
 	CPU_CHECK(cpu.isPower10 && cpu.isPower9, "power10 must imply power9");
 
+	// The derived capability needs BOTH halves, exactly like the BE decode:
+	// ISA 2.07 says mtvsrd/mfvsrd exist, the VSX facility bit says the OS
+	// enabled the register state. A kernel with VSX disabled must not claim
+	// the moves despite the ISA level.
+	ppc64leCpuDecode(&cpu, PPC64LE_FEATURE_64, PPC64LE_FEATURE2_ARCH_2_07);
+	CPU_CHECK(!cpu.hasVsx && !cpu.hasGprVsrMoves,
+		"ISA 2.07 without the VSX facility must NOT claim the GPR<->VSR moves");
+
 	// An under-reporting host must claim NOTHING rather than inherit the floor:
 	// the global starts at the baseline, but a decode is only ever what it read.
 	ppc64leCpuDecode(&cpu, 0, 0);

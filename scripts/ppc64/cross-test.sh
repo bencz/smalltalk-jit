@@ -71,13 +71,26 @@ if [ "$MODE" = be ]; then
 	# requires POWER7 (a rootfs constraint, not a JIT one). power7 is the
 	# oldest runnable model and exactly the case we need anyway: VSX present
 	# but NO ISA 2.07, so the GPR<->FPR moves MUST take the memory path.
+	# gprvsr is the DERIVED capability the emitter branches on: assert it on
+	# both sides of the gate, not just the raw level bits.
 	echo "== ST_CPU_INFO (power7 must NOT claim ISA 2.07; power9 must):"
 	QEMU_CPU=power7 ST_CPU_INFO=1 ST_SMALLFLOAT_TEST=1 "$OUT/st" </dev/null | grep "ppc64 CPU"
 	QEMU_CPU=power7 ST_CPU_INFO=1 ST_SMALLFLOAT_TEST=1 "$OUT/st" </dev/null | grep -q "power8=0" \
 		|| { echo "FAIL: power7 claimed ISA 2.07"; exit 1; }
+	QEMU_CPU=power7 ST_CPU_INFO=1 ST_SMALLFLOAT_TEST=1 "$OUT/st" </dev/null | grep -q "gprvsr=0" \
+		|| { echo "FAIL: power7 claimed the GPR<->VSR moves"; exit 1; }
 	QEMU_CPU=power9 ST_CPU_INFO=1 ST_SMALLFLOAT_TEST=1 "$OUT/st" </dev/null | grep "ppc64 CPU"
 	QEMU_CPU=power9 ST_CPU_INFO=1 ST_SMALLFLOAT_TEST=1 "$OUT/st" </dev/null | grep -q "power8=1 power9=1" \
 		|| { echo "FAIL: power9 must imply ISA 2.07"; exit 1; }
+	QEMU_CPU=power9 ST_CPU_INFO=1 ST_SMALLFLOAT_TEST=1 "$OUT/st" </dev/null | grep -q "gprvsr=1" \
+		|| { echo "FAIL: power9 must have the GPR<->VSR moves"; exit 1; }
+else
+	echo "== ST_CPU_INFO (the ppc64le floor is POWER8: gprvsr everywhere):"
+	for cpu in power8 power9; do
+		QEMU_CPU=$cpu ST_CPU_INFO=1 ST_SMALLFLOAT_TEST=1 "$OUT/st" </dev/null | grep "ppc64le CPU"
+		QEMU_CPU=$cpu ST_CPU_INFO=1 ST_SMALLFLOAT_TEST=1 "$OUT/st" </dev/null | grep -q "gprvsr=1" \
+			|| { echo "FAIL: $cpu must have the GPR<->VSR moves"; exit 1; }
+	done
 fi
 
 # ---- the .st test surface under qemu ----------------------------------------
@@ -86,6 +99,21 @@ fi
 echo "== bootstrap + numeric .st tests under qemu ($TARGET_ARCH):"
 IMG="/tmp/st-cross-$TARGET_ARCH.img"
 "$OUT/st" -s "$IMG" -b smalltalk </dev/null >/dev/null
+if [ "$MODE" = be ]; then
+	# Bootstrap compiles the WHOLE kernel: the largest codegen the VM ever
+	# does, and the case that shipped broken once. Under power7 the float
+	# fast path takes the longer TLS memory path for GPR<->FPR moves, which
+	# pushed Character class>>initialize past the old 64KB per-method
+	# pointer-offset ceiling. Run the full bootstrap on the memory-path side
+	# of the gate, then prove the image it built actually works there.
+	echo "==   full bootstrap under QEMU_CPU=power7 (memory-path codegen):"
+	IMG7="/tmp/st-cross-$TARGET_ARCH-power7.img"
+	QEMU_CPU=power7 timeout 1800 "$OUT/st" -s "$IMG7" -b smalltalk </dev/null >/dev/null \
+		|| { echo "FAIL: bootstrap under power7"; exit 1; }
+	QEMU_CPU=power7 timeout 900 "$OUT/st" -s "$IMG7" -f tests/FloatTest.st </dev/null >/dev/null 2>&1 \
+		|| { echo "FAIL: FloatTest.st on the power7-built image"; exit 1; }
+	echo "     pass power7 bootstrap + FloatTest"
+fi
 if [ "$MODE" = be ]; then CPUS="power7 power9"; else CPUS="power8 power9"; fi
 for cpu in $CPUS; do
 	echo "==   QEMU_CPU=$cpu:"

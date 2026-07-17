@@ -513,7 +513,7 @@ static void iterateRememberedSet(Scavenger *scavenger)
 // Fix one run of baked-pointer sites: read each arch-encoded immediate,
 // forward it (tagged or raw), write it back. Shared by the published-code walk
 // and the in-flight codegen-buffer walk.
-static void processPointerSites(Scavenger *scavenger, uint8_t *insts, const uint16_t *offsets, size_t count)
+static void processPointerSites(Scavenger *scavenger, uint8_t *insts, const uint32_t *offsets, size_t count)
 {
 	for (size_t i = 0; i < count; i++) {
 		// The baked immediate has no contiguous in-memory form on
@@ -552,7 +552,7 @@ static void iterateNativeCode(Scavenger *scavenger)
 				processPointer(scavenger, (RawObject **) &code->typeFeedback);
 			}
 			processPointerSites(scavenger, code->insts,
-				(uint16_t *) (code->insts + code->size), code->pointersOffsetsSize);
+				nativeCodePointersOffsets(code), code->pointersOffsetsSize);
 			if (code->pointersOffsetsSize > 0) {
 				// Baked object immediates INSIDE instructions may have been
 				// rewritten above (moved objects): republish to instruction

@@ -236,6 +236,25 @@ statement about G5 hardware: it contradicts the real machine, and the real
 machine wins. Test G5 support on a G5, or on qemu-system, not with
 `QEMU_CPU=970` under qemu-user.
 
+**A CPU-model branch changes CODE SIZE, and per-method limits are structural.**
+The lesson that produced this paragraph: under POWER7 (`hasGprVsrMoves=0`) the
+float intrinsic takes the longer TLS-memory path for GPR<->FPR moves, which
+pushed `Character class>>initialize` past the then-64KB per-method ceiling of
+the baked-pointer patch table, aborting the bootstrap ONLY on that CPU model.
+The offsets are uint32 now, but per-method ceilings remain and a backend author
+must know them: 1024 baked young-pointer sites per method
+(`asmAddPointerOffset`), 8 IP fixups per buffer (`asmEmitFixup`), and on POWER
+a conditional `bc` reaches only +-32KB (`ppcCheckBranchDisp16`; there is no
+long-branch fallback). All of these are enforced by `ASSERT` alone, so a
+`-DNDEBUG` build silently truncates or overruns instead of aborting; this tree
+never defines NDEBUG (CMakeLists overrides the Release flags), keep it that
+way. Corollaries: (a) whenever an emit site grows under a feature flag, the
+gate must compile the WHOLE kernel on BOTH sides of that flag (the cross-test
+now bootstraps under `QEMU_CPU=power7` for exactly this reason); (b)
+`ST_CPU_INFO` must print every DERIVED capability the emitter branches on
+(`gprvsr=` today), or the one bit that decides the emission is invisible in a
+post-mortem.
+
 ## Adding an OS (windows, osx, aix, ...)
 
 Create `vm/os/<os>/` implementing every function in `vm/os/Os.h`, one file per

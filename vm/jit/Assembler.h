@@ -50,7 +50,7 @@ typedef struct {
 	ptrdiff_t instOffset;
 	AssemblerFixup fixups[8];
 	uint8_t fixupsSize;
-	uint16_t pointersOffsets[1024]; // TODO: get rid of fixed size buffer?
+	uint32_t pointersOffsets[1024]; // TODO: get rid of fixed size buffer?
 	size_t pointersOffsetsSize;
 	CodegenSites sitesNode; // GC visibility of the baked pointers (see Thread.h)
 } AssemblerBuffer;
@@ -65,7 +65,7 @@ static void asmLabelBind(AssemblerBuffer *buffer, AssemblerLabel *label, ptrdiff
 static AssemblerFixup *asmEmitFixup(AssemblerBuffer *buffer, AssemblerFixupType type, size_t size, ptrdiff_t offset);
 static void asmBindFixups(AssemblerBuffer *buffer, uint8_t *p);
 static void asmAddPointerOffset(AssemblerBuffer *buffer, ptrdiff_t offset);
-static void asmCopyPointersOffsets(AssemblerBuffer *buffer, uint16_t *dest);
+static void asmCopyPointersOffsets(AssemblerBuffer *buffer, uint32_t *dest);
 static void asmEmitInt8(AssemblerBuffer *buffer, int8_t v);
 static void asmEmitUint8(AssemblerBuffer *buffer, uint8_t v);
 static void asmEmitInt32(AssemblerBuffer *buffer, int32_t v);
@@ -226,16 +226,19 @@ static void asmBindFixup(AssemblerBuffer *buffer, AssemblerFixup *fixup, int64_t
 
 static void asmAddPointerOffset(AssemblerBuffer *buffer, ptrdiff_t offset)
 {
-	// The offset is a positive position within the method's machine code, stored and
-	// read back as an unsigned uint16 (see the GC in Scavenger.c/GarbageCollector.c),
-	// so the real per-method code-size limit is UINT16_MAX, not INT16_MAX.
-	ASSERT(0 <= offset && offset <= UINT16_MAX);
+	// The offset is a positive position within the method's machine code, stored
+	// and read back as a uint32 (see the GC in Scavenger.c/GarbageCollector.c and
+	// nativeCodePointersOffsets in CompiledCode.h). uint16 was the old width, and
+	// its 64KB ceiling was reachable: a bootstrap-sized method full of arithmetic
+	// sends crossed it on ppc64 when the POWER7 GPR<->FPR memory path lengthened
+	// the float fast path.
+	ASSERT(0 <= offset && offset <= UINT32_MAX);
 	ASSERT(buffer->pointersOffsetsSize < 1024);
-	buffer->pointersOffsets[buffer->pointersOffsetsSize++] = offset;
+	buffer->pointersOffsets[buffer->pointersOffsetsSize++] = (uint32_t) offset;
 }
 
 
-static void asmCopyPointersOffsets(AssemblerBuffer *buffer, uint16_t *dest)
+static void asmCopyPointersOffsets(AssemblerBuffer *buffer, uint32_t *dest)
 {
 	memcpy(dest, buffer->pointersOffsets, buffer->pointersOffsetsSize * sizeof(*dest));
 }

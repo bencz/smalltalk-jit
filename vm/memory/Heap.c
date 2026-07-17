@@ -356,7 +356,10 @@ void freeObject(PageSpace *space, RawObject *object)
 
 NativeCode *allocateNativeCode(Heap *heap, size_t size, size_t pointersOffsetsSize)
 {
-	size_t realSize = align(sizeof(NativeCode) + size + pointersOffsetsSize * sizeof(uint16_t), HEAP_OBJECT_ALIGN);
+	// Room for the inline offsets array at its 4-byte aligned base (the code
+	// byte count has arbitrary parity): mirror nativeCodePointersOffsets.
+	size_t realSize = align(sizeof(NativeCode) + ((size + 3) & ~(size_t) 3)
+		+ pointersOffsetsSize * sizeof(uint32_t), HEAP_OBJECT_ALIGN);
 	// Serialize concurrent exec-space carving across worker threads (see execLock).
 	pthread_mutex_lock(&heap->execLock);
 	NativeCode *code = (NativeCode *) pageSpaceAllocate(&heap->execSpace, realSize);

@@ -46,9 +46,13 @@ void ppc64leCpuDecode(Ppc64leCpu *cpu, uint64_t hwcap, uint64_t hwcap2)
 	cpu->isPower9 = cpu->isPower10 || (hwcap2 & PPC64LE_FEATURE2_ARCH_3_00) != 0;
 
 	// Derived capability, from the words actually read (a decode never
-	// inherits the floor; only the baseline GLOBAL assumes it, see below):
-	// the ISA 2.07 level bit is the feature bit for mtvsrd/mfvsrd.
-	cpu->hasGprVsrMoves = cpu->isPower9 || (hwcap2 & PPC64LE_FEATURE2_ARCH_2_07) != 0;
+	// inherits the floor; only the baseline GLOBAL assumes it, see below).
+	// ISA 2.07 says mtvsrd/mfvsrd EXIST; the VSX facility bit says the OS
+	// makes the register state available: both are required, exactly like
+	// the BE decode. A kernel with VSX disabled clears the facility bit and
+	// the moves would trap despite the ISA level.
+	cpu->hasGprVsrMoves = (cpu->isPower9 || (hwcap2 & PPC64LE_FEATURE2_ARCH_2_07) != 0)
+		&& cpu->hasVsx;
 
 	// Best-effort model name, for humans only: never branch the codegen on it.
 	// AT_PLATFORM would be authoritative but is NOT available everywhere

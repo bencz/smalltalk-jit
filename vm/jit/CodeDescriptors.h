@@ -20,21 +20,31 @@ typedef struct {
 } RawTypeFeedback;
 OBJECT_HANDLE(TypeFeedback);
 
+// SOURCE descriptor (compiler side): pos/line/column, 16 bits each.
 #define DESC_POS_OFFSET 48
 #define DESC_LINE_OFFSET 32
 #define DESC_COLUMN_OFFSET 16
-#define DESC_BYTECODE_OFFSET 32
+// NATIVE descriptor (codegen side): the position is an offset into the
+// method's machine code and gets 32 bits (uint16 capped methods at 64KB of
+// code, a ceiling a bootstrap-sized method crossed on ppc64/POWER7); the
+// bytecode position keeps 16. Both layouts keep the low 16 bits zero so the
+// packed Value always reads as a SmallInteger (tag 00) in the descriptors
+// Array the GC scans.
+#define DESC_NATIVE_POS_OFFSET 16
+#define DESC_NATIVE_BYTECODE_OFFSET 48
 
 static Value createSouceCodeDescriptor(uint16_t pos, uint16_t line, uint16_t column);
-static Value createBytecodeDescriptor(uint16_t pos, uint16_t bytecodePos);
+static Value createBytecodeDescriptor(uint32_t pos, uint16_t bytecodePos);
 static uint16_t descriptorGetPos(Value descriptor);
 static uint16_t descriptorGetLine(Value descriptor);
 static uint16_t descriptorGetColumn(Value descriptor);
+static uint32_t descriptorGetNativePos(Value descriptor);
 static uint16_t descriptorGetBytecode(Value descriptor);
 static Class *typeFeedbackGetHintedClass(TypeFeedback *feedback);
 static void stackmapAdd(RawStackmap *stackmap, ptrdiff_t i);
 static _Bool stackmapIncludes(RawStackmap *stackmap, ptrdiff_t i);
 static Value descriptorsAtPosition(RawArray *descriptors, uint16_t pos);
+static Value descriptorsAtNativePosition(RawArray *descriptors, uint32_t pos);
 static Value descriptorsAtBytecode(RawArray *descriptors, uint16_t bytecodePos);
 static Value findSourceCode(RawObject *compiledCode, ptrdiff_t ic);
 static RawStackmap *findStackmap(NativeCode *code, ptrdiff_t ic);
@@ -54,12 +64,12 @@ static Value createSouceCodeDescriptor(uint16_t pos, uint16_t line, uint16_t col
 }
 
 
-static Value createBytecodeDescriptor(uint16_t pos, uint16_t bytecodePos)
+static Value createBytecodeDescriptor(uint32_t pos, uint16_t bytecodePos)
 {
 	Value descriptor = 0;
-	descriptor |= (Value) pos << DESC_POS_OFFSET;
-	descriptor |= (Value) bytecodePos << DESC_BYTECODE_OFFSET;
-	ASSERT(pos == descriptorGetPos(descriptor));
+	descriptor |= (Value) pos << DESC_NATIVE_POS_OFFSET;
+	descriptor |= (Value) bytecodePos << DESC_NATIVE_BYTECODE_OFFSET;
+	ASSERT(pos == descriptorGetNativePos(descriptor));
 	ASSERT(bytecodePos == descriptorGetBytecode(descriptor));
 	return descriptor;
 }
@@ -83,9 +93,15 @@ static uint16_t descriptorGetColumn(Value descriptor)
 }
 
 
+static uint32_t descriptorGetNativePos(Value descriptor)
+{
+	return (uint32_t) (descriptor >> DESC_NATIVE_POS_OFFSET);
+}
+
+
 static uint16_t descriptorGetBytecode(Value descriptor)
 {
-	return descriptor >> DESC_BYTECODE_OFFSET;
+	return descriptor >> DESC_NATIVE_BYTECODE_OFFSET;
 }
 
 
@@ -122,6 +138,20 @@ static Value descriptorsAtPosition(RawArray *descriptors, uint16_t pos)
 }
 
 
+static Value descriptorsAtNativePosition(RawArray *descriptors, uint32_t pos)
+{
+	size_t size = descriptors->size;
+
+	for (size_t i = 0; i < size; i++) {
+		Value descriptor = descriptors->vars[i];
+		if (descriptorGetNativePos(descriptor) == pos) {
+			return descriptor;
+		}
+	}
+	return 0;
+}
+
+
 static Value descriptorsAtBytecode(RawArray *descriptors, uint16_t bytecodePos)
 {
 	size_t size = descriptors->size;
@@ -147,7 +177,8 @@ static Value findSourceCode(RawObject *compiledCode, ptrdiff_t ic)
 		return 0;
 	}
 
-	Value bytecode = descriptorsAtPosition(nativeCode->descriptors, ic - (ptrdiff_t) nativeCode->insts);
+	Value bytecode = descriptorsAtNativePosition(nativeCode->descriptors,
+		(uint32_t) (ic - (ptrdiff_t) nativeCode->insts));
 	RawArray *descriptors;
 	if (compiledCode->class == Handles.CompiledMethod->raw) {
 		descriptors = (RawArray *) asObject(((RawCompiledMethod *) compiledCode)->descriptors);

@@ -619,8 +619,12 @@ static void generateFloatOperandLoad(AssemblerBuffer *buffer, Register reg,
 	asmJ(buffer, COND_ZERO, &boxed);
 
 	// SmallFloat64 decode, the inverse of tagFloat (see Object.h): payload =
-	// value >> 2; bits = ROR64(payload <= 1 ? payload : payload + offset, 1)
-	asmMovq(buffer, reg, scratch);
+	// value >> 2; bits = ROR64(payload <= 1 ? payload : payload + offset, 1).
+	// Both call sites pass scratch == reg (the operand register is dead once
+	// the double is in xmm): no copy then, shift in place.
+	if (scratch != reg) {
+		asmMovq(buffer, reg, scratch);
+	}
 	asmShrqImm(buffer, scratch, 2);
 	asmCmpqImm(buffer, scratch, 1);
 	asmJ(buffer, COND_BELOW_EQUAL, &zero);  // payloads 0/1 are +-0.0: no rebias
@@ -649,7 +653,15 @@ static void generateFloatOperandLoad(AssemblerBuffer *buffer, Register reg,
 // the stub). Misses touch only RAX/RSI/RDI (all rebuilt by dispatch); RDX and
 // XMM0/XMM1 are clobbered on the committed paths only; TMP is left untouched on
 // every fall-through-to-dispatch path so the class recompute works.
-static void generateFloatFastPath(CodeGenerator *generator, int arithKind, AssemblerLabel *arithMerge)
+//
+// litArgBits, when non-NULL, are the IEEE bits of a SmallFloat64 LITERAL
+// argument (OPERAND_VALUE tagged 0b11), known at codegen time: the arg needs
+// no guard (it cannot miss) and no runtime decode, the constant is
+// materialized straight into XMM1 (movabs + movq), both here and in the
+// re-decode after the boxing stub. The bits are plain data, not a heap
+// pointer: nothing to re-read, nothing for the GC to see.
+static void generateFloatFastPath(CodeGenerator *generator, int arithKind,
+	AssemblerLabel *arithMerge, const uint64_t *litArgBits)
 {
 	AssemblerBuffer *buffer = &generator->buffer;
 	AssemblerLabel tagMissR, tagMissA, immOkR, immOkA, classMissR, classMissA;
@@ -661,12 +673,14 @@ static void generateFloatFastPath(CodeGenerator *generator, int arithKind, Assem
 	asmInitLabel(&classMissA);
 
 	asmMovqMem(buffer, asmMem(RSP, NO_REGISTER, SS_1, 0), RAX);                     // receiver
-	asmMovqMem(buffer, asmMem(RSP, NO_REGISTER, SS_1, sizeof(intptr_t)), RSI);      // arg
+	if (litArgBits == NULL) {
+		asmMovqMem(buffer, asmMem(RSP, NO_REGISTER, SS_1, sizeof(intptr_t)), RSI);  // arg
+	}
 
 	// Guard phase, the ONLY phase that can fall to dispatch: each operand must
 	// be a SmallFloat64 immediate (both tag bits set) or a pointer whose class
 	// word is BoxedFloat64. A bare bit-0 test would accept an immediate and
-	// dereference it as a box.
+	// dereference it as a box. A literal arg is a known immediate: no guard.
 	generateLoadObject(buffer, (RawObject *) Handles.BoxedFloat64->raw, RDI, 0);    // BoxedFloat64 class (raw)
 	asmTestqImm(buffer, RAX, VALUE_POINTER);
 	asmJ(buffer, COND_ZERO, &tagMissR);           // 0b00/0b10: not a Float
@@ -675,19 +689,26 @@ static void generateFloatFastPath(CodeGenerator *generator, int arithKind, Assem
 	asmCmpqMem(buffer, asmMem(RAX, NO_REGISTER, SS_1, varOffset(RawObject, class)), RDI);
 	asmJ(buffer, COND_NOT_EQUAL, &classMissR);
 	asmLabelBind(buffer, &immOkR, asmOffset(buffer));
-	asmTestqImm(buffer, RSI, VALUE_POINTER);
-	asmJ(buffer, COND_ZERO, &tagMissA);
-	asmTestqImm(buffer, RSI, VALUE_CHAR);
-	asmJ(buffer, COND_NOT_ZERO, &immOkA);
-	asmCmpqMem(buffer, asmMem(RSI, NO_REGISTER, SS_1, varOffset(RawObject, class)), RDI);
-	asmJ(buffer, COND_NOT_EQUAL, &classMissA);
-	asmLabelBind(buffer, &immOkA, asmOffset(buffer));
+	if (litArgBits == NULL) {
+		asmTestqImm(buffer, RSI, VALUE_POINTER);
+		asmJ(buffer, COND_ZERO, &tagMissA);
+		asmTestqImm(buffer, RSI, VALUE_CHAR);
+		asmJ(buffer, COND_NOT_ZERO, &immOkA);
+		asmCmpqMem(buffer, asmMem(RSI, NO_REGISTER, SS_1, varOffset(RawObject, class)), RDI);
+		asmJ(buffer, COND_NOT_EQUAL, &classMissA);
+		asmLabelBind(buffer, &immOkA, asmOffset(buffer));
+	}
 
 	// Committed: decode both operands into XMM0/XMM1. RDI/RDX become scratch
 	// from here on; nothing below falls to dispatch.
 	asmMovqImm(buffer, (int64_t) SMALLFLOAT_OFFSET, RDX);
 	generateFloatOperandLoad(buffer, RAX, RAX, RDX, XMM0);
-	generateFloatOperandLoad(buffer, RSI, RSI, RDX, XMM1);
+	if (litArgBits == NULL) {
+		generateFloatOperandLoad(buffer, RSI, RSI, RDX, XMM1);
+	} else {
+		asmMovqImm(buffer, (int64_t) *litArgBits, RSI);
+		asmMovqToXmm(buffer, RSI, XMM1);
+	}
 
 	if (arithIsCompare(arithKind)) {
 		// No allocation: ucomisd, load true/false. ucomisd sets CF/ZF/PF
@@ -770,10 +791,17 @@ static void generateFloatFastPath(CodeGenerator *generator, int arithKind, Assem
 		asmMovqImm(buffer, 0, RDX);                                                 // no indexed slots
 		generateStubCall(generator, &AllocateStub);                                // RAX = new tagged Float
 		asmMovqMem(buffer, asmMem(RSP, NO_REGISTER, SS_1, 0), RSI);                 // reload receiver (GC-updated)
-		asmMovqMem(buffer, asmMem(RSP, NO_REGISTER, SS_1, sizeof(intptr_t)), RDI);  // reload arg
+		if (litArgBits == NULL) {
+			asmMovqMem(buffer, asmMem(RSP, NO_REGISTER, SS_1, sizeof(intptr_t)), RDI); // reload arg
+		}
 		asmMovqImm(buffer, (int64_t) SMALLFLOAT_OFFSET, RDX);
 		generateFloatOperandLoad(buffer, RSI, RSI, RDX, XMM0);
-		generateFloatOperandLoad(buffer, RDI, RDI, RDX, XMM1);
+		if (litArgBits == NULL) {
+			generateFloatOperandLoad(buffer, RDI, RDI, RDX, XMM1);
+		} else {
+			asmMovqImm(buffer, (int64_t) *litArgBits, RDI);
+			asmMovqToXmm(buffer, RDI, XMM1);
+		}
 		switch (arithKind) {
 		case ARITH_ADD: asmAddsd(buffer, XMM1, XMM0); break;
 		case ARITH_SUB: asmSubsd(buffer, XMM1, XMM0); break;
@@ -818,8 +846,21 @@ static void generateSend(CodeGenerator *generator, BytecodesIterator *iterator)
 		? classifyArith(compiledCodeLiteralAt(&generator->code, selectorIndex)) : ARITH_NONE;
 	int identKind = classifyIdentity(compiledCodeLiteralAt(&generator->code, selectorIndex), argsSize);
 
+	// A SmallFloat64 LITERAL argument (OPERAND_VALUE tagged 0b11) is known at
+	// codegen time: the float fast path materializes it as a constant and skips
+	// its guard and decode, and the SmallInteger fast path is dead (its arg tag
+	// test can never pass). The Value is an immediate, not a heap pointer, so
+	// holding its bits across the pushes is GC-safe.
+	_Bool floatLitArg = 0;
+	uint64_t litArgBits = 0;
 	for (uint8_t i = 0; i < argsSize; i++) {
-		pushOperand(generator, bytecodeNextOperand(iterator));
+		Operand arg = bytecodeNextOperand(iterator);
+		if (i == 0 && argsSize == 1 && arg.type == OPERAND_VALUE
+				&& valueTypeOf(arg.value, VALUE_FLOAT)) {
+			floatLitArg = 1;
+			litArgBits = doubleToBits(floatValueOf(arg.value));
+		}
+		pushOperand(generator, arg);
 	}
 	movOperand(generator, receiver, TMP);
 	asmPushq(buffer, TMP);
@@ -833,7 +874,8 @@ static void generateSend(CodeGenerator *generator, BytecodesIterator *iterator)
 	// only RAX/RSI/RDI(/RDX) as scratch and leave TMP (= receiver) untouched on
 	// the dispatch fall-through, so the class recompute below works.
 	_Bool identityInline = identKind != IDENT_NONE;
-	_Bool intInline = arithKind != ARITH_NONE && arithKind != ARITH_DIV;   // int has no inline '/'
+	// int has no inline '/'; a float-literal arg fails its arg tag test always
+	_Bool intInline = arithKind != ARITH_NONE && arithKind != ARITH_DIV && !floatLitArg;
 	_Bool floatInline = arithKind != ARITH_NONE && !arithIsBitOp(arithKind) && floatInlineEnabled();
 	_Bool anyInline = intInline || floatInline || identityInline;
 	// Separate merge labels: each AssemblerLabel supports only one reference, so
@@ -908,7 +950,8 @@ static void generateSend(CodeGenerator *generator, BytecodesIterator *iterator)
 	}
 
 	if (floatInline) {
-		generateFloatFastPath(generator, arithKind, &floatMerge);
+		generateFloatFastPath(generator, arithKind, &floatMerge,
+			floatLitArg ? &litArgBits : NULL);
 	}
 
 	if (identityInline) {
@@ -2105,7 +2148,7 @@ NativeCode *buildNativeCodeFromAssembler(AssemblerBuffer *buffer)
 	code->counter = 0;
 	asmBindFixups(buffer, code->insts);
 	asmCopyBuffer(buffer, code->insts, size);
-	asmCopyPointersOffsets(buffer, (uint16_t *) (code->insts + size));
+	asmCopyPointersOffsets(buffer, nativeCodePointersOffsets(code));
 	// Single funnel for ALL code creation (methods, blocks, stubs): make the
 	// fresh instructions visible to instruction fetch before anyone can jump
 	// here (no-op on x86; required on ARM/RISC-V/PPC).

@@ -75,7 +75,7 @@ CompiledMethod *optimizeMethod(CompiledMethod *method)
 			initOrdCollIterator(&typesIterator, typeFeedback, 0, 0);
 			while (iteratorHasNext(&typesIterator)) {
 				TypeFeedback *feedback = (TypeFeedback *) iteratorNextObject(&typesIterator);
-				Value descriptor = descriptorsAtPosition(descriptors->raw, asCInt(feedback->raw->ic));
+				Value descriptor = descriptorsAtNativePosition(descriptors->raw, (uint32_t) asCInt(feedback->raw->ic));
 				if (descriptorGetBytecode(descriptor) == bytecodeOff) {
 					Class *class = typeFeedbackGetHintedClass(feedback);
 					ptrdiff_t classIndex = ordCollAddObjectIfNotExists(optimizer.literals, (Object *) class);

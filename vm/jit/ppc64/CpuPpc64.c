@@ -85,6 +85,14 @@ static const struct {
 		| PPC64_FEATURE_ARCH_2_05 | PPC64_FEATURE_HAS_DFP
 		| PPC64_FEATURE_HAS_ALTIVEC | PPC64_FEATURE_ARCH_2_06
 		| PPC64_FEATURE_HAS_VSX, 0 },
+	// power7+ is a real qemu/-cpu model name; it reports the same feature
+	// words as power7 (ISA 2.06 plus VSX, no 2.07), so it is an accepted
+	// ALIAS here and the decode will name the result "power7".
+	{ "power7+", PPC64_FEATURE_64 | PPC64_FEATURE_POWER4
+		| PPC64_FEATURE_POWER5 | PPC64_FEATURE_POWER5_PLUS
+		| PPC64_FEATURE_ARCH_2_05 | PPC64_FEATURE_HAS_DFP
+		| PPC64_FEATURE_HAS_ALTIVEC | PPC64_FEATURE_ARCH_2_06
+		| PPC64_FEATURE_HAS_VSX, 0 },
 	{ "power8", PPC64_FEATURE_64 | PPC64_FEATURE_POWER4
 		| PPC64_FEATURE_POWER5 | PPC64_FEATURE_POWER5_PLUS
 		| PPC64_FEATURE_ARCH_2_05 | PPC64_FEATURE_HAS_DFP
@@ -111,7 +119,7 @@ static const struct {
 
 const char *const Ppc64CpuNames[] = {
 	PPC64_CPU_BASELINE_NAME, "ppc970", "power4", "power5", "power5+",
-	"power6", "power7", "power8", "power9", "power10", NULL,
+	"power6", "power7", "power7+", "power8", "power9", "power10", NULL,
 };
 
 _Bool ppc64CpuByName(Ppc64Cpu *cpu, const char *name)

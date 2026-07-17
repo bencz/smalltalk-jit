@@ -28,7 +28,7 @@ typedef struct TLAB {
 // growth (insts) and keeps baking (count).
 typedef struct CodegenSites {
 	uint8_t **insts;              // &buffer->buffer
-	uint16_t *offsets;            // buffer->pointersOffsets (inline array, stable)
+	uint32_t *offsets;            // buffer->pointersOffsets (inline array, stable)
 	size_t *count;                // &buffer->pointersOffsetsSize
 	struct CodegenSites *next;
 } CodegenSites;
