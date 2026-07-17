@@ -89,17 +89,22 @@ HttpConnection := Object [
 
 	readRequest [
 		"Answer the next HttpRequest, or nil when the connection is done."
-		| line parts request |
+		| line sp1 sp2 request method target version |
 		line := self readLine.
 		line isNil ifTrue: [ ^nil ].
 		line isEmpty ifTrue: [ ^self readRequest ].   "tolerate stray blank lines"
-		parts := line splitBy: Character space.
-		parts size < 2 ifTrue: [ ^nil ].              "malformed request line"
+		"Split the request line on its (up to two) spaces directly with memchr,
+		 avoiding an OrderedCollection + 16-slot backing array for 3 fixed fields."
+		sp1 := line indexOfByte: 32 startingAt: 1.       "space after METHOD"
+		sp1 = 0 ifTrue: [ ^nil ].                        "malformed request line"
+		sp2 := line indexOfByte: 32 startingAt: sp1 + 1. "space after TARGET"
+		method := line copyFrom: 1 to: sp1 - 1.
+		sp2 = 0
+			ifTrue: [ target := line copyFrom: sp1 + 1 to: line size. version := 'HTTP/1.0' ]
+			ifFalse: [ target := line copyFrom: sp1 + 1 to: sp2 - 1.
+				version := line copyFrom: sp2 + 1 to: line size ].
 		request := HttpRequest new.
-		request
-			setMethod: (parts at: 1)
-			target: (parts at: 2)
-			version: (parts size >= 3 ifTrue: [ parts at: 3 ] ifFalse: [ 'HTTP/1.0' ]).
+		request setMethod: method target: target version: version.
 		self readHeadersInto: request.
 		self readBodyInto: request.
 		^request
@@ -107,15 +112,14 @@ HttpConnection := Object [
 
 
 	readHeadersInto: request [
-		| line idx |
+		"Stash each raw 'Name: value' line as-is; the request parses them lazily
+		 (and finds content-length / connection by an allocation-free raw scan)
+		 so a request whose handler never reads a header pays nothing here."
+		| line |
 		[
 			line := self readLine.
 			(line isNil or: [ line isEmpty ]) ifTrue: [ ^self ].
-			idx := line indexOfByte: 58 startingAt: 1.   "$:"
-			idx > 0 ifTrue: [
-				request
-					setHeader: (line copyFrom: 1 to: idx - 1) trimSeparators asLowercase
-					to: (line copyFrom: idx + 1 to: line size) trimSeparators ]
+			request addRawHeaderLine: line
 		] repeat.
 	]
 

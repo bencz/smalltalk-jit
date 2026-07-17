@@ -43,6 +43,11 @@ typedef struct {
 static PrimitiveResult arrayEqualsPrimitive(Value receiver, Value operand);
 static PrimitiveResult replaceBytesPrimitive(Value self, Value start, Value stop, Value replacement, Value replacementStart);
 static PrimitiveResult indexOfBytePrimitive(Value self, Value byte, Value start);
+static PrimitiveResult stringAsciiLowercasePrimitive(Value receiver);
+static PrimitiveResult stringAsciiUppercasePrimitive(Value receiver);
+static PrimitiveResult stringTrimSeparatorsPrimitive(Value receiver);
+static PrimitiveResult stringAsciiCaseEqualsPrimitive(Value self, Value other);
+static PrimitiveResult stringStartsWithAsciiCasePrimitive(Value self, Value prefix);
 static PrimitiveResult becomePrimitive(Value object, Value other);
 static PrimitiveResult workerParallelPrimitive(Value self, Value blocks);
 static PrimitiveResult contextPositionDescriptorPrimitive(Value vContext);
@@ -316,6 +321,11 @@ Primitive Primitives[] = {
 	{"FloatExponentPrimitive", CCALL, .cFunction = floatExponentPrimitive, 1},
 	{"FloatTimesTwoPowerPrimitive", CCALL, .cFunction = floatTimesTwoPowerPrimitive, 2},
 	{"BlockUnwindPrimitive", GEN, generateBlockUnwindPrimitive},
+	{"StringAsciiLowercasePrimitive", CCALL, .cFunction = stringAsciiLowercasePrimitive, 1},
+	{"StringAsciiUppercasePrimitive", CCALL, .cFunction = stringAsciiUppercasePrimitive, 1},
+	{"StringTrimSeparatorsPrimitive", CCALL, .cFunction = stringTrimSeparatorsPrimitive, 1},
+	{"StringAsciiCaseEqualsPrimitive", CCALL, .cFunction = stringAsciiCaseEqualsPrimitive, 2},
+	{"StringStartsWithAsciiCasePrimitive", CCALL, .cFunction = stringStartsWithAsciiCasePrimitive, 2},
 };
 
 
@@ -434,6 +444,142 @@ static PrimitiveResult indexOfBytePrimitive(Value vSelf, Value vByte, Value vSta
 	uint8_t *data = getRawObjectIndexedVars(self);
 	uint8_t *found = memchr(data + (start - 1), (int) byte, (size_t) (size - (start - 1)));
 	return primSuccess(tagInt(found == NULL ? 0 : (intptr_t) (found - data) + 1));
+}
+
+
+// ---- ASCII string helpers moved to C (the per-char Smalltalk loops were the
+// hottest userspace work on the HTTP request path). All match the semantics of
+// the Smalltalk fallbacks EXACTLY: Character's fold Table is a pure ASCII fold
+// (A-Z<->a-z, identity elsewhere) and isSeparator = {tab,lf,ff,cr,space}. Guarded
+// to plain String receivers so Symbol/other byte shapes keep the .st path (which
+// preserves the receiver's species). ----
+
+static inline _Bool asciiIsSeparatorByte(uint8_t c)
+{
+	return c == 9 || c == 10 || c == 12 || c == 13 || c == 32;
+}
+
+// True if two byte runs are equal ignoring ASCII letter case.
+static _Bool asciiCaseEqualBytes(const uint8_t *a, const uint8_t *b, size_t n)
+{
+	for (size_t i = 0; i < n; i++) {
+		uint8_t ca = a[i], cb = b[i];
+		if (ca != cb) {
+			uint8_t la = ca | 0x20;
+			if (!(la >= 'a' && la <= 'z' && la == (cb | 0x20))) {
+				return 0;
+			}
+		}
+	}
+	return 1;
+}
+
+static PrimitiveResult stringAsciiLowercasePrimitive(Value receiver)
+{
+	RawObject *raw = asObject(receiver);
+	if (raw->class != Handles.String->raw) {
+		return primFailed();
+	}
+	HandleScope scope;
+	openHandleScope(&scope);
+	String *src = scopeHandle(raw);
+	size_t size = src->raw->size;
+	String *dst = newString(size);          // may GC; src handle stays valid
+	uint8_t *s = (uint8_t *) src->raw->contents;   // re-read AFTER the allocation
+	uint8_t *d = (uint8_t *) dst->raw->contents;
+	for (size_t i = 0; i < size; i++) {
+		uint8_t c = s[i];
+		d[i] = (c >= 'A' && c <= 'Z') ? (uint8_t) (c + 32) : c;
+	}
+	Value result = getTaggedPtr(dst);
+	closeHandleScope(&scope, NULL);
+	return primSuccess(result);
+}
+
+static PrimitiveResult stringAsciiUppercasePrimitive(Value receiver)
+{
+	RawObject *raw = asObject(receiver);
+	if (raw->class != Handles.String->raw) {
+		return primFailed();
+	}
+	HandleScope scope;
+	openHandleScope(&scope);
+	String *src = scopeHandle(raw);
+	size_t size = src->raw->size;
+	String *dst = newString(size);
+	uint8_t *s = (uint8_t *) src->raw->contents;
+	uint8_t *d = (uint8_t *) dst->raw->contents;
+	for (size_t i = 0; i < size; i++) {
+		uint8_t c = s[i];
+		d[i] = (c >= 'a' && c <= 'z') ? (uint8_t) (c - 32) : c;
+	}
+	Value result = getTaggedPtr(dst);
+	closeHandleScope(&scope, NULL);
+	return primSuccess(result);
+}
+
+static PrimitiveResult stringTrimSeparatorsPrimitive(Value receiver)
+{
+	RawObject *raw = asObject(receiver);
+	if (raw->class != Handles.String->raw) {
+		return primFailed();
+	}
+	HandleScope scope;
+	openHandleScope(&scope);
+	String *src = scopeHandle(raw);
+	size_t size = src->raw->size;
+	uint8_t *s = (uint8_t *) src->raw->contents;
+	size_t start = 0, end = size;
+	while (start < end && asciiIsSeparatorByte(s[start])) {
+		start++;
+	}
+	while (end > start && asciiIsSeparatorByte(s[end - 1])) {
+		end--;
+	}
+	size_t len = end - start;
+	String *dst = newString(len);            // may GC; src handle stays valid
+	memcpy(dst->raw->contents, src->raw->contents + start, len);  // re-read src after alloc
+	Value result = getTaggedPtr(dst);
+	closeHandleScope(&scope, NULL);
+	return primSuccess(result);
+}
+
+// ASCII case-insensitive equality without allocating.
+static PrimitiveResult stringAsciiCaseEqualsPrimitive(Value vSelf, Value vOther)
+{
+	if (!valueTypeOf(vOther, VALUE_POINTER)) {
+		return primFailed();
+	}
+	RawObject *a = asObject(vSelf);
+	RawObject *b = asObject(vOther);
+	if (!a->class->instanceShape.isBytes || !b->class->instanceShape.isBytes) {
+		return primFailed();
+	}
+	size_t na = rawObjectSize(a);
+	if (na != rawObjectSize(b)) {
+		return primSuccess(getTaggedPtr(Handles.false));
+	}
+	_Bool equal = asciiCaseEqualBytes(getRawObjectIndexedVars(a), getRawObjectIndexedVars(b), na);
+	return primSuccess(getTaggedPtr(equal ? Handles.true : Handles.false));
+}
+
+// True if `self` begins with `prefix`, ignoring ASCII letter case. No allocation.
+static PrimitiveResult stringStartsWithAsciiCasePrimitive(Value vSelf, Value vPrefix)
+{
+	if (!valueTypeOf(vPrefix, VALUE_POINTER)) {
+		return primFailed();
+	}
+	RawObject *a = asObject(vSelf);
+	RawObject *b = asObject(vPrefix);
+	if (!a->class->instanceShape.isBytes || !b->class->instanceShape.isBytes) {
+		return primFailed();
+	}
+	size_t na = rawObjectSize(a), nb = rawObjectSize(b);
+	if (nb > na) {
+		return primSuccess(getTaggedPtr(Handles.false));
+	}
+	_Bool match = asciiCaseEqualBytes(getRawObjectIndexedVars(a), getRawObjectIndexedVars(b), nb);
+	return primSuccess(getTaggedPtr(match ? Handles.true : Handles.false));
 }
 
 

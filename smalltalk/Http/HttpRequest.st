@@ -3,7 +3,7 @@
  body, and route params bound by the router (e.g. the ':id' in '/cards/:id')."
 HttpRequest := Object [
 
-	| method path version headers query body params |
+	| method path version headers rawHeaders query body params |
 
 
 	class new [
@@ -12,10 +12,13 @@ HttpRequest := Object [
 
 
 	initRequest [
-		"Only the header map is always needed. query/params stay nil until a
-		 query string or a route param actually appears — most requests have
-		 neither, so this saves two 64-slot Dictionary allocations each."
-		headers := Dictionary new: 8.
+		"Nothing eager: the header map is built lazily from the raw header lines
+		 only if the app actually reads a header (see #headers). The reader just
+		 stashes raw 'Name: value' line refs via #addRawHeaderLine:, and
+		 content-length / connection are found by an allocation-free raw scan
+		 (#rawHeaderValueFor:). query/params also stay nil until a query string
+		 or route param appears. So a plain keep-alive GET allocates no header
+		 Dictionary, no per-header trim/lowercase/Association at all."
 		body := ''.
 		^self
 	]
@@ -77,8 +80,45 @@ HttpRequest := Object [
 	]
 
 
-	setHeader: aKey to: aValue [ headers at: aKey put: aValue. ^self ]
+	setHeader: aKey to: aValue [ self headers at: aKey put: aValue. ^self ]
 	setBody: aString [ body := aString. ^self ]
+
+
+	"The reader stashes each raw 'Name: value' line as-is (no copy, no parse).
+	 The header Dictionary is materialised lazily by #headers only if read."
+	addRawHeaderLine: aLine [
+		rawHeaders isNil ifTrue: [ rawHeaders := OrderedCollection new ].
+		rawHeaders addLast: aLine.
+		^self
+	]
+
+
+	parseHeaders [
+		"Materialise the lowercased-key header Dictionary from the raw lines."
+		headers := Dictionary new: 8.
+		rawHeaders isNil ifTrue: [ ^headers ].
+		rawHeaders do: [:line |
+			| idx |
+			idx := line indexOfByte: 58 startingAt: 1.   "$:"
+			idx > 0 ifTrue: [
+				headers
+					at: (line copyFrom: 1 to: idx - 1) trimSeparators asLowercase
+					put: (line copyFrom: idx + 1 to: line size) trimSeparators ] ].
+		^headers
+	]
+
+
+	rawHeaderValueFor: aLowercaseName [
+		"Find one header's trimmed value by scanning the raw lines, without
+		 building the Dictionary. Allocates only the matched value string."
+		rawHeaders isNil ifTrue: [ ^nil ].
+		rawHeaders do: [:line |
+			(line headerNameMatches: aLowercaseName) ifTrue: [
+				| idx |
+				idx := line indexOfByte: 58 startingAt: 1.
+				^(line copyFrom: idx + 1 to: line size) trimSeparators ] ].
+		^nil
+	]
 
 
 	"---- accessing ----"
@@ -86,13 +126,13 @@ HttpRequest := Object [
 	method [ ^method ]
 	path [ ^path ]
 	version [ ^version ]
-	headers [ ^headers ]
+	headers [ headers isNil ifTrue: [ self parseHeaders ]. ^headers ]
 	query [ ^query ]
 	params [ ^params ]
 	body [ ^body ]
 
 
-	header: aKey [ ^headers at: aKey asLowercase ifAbsent: [ nil ] ]
+	header: aKey [ ^self headers at: aKey asLowercase ifAbsent: [ nil ] ]
 	query: aKey [ query isNil ifTrue: [ ^nil ]. ^query at: aKey ifAbsent: [ nil ] ]
 	param: aKey [ params isNil ifTrue: [ ^nil ]. ^params at: aKey ifAbsent: [ nil ] ]
 	param: aKey put: aValue [
@@ -108,7 +148,7 @@ HttpRequest := Object [
 
 	contentLength [
 		| value |
-		value := self header: 'content-length'.
+		value := self rawHeaderValueFor: 'content-length'.
 		value isNil ifTrue: [ ^0 ].
 		^value asNumber
 	]
@@ -131,12 +171,12 @@ HttpRequest := Object [
 
 	isKeepAlive [
 		| conn |
-		conn := self header: 'connection'.
+		conn := self rawHeaderValueFor: 'connection'.
 		version = 'HTTP/1.0' ifTrue: [
-			^conn notNil and: [ conn asLowercase = 'keep-alive' ] ].
+			^conn notNil and: [ conn sameAsciiCaseAs: 'keep-alive' ] ].
 		"HTTP/1.1: keep-alive unless explicitly closed"
 		conn isNil ifTrue: [ ^true ].
-		^(conn asLowercase = 'close') not
+		^(conn sameAsciiCaseAs: 'close') not
 	]
 
 

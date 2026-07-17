@@ -18,6 +18,57 @@ String := ArrayedCollection [
 	]
 
 
+	sameAsciiCaseAs: aString [
+		"ASCII case-insensitive equality WITHOUT allocating (unlike
+		 `self asLowercase = aString`). For the HTTP hot path, where header
+		 names/tokens are compared but never need a lowercased copy."
+		<primitive: StringAsciiCaseEqualsPrimitive>
+		| n a b la |
+		n := self size.
+		n = aString size ifFalse: [ ^false ].
+		1 to: n do: [ :i |
+			a := (self at: i) codePoint.
+			b := (aString at: i) codePoint.
+			a = b ifFalse: [
+				la := a bitOr: 32.
+				((la between: 97 and: 122) and: [ la = (b bitOr: 32) ])
+					ifFalse: [ ^false ] ] ].
+		^true
+	]
+
+
+	startsWithAsciiCase: aPrefix [
+		"True if the receiver begins with aPrefix, ASCII case-insensitive, without
+		 allocating. C fast path; the .st fallback covers non-byte operands."
+		<primitive: StringStartsWithAsciiCasePrimitive>
+		| n a b la |
+		n := aPrefix size.
+		n > self size ifTrue: [ ^false ].
+		1 to: n do: [ :i |
+			a := (self at: i) codePoint.
+			b := (aPrefix at: i) codePoint.
+			a = b ifFalse: [
+				la := a bitOr: 32.
+				((la between: 97 and: 122) and: [ la = (b bitOr: 32) ]) ifFalse: [ ^false ] ] ].
+		^true
+	]
+
+
+	headerNameMatches: aLowercaseName [
+		"True if the name part of this 'Name: value' header line (the bytes before
+		 the first ':', minus any separators before it) equals aLowercaseName,
+		 ASCII case-insensitive. Allocation-free, so the HTTP reader finds
+		 content-length / connection without materialising the header dict. HTTP
+		 header names start at column 0, so anchor with startsWithAsciiCase: (in C)."
+		| i sz |
+		(self startsWithAsciiCase: aLowercaseName) ifFalse: [ ^false ].
+		sz := self size.
+		i := aLowercaseName size + 1.
+		[ i <= sz and: [ (self at: i) isSeparator ] ] whileTrue: [ i := i + 1 ].
+		^i <= sz and: [ (self at: i) codePoint = 58 ]
+	]
+
+
 	"scanning"
 
 	indexOfByte: anInteger startingAt: start [
@@ -37,8 +88,10 @@ String := ArrayedCollection [
 
 
 	asLowercase [
+		"C fast path: pure ASCII fold (A-Z -> a-z). The Smalltalk fallback runs
+		 for non-String byte shapes (e.g. Symbol) so the receiver species is kept."
+		<primitive: StringAsciiLowercasePrimitive>
 		| newString |
-
 		newString := self class new: self size.
 		1 to: self size do: [ :i | newString at: i put: (self at: i) asLowercase].
 		^newString
@@ -46,8 +99,8 @@ String := ArrayedCollection [
 
 
 	asUppercase [
+		<primitive: StringAsciiUppercasePrimitive>
 		| newString |
-
 		newString := self class new: self size.
 		1 to: self size do: [ :i | newString at: i put: (self at: i) asUppercase].
 		^newString
@@ -60,6 +113,8 @@ String := ArrayedCollection [
 
 
 	trimSeparators [
+		"C fast path: trim {tab,lf,ff,cr,space} from both ends in one pass."
+		<primitive: StringTrimSeparatorsPrimitive>
 		1 to: self size do: [ :start |
 			(self at: start) isSeparator ifFalse: [
 				self size to: start by: -1 do: [ :stop |

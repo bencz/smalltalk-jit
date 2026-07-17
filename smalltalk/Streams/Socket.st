@@ -64,6 +64,15 @@ Socket := ExternalStream [
 	]
 
 
+	nextPutAll: aCollection count: anInteger [
+		"Write the first anInteger bytes of aCollection in one syscall. Lets a
+		 caller hand over a stream's oversized backing buffer directly instead
+		 of copying out an exact-length slice first (HTTP response hot path)."
+		Socket write: descriptor from: aCollection size: anInteger.
+		^aCollection
+	]
+
+
 	"flushing"
 
 	flush [

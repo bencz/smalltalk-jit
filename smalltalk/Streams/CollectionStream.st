@@ -111,6 +111,13 @@ CollectionStream := PositionableStream [
 	]
 
 
+	collection [
+		"The raw backing collection (may be larger than #size). Paired with
+		 #size it lets a caller consume the written bytes without a copy."
+		^collection
+	]
+
+
 	upToEnd [
 		^collection copyFrom: position to: end - 1
 	]

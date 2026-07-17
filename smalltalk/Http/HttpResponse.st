@@ -124,9 +124,9 @@ HttpResponse := Object [
 		out nextPutAll: reason.
 		self endLineOn: out.
 		headers keysAndValuesDo: [:k :v |
-			| lk |
-			lk := k asLowercase.
-			(lk = 'content-length' or: [ lk = 'connection' ])
+			"skip content-length / connection (written explicitly below); compare
+			 case-insensitively without allocating a lowercased copy of the key."
+			((k sameAsciiCaseAs: 'content-length') or: [ k sameAsciiCaseAs: 'connection' ])
 				ifFalse: [ self putHeader: k value: v on: out ] ].
 		self putHeader: 'Content-Length' value: body size on: out.
 		self putHeader: 'Connection'
@@ -134,7 +134,9 @@ HttpResponse := Object [
 			on: out.
 		self endLineOn: out.
 		out nextPutAll: body.
-		aSocket nextPutAll: out contents.
+		"write the stream's backing buffer directly (first `out size` bytes) —
+		 no exact-length `contents` copy of the whole response before the syscall."
+		aSocket nextPutAll: out collection count: out size.
 		^self
 	]
 
