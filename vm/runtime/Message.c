@@ -328,6 +328,12 @@ static _Bool structEqual(RawObject *a, RawObject *b, int depth)
 	if (shape.isIndexed && shape.isBytes) {
 		return memcmp(getRawObjectIndexedVars(a), getRawObjectIndexedVars(b), sa) == 0;
 	}
+	if (isFloatShape(shape)) {
+		// A boxed Float's double lives in an unscanned payload word that the
+		// field walk below never visits (varsSize is 0, so the loop is empty
+		// and any two boxed Floats would compare equal): check it bit-exactly.
+		return *(int64_t *) &((RawFloat *) a)->value == *(int64_t *) &((RawFloat *) b)->value;
+	}
 	size_t n = shape.varsSize + (shape.isIndexed ? sa : 0);
 	Value *va = getRawObjectVars(a);
 	Value *vb = getRawObjectVars(b);
@@ -353,11 +359,30 @@ int messageSelfTest(void)
 		"3.14159",
 		"| d | d := Dictionary new. d at: #one put: 1. d at: #two put: #(2 3 4). d at: 'name' put: 'bob'. d",
 		"(1 to: 50) asArray",
+		"1.0e300",
 	};
 	int failures = 0;
 	for (size_t k = 0; k < sizeof(cases) / sizeof(cases[0]); k++) {
 		Value origV = evalObject((char *) cases[k]);
-		if (!valueTypeOf(origV, VALUE_POINTER)) { fprintf(stderr, "  case %zu: eval did not yield an object\n", k); failures++; continue; }
+		if (!valueTypeOf(origV, VALUE_POINTER)) {
+			// An immediate result (SmallInteger, SmallFloat64, Character; case
+			// 3 lands here since in-range float literals stopped boxing): the
+			// wire format carries the Value verbatim (MSG_INT), so the
+			// round-trip must give back the identical bits. `distinct` does
+			// not apply, immediates are not heap objects.
+			size_t size = 0;
+			uint8_t *bytes = messageSerialize(origV, &size);
+			Value copyV = 0;
+			_Bool ok = bytes != NULL && messageDeserialize(bytes, size, &copyV);
+			free(bytes);
+			if (!ok || copyV != origV) {
+				fprintf(stderr, "  case %zu: immediate roundtrip FAILED\n", k);
+				failures++;
+			} else {
+				fprintf(stderr, "  case %zu: bytes=%zu immediate equal=1\n", k, size);
+			}
+			continue;
+		}
 		Object *orig = scopeHandle(asObject(origV));
 		size_t size = 0;
 		uint8_t *bytes = messageSerialize(getTaggedPtr(orig), &size);

@@ -664,14 +664,17 @@ static void generateFloatOperandLoad(AssemblerBuffer *buffer, Register reg, int 
 // operands: no FPR value survives the stub). GPR<->FPR moves use mtvsrd/mfvsrd
 // on ISA 2.07+, else the per-thread TLS scratch (970/POWER7 baseline). The
 // result lands in r3 on every committed path.
-// litArgBits, when non-NULL, are the IEEE bits of a SmallFloat64 LITERAL
-// argument (OPERAND_VALUE tagged 0b11), known at codegen time: the arg needs
-// no guard (it cannot miss) and no runtime decode, the constant is
-// materialized straight into f1 (li64 + the GPR->FPR move), both here and in
-// the re-decode after the boxing stub. The bits are plain data, not a heap
-// pointer: nothing to re-read, nothing for the GC to see.
+// litRcvBits / litArgBits, when non-NULL, are the IEEE bits of a SmallFloat64
+// LITERAL receiver / argument (OPERAND_VALUE tagged 0b11), known at codegen
+// time: that operand needs no guard (it cannot miss) and no runtime decode,
+// the constant is materialized straight into its FPR (li64 + the GPR->FPR
+// move), both here and in the re-decode after the boxing stub. The bits are
+// plain data, not a heap pointer: nothing to re-read, nothing for the GC to
+// see. With BOTH operands literal no guard is emitted at all (not even the
+// class load) and the fast path can never fall to dispatch; the unreferenced
+// miss labels bind as no-ops.
 static void generateFloatFastPath(CodeGenerator *generator, int arithKind,
-	AssemblerLabel *arithMerge, const uint64_t *litArgBits)
+	AssemblerLabel *arithMerge, const uint64_t *litRcvBits, const uint64_t *litArgBits)
 {
 	AssemblerBuffer *buffer = &generator->buffer;
 	AssemblerLabel tagMissR, tagMissA, immOkR, immOkA, classMissR, classMissA;
@@ -682,22 +685,28 @@ static void generateFloatFastPath(CodeGenerator *generator, int arithKind,
 	asmInitLabel(&classMissR);
 	asmInitLabel(&classMissA);
 
-	asmLd(buffer, R3, 0, R1);                    // receiver
+	if (litRcvBits == NULL) {
+		asmLd(buffer, R3, 0, R1);                // receiver
+	}
 	if (litArgBits == NULL) {
 		asmLd(buffer, R4, sizeof(intptr_t), R1); // arg
 	}
 	// Guard phase, the ONLY phase that can fall to dispatch: each operand must
 	// be a SmallFloat64 immediate (both tag bits set) or a pointer whose class
-	// word is BoxedFloat64. A literal arg is a known immediate: no guard.
-	generateLoadObject(buffer, (RawObject *) Handles.BoxedFloat64->raw, R6, 0);  // BoxedFloat64 class (raw)
-	asmAndiDot(buffer, R0, R3, 1);
-	asmBeq(buffer, &tagMissR);               // 0b00/0b10: not a Float
-	asmAndiDot(buffer, R0, R3, 2);
-	asmBne(buffer, &immOkR);                 // 0b11: immediate
-	asmLdT(buffer, R0, varOffset(RawObject, class), R3);
-	asmCmpd(buffer, 0, R0, R6);
-	asmBne(buffer, &classMissR);
-	asmPpcLabelBind(buffer, &immOkR, asmOffset(buffer));
+	// word is BoxedFloat64. A literal operand is a known immediate: no guard.
+	if (litRcvBits == NULL || litArgBits == NULL) {
+		generateLoadObject(buffer, (RawObject *) Handles.BoxedFloat64->raw, R6, 0); // BoxedFloat64 class (raw)
+	}
+	if (litRcvBits == NULL) {
+		asmAndiDot(buffer, R0, R3, 1);
+		asmBeq(buffer, &tagMissR);           // 0b00/0b10: not a Float
+		asmAndiDot(buffer, R0, R3, 2);
+		asmBne(buffer, &immOkR);             // 0b11: immediate
+		asmLdT(buffer, R0, varOffset(RawObject, class), R3);
+		asmCmpd(buffer, 0, R0, R6);
+		asmBne(buffer, &classMissR);
+		asmPpcLabelBind(buffer, &immOkR, asmOffset(buffer));
+	}
 	if (litArgBits == NULL) {
 		asmAndiDot(buffer, R0, R4, 1);
 		asmBeq(buffer, &tagMissA);
@@ -716,7 +725,12 @@ static void generateFloatFastPath(CodeGenerator *generator, int arithKind,
 	if (!gPpc64Cpu.hasGprVsrMoves) {
 		asmLoadTls(buffer, TMP2, gCurrentThreadTpoff);
 	}
-	generateFloatOperandLoad(buffer, R3, 0, R5, TMP2);
+	if (litRcvBits == NULL) {
+		generateFloatOperandLoad(buffer, R3, 0, R5, TMP2);
+	} else {
+		asmLi64(buffer, R0, *litRcvBits);
+		generateBitsToFpr(buffer, R0, 0, TMP2);
+	}
 	if (litArgBits == NULL) {
 		generateFloatOperandLoad(buffer, R4, 1, R5, TMP2);
 	} else {
@@ -795,16 +809,25 @@ static void generateFloatFastPath(CodeGenerator *generator, int arithKind,
 		generateLoadObject(buffer, (RawObject *) Handles.BoxedFloat64->raw, R4, 0);
 		asmLi(buffer, R5, 0);
 		generateStubCall(generator, &AllocateStub);   // r3 = new tagged Float
-		asmLd(buffer, R4, 0, R1);                     // reload receiver
+		if (litRcvBits == NULL) {
+			asmLd(buffer, R4, 0, R1);                 // reload receiver
+		}
 		if (litArgBits == NULL) {
 			asmLd(buffer, R6, sizeof(intptr_t), R1);  // reload arg
 		}
-		asmLi(buffer, R5, 6);                         // offset again (R5 was the stub arg)
-		asmSldi(buffer, R5, R5, 60);
+		if (litRcvBits == NULL || litArgBits == NULL) {
+			asmLi(buffer, R5, 6);                     // offset again (R5 was the stub arg)
+			asmSldi(buffer, R5, R5, 60);
+		}
 		if (!gPpc64Cpu.hasGprVsrMoves) {
 			asmLoadTls(buffer, TMP2, gCurrentThreadTpoff);
 		}
-		generateFloatOperandLoad(buffer, R4, 0, R5, TMP2);
+		if (litRcvBits == NULL) {
+			generateFloatOperandLoad(buffer, R4, 0, R5, TMP2);
+		} else {
+			asmLi64(buffer, R0, *litRcvBits);
+			generateBitsToFpr(buffer, R0, 0, TMP2);
+		}
 		if (litArgBits == NULL) {
 			generateFloatOperandLoad(buffer, R6, 1, R5, TMP2);
 		} else {
@@ -845,11 +868,15 @@ static void generateSend(CodeGenerator *generator, BytecodesIterator *iterator)
 		? classifyArith(compiledCodeLiteralAt(&generator->code, selectorIndex)) : ARITH_NONE;
 	int identKind = classifyIdentity(compiledCodeLiteralAt(&generator->code, selectorIndex), argsSize);
 
-	// A SmallFloat64 LITERAL argument (OPERAND_VALUE tagged 0b11) is known at
-	// codegen time: the float fast path materializes it as a constant and skips
-	// its guard and decode, and the SmallInteger fast path is dead (its arg tag
-	// test can never pass). The Value is an immediate, not a heap pointer, so
-	// holding its bits across the pushes is GC-safe (see the x64 original).
+	// A SmallFloat64 LITERAL receiver or argument (OPERAND_VALUE tagged 0b11)
+	// is known at codegen time: the float fast path materializes it as a
+	// constant and skips its guard and decode, and the SmallInteger fast path
+	// is dead (that operand's tag test can never pass). The Value is an
+	// immediate, not a heap pointer, so holding its bits across the pushes is
+	// GC-safe (see the x64 original).
+	_Bool floatLitRcv = receiver.type == OPERAND_VALUE
+		&& valueTypeOf(receiver.value, VALUE_FLOAT);
+	uint64_t litRcvBits = floatLitRcv ? doubleToBits(floatValueOf(receiver.value)) : 0;
 	_Bool floatLitArg = 0;
 	uint64_t litArgBits = 0;
 	for (uint8_t i = 0; i < argsSize; i++) {
@@ -867,8 +894,9 @@ static void generateSend(CodeGenerator *generator, BytecodesIterator *iterator)
 
 	// --- inline arithmetic/comparison fast paths (see x64) ------------------
 	_Bool identityInline = identKind != IDENT_NONE;
-	// int has no inline '/'; a float-literal arg fails its arg tag test always
-	_Bool intInline = arithKind != ARITH_NONE && arithKind != ARITH_DIV && !floatLitArg;
+	// int has no inline '/'; a float-literal operand fails its tag test always
+	_Bool intInline = arithKind != ARITH_NONE && arithKind != ARITH_DIV
+		&& !floatLitArg && !floatLitRcv;
 	_Bool floatInline = arithKind != ARITH_NONE && !arithIsBitOp(arithKind) && floatInlineEnabled();
 	_Bool anyInline = intInline || floatInline || identityInline;
 	AssemblerLabel arithMerge, floatMerge;
@@ -943,7 +971,7 @@ static void generateSend(CodeGenerator *generator, BytecodesIterator *iterator)
 
 	if (floatInline) {
 		generateFloatFastPath(generator, arithKind, &floatMerge,
-			floatLitArg ? &litArgBits : NULL);
+			floatLitRcv ? &litRcvBits : NULL, floatLitArg ? &litArgBits : NULL);
 	}
 
 	if (identityInline) {

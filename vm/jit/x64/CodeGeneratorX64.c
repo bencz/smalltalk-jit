@@ -654,14 +654,17 @@ static void generateFloatOperandLoad(AssemblerBuffer *buffer, Register reg,
 // XMM0/XMM1 are clobbered on the committed paths only; TMP is left untouched on
 // every fall-through-to-dispatch path so the class recompute works.
 //
-// litArgBits, when non-NULL, are the IEEE bits of a SmallFloat64 LITERAL
-// argument (OPERAND_VALUE tagged 0b11), known at codegen time: the arg needs
-// no guard (it cannot miss) and no runtime decode, the constant is
-// materialized straight into XMM1 (movabs + movq), both here and in the
-// re-decode after the boxing stub. The bits are plain data, not a heap
-// pointer: nothing to re-read, nothing for the GC to see.
+// litRcvBits / litArgBits, when non-NULL, are the IEEE bits of a SmallFloat64
+// LITERAL receiver / argument (OPERAND_VALUE tagged 0b11), known at codegen
+// time: that operand needs no guard (it cannot miss) and no runtime decode,
+// the constant is materialized straight into its XMM register (movabs +
+// movq), both here and in the re-decode after the boxing stub. The bits are
+// plain data, not a heap pointer: nothing to re-read, nothing for the GC to
+// see. With BOTH operands literal no guard is emitted at all (not even the
+// class load) and the fast path can never fall to dispatch; the unreferenced
+// miss labels bind as no-ops.
 static void generateFloatFastPath(CodeGenerator *generator, int arithKind,
-	AssemblerLabel *arithMerge, const uint64_t *litArgBits)
+	AssemblerLabel *arithMerge, const uint64_t *litRcvBits, const uint64_t *litArgBits)
 {
 	AssemblerBuffer *buffer = &generator->buffer;
 	AssemblerLabel tagMissR, tagMissA, immOkR, immOkA, classMissR, classMissA;
@@ -672,7 +675,9 @@ static void generateFloatFastPath(CodeGenerator *generator, int arithKind,
 	asmInitLabel(&classMissR);
 	asmInitLabel(&classMissA);
 
-	asmMovqMem(buffer, asmMem(RSP, NO_REGISTER, SS_1, 0), RAX);                     // receiver
+	if (litRcvBits == NULL) {
+		asmMovqMem(buffer, asmMem(RSP, NO_REGISTER, SS_1, 0), RAX);                 // receiver
+	}
 	if (litArgBits == NULL) {
 		asmMovqMem(buffer, asmMem(RSP, NO_REGISTER, SS_1, sizeof(intptr_t)), RSI);  // arg
 	}
@@ -680,15 +685,19 @@ static void generateFloatFastPath(CodeGenerator *generator, int arithKind,
 	// Guard phase, the ONLY phase that can fall to dispatch: each operand must
 	// be a SmallFloat64 immediate (both tag bits set) or a pointer whose class
 	// word is BoxedFloat64. A bare bit-0 test would accept an immediate and
-	// dereference it as a box. A literal arg is a known immediate: no guard.
-	generateLoadObject(buffer, (RawObject *) Handles.BoxedFloat64->raw, RDI, 0);    // BoxedFloat64 class (raw)
-	asmTestqImm(buffer, RAX, VALUE_POINTER);
-	asmJ(buffer, COND_ZERO, &tagMissR);           // 0b00/0b10: not a Float
-	asmTestqImm(buffer, RAX, VALUE_CHAR);
-	asmJ(buffer, COND_NOT_ZERO, &immOkR);         // 0b11: immediate
-	asmCmpqMem(buffer, asmMem(RAX, NO_REGISTER, SS_1, varOffset(RawObject, class)), RDI);
-	asmJ(buffer, COND_NOT_EQUAL, &classMissR);
-	asmLabelBind(buffer, &immOkR, asmOffset(buffer));
+	// dereference it as a box. A literal operand is a known immediate: no guard.
+	if (litRcvBits == NULL || litArgBits == NULL) {
+		generateLoadObject(buffer, (RawObject *) Handles.BoxedFloat64->raw, RDI, 0); // BoxedFloat64 class (raw)
+	}
+	if (litRcvBits == NULL) {
+		asmTestqImm(buffer, RAX, VALUE_POINTER);
+		asmJ(buffer, COND_ZERO, &tagMissR);       // 0b00/0b10: not a Float
+		asmTestqImm(buffer, RAX, VALUE_CHAR);
+		asmJ(buffer, COND_NOT_ZERO, &immOkR);     // 0b11: immediate
+		asmCmpqMem(buffer, asmMem(RAX, NO_REGISTER, SS_1, varOffset(RawObject, class)), RDI);
+		asmJ(buffer, COND_NOT_EQUAL, &classMissR);
+		asmLabelBind(buffer, &immOkR, asmOffset(buffer));
+	}
 	if (litArgBits == NULL) {
 		asmTestqImm(buffer, RSI, VALUE_POINTER);
 		asmJ(buffer, COND_ZERO, &tagMissA);
@@ -702,7 +711,12 @@ static void generateFloatFastPath(CodeGenerator *generator, int arithKind,
 	// Committed: decode both operands into XMM0/XMM1. RDI/RDX become scratch
 	// from here on; nothing below falls to dispatch.
 	asmMovqImm(buffer, (int64_t) SMALLFLOAT_OFFSET, RDX);
-	generateFloatOperandLoad(buffer, RAX, RAX, RDX, XMM0);
+	if (litRcvBits == NULL) {
+		generateFloatOperandLoad(buffer, RAX, RAX, RDX, XMM0);
+	} else {
+		asmMovqImm(buffer, (int64_t) *litRcvBits, RAX);
+		asmMovqToXmm(buffer, RAX, XMM0);
+	}
 	if (litArgBits == NULL) {
 		generateFloatOperandLoad(buffer, RSI, RSI, RDX, XMM1);
 	} else {
@@ -790,12 +804,21 @@ static void generateFloatFastPath(CodeGenerator *generator, int arithKind,
 		generateLoadObject(buffer, (RawObject *) Handles.BoxedFloat64->raw, RSI, 0); // class for AllocateStub
 		asmMovqImm(buffer, 0, RDX);                                                 // no indexed slots
 		generateStubCall(generator, &AllocateStub);                                // RAX = new tagged Float
-		asmMovqMem(buffer, asmMem(RSP, NO_REGISTER, SS_1, 0), RSI);                 // reload receiver (GC-updated)
+		if (litRcvBits == NULL) {
+			asmMovqMem(buffer, asmMem(RSP, NO_REGISTER, SS_1, 0), RSI);             // reload receiver (GC-updated)
+		}
 		if (litArgBits == NULL) {
 			asmMovqMem(buffer, asmMem(RSP, NO_REGISTER, SS_1, sizeof(intptr_t)), RDI); // reload arg
 		}
-		asmMovqImm(buffer, (int64_t) SMALLFLOAT_OFFSET, RDX);
-		generateFloatOperandLoad(buffer, RSI, RSI, RDX, XMM0);
+		if (litRcvBits == NULL || litArgBits == NULL) {
+			asmMovqImm(buffer, (int64_t) SMALLFLOAT_OFFSET, RDX);
+		}
+		if (litRcvBits == NULL) {
+			generateFloatOperandLoad(buffer, RSI, RSI, RDX, XMM0);
+		} else {
+			asmMovqImm(buffer, (int64_t) *litRcvBits, RSI);
+			asmMovqToXmm(buffer, RSI, XMM0);
+		}
 		if (litArgBits == NULL) {
 			generateFloatOperandLoad(buffer, RDI, RDI, RDX, XMM1);
 		} else {
@@ -846,11 +869,15 @@ static void generateSend(CodeGenerator *generator, BytecodesIterator *iterator)
 		? classifyArith(compiledCodeLiteralAt(&generator->code, selectorIndex)) : ARITH_NONE;
 	int identKind = classifyIdentity(compiledCodeLiteralAt(&generator->code, selectorIndex), argsSize);
 
-	// A SmallFloat64 LITERAL argument (OPERAND_VALUE tagged 0b11) is known at
-	// codegen time: the float fast path materializes it as a constant and skips
-	// its guard and decode, and the SmallInteger fast path is dead (its arg tag
-	// test can never pass). The Value is an immediate, not a heap pointer, so
-	// holding its bits across the pushes is GC-safe.
+	// A SmallFloat64 LITERAL receiver or argument (OPERAND_VALUE tagged 0b11)
+	// is known at codegen time: the float fast path materializes it as a
+	// constant and skips its guard and decode, and the SmallInteger fast path
+	// is dead (that operand's tag test can never pass). The Value is an
+	// immediate, not a heap pointer, so holding its bits across the pushes is
+	// GC-safe.
+	_Bool floatLitRcv = receiver.type == OPERAND_VALUE
+		&& valueTypeOf(receiver.value, VALUE_FLOAT);
+	uint64_t litRcvBits = floatLitRcv ? doubleToBits(floatValueOf(receiver.value)) : 0;
 	_Bool floatLitArg = 0;
 	uint64_t litArgBits = 0;
 	for (uint8_t i = 0; i < argsSize; i++) {
@@ -874,8 +901,9 @@ static void generateSend(CodeGenerator *generator, BytecodesIterator *iterator)
 	// only RAX/RSI/RDI(/RDX) as scratch and leave TMP (= receiver) untouched on
 	// the dispatch fall-through, so the class recompute below works.
 	_Bool identityInline = identKind != IDENT_NONE;
-	// int has no inline '/'; a float-literal arg fails its arg tag test always
-	_Bool intInline = arithKind != ARITH_NONE && arithKind != ARITH_DIV && !floatLitArg;
+	// int has no inline '/'; a float-literal operand fails its tag test always
+	_Bool intInline = arithKind != ARITH_NONE && arithKind != ARITH_DIV
+		&& !floatLitArg && !floatLitRcv;
 	_Bool floatInline = arithKind != ARITH_NONE && !arithIsBitOp(arithKind) && floatInlineEnabled();
 	_Bool anyInline = intInline || floatInline || identityInline;
 	// Separate merge labels: each AssemblerLabel supports only one reference, so
@@ -951,7 +979,7 @@ static void generateSend(CodeGenerator *generator, BytecodesIterator *iterator)
 
 	if (floatInline) {
 		generateFloatFastPath(generator, arithKind, &floatMerge,
-			floatLitArg ? &litArgBits : NULL);
+			floatLitRcv ? &litRcvBits : NULL, floatLitArg ? &litArgBits : NULL);
 	}
 
 	if (identityInline) {

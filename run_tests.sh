@@ -82,6 +82,17 @@ for st in ST_SMALLFLOAT_TEST ST_ABI_EMIT_TEST; do
 	fi
 done
 
+# The message-serializer self-test evals Smalltalk source, so unlike the loop
+# above it needs the freshly bootstrapped image (-s).
+if ST_MESSAGE_TEST=1 "$BUILD/st" -s "$SNAP" </dev/null >/dev/null 2>&1; then
+	printf "  ${G}pass${Z}  %s\n" "ST_MESSAGE_TEST"
+	pass=$((pass + 1))
+else
+	printf "  ${R}FAIL${Z}  %s\n" "ST_MESSAGE_TEST"
+	fail=$((fail + 1))
+	failed="$failed ST_MESSAGE_TEST"
+fi
+
 run_group() {
 	local title="$1"; shift
 	echo ""
