@@ -1,4 +1,4 @@
-// Golden-byte emission tests for the ppc64 (big-endian, ELFv1) backend —
+// Golden-byte emission tests for the ppc64 (big-endian, ELFv1) backend ,
 // bring-up rung 1 of PORTING.md, and deliberately HOST-INDEPENDENT: the
 // encoders emit explicitly big-endian words into a buffer, so this TU
 // compiles and runs on the x86 dev host (linked into its `st` next to the
@@ -7,15 +7,17 @@
 //
 // The expected vectors (EmitGoldenPpc64Expected.h) are validated against a
 // CROSS objdump oracle: the same sequences assembled with
-// powerpc64-linux-gnu-as, disassembled, and byte-compared — see
+// powerpc64-linux-gnu-as, disassembled, and byte-compared, see
 // scripts/ppc64/golden-oracle.sh. ST_PPC64_EMIT_TEST=print regenerates the
 // paste-ready arrays (all immediates are deterministic fakes; no masking
 // needed, unlike x64).
 //
-// ⚠ Do not include jit/CodeGenerator.h or call generic backend names
+// WARNING: Do not include jit/CodeGenerator.h or call generic backend names
 // (asmLoadTls, fiberSwitchAsm) here: in a foreign-host binary those resolve
 // to the HOST backend. Everything goes through the AbiPpc64ElfV1 instance
 // and the ppc64 encoders directly.
+// The byte order under test is the TARGET's, not the compiling host's.
+#define ST_PPC64_EMIT_BE 1
 #include "vm/tests/SelfTests.h"
 #include "vm/jit/ppc64/Abi.h"
 #include "vm/jit/ppc64/Cpu.h"
@@ -199,7 +201,7 @@ static void emitSmallFloatOpsCase(AssemblerBuffer *buffer)
 }
 
 // ---- expected vectors -------------------------------------------------------
-// Validated against powerpc64-linux-gnu-as + objdump (the cross oracle) —
+// Validated against powerpc64-linux-gnu-as + objdump (the cross oracle) ,
 // scripts/ppc64/golden-oracle.sh. Regenerate with ST_PPC64_EMIT_TEST=print.
 
 #include "vm/tests/EmitGoldenPpc64Expected.h"
@@ -272,7 +274,7 @@ static size_t runCase(const GoldenCase *c, uint8_t **outBytes)
 }
 
 // asmLi64Patch must turn an emitted li64(A) into byte-exact li64(B) by
-// rewriting only the four immediate halves — the mechanism a GC
+// rewriting only the four immediate halves, the mechanism a GC
 // pointer-patch loop will rely on. Self-checking (no pinned vector).
 static int checkLi64Patch(void)
 {
@@ -298,7 +300,7 @@ static int checkLi64Patch(void)
 	return errors;
 }
 
-// The prime half of the fiber pair is plain C — verify the exact frame
+// The prime half of the fiber pair is plain C, verify the exact frame
 // layout the fiberSwitchElfV1 restore path consumes, natively. Under ELFv1
 // the entry function pointer is a DESCRIPTOR pointer: prime must plant the
 // descriptor's entry in the LR slot and its TOC in the r2 slot.
@@ -342,7 +344,7 @@ static int checkFiberPrimeLayout(void)
 
 // Cross-member consistency of the ABI instance (mirrors the x64 golden):
 // every register the JIT may hold live values in (allocation pool + the
-// r3-r8 result/dispatch-scratch extras — see the role table in
+// r3-r8 result/dispatch-scratch extras, see the role table in
 // AssemblerPpc64.h) that the C ABI clobbers must be in the spill list,
 // nothing else may be, and argument registers must be volatile. This is what
 // keeps the instance honest whenever the pool is revisited.

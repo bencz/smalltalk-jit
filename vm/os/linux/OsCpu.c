@@ -39,7 +39,7 @@ int osAvailableCoreCount(void)
 // real header. The copy exists so the decode compiles on a foreign host; the
 // assert exists so it can never drift. It belongs here, on the OS axis, because
 // <bits/hwcap.h> is Linux's header, not the architecture's.
-#if defined(__powerpc64__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+#ifdef __powerpc64__
 #include "jit/ppc64/Cpu.h"
 #define ST_PPC_CPU_BITS(p) \
 	_Static_assert(p##_FEATURE_HAS_ALTIVEC == PPC_FEATURE_HAS_ALTIVEC, "hwcap copy drifted"); \
@@ -57,17 +57,6 @@ _Static_assert(PPC64_FEATURE_ARCH_2_05 == PPC_FEATURE_ARCH_2_05, "hwcap copy dri
 _Static_assert(PPC64_FEATURE_HAS_DFP == PPC_FEATURE_HAS_DFP, "hwcap copy drifted");
 _Static_assert(PPC64_FEATURE2_DARN == PPC_FEATURE2_DARN, "hwcap2 copy drifted");
 _Static_assert(PPC64_FEATURE2_MMA == PPC_FEATURE2_MMA, "hwcap2 copy drifted");
-#elif defined(__powerpc64__)
-#include "jit/ppc64le/Cpu.h"
-_Static_assert(PPC64LE_FEATURE_64 == PPC_FEATURE_64, "hwcap copy drifted");
-_Static_assert(PPC64LE_FEATURE_HAS_ALTIVEC == PPC_FEATURE_HAS_ALTIVEC, "hwcap copy drifted");
-_Static_assert(PPC64LE_FEATURE_ARCH_2_06 == PPC_FEATURE_ARCH_2_06, "hwcap copy drifted");
-_Static_assert(PPC64LE_FEATURE_HAS_VSX == PPC_FEATURE_HAS_VSX, "hwcap copy drifted");
-_Static_assert(PPC64LE_FEATURE2_ARCH_2_07 == PPC_FEATURE2_ARCH_2_07, "hwcap2 copy drifted");
-_Static_assert(PPC64LE_FEATURE2_ARCH_3_00 == PPC_FEATURE2_ARCH_3_00, "hwcap2 copy drifted");
-_Static_assert(PPC64LE_FEATURE2_DARN == PPC_FEATURE2_DARN, "hwcap2 copy drifted");
-_Static_assert(PPC64LE_FEATURE2_ARCH_3_1 == PPC_FEATURE2_ARCH_3_1, "hwcap2 copy drifted");
-_Static_assert(PPC64LE_FEATURE2_MMA == PPC_FEATURE2_MMA, "hwcap2 copy drifted");
 #endif
 
 

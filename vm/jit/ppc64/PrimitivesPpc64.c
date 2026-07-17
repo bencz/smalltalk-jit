@@ -1,21 +1,22 @@
-// ppc64 (big-endian, ELFv1) backend — the generated primitives. A mechanical
+// ppc64 backend (BOTH byte orders), the generated primitives. A mechanical
 // translation of vm/jit/x64/PrimitivesX64.c under the mapping in
 // vm/jit/ppc64/DESIGN.md. Structural differences from x64, all pinned there:
 //  - frameless primitives: arg i lives at i*8(r1) (POWER keeps the return
 //    address in LR, not on the stack); FRAMED primitives push LR first, which
 //    makes every FP-relative x64 offset identical;
-//  - generateCCallPrimitive is FUSED (ELFv1 returns the 16-byte
-//    PrimitiveResult through a hidden sret pointer in r3, and the result must
-//    be read back BEFORE the ABI frame is torn down);
+//  - generateCCallPrimitive is a shell around the ABI's emitCCallPrimitive
+//    hook (fused sret frame under ELFv1, generateCCall-owned frame under
+//    ELFv2 - see Abi.h);
 //  - overflow checks are addo./nego./mulldo. + bso with the sticky-XER[SO]
 //    protocol (misses re-arm);
 //  - IntMod keeps x64's sign-fixup quirk bug-compatibly.
-#if !defined(__powerpc64__) || __BYTE_ORDER__ != __ORDER_BIG_ENDIAN__
-#error "vm/jit/ppc64/ is BIG-ENDIAN ppc64 only (ppc64le has its own backend) - check ST_ARCH in CMakeLists.txt"
+#ifndef __powerpc64__
+#error "vm/jit/ppc64/ is powerpc64-only code (both byte orders) - check ST_ARCH in CMakeLists.txt"
 #endif
 
 #include "jit/ppc64/AssemblerPpc64.h"
 #include "jit/ppc64/Abi.h"
+#include "jit/ppc64/PrimFrame.h"
 #include "jit/TargetPrimitives.h"
 #include "core/Exception.h"
 #include "core/StackFrame.h"
@@ -31,32 +32,11 @@ static void movArg(AssemblerBuffer *buffer, ptrdiff_t index, Register dst)
 	asmLd(buffer, dst, index * sizeof(intptr_t), R1);
 }
 
-// Framed-primitive prologue/epilogue (LR discipline rule 1): push LR first —
-// [FP+8] then holds the send-site return address, byte-compatible with the
-// x64 call-pushed one — then FP.
-static void primFramedPrologue(AssemblerBuffer *buffer)
-{
-	asmMflr(buffer, R0);
-	asmPush(buffer, R0);
-	asmPush(buffer, FP);
-	asmMr(buffer, FP, R1);
-}
-
-// Tear the frame down to FP, restore FP and LR. Emits NO blr: return paths
-// add it; fail paths fall through into the method body (whose prologue
-// re-pushes the restored LR).
-static void primFramedEpilogue(AssemblerBuffer *buffer)
-{
-	asmMr(buffer, R1, FP);
-	asmPop(buffer, FP);
-	asmPop(buffer, R0);
-	asmMtlr(buffer, R0);
-}
-
-
-// CCALL-primitive trampoline, FUSED for ELFv1 (see DESIGN.md): builds the
-// temp frame + ABI frame itself instead of reusing generateCCall, because
-// the hidden sret buffer (96(r1)) must be read back before teardown.
+// CCALL-primitive trampoline shell. The whole convention-dependent body,
+// marshal + call + PrimitiveResult decode + fail branch, is the ABI's
+// emitCCallPrimitive hook (fused sret frame under ELFv1, generateCCall-owned
+// frame under ELFv2, see Abi.h); only the return and the
+// fallthrough-to-fallback tail are convention-free.
 void generateCCallPrimitive(CodeGenerator *generator, PrimitiveResult (*cFunction)(), size_t argsSize)
 {
 	AssemblerBuffer *buffer = &generator->buffer;
@@ -64,36 +44,7 @@ void generateCCallPrimitive(CodeGenerator *generator, PrimitiveResult (*cFunctio
 	asmInitLabel(&failed);
 	ASSERT(argsSize <= 5);
 
-	primFramedPrologue(buffer);
-	asmPush(buffer, CTX);
-	asmMr(buffer, R15_PPC, TGT);       // the x64 R11->R13 native-code dance
-	asmRldicr(buffer, R1, R1, 0, 59);  // 16-byte alignment
-	asmStdu(buffer, R1, -112, R1);     // ELFv1 header + param save area
-
-	// exit frame for the C call (RUNNING worker via TLS)
-	asmLoadTls(buffer, TMP, gCurrentThreadTpoff);
-	asmLd(buffer, TMP, offsetof(Thread, stackFramesTail), TMP);
-	asmStd(buffer, FP, offsetof(EntryStackFrame, exit), TMP);
-
-	// marshal: r3 = hidden sret pointer, Smalltalk arg i (at (i+2)*8(FP)
-	// after the two pushes) -> C arg i+1 (r4..)
-	asmAddi(buffer, R3, R1, 96);
-	for (size_t i = 0; i < argsSize; i++) {
-		asmLd(buffer, (Register) (R4 + i), (ptrdiff_t) (i + 2) * sizeof(intptr_t), FP);
-	}
-
-	gPpc64Abi->emitCallCFunction(buffer, (intptr_t) cFunction);
-
-	// decode the PrimitiveResult from the sret buffer BEFORE teardown (below
-	// r1 is signal-clobberable memory)
-	asmLd(buffer, R3, 96, R1);                       // value
-	asmLd(buffer, R4, 96 + sizeof(Value), R1);       // failed
-
-	asmLd(buffer, CTX, -(ptrdiff_t) sizeof(intptr_t), FP);
-	primFramedEpilogue(buffer);
-
-	asmCmpdi(buffer, 0, R4, 0);
-	asmBne(buffer, &failed);
+	gPpc64Abi->emitCCallPrimitive(buffer, generator, (intptr_t) cFunction, argsSize, &failed);
 	asmBlr(buffer);
 	asmPpcLabelBind(buffer, &failed, asmOffset(buffer));
 	asmMr(buffer, TGT, R15_PPC);
@@ -107,7 +58,7 @@ static void loadClass(CodeGenerator *generator, Register src, Register dst)
 }
 
 
-// x64 `test reg, 3` — sets CR0 like every andi.; the result lands in the r0
+// x64 `test reg, 3`, sets CR0 like every andi.; the result lands in the r0
 // throwaway.
 static void testInt(CodeGenerator *generator, Register reg)
 {
@@ -125,7 +76,7 @@ static void primitveNotImplemented(void)
 void generateNotImplementedPrimitive(CodeGenerator *generator)
 {
 	// A bare movabs+call on x64; on POWER every C call takes the descriptor
-	// discipline — generateCCall (which also preserves LR).
+	// discipline, generateCCall (which also preserves LR).
 	generateCCall(generator, (intptr_t) primitveNotImplemented, 0, 0);
 }
 
@@ -744,7 +695,7 @@ void generateIntMulPrimitive(CodeGenerator *generator)
 	testInt(generator, R3);
 	asmBne(buffer, &notInt);
 
-	// untag one side (arithmetic shift — x64 used a logical one; same
+	// untag one side (arithmetic shift, x64 used a logical one; same
 	// product mod 2^64, cleaner overflow semantics), multiply by the tagged
 	// other side: (b>>2) * (a<<2) = (a*b)<<2, still tagged
 	asmSradi(buffer, R3, R3, 2);
@@ -770,7 +721,7 @@ void generateIntQuoPrimitive(CodeGenerator *generator)
 	movArg(buffer, 1, R4);
 	testInt(generator, R4);
 	asmBne(buffer, &notInt);
-	asmCmpdi(buffer, 0, R4, 0);        // POWER divd does not trap on /0 —
+	asmCmpdi(buffer, 0, R4, 0);        // POWER divd does not trap on /0 ,
 	asmBeq(buffer, &divZero);          // fail so the Smalltalk fallback raises
 
 	movArg(buffer, 0, R3);
@@ -1056,7 +1007,7 @@ void generateBlockValueArgsPrimitive(CodeGenerator *generator)
 
 	generateBlockContextAllocation(generator);
 
-	// call the block (through TGT — the VM convention — unlike x64's bare
+	// call the block (through TGT, the VM convention, unlike x64's bare
 	// RAX call, so the callee's slot-0 native-code spill stays correct)
 	asmLdT(buffer, TGT, varOffset(RawBlock, nativeCode), R15_PPC);
 	asmAddi(buffer, TGT, TGT, offsetof(NativeCode, insts));

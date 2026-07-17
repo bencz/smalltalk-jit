@@ -14,8 +14,8 @@
 // needs no OS at all.
 //
 // Contract: jit/TargetCpu.h. Called ONCE, first thing in main().
-#if !defined(__powerpc64__) || __BYTE_ORDER__ != __ORDER_BIG_ENDIAN__
-#error "vm/jit/ppc64/ is BIG-ENDIAN ppc64 only (ppc64le has its own backend) - check ST_ARCH in CMakeLists.txt"
+#ifndef __powerpc64__
+#error "vm/jit/ppc64/ is powerpc64-only code (both byte orders) - check ST_ARCH in CMakeLists.txt"
 #endif
 
 #include "jit/ppc64/Cpu.h"
@@ -23,6 +23,7 @@
 #include "os/Os.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 static void printCpu(const Ppc64Cpu *cpu, const char *how)
 {
@@ -42,9 +43,16 @@ void targetCpuDetect(void)
 	const char *forced = getenv("ST_CPU");
 
 	if (forced != NULL) {
-		if (!ppc64CpuByName(&gPpc64Cpu, forced)) {
+		// Validate against THIS target's accepted subset (cpu/CpuBind*.c):
+		// the decoder knows every profile, but forcing a pre-POWER8 model on
+		// ppc64le would emit for a machine that cannot exist.
+		_Bool accepted = 0;
+		for (const char *const *n = Ppc64CpuAccepted; *n != NULL; n++) {
+			accepted |= strcmp(forced, *n) == 0;
+		}
+		if (!accepted || !ppc64CpuByName(&gPpc64Cpu, forced)) {
 			printf("ST_CPU: unknown ppc64 CPU '%s'. Known:", forced);
-			for (const char *const *n = Ppc64CpuNames; *n != NULL; n++) {
+			for (const char *const *n = Ppc64CpuAccepted; *n != NULL; n++) {
 				printf(" %s", *n);
 			}
 			printf("\n");

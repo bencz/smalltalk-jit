@@ -8,7 +8,7 @@
 #error "host stub must not be linked into a ppc64le build - FiberElfV2.c provides the real switch"
 #endif
 
-#include "vm/jit/ppc64le/abi/elfv2/FiberElfV2.h"
+#include "vm/jit/ppc64/abi/elfv2/FiberElfV2.h"
 #include "vm/core/Assert.h"
 
 void fiberSwitchElfV2(void **saveSp, void *newSp)

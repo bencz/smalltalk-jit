@@ -30,7 +30,7 @@ void *fiberPrimeStackElfV2(void *top, void (*entry)(void));
 //            saved, and unlike the BE port that gap is not theoretical here:
 //            the ppc64le baseline is POWER8, so the compiler CAN allocate a
 //            nonvolatile vector register across a switch. See PORTING.md and
-//            vm/jit/ppc64le/DESIGN.md item 6)
+//            vm/jit/ppc64/DESIGN-elfv2.md item 6)
 //   320     total (16-byte aligned, ELFv2 requirement)
 #define ELFV2_NV_FRAME_SIZE 320
 #define ELFV2_NV_FRAME_TOC 24

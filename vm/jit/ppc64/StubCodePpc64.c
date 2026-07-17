@@ -1,10 +1,10 @@
-// ppc64 (big-endian, ELFv1) backend — the four JIT stubs. A mechanical
+// ppc64 backend (BOTH byte orders), the four JIT stubs. A mechanical
 // translation of vm/jit/x64/StubCodeX64.c under the register/frame mapping
 // pinned in vm/jit/ppc64/DESIGN.md (read that first: FP=r31, CTX=r30,
 // TGT=r12, TMP=r11, TMP2=r10, r3=result/argA, LR discipline, tagged-base
 // asmLdT/asmStdT, big-endian header stores).
-#if !defined(__powerpc64__) || __BYTE_ORDER__ != __ORDER_BIG_ENDIAN__
-#error "vm/jit/ppc64/ is BIG-ENDIAN ppc64 only (ppc64le has its own backend) - check ST_ARCH in CMakeLists.txt"
+#ifndef __powerpc64__
+#error "vm/jit/ppc64/ is powerpc64-only code (both byte orders) - check ST_ARCH in CMakeLists.txt"
 #endif
 
 #include "jit/StubCode.h"
@@ -22,9 +22,9 @@
 static CompiledMethod *createDoesNotUnderstandCode(void);
 
 
-// Direct JIT-to-JIT call into a stub (raw insts address — descriptors are a
+// Direct JIT-to-JIT call into a stub (raw insts address, descriptors are a
 // C-ABI affair only). LR: callers are method bodies (LR dead) or framed
-// primitives (LR pushed at entry) — see the LR discipline in DESIGN.md.
+// primitives (LR pushed at entry), see the LR discipline in DESIGN.md.
 void generateStubCall(CodeGenerator *generator, StubCode *stubCode)
 {
 	AssemblerBuffer *buffer = &generator->buffer;
@@ -45,7 +45,7 @@ void generateStubCall(CodeGenerator *generator, StubCode *stubCode)
 static void generateSmalltalkEntry(CodeGenerator *generator)
 {
 	AssemblerBuffer *buffer = &generator->buffer;
-	const Ppc64Abi *abi = &AbiPpc64ElfV1;
+	const Ppc64Abi *abi = gPpc64Abi;
 	AssemblerLabel loop;
 	ptrdiff_t argsOffset = offsetof(RawCompiledMethod, header) + offsetof(CompiledCodeHeader, argsSize);
 
@@ -78,7 +78,7 @@ static void generateSmalltalkEntry(CodeGenerator *generator)
 	asmStd(buffer, R1, offsetof(Thread, stackFramesTail), regThread);
 
 	// load method arguments size (r14: VM-internal loop counter, inside the
-	// entry hook's saved area — the C caller's r14 is preserved by the hook)
+	// entry hook's saved area, the C caller's r14 is preserved by the hook)
 	asmLbz(buffer, R14_PPC, argsOffset, regMethod);
 	asmAddi(buffer, R14_PPC, R14_PPC, 1); // there is always the 'self' argument
 	asmPush(buffer, R14_PPC);
@@ -101,7 +101,7 @@ static void generateSmalltalkEntry(CodeGenerator *generator)
 
 	// load the CURRENT worker's thread from TLS (the fiber may have migrated
 	// OS threads during the Smalltalk call); regThread doubles as the
-	// post-call scratch — volatile in the C ABI
+	// post-call scratch, volatile in the C ABI
 	asmLoadTls(buffer, regThread, gCurrentThreadTpoff);
 	// load entry frame
 	asmLd(buffer, TMP, offsetof(Thread, stackFramesTail), regThread);
@@ -188,7 +188,7 @@ static void generateAllocate(CodeGenerator *generator)
 	asmAddi(buffer, R6, R6, HEAP_OBJECT_ALIGN - 1);
 	asmRldicr(buffer, R6, R6, 0, 59);     // r6: aligned size (& ~15)
 
-	// check free space — bump the RUNNING worker's TLAB, read from TLS so
+	// check free space, bump the RUNNING worker's TLAB, read from TLS so
 	// shared JIT code allocates into whichever worker executes this fiber
 	asmLoadTls(buffer, R9_PPC, gCurrentThreadTpoff); // r9: &CurrentThread
 	asmLd(buffer, TMP, tlabOffset + offsetof(TLAB, end), R9_PPC);
@@ -205,7 +205,7 @@ static void generateAllocate(CodeGenerator *generator)
 	// class
 	asmStd(buffer, R4, offsetof(RawObject, class), R3);
 	// header: hash = (addr >> 2) truncated to 32 bits. BIG-ENDIAN RULE
-	// (DESIGN.md): two 32-bit stores — the hash word at +8 and a zeroed
+	// (DESIGN.md): two 32-bit stores, the hash word at +8 and a zeroed
 	// unused/payloadSize/varsSize/tags word at +12. (x64 wrote one 64-bit
 	// word, which only lands the hash in bytes 8-11 on little-endian.)
 	asmSrdi(buffer, TMP, R3, 2);
@@ -281,7 +281,7 @@ static void generateAllocate(CodeGenerator *generator)
 	asmBlr(buffer);
 
 	asmPpcLabelBind(buffer, &noFreeSpace, asmOffset(buffer));
-	// slow path: allocateObject(heap, class, size) — r4/r5 already sit in
+	// slow path: allocateObject(heap, class, size), r4/r5 already sit in
 	// their C argument slots (the same pre-placement trick as SysV x64);
 	// r9 still holds the thread base here (the branch precedes its reuse).
 	asmLd(buffer, R3, offsetof(Thread, heap), R9_PPC);
@@ -332,7 +332,7 @@ static void generateDoesNotUnderstandStub(CodeGenerator *generator)
 	asmPush(buffer, R3);
 
 	// allocate arguments array (r5 = the send's argsSize, still live from
-	// the trampoline — the same flow as x64's RDX into the stub)
+	// the trampoline, the same flow as x64's RDX into the stub)
 	generateLoadObject(buffer, (RawObject *) Handles.Array->raw, R4, 0);
 	generateStubCall(generator, &AllocateStub);
 

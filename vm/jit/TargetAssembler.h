@@ -13,10 +13,8 @@
 // CMakeLists.txt.
 #if defined(__x86_64__)
 #include "jit/x64/AssemblerX64.h"
-#elif defined(__powerpc64__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-#include "jit/ppc64/AssemblerPpc64.h"
 #elif defined(__powerpc64__)
-#include "jit/ppc64le/AssemblerPpc64le.h"
+#include "jit/ppc64/AssemblerPpc64.h"
 #else
 #error "No JIT backend for this CPU. Create vm/jit/<arch>/ and extend this dispatch - see PORTING.md."
 #endif

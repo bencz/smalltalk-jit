@@ -11,9 +11,12 @@ The one-line framing that resolves almost every question:
 > ISA/frame question: copy `vm/jit/ppc64/`. Endianness question (object header,
 > hash): **`vm/jit/x64/` is the reference, NOT the BE backend.**
 
-The two backends are SEPARATE by design (the ecosystem treats them as distinct
-architectures and the codegen diverges beyond the ABI); no code is shared, so a
-POWER fix must be applied to both directories.
+Since the unification there is ONE backend (`vm/jit/ppc64/`) serving both
+byte orders: the word layout is the WordBe.h/WordLe.h selector in
+AssemblerPpc64.h, the conventions below live in `abi/elfv2/` behind the
+Ppc64Abi vtable, and the POWER8 floor is `cpu/CpuBindLe.c`. A POWER fix is
+written once. This file remains the record of the ELFv2 facts and how they
+were derived.
 
 ## ELFv2 facts, DERIVED FROM THE TOOLCHAIN rather than from documentation
 

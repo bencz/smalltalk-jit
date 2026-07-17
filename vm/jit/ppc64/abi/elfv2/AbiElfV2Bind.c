@@ -1,19 +1,19 @@
 // Binds the GENERIC ABI names to the ELFv2 instance. This is the only file
-// that may define gPpc64leAbi, asmLoadTls and the jit/TargetFiber.h symbols:
-// CMake's ST_ABI links exactly one Abi<Abi>Bind.c into a REAL ppc64le build.
+// that may define gPpc64Abi, asmLoadTls and the jit/TargetFiber.h symbols:
+// CMake's ST_ABI links exactly one Abi<Abi>Bind.c into a REAL ppc64le (ELFv2) build.
 // Foreign-host golden builds link the instance (AbiElfV2.c) WITHOUT this TU:
 // there the generic names belong to the host backend's own binding.
 #if !defined(__powerpc64__) || __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
-#error "vm/jit/ppc64le/ is LITTLE-ENDIAN ppc64le only (big-endian ppc64 has its own backend) - check ST_ARCH in CMakeLists.txt"
+#error "AbiElfV2Bind.c is for LITTLE-ENDIAN ppc64 builds - check ST_ABI in CMakeLists.txt"
 #endif
 
-#include "jit/ppc64le/Abi.h"
-#include "jit/ppc64le/abi/elfv2/FiberElfV2.h"
+#include "jit/ppc64/Abi.h"
+#include "jit/ppc64/abi/elfv2/FiberElfV2.h"
 #include "jit/TargetFiber.h"
 #include "jit/TargetEntry.h"
 #include "core/CompiledCode.h"
 
-const Ppc64leAbi *const gPpc64leAbi = &AbiPpc64leElfV2;
+const Ppc64Abi *const gPpc64Abi = &AbiPpc64ElfV2;
 
 // C -> JIT entry (jit/TargetEntry.h). ELFv2 has NO function descriptors, so
 // the stub's raw code address IS a callable C function pointer: this is the
@@ -37,7 +37,7 @@ Value targetCallSmalltalkEntry(void *entryStubInsts, void *arg0, void *arg1,
 // code, since the vtable is dereferenced while EMITTING, not while running).
 void asmLoadTls(AssemblerBuffer *buffer, Register dst, ptrdiff_t tpoff)
 {
-	gPpc64leAbi->emitLoadTls(buffer, dst, tpoff);
+	gPpc64Abi->emitLoadTls(buffer, dst, tpoff);
 }
 
 // The jit/TargetFiber.h contract names, statically bound to the ELFv2 pair:

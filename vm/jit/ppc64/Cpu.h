@@ -1,9 +1,12 @@
 #ifndef PPC64_CPU_H
 #define PPC64_CPU_H
 
-// The ppc64 (big-endian) CPU-MODEL binding: which POWER generation this
-// process is running on. See jit/TargetCpu.h for the axis and its contract;
-// ppc64le has its own copy, like every other part of these two backends.
+// The ppc64 CPU-MODEL binding, BOTH byte orders: which POWER generation this
+// process is running on. See jit/TargetCpu.h for the axis and its contract.
+// The decode is one pure function shared by the two targets; what differs is
+// the FLOOR, and that lives in the per-target cpu/ bind TUs (the BE baseline
+// claims nothing, the LE baseline is POWER8 because ppc64le has no earlier
+// member).
 //
 // SPLIT, mirroring the ABI instance/Bind split:
 //   this header + CpuPpc64.c  the feature struct and the pure DECODE of the
@@ -79,7 +82,9 @@ typedef struct {
 	uint64_t hwcap2;
 } Ppc64Cpu;
 
-// Read-only after targetCpuDetect(); defined in CpuPpc64.c at the BASELINE.
+// Read-only after targetCpuDetect(); defined at the TARGET's baseline in the
+// selected cpu/CpuBind*.c (real ppc64 builds only; host golden code works on
+// locals through the pure decode instead).
 extern Ppc64Cpu gPpc64Cpu;
 
 // Pure decode of the kernel's two hwcap words into `cpu`. No syscalls, no
@@ -91,8 +96,13 @@ void ppc64CpuDecode(Ppc64Cpu *cpu, uint64_t hwcap, uint64_t hwcap2);
 // Also the mechanism the golden uses to pin a deterministic feature set.
 _Bool ppc64CpuByName(Ppc64Cpu *cpu, const char *name);
 
-// The names ppc64CpuByName accepts, NULL-terminated (for ST_CPU=? and tests).
+// Every profile the DECODER knows, NULL-terminated (goldens/tests; the full
+// table stays host-linkable).
 extern const char *const Ppc64CpuNames[];
+
+// The subset of Ppc64CpuNames this TARGET accepts for ST_CPU, from the
+// selected cpu/CpuBind*.c: everything on BE, power8 and up on LE.
+extern const char *const *const Ppc64CpuAccepted;
 
 // The safe default when detection is unavailable or under-reports: claim
 // NOTHING, which is the PowerPC 64-bit base ISA the JIT is measured to emit

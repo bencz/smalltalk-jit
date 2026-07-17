@@ -8,13 +8,23 @@
 // on foreign hosts. Keep it that way: no `register asm("r2")`, no target
 // intrinsics.
 //
-// The generic bindings (gPpc64leAbi, asmLoadTls, TargetFiber.h names) live in
+// The generic bindings (gPpc64Abi, asmLoadTls, TargetFiber.h names) live in
 // AbiElfV2Bind.c, which only a real ppc64le build links.
 //
 // Every ELFv2 fact encoded here was derived from gcc's own output rather than
-// from the spec, with the BE cross as a control: vm/jit/ppc64le/DESIGN.md.
-#include "jit/ppc64le/Abi.h"
-#include "jit/ppc64le/abi/elfv2/FiberElfV2.h"
+// from the spec, with the BE cross as a control: vm/jit/ppc64/DESIGN-elfv2.md.
+// This instance emits LITTLE-ENDIAN instruction words wherever it is
+// compiled (the byte order belongs to the TARGET, not the build host).
+#define ST_PPC64_EMIT_LE 1
+#include "jit/ppc64/Abi.h"
+#include "jit/ppc64/abi/elfv2/FiberElfV2.h"
+
+// Target-only service this hook drives through the OPAQUE generator (see the
+// emitCCallPrimitive contract in Abi.h): declared locally because instance
+// TUs must not include jit/CodeGenerator.h. On a foreign golden host the
+// symbol resolves to the host backend and is never called.
+void generateCCall(struct CodeGenerator *generator, intptr_t cFunction,
+	size_t argsSize, _Bool storeIp);
 #include "core/Assert.h"
 #include <string.h>
 
@@ -93,35 +103,36 @@ static void elfv2EmitCallCFunction(AssemblerBuffer *buffer, intptr_t cFunction)
 	asmLd(buffer, R2, ELFV2_NV_FRAME_TOC, R1);
 }
 
-// CCALL-primitive argument marshalling. Runs BEFORE generateCCall builds its
-// frame, so r1 is still the primitive's frameless entry SP.
+// The CCALL-primitive trampoline body, the SysV-like shape: ELFv2 returns
+// the 16-byte PrimitiveResult in r3:r4 = value:failed with no hidden sret
+// pointer and no argument shift, so generateCCall can own the frame as
+// usual and nothing must be read back before teardown (the reason ELFv1's
+// body is fused instead).
 //
-// The x64 hook reads slot i at [RSP + (i+1)*8] because `call` pushed a return
-// address; POWER keeps the return address in LR, so arg i really sits at
-// i*8(r1). This is the same +1 bias that fillVar has to undo (BE bring-up
-// bug #2), showing up in a second place.
-static void elfv2EmitCCallPrimArgs(AssemblerBuffer *buffer, size_t argsSize)
+// The marshal runs BEFORE generateCCall builds its frame, so r1 is still the
+// primitive's frameless entry SP. The x64 hook reads slot i at
+// [RSP + (i+1)*8] because `call` pushed a return address; POWER keeps the
+// return address in LR, so arg i really sits at i*8(r1). This is the same +1
+// bias that fillVar has to undo (BE bring-up bug #2), showing up in a second
+// place. After the call r3 = value is already where the VM wants it (our
+// result register), so just test the flag and branch.
+static void elfv2EmitCCallPrimitive(AssemblerBuffer *buffer,
+	struct CodeGenerator *generator, intptr_t cFunction, size_t argsSize,
+	AssemblerLabel *failLabel)
 {
 	ASSERT(argsSize <= sizeof(ElfV2ArgRegs));
 	for (size_t i = 0; i < argsSize; i++) {
 		asmLd(buffer, (Register) ElfV2ArgRegs[i], (ptrdiff_t) (i * sizeof(intptr_t)), R1);
 	}
-}
-
-// ELFv2 returns the 16-byte PrimitiveResult in r3:r4 = value:failed, with no
-// hidden sret pointer and no argument shift: the SysV shape, and the reason
-// this backend needs none of ELFv1's fused CCall+marshal+decode sequence. The
-// value is already where the VM wants it (r3 is our result register), so just
-// test the flag and branch. Runs after generateCCall restored r1/FP/CTX.
-static void elfv2EmitPrimResultCheck(AssemblerBuffer *buffer, AssemblerLabel *failLabel)
-{
+	asmMr(buffer, R15_PPC, TGT);       // the x64 R11->R13 native-code dance
+	generateCCall(generator, cFunction, argsSize, 0);
 	asmCmpdi(buffer, 0, R4, 0);
 	asmBne(buffer, failLabel);
 }
 
 // Entry-stub register save/restore: the full ELFv2 nonvolatile set in the
 // shared ELFV2_NV frame shape (see FiberElfV2.h). Must move r1 by exactly
-// AbiPpc64leElfV2.entrySavedRegsSize.
+// AbiPpc64ElfV2.entrySavedRegsSize.
 static void elfv2EmitEntrySaveRegs(AssemblerBuffer *buffer)
 {
 	asmMflr(buffer, R0);
@@ -179,7 +190,7 @@ void *fiberPrimeStackElfV2(void *top, void (*entry)(void))
 	return (void *) sp;
 }
 
-const Ppc64leAbi AbiPpc64leElfV2 = {
+const Ppc64Abi AbiPpc64ElfV2 = {
 	.name = "elfv2",
 	.argRegs = ElfV2ArgRegs,
 	.argRegsCount = sizeof(ElfV2ArgRegs),
@@ -187,13 +198,13 @@ const Ppc64leAbi AbiPpc64leElfV2 = {
 	.callerSavedSpill = ElfV2CallerSavedSpill,
 	.callerSavedSpillCount = sizeof(ElfV2CallerSavedSpill),
 	.paramSaveArea = 0,
+	.cCallFrameSize = 32,
 	.entrySavedRegsSize = ELFV2_NV_FRAME_SIZE,
 	.emitEntrySaveRegs = elfv2EmitEntrySaveRegs,
 	.emitEntryRestoreRegs = elfv2EmitEntryRestoreRegs,
 	.emitLoadTls = elfv2EmitLoadTls,
 	.emitCallCFunction = elfv2EmitCallCFunction,
-	.emitCCallPrimArgs = elfv2EmitCCallPrimArgs,
-	.emitPrimResultCheck = elfv2EmitPrimResultCheck,
+	.emitCCallPrimitive = elfv2EmitCCallPrimitive,
 	.fiberSwitch = fiberSwitchElfV2,
 	.fiberPrimeStack = fiberPrimeStackElfV2,
 };

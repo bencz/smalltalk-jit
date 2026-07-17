@@ -21,10 +21,8 @@
 // the compiler in vm/core/Endian.h.
 #if defined(__x86_64__)
 #include "jit/x64/TraitsX64.h"
-#elif defined(__powerpc64__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-#include "jit/ppc64/TraitsPpc64.h"
 #elif defined(__powerpc64__)
-#include "jit/ppc64le/TraitsPpc64le.h"
+#include "jit/ppc64/TraitsPpc64.h"
 #else
 #error "No target traits for this CPU. Create vm/jit/<arch>/Traits<Arch>.h and extend this dispatch - see PORTING.md."
 #endif

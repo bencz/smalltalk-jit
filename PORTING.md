@@ -296,15 +296,22 @@ linux/ppc64le` container, which needs no hand-built rootfs at all, and under
 qemu-user the bootstrap produces a byte-count-identical image with `tests/`
 40/40 and all samples passing. Its deltas from this backend, and the ELFv2
 facts DERIVED FROM THE TOOLCHAIN rather than from the spec (with the BE cross
-as the control that validates the method), are in `vm/jit/ppc64le/DESIGN.md`.
-Read it before assuming anything about ELFv2.
+as the control that validates the method), are in
+`vm/jit/ppc64/DESIGN-elfv2.md`. Read it before assuming anything about ELFv2.
 
-They are SEPARATE backends by design: the ecosystem treats them as distinct
-architectures and the codegen diverges beyond the ABI. `vm/jit/ppc64le/` is a
-deliberate COPY, not a refactor, and the two assemblers now `#error` if a
-translation unit tries to include both (each fixes the instruction word's byte
-order file-wide). Only SIX of the assembler's 101 functions actually differ;
-the other 95 pack bit-fields into a `uint32_t` and are byte-order-neutral. The
+They are ONE backend serving both byte orders (`vm/jit/ppc64/`). The LE port
+began as a deliberate COPY (`vm/jit/ppc64le/`), which proved the two targets
+byte-for-byte and also measured the real divergence: only FOUR of the
+assembler's ~100 functions differ (the instruction-word/asmLi64 byte layout),
+one C-call frame constant, the CPU floor and the CCALL-primitive shape, and
+all of those already had homes on existing seams. So the copy was folded
+back: the byte order is the single selector at the top of
+`AssemblerPpc64.h` (WordBe.h/WordLe.h; golden TUs pin their TARGET order with
+ST_PPC64_EMIT_BE/_LE), the C ABI stays on the ST_ABI axis (`abi/elfv1/` vs
+`abi/elfv2/`, with `cCallFrameSize` and the whole-body `emitCCallPrimitive`
+hook in the vtable), and the CPU floor is the `cpu/CpuBindBe.c` /
+`cpu/CpuBindLe.c` pair. Optimizations are gated by the RUNTIME CPU axis
+(POWER8+ machines run big-endian too), never by the target. The
 endianness/portability hazards found by the deep audit are FIXED in generic
 code: snapshot format v2 is self-describing (magic/version/byte-order header,
 struct-layout-independent shape encoding, loud refusal of foreign images),
@@ -410,11 +417,13 @@ What exists (rung 1):
 - **PrimitiveResult sret** — PORT_ME(elfv1-sret): ELFv1 returns ALL structs
   (including the 16-byte PrimitiveResult) through a HIDDEN pointer in r3,
   shifting every argument right by one — the same class of silent break as
-  Win64 item 1. This is why ppc64's `generateCCallPrimitive` is a FUSED
-  CCall+marshal+decode sequence (the sret buffer lives inside the ABI frame and
-  must be read back BEFORE teardown) while ppc64le uses the plain x64
-  structure, the single biggest structural divergence between the two POWER
-  backends, and the reason they are separate files.
+  Win64 item 1. This is why ppc64's `generateCCallPrimitive` is a thin
+  shell over the vtable's whole-body `emitCCallPrimitive` hook: under ELFv1
+  the hook is a FUSED CCall+marshal+decode sequence (the sret buffer lives
+  inside the ABI frame and must be read back BEFORE teardown), under ELFv2 it
+  marshals, lets `generateCCall` own the frame and tests r3:r4, the single
+  biggest structural divergence between the two POWER conventions, and the
+  reason the hook is whole-body rather than x64's args/check pair.
 - **TOC (r2)**: reserved; save/restore across cross-module calls per ABI
   (`emitCallCFunction` uses the 40(r1) slot).
 - **No push/pop**: frames are `stdu r1, -N(r1)` with a back-chain word; the

@@ -19,7 +19,7 @@
 //    code is generated (note that main.c's self-test dispatch returns early,
 //    so detection has to precede even that).
 //  - After it returns, the arch's feature struct (gX64Cpu / gPpc64Cpu /
-//    gPpc64leCpu, declared in vm/jit/<arch>/Cpu.h) is read-only for the rest of
+//    declared in vm/jit/<arch>/Cpu.h) is read-only for the rest of
 //    the process. It is therefore safe to read from every worker thread with no
 //    locking and no TLS.
 //  - It is consulted at EMIT time only. Generated code NEVER tests a feature

@@ -1,5 +1,5 @@
 // Binds the GENERIC ABI names to the ELFv1 instance. This is the only file
-// that may define gPpc64Abi, asmLoadTls and the jit/TargetFiber.h symbols —
+// that may define gPpc64Abi, asmLoadTls and the jit/TargetFiber.h symbols ,
 // CMake's ST_ABI links exactly one Abi<Abi>Bind.c into a REAL ppc64 build.
 // Foreign-host golden builds link the instance (AbiElfV1.c) WITHOUT this TU:
 // there the generic names belong to the host backend's own binding.
@@ -27,7 +27,7 @@ Value targetCallSmalltalkEntry(void *entryStubInsts, void *arg0, void *arg1,
 	__asm__("" : "=r"(toc));
 	// volatile + the escape barrier below: the indirect call reads the
 	// descriptor words through the ABI, invisibly to the compiler's alias
-	// analysis — without them GCC dead-stores the array and CTR loads junk.
+	// analysis, without them GCC dead-stores the array and CTR loads junk.
 	volatile uintptr_t descriptor[3];
 	descriptor[0] = (uintptr_t) entryStubInsts;
 	descriptor[1] = (uintptr_t) toc;
@@ -42,14 +42,14 @@ Value targetCallSmalltalkEntry(void *entryStubInsts, void *arg0, void *arg1,
 }
 
 // TLS load delegate: same seam as x64 (emit-time only, no cost in generated
-// code — the vtable is dereferenced while EMITTING, not while running).
+// code, the vtable is dereferenced while EMITTING, not while running).
 void asmLoadTls(AssemblerBuffer *buffer, Register dst, ptrdiff_t tpoff)
 {
 	gPpc64Abi->emitLoadTls(buffer, dst, tpoff);
 }
 
 // The jit/TargetFiber.h contract names, statically bound to the ELFv1 pair:
-// at -O2 these compile to direct tail-calls — no vtable dereference on the
+// at -O2 these compile to direct tail-calls, no vtable dereference on the
 // context-switch path.
 void fiberSwitchAsm(void **saveSp, void *newSp)
 {

@@ -220,7 +220,7 @@ EOF
 }
 
 # ---- little-endian / ELFv2 -----------------------------------------------------
-# Frame facts (all derived from gcc's own output, see vm/jit/ppc64le/DESIGN.md):
+# Frame facts (all derived from gcc's own output, see vm/jit/ppc64/DESIGN-elfv2.md):
 # 32-byte header, TOC save at 24(r1), 320-byte NV frame with GPRs at 32 and
 # FPRs at 176; NO function descriptors, so a C call just puts the target in
 # r12 (the ABI's global-entry register) and dispatches through CTR. The two

@@ -9,7 +9,10 @@
 #include "runtime/String.h"
 #include "jit/RegisterAllocator.h"
 
-typedef struct {
+// Tagged so ABI instance TUs can hold a CodeGenerator* OPAQUELY (they must
+// not include this header: on a foreign golden host it would drag in the
+// HOST backend's TargetAssembler; see the Ppc64Abi emitCCallPrimitive hook).
+typedef struct CodeGenerator {
 	CompiledCode code;
 	AssemblerBuffer buffer;
 	size_t frameSize;

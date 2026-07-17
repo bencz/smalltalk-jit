@@ -15,17 +15,20 @@
 //
 // WARNING: do not include jit/CodeGenerator.h or call generic backend names
 // (asmLoadTls, fiberSwitchAsm) here: in a foreign-host binary those resolve to
-// the HOST backend. Everything goes through the AbiPpc64leElfV2 instance and
+// the HOST backend. Everything goes through the AbiPpc64ElfV2 instance and
 // the ppc64le encoders directly.
 //
-// Two cases exist here that the BE golden cannot have: emitCCallPrimArgs and
-// emitPrimResultCheck are REAL under ELFv2 (PrimitiveResult comes back in
-// r3:r4 with unshifted arguments), where ELFv1's hidden-sret convention leaves
-// them FAIL()-stubbed. See vm/jit/ppc64le/DESIGN.md.
+// The CCALL-primitive trampoline is a single whole-body vtable hook
+// (emitCCallPrimitive, see Abi.h); it drives generateCCall and so cannot run
+// under a foreign-host golden. Its instruction-level pieces (ld i*8(r1)
+// marshal, cmpdi/bne) are covered by the encoder cases below, and the whole
+// sequence end-to-end by the target gates. See vm/jit/ppc64/DESIGN-elfv2.md.
+// The byte order under test is the TARGET's, not the compiling host's.
+#define ST_PPC64_EMIT_LE 1
 #include "vm/tests/SelfTests.h"
-#include "vm/jit/ppc64le/Abi.h"
-#include "vm/jit/ppc64le/Cpu.h"
-#include "vm/jit/ppc64le/abi/elfv2/FiberElfV2.h"
+#include "vm/jit/ppc64/Abi.h"
+#include "vm/jit/ppc64/Cpu.h"
+#include "vm/jit/ppc64/abi/elfv2/FiberElfV2.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -113,45 +116,27 @@ static void emitBranchLabelCase(AssemblerBuffer *buffer)
 
 static void emitLoadTlsCase(AssemblerBuffer *buffer)
 {
-	AbiPpc64leElfV2.emitLoadTls(buffer, R11_PPC, FAKE_TPOFF);
+	AbiPpc64ElfV2.emitLoadTls(buffer, R11_PPC, FAKE_TPOFF);
 }
 
 static void emitLoadTlsNegCase(AssemblerBuffer *buffer)
 {
-	AbiPpc64leElfV2.emitLoadTls(buffer, R11_PPC, FAKE_TPOFF_NEG);
+	AbiPpc64ElfV2.emitLoadTls(buffer, R11_PPC, FAKE_TPOFF_NEG);
 }
 
 static void emitCallCFunctionCase(AssemblerBuffer *buffer)
 {
-	AbiPpc64leElfV2.emitCallCFunction(buffer, FAKE_C_FUNCTION);
-}
-
-// ELFv2-only: the CCALL-primitive hooks are real here. Arity 5 mirrors the
-// x64 golden's choice. The loads must read i*8(r1), NOT (i+1)*8: POWER keeps
-// the return address in LR, so a frameless primitive's arg 0 sits at 0(r1).
-// Same +1 x86 bias that fillVar has to undo.
-static void emitCCallPrimArgsCase(AssemblerBuffer *buffer)
-{
-	AbiPpc64leElfV2.emitCCallPrimArgs(buffer, 5);
-}
-
-static void emitPrimResultCheckCase(AssemblerBuffer *buffer)
-{
-	AssemblerLabel failed;
-	asmInitLabel(&failed);
-	AbiPpc64leElfV2.emitPrimResultCheck(buffer, &failed);
-	// Bind the forward reference so the emitted displacement is deterministic.
-	asmPpcLabelBind(buffer, &failed, asmOffset(buffer));
+	AbiPpc64ElfV2.emitCallCFunction(buffer, FAKE_C_FUNCTION);
 }
 
 static void emitEntrySaveCase(AssemblerBuffer *buffer)
 {
-	AbiPpc64leElfV2.emitEntrySaveRegs(buffer);
+	AbiPpc64ElfV2.emitEntrySaveRegs(buffer);
 }
 
 static void emitEntryRestoreCase(AssemblerBuffer *buffer)
 {
-	AbiPpc64leElfV2.emitEntryRestoreRegs(buffer);
+	AbiPpc64ElfV2.emitEntryRestoreRegs(buffer);
 }
 
 static void emitSubWordCase(AssemblerBuffer *buffer)
@@ -247,10 +232,6 @@ static const GoldenCase Cases[] = {
 	  ExpectedPpcLeLoadTlsNeg, sizeof(ExpectedPpcLeLoadTlsNeg) },
 	{ "elfv2 emitCallCFunction (r12, no descriptor)", emitCallCFunctionCase,
 	  ExpectedPpcLeCallCFunction, sizeof(ExpectedPpcLeCallCFunction) },
-	{ "elfv2 emitCCallPrimArgs(5)", emitCCallPrimArgsCase,
-	  ExpectedPpcLeCCallPrimArgs, sizeof(ExpectedPpcLeCCallPrimArgs) },
-	{ "elfv2 emitPrimResultCheck (r3:r4)", emitPrimResultCheckCase,
-	  ExpectedPpcLePrimResultCheck, sizeof(ExpectedPpcLePrimResultCheck) },
 	{ "elfv2 entry save regs", emitEntrySaveCase,
 	  ExpectedPpcLeEntrySave, sizeof(ExpectedPpcLeEntrySave) },
 	{ "elfv2 entry restore regs", emitEntryRestoreCase,
@@ -344,7 +325,7 @@ static int checkFiberPrimeLayout(void)
 	static uint8_t stack[4096];
 	void (*fakeEntry)(void) = (void (*)(void)) (uintptr_t) 0xAAAAAAAA11111111ULL;
 	uint8_t *top = stack + sizeof(stack);
-	void *sp = AbiPpc64leElfV2.fiberPrimeStack(top, fakeEntry);
+	void *sp = AbiPpc64ElfV2.fiberPrimeStack(top, fakeEntry);
 
 	uintptr_t spValue = (uintptr_t) sp;
 	uintptr_t base = ((uintptr_t) top - 64) & ~(uintptr_t) 15;
@@ -378,7 +359,7 @@ static int checkFiberPrimeLayout(void)
 // AssemblerPpc64le.h) that the C ABI clobbers must be in the spill list,
 // nothing else may be, and argument registers must be volatile. This is what
 // keeps the instance honest whenever the pool is revisited.
-static int checkAbiInvariants(const Ppc64leAbi *abi)
+static int checkAbiInvariants(const Ppc64Abi *abi)
 {
 	_Bool live[32] = { 0 };
 	for (size_t i = 0; i < Ppc64AvailableRegs.regsSize; i++) {
@@ -418,58 +399,59 @@ static int checkAbiInvariants(const Ppc64leAbi *abi)
 // so there is no AltiVec-without-VSX or POWER5-without-AltiVec case to guard.
 static int checkCpuDecode(void)
 {
-	Ppc64leCpu cpu;
+	Ppc64Cpu cpu;
 	int errors = 0;
 
 #define CPU_CHECK(cond, what) \
 	if (!(cond)) { printf("CPU DECODE: %s\n", what); errors++; }
 
-	ppc64leCpuByName(&cpu, "power8");
+	ppc64CpuByName(&cpu, "power8");
 	CPU_CHECK(cpu.hasVsx && cpu.hasAltivec, "the ppc64le floor includes VSX and AltiVec");
 	CPU_CHECK(cpu.hasGprVsrMoves, "power8 must have the ISA 2.07 GPR<->VSR moves");
 	CPU_CHECK(!cpu.isPower9 && !cpu.isPower10, "power8 level wrong");
 	CPU_CHECK(strcmp(cpu.name, "power8") == 0, "power8 misnamed");
 
-	ppc64leCpuByName(&cpu, "power9");
+	ppc64CpuByName(&cpu, "power9");
 	CPU_CHECK(cpu.isPower9 && !cpu.isPower10, "power9 level wrong");
 
 	// Levels must be CUMULATIVE downward, whatever a stingy reporter says.
-	ppc64leCpuByName(&cpu, "power10");
+	ppc64CpuByName(&cpu, "power10");
 	CPU_CHECK(cpu.isPower10 && cpu.isPower9, "power10 must imply power9");
 
 	// The derived capability needs BOTH halves, exactly like the BE decode:
 	// ISA 2.07 says mtvsrd/mfvsrd exist, the VSX facility bit says the OS
 	// enabled the register state. A kernel with VSX disabled must not claim
 	// the moves despite the ISA level.
-	ppc64leCpuDecode(&cpu, PPC64LE_FEATURE_64, PPC64LE_FEATURE2_ARCH_2_07);
+	ppc64CpuDecode(&cpu, PPC64_FEATURE_64, PPC64_FEATURE2_ARCH_2_07);
 	CPU_CHECK(!cpu.hasVsx && !cpu.hasGprVsrMoves,
 		"ISA 2.07 without the VSX facility must NOT claim the GPR<->VSR moves");
 
 	// An under-reporting host must claim NOTHING rather than inherit the floor:
 	// the global starts at the baseline, but a decode is only ever what it read.
-	ppc64leCpuDecode(&cpu, 0, 0);
+	ppc64CpuDecode(&cpu, 0, 0);
 	CPU_CHECK(!cpu.isPower9 && !cpu.isPower10 && !cpu.hasVsx && !cpu.hasAltivec
 			&& !cpu.hasGprVsrMoves,
 		"an empty hwcap must claim NOTHING");
 
-	// The default global, by contrast, IS the architecture's floor.
-	CPU_CHECK(gPpc64leCpu.hasVsx && gPpc64leCpu.hasAltivec && gPpc64leCpu.hasGprVsrMoves,
-		"the ppc64le baseline global must assume POWER8");
+	// The baseline GLOBAL (the LE floor) lives in cpu/CpuBindLe.c, which only
+	// a real ppc64le build links: the cross-test gate asserts it end-to-end
+	// (ST_CPU_INFO gprvsr=1 on power8/power9).
 
-	for (const char *const *n = Ppc64leCpuNames; *n != NULL; n++) {
-		if (!ppc64leCpuByName(&cpu, *n)) {
+	static const char *const leNames[] = { "power8", "power9", "power10", NULL };
+	for (const char *const *n = leNames; *n != NULL; n++) {
+		if (!ppc64CpuByName(&cpu, *n)) {
 			printf("CPU DECODE: advertised name '%s' does not decode\n", *n);
 			errors++;
 		}
 	}
-	CPU_CHECK(!ppc64leCpuByName(&cpu, "power42"), "an unknown name must be rejected");
+	CPU_CHECK(!ppc64CpuByName(&cpu, "power42"), "an unknown name must be rejected");
 #undef CPU_CHECK
 	return errors;
 }
 
 int ppc64leEmitGoldenSelfTest(const char *mode)
 {
-	int failures = checkAbiInvariants(&AbiPpc64leElfV2);
+	int failures = checkAbiInvariants(&AbiPpc64ElfV2);
 	failures += checkLi64Patch();
 	failures += checkFiberPrimeLayout();
 	failures += checkCpuDecode();

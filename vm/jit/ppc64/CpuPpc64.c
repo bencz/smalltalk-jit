@@ -1,5 +1,5 @@
-// The ppc64 CPU-model DECODE: pure functions over the kernel's hwcap words,
-// plus the process-wide feature struct. HOST-INDEPENDENT by design (no
+// The ppc64 CPU-model DECODE: pure functions over the kernel's hwcap words.
+// Serves BOTH byte orders (the bits mean the same thing). HOST-INDEPENDENT by design (no
 // syscalls, no getauxval, no POWER intrinsics), so the x86 dev host links this
 // TU into its own `st` and the golden checks the bit decode against fabricated
 // hwcaps: see vm/tests/EmitGoldenPpc64.c. The arch-only binding lives in
@@ -10,13 +10,12 @@
 #include "jit/ppc64/Cpu.h"
 #include <string.h>
 
-// The BASELINE: the PowerPC 64-bit base ISA, which is what the JIT is measured
-// to emit (see Cpu.h). Claiming nothing means a failed, absent or
-// under-reporting detection can only lose optimizations, never emit an illegal
-// instruction, and it is the level an Apple G5 runs.
-Ppc64Cpu gPpc64Cpu = {
-	.name = PPC64_CPU_BASELINE_NAME,
-};
+// The BASELINE global gPpc64Cpu and the ST_CPU-accepted name list live in
+// the per-target bind TUs (cpu/CpuBindBe.c / cpu/CpuBindLe.c, picked by
+// CMake next to the ABI bind): the FLOOR is a target fact (the BE ecosystem
+// reaches down to the base ISA, ppc64le starts at POWER8), while everything
+// in this file is a pure function of the feature words and links on any
+// host, which is how the goldens falsify the decode.
 
 void ppc64CpuDecode(Ppc64Cpu *cpu, uint64_t hwcap, uint64_t hwcap2)
 {

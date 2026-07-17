@@ -21,20 +21,25 @@ TARGET_ARCH="${TARGET_ARCH:-$(uname -m)}"
 STATIC="${STATIC:-0}"
 CFLAGS="-std=gnu11 -O2 -fcommon -fno-omit-frame-pointer -I$ROOT/vm -I$ROOT"
 
+# ONE backend serves both byte orders (vm/jit/ppc64/); the targets differ in
+# the ABI bind (elfv1/elfv2), the CPU-floor bind (cpu/CpuBind*.c) and the
+# goldens (byte vectors genuinely differ per byte order).
 case "$TARGET_ARCH" in
 	ppc64)
 		ARCH_DIR="ppc64"
 		ABI_SRCS="$ROOT/vm/jit/ppc64/abi/elfv1/AbiElfV1.c
 			$ROOT/vm/jit/ppc64/abi/elfv1/AbiElfV1Bind.c
-			$ROOT/vm/jit/ppc64/abi/elfv1/FiberElfV1.c"
+			$ROOT/vm/jit/ppc64/abi/elfv1/FiberElfV1.c
+			$ROOT/vm/jit/ppc64/cpu/CpuBindBe.c"
 		TEST_SRCS="$ROOT/vm/tests/EmitGoldenPpc64.c $ROOT/vm/tests/EmitGoldenPpc64Bind.c"
 		CITYHASH_FLAGS="-DWORDS_BIGENDIAN"
 		;;
 	ppc64le)
-		ARCH_DIR="ppc64le"
-		ABI_SRCS="$ROOT/vm/jit/ppc64le/abi/elfv2/AbiElfV2.c
-			$ROOT/vm/jit/ppc64le/abi/elfv2/AbiElfV2Bind.c
-			$ROOT/vm/jit/ppc64le/abi/elfv2/FiberElfV2.c"
+		ARCH_DIR="ppc64"
+		ABI_SRCS="$ROOT/vm/jit/ppc64/abi/elfv2/AbiElfV2.c
+			$ROOT/vm/jit/ppc64/abi/elfv2/AbiElfV2Bind.c
+			$ROOT/vm/jit/ppc64/abi/elfv2/FiberElfV2.c
+			$ROOT/vm/jit/ppc64/cpu/CpuBindLe.c"
 		TEST_SRCS="$ROOT/vm/tests/EmitGoldenPpc64le.c $ROOT/vm/tests/EmitGoldenPpc64leBind.c"
 		CITYHASH_FLAGS=""
 		;;

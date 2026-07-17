@@ -51,14 +51,14 @@ if(ST_ARCH STREQUAL "x64")
 		vm/jit/x64/PrimitivesX64.c
 		vm/jit/x64/StubCodeX64.c)
 	# Golden-byte emission tests for this backend's ABI emitters (linked into
-	# st), PLUS BOTH POWER goldens: those encoders and their ABI instances are
-	# host-independent (each emits its own byte order explicitly, and nothing
-	# executes), so the ppc64 and ppc64le ports' rung-1 bring-up develops
+	# st), PLUS BOTH POWER goldens: the encoders and ABI instances are
+	# host-independent (each golden TU pins its TARGET byte order via
+	# ST_PPC64_EMIT_BE/_LE before including the one POWER assembler, and
+	# nothing executes), so both POWER targets' rung-1 bring-up develops
 	# natively here — ST_PPC64_EMIT_TEST / ST_PPC64LE_EMIT_TEST =1|print. The
-	# host stubs trap the one arch-only symbol per ABI (the POWER fiber switch)
-	# if anything tries to RUN it. The two POWER backends are separate by
-	# design; their assemblers refuse to be co-included in one TU, which is why
-	# each golden is its own translation unit with its own entry point.
+	# host stubs trap the one arch-only symbol per ABI (the POWER fiber
+	# switch) if anything tries to RUN it. No cpu/CpuBind*.c here: goldens
+	# exercise the pure decode on locals, never the per-target global.
 	set(vmArchTestSources
 		vm/tests/EmitGoldenX64.c
 		vm/tests/EmitGoldenPpc64.c
@@ -67,35 +67,31 @@ if(ST_ARCH STREQUAL "x64")
 		vm/jit/ppc64/CpuPpc64.c
 		vm/tests/EmitGoldenPpc64le.c
 		vm/tests/EmitGoldenPpc64leHostStub.c
-		vm/jit/ppc64le/abi/elfv2/AbiElfV2.c
-		vm/jit/ppc64le/CpuPpc64le.c)
-elseif(ST_ARCH STREQUAL "ppc64")
-	# Complete backend (big-endian, ELFv1): encoders, ABI instance and the full
-	# code generator are real; ./build.sh runs green in a native ppc64 BE
-	# rootfs. The mapping and the bring-up war stories: vm/jit/ppc64/DESIGN.md.
+		vm/jit/ppc64/abi/elfv2/AbiElfV2.c)
+elseif(ST_ARCH STREQUAL "ppc64" OR ST_ARCH STREQUAL "ppc64le")
+	# ONE backend serves both POWER byte orders (vm/jit/ppc64/): the ~100
+	# encoders are byte-order-neutral, the word layout comes from the single
+	# selector in AssemblerPpc64.h (WordBe.h/WordLe.h), the C ABI is the
+	# ST_ABI axis (elfv1 on BE, elfv2 on LE) and the CPU floor is the
+	# cpu/CpuBind*.c pair below. Mapping and bring-up war stories:
+	# vm/jit/ppc64/DESIGN.md; the ELFv2 deltas: vm/jit/ppc64/DESIGN-elfv2.md.
 	set(vmArchSources
 		vm/jit/ppc64/CodeGeneratorPpc64.c
 		vm/jit/ppc64/CpuPpc64.c
 		vm/jit/ppc64/CpuDetectPpc64.c
 		vm/jit/ppc64/PrimitivesPpc64.c
 		vm/jit/ppc64/StubCodePpc64.c)
-	set(vmArchTestSources
-		vm/tests/EmitGoldenPpc64.c
-		vm/tests/EmitGoldenPpc64Bind.c)
-elseif(ST_ARCH STREQUAL "ppc64le")
-	# Backend under bring-up (little-endian, ELFv2). SEPARATE from ppc64 by
-	# design: same ISA, but the codegen diverges past the ABI and each
-	# assembler fixes its own instruction-word byte order per translation unit.
-	# The deltas vs the BE spec: vm/jit/ppc64le/DESIGN.md.
-	set(vmArchSources
-		vm/jit/ppc64le/CodeGeneratorPpc64le.c
-		vm/jit/ppc64le/CpuPpc64le.c
-		vm/jit/ppc64le/CpuDetectPpc64le.c
-		vm/jit/ppc64le/PrimitivesPpc64le.c
-		vm/jit/ppc64le/StubCodePpc64le.c)
-	set(vmArchTestSources
-		vm/tests/EmitGoldenPpc64le.c
-		vm/tests/EmitGoldenPpc64leBind.c)
+	if(ST_ARCH STREQUAL "ppc64")
+		list(APPEND vmArchSources vm/jit/ppc64/cpu/CpuBindBe.c)
+		set(vmArchTestSources
+			vm/tests/EmitGoldenPpc64.c
+			vm/tests/EmitGoldenPpc64Bind.c)
+	else()
+		list(APPEND vmArchSources vm/jit/ppc64/cpu/CpuBindLe.c)
+		set(vmArchTestSources
+			vm/tests/EmitGoldenPpc64le.c
+			vm/tests/EmitGoldenPpc64leBind.c)
+	endif()
 else()
 	message(FATAL_ERROR "Unknown ST_ARCH '${ST_ARCH}' (supported: x64, ppc64, ppc64le)")
 endif()
@@ -164,9 +160,9 @@ elseif(ST_ARCH STREQUAL "ppc64" AND ST_ABI STREQUAL "elfv1")
 		vm/jit/ppc64/abi/elfv1/FiberElfV1.c)
 elseif(ST_ARCH STREQUAL "ppc64le" AND ST_ABI STREQUAL "elfv2")
 	set(vmAbiSources
-		vm/jit/ppc64le/abi/elfv2/AbiElfV2.c
-		vm/jit/ppc64le/abi/elfv2/AbiElfV2Bind.c
-		vm/jit/ppc64le/abi/elfv2/FiberElfV2.c)
+		vm/jit/ppc64/abi/elfv2/AbiElfV2.c
+		vm/jit/ppc64/abi/elfv2/AbiElfV2Bind.c
+		vm/jit/ppc64/abi/elfv2/FiberElfV2.c)
 else()
 	message(FATAL_ERROR
 		"Unknown ST_ABI '${ST_ABI}' for ST_ARCH '${ST_ARCH}' (implemented: x64+sysv, "

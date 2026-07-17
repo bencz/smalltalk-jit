@@ -6,7 +6,7 @@
 // exactly like a compiled prologue. v20-v31/VSX are NOT saved: unlike the BE
 // port, whose baseline is pre-VSX power4, the ppc64le baseline IS power8, so
 // audit this before trusting vectorized C across a switch (PORTING.md and
-// vm/jit/ppc64le/DESIGN.md item 6).
+// vm/jit/ppc64/DESIGN-elfv2.md item 6).
 //
 // This is the ONLY arch-only TU of the elfv2 binding: everything else is
 // host-independent for native golden-testing; foreign hosts link a FAIL()
@@ -22,10 +22,10 @@
 //      emitted file-wide by the ppc64le compiler driving this TU.
 //   2. `mr 12,0` on the restore path (see below).
 #if !defined(__powerpc64__) || __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
-#error "vm/jit/ppc64le/ is LITTLE-ENDIAN ppc64le only (ppc64 has its own backend) - check ST_ARCH in CMakeLists.txt"
+#error "FiberElfV2.c is for LITTLE-ENDIAN ppc64 builds - check ST_ABI in CMakeLists.txt"
 #endif
 
-#include "jit/ppc64le/abi/elfv2/FiberElfV2.h"
+#include "jit/ppc64/abi/elfv2/FiberElfV2.h"
 
 #define STR_(x) #x
 #define STR(x) STR_(x)

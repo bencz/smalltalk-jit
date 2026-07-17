@@ -1,24 +1,41 @@
 #ifndef ASSEMBLER_PPC64_H
 #define ASSEMBLER_PPC64_H
 
-// ppc64 (BIG-ENDIAN, ELFv1) backend: the POWER ISA model — Register enum,
-// register-allocation pool, and the instruction ENCODERS. ppc64le lives in
-// its own backend directory (the ecosystem treats them as distinct arches and
-// the codegen diverges beyond the ABI).
+// ppc64 backend, BOTH byte orders: the POWER ISA model, the Register enum,
+// register-allocation pool, and the instruction ENCODERS. All ~100 encoders
+// pack bit-fields into a uint32_t and are byte-order-neutral; HOW that word
+// (and the imm halves of an asmLi64 sequence) lays out in memory is the ONE
+// compile-time seam of this backend, bound by the selector block right below.
+// Everything else that differs between the two POWER targets is a runtime or
+// link-time binding: the C ABI behind the Ppc64Abi vtable (abi/elfv1 vs
+// abi/elfv2), the CPU floor behind the cpu/ bind TUs, and CPU features read
+// from gPpc64Cpu at emit time.
 //
-// HOST-INDEPENDENT BY DESIGN: every encoder builds a 32-bit instruction word
-// and stores it explicitly BIG-ENDIAN — which IS native byte order on every
-// host this backend ever executes on, and lets any build host (the x86 dev
-// box) compile these emitters, run them into an AssemblerBuffer and
+// HOST-INDEPENDENT BY DESIGN: any build host (the x86 dev box) can compile
+// these emitters for EITHER byte order, run them into an AssemblerBuffer and
 // byte-compare the output against pinned vectors validated with a cross
-// objdump (vm/tests/EmitGoldenPpc64.c, ST_PPC64_EMIT_TEST) — bring-up rung 1
-// of PORTING.md, no target hardware involved.
+// objdump (vm/tests/EmitGoldenPpc64.c / EmitGoldenPpc64le.c), bring-up rung
+// 1 of PORTING.md, no target hardware involved.
 //
 // Encoder operand order mirrors the ASSEMBLY MNEMONIC (destination first):
 // asmAddi(b, rt, ra, si) == addi rt, ra, si; loads/stores read like
 // ld rt, disp(ra) == asmLd(b, rt, disp, ra).
-#ifdef ASSEMBLER_PPC64LE_H
-#error "AssemblerPpc64.h (BE) and AssemblerPpc64le.h (LE) are SEPARATE backends: each fixes the instruction word's byte order for the whole translation unit, so no TU may include both."
+
+// ---- THE one byte-order selector (nothing else may test endianness) ---------
+// Golden TUs pin their target explicitly (ST_PPC64_EMIT_BE/_LE before the
+// include: the byte order is a property of the TARGET being emitted for, not
+// of the compiling host); a real ppc64 build defines neither and inherits the
+// toolchain's byte order. WordBe.h/WordLe.h refuse co-inclusion in one TU.
+#if defined(ST_PPC64_EMIT_BE)
+#include "jit/ppc64/WordBe.h"
+#elif defined(ST_PPC64_EMIT_LE)
+#include "jit/ppc64/WordLe.h"
+#elif defined(__powerpc64__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+#include "jit/ppc64/WordBe.h"
+#elif defined(__powerpc64__)
+#include "jit/ppc64/WordLe.h"
+#else
+#error "foreign-host TU must pick a byte order: define ST_PPC64_EMIT_BE or ST_PPC64_EMIT_LE before including AssemblerPpc64.h"
 #endif
 
 #include "jit/Assembler.h"
@@ -27,12 +44,12 @@
 #include <stddef.h>
 
 // POWER general-purpose registers. Reservations fixed by the ABIs/kernel:
-//   r0   sometimes reads as literal 0 in addressing forms — usable only as a
+//   r0   sometimes reads as literal 0 in addressing forms, usable only as a
 //        computation target / X-form operand, NEVER as a D/DS-form base
 //   r1   stack pointer (back-chain ABI, no push/pop instructions)
 //   r2   TOC pointer (ELFv1 always; ELFv2 across global calls)
 //   r13  thread pointer (TLS; tpoffs are computed at runtime from r13, so the
-//        ABI's 0x7000 bias cancels out of the arithmetic — see Thread.c)
+//        ABI's 0x7000 bias cancels out of the arithmetic, see Thread.c)
 // VM-internal roles (the x64 mapping is pinned in vm/jit/ppc64/DESIGN.md):
 //   FP   = r31  frame pointer, StackFrame*-compatible   (x64 RBP)
 //   CTX  = r30  context                                 (x64 R12)
@@ -65,7 +82,7 @@ typedef enum {
 // Allocation pool: nonvolatile-heavy so values survive C calls without
 // spills, plus one volatile. Excludes every reserved/role register above.
 // The ABI golden test enforces the cross-member invariant (spill list ==
-// C-clobbered subset of pool ∪ scratch extras) — update AbiElfV1's
+// C-clobbered subset of pool ∪ scratch extras), update AbiElfV1's
 // callerSavedSpill and the golden's extras together with this pool.
 static uint8_t Ppc64Registers[] = {
 	R16, R17, R18, R19, R20, R21, R22, R23, R24,
@@ -95,21 +112,7 @@ enum {
 	SPR_CTR = 9,
 };
 
-// ---- raw word emission (explicitly big-endian) ------------------------------
-
-static inline uint32_t ppcLoadWord(const uint8_t *p)
-{
-	return ((uint32_t) p[0] << 24) | ((uint32_t) p[1] << 16)
-		| ((uint32_t) p[2] << 8) | (uint32_t) p[3];
-}
-
-static inline void ppcStoreWord(uint8_t *p, uint32_t word)
-{
-	p[0] = (uint8_t) (word >> 24);
-	p[1] = (uint8_t) (word >> 16);
-	p[2] = (uint8_t) (word >> 8);
-	p[3] = (uint8_t) word;
-}
+// ---- raw word emission (byte order from the Word header selected above) -----
 
 static inline void asmPpcEmitWord(AssemblerBuffer *buffer, uint32_t word)
 {
@@ -142,7 +145,7 @@ static inline void asmStd(AssemblerBuffer *buffer, Register rs, ptrdiff_t disp, 
 }
 
 // std with update: writes the back-chain word and lowers r1 in one
-// instruction — THE ppc64 frame push (there is no push/pop on POWER).
+// instruction, THE ppc64 frame push (there is no push/pop on POWER).
 static inline void asmStdu(AssemblerBuffer *buffer, Register rs, ptrdiff_t disp, Register ra)
 {
 	asmPpcEmitWord(buffer, ppcDsForm(62, rs, disp, ra, 1));
@@ -168,7 +171,7 @@ static inline void asmStw(AssemblerBuffer *buffer, Register rs, ptrdiff_t disp, 
 }
 
 // Floating-point doubleword load/store (frt is a raw FPR number 0..31; the
-// fiber switch and entry stub must preserve the NONVOLATILE f14-f31 — unlike
+// fiber switch and entry stub must preserve the NONVOLATILE f14-f31, unlike
 // SysV x64, ppc64 has callee-saved FP registers).
 static inline void asmLfd(AssemblerBuffer *buffer, int frt, ptrdiff_t disp, Register ra)
 {
@@ -184,7 +187,7 @@ static inline void asmStfd(AssemblerBuffer *buffer, int frs, ptrdiff_t disp, Reg
 
 // ---- arithmetic / logical / moves --------------------------------------------
 
-// addi/addis read RA=0 as the LITERAL ZERO, not r0 — that form is the li/lis
+// addi/addis read RA=0 as the LITERAL ZERO, not r0, that form is the li/lis
 // alias below; the plain emitters assert it away to catch accidents.
 static inline void asmAddi(AssemblerBuffer *buffer, Register rt, Register ra, ptrdiff_t si)
 {
@@ -245,7 +248,7 @@ static inline void asmMr(AssemblerBuffer *buffer, Register ra, Register rs)
 
 // MD-form rotate; sldi(ra, rs, n) == rldicr(ra, rs, n, 63-n). The 6-bit
 // mask field is stored rotated (me[1:5] || me[0]) and the 6-bit shift is
-// split (sh[0:4] in bits 16-20, sh[5] in bit 30) — Power ISA MD-form.
+// split (sh[0:4] in bits 16-20, sh[5] in bit 30), Power ISA MD-form.
 static inline void asmRldicr(AssemblerBuffer *buffer, Register ra, Register rs, int sh, int me)
 {
 	ASSERT(0 <= sh && sh <= 63 && 0 <= me && me <= 63);
@@ -260,7 +263,7 @@ static inline void asmSldi(AssemblerBuffer *buffer, Register ra, Register rs, in
 	asmRldicr(buffer, ra, rs, n, 63 - n);
 }
 
-// cmpdi crf, ra, si — 64-bit signed compare with immediate (L bit set).
+// cmpdi crf, ra, si, 64-bit signed compare with immediate (L bit set).
 static inline void asmCmpdi(AssemblerBuffer *buffer, int crf, Register ra, ptrdiff_t si)
 {
 	ASSERT(0 <= crf && crf <= 7);
@@ -272,7 +275,7 @@ static inline void asmCmpdi(AssemblerBuffer *buffer, int crf, Register ra, ptrdi
 // ---- 64-bit immediates ---------------------------------------------------------
 
 // Materialize an arbitrary 64-bit immediate in a FIXED 5-instruction shape
-// (lis; ori; sldi 32; oris; ori) — the ppc64 analog of x64's movabs: constant
+// (lis; ori; sldi 32; oris; ori), the ppc64 analog of x64's movabs: constant
 // size, patchable in place (asmLi64Patch), works for every value. The sign
 // junk lis/ori leave in the high word is shifted out by the sldi.
 static inline void asmLi64(AssemblerBuffer *buffer, Register rt, uint64_t imm)
@@ -284,34 +287,9 @@ static inline void asmLi64(AssemblerBuffer *buffer, Register rt, uint64_t imm)
 	asmOri(buffer, rt, rt, (uint32_t) (imm & 0xFFFF));
 }
 
-// Reassemble the 64-bit immediate of an emitted asmLi64 sequence — the read
-// half of the targetReadCodePointer/targetWriteCodePointer contract
-// (jit/TargetCodePatch.h) that the GC's baked-pointer walks use.
-static inline uint64_t asmLi64Read(const uint8_t *seq)
-{
-	ASSERT(seq[0] >> 2 == 15 && seq[4] >> 2 == 24 && seq[8] >> 2 == 30
-		&& seq[12] >> 2 == 25 && seq[16] >> 2 == 24);
-	return ((uint64_t) seq[2] << 56) | ((uint64_t) seq[3] << 48)
-		| ((uint64_t) seq[6] << 40) | ((uint64_t) seq[7] << 32)
-		| ((uint64_t) seq[14] << 24) | ((uint64_t) seq[15] << 16)
-		| ((uint64_t) seq[18] << 8) | (uint64_t) seq[19];
-}
-
-// Rewrite the four 16-bit immediate halves of an emitted asmLi64 sequence
-// (the sldi word is immutable). This is what a GC pointer-patch loop and
-// absolute-address fixups will use; `seq` points at the first byte of the
-// 5-word sequence in FINAL (or buffer) memory.
-static inline void asmLi64Patch(uint8_t *seq, uint64_t imm)
-{
-	// Defensive: primary opcodes of lis/ori/rldicr/oris/ori live in the top
-	// 6 bits of each big-endian word == top 6 bits of its first byte.
-	ASSERT(seq[0] >> 2 == 15 && seq[4] >> 2 == 24 && seq[8] >> 2 == 30
-		&& seq[12] >> 2 == 25 && seq[16] >> 2 == 24);
-	seq[2] = (uint8_t) (imm >> 56); seq[3] = (uint8_t) (imm >> 48);
-	seq[6] = (uint8_t) (imm >> 40); seq[7] = (uint8_t) (imm >> 32);
-	seq[14] = (uint8_t) (imm >> 24); seq[15] = (uint8_t) (imm >> 16);
-	seq[18] = (uint8_t) (imm >> 8); seq[19] = (uint8_t) imm;
-}
+// asmLi64Read/asmLi64Patch (the GC's targetReadCodePointer /
+// targetWriteCodePointer halves over this 5-word shape) live in the selected
+// Word header: WHERE each imm halfword's bytes sit is the byte-order seam.
 
 // ---- special-purpose registers -------------------------------------------------
 
@@ -380,7 +358,7 @@ static inline void asmBctrl(AssemblerBuffer *buffer)
 
 // POWER branch displacements are relative to the branch instruction's OWN
 // address (not the next instruction, as on x86) and are embedded in the low
-// bits of the instruction word — so labels get ppc64-specific emit/bind
+// bits of the instruction word, so labels get ppc64-specific emit/bind
 // logic: forward references write a zero displacement and asmPpcLabelBind
 // patches the WORD (big-endian) once the target offset is known, telling the
 // I-form (b, ±32MB) from the B-form (bc, ±32KB) by the primary opcode. Same
@@ -492,7 +470,7 @@ static inline void asmBle(AssemblerBuffer *buffer, AssemblerLabel *label)
 // oracle-validated.
 
 // D-form sub-word loads/stores (zero-extending loads). Used for every
-// sub-word C struct field at its offsetof() — natural-width accesses are
+// sub-word C struct field at its offsetof(), natural-width accesses are
 // endian-correct by construction (DESIGN.md, endianness rules).
 static inline void asmLbz(AssemblerBuffer *buffer, Register rt, ptrdiff_t disp, Register ra)
 {
@@ -514,7 +492,7 @@ static inline void asmSth(AssemblerBuffer *buffer, Register rs, ptrdiff_t disp, 
 	asmPpcEmitWord(buffer, ppcDForm(44, (uint8_t) rs, (uint8_t) ra, disp));
 }
 
-// X-form indexed loads/stores (EA = RA|0 + RB) — the substitute for x64's
+// X-form indexed loads/stores (EA = RA|0 + RB), the substitute for x64's
 // scaled-index addressing (scale with asmSldi into a scratch first).
 static inline uint32_t ppcXForm(Register rt, Register ra, Register rb, uint32_t xo)
 {
@@ -571,7 +549,7 @@ static inline void asmCmpldi(AssemblerBuffer *buffer, int crf, Register ra, uint
 
 // ---- XO-form arithmetic ----------------------------------------------------------
 // OE=1/Rc=1 variants exist for the tagged-integer overflow protocol: `addo.`
-// then `bso` on CR0.SO. XER[SO] is STICKY — fast paths do not clear it; a
+// then `bso` on CR0.SO. XER[SO] is STICKY, fast paths do not clear it; a
 // stale SO only causes a false-positive fall-through to the send/dispatch
 // path, which re-arms with asmClearXerSo (DESIGN.md, arithmetic rules).
 
@@ -623,7 +601,7 @@ static inline void asmMulldoDot(AssemblerBuffer *buffer, Register rt, Register r
 }
 
 // divd of two IDENTICALLY-tagged ints yields the UNTAGGED quotient (the x64
-// idiv trick); no trap on POWER for /0 or overflow — guards stay explicit.
+// idiv trick); no trap on POWER for /0 or overflow, guards stay explicit.
 static inline void asmDivd(AssemblerBuffer *buffer, Register rt, Register ra, Register rb)
 {
 	asmPpcEmitWord(buffer, ppcXoForm(rt, ra, rb, 489, 0, 0));
@@ -643,7 +621,7 @@ static inline void asmXor(AssemblerBuffer *buffer, Register ra, Register rs, Reg
 		| ((uint32_t) (ra & 31) << 16) | ((uint32_t) (rb & 31) << 11) | (316u << 1));
 }
 
-// andi. ALWAYS sets CR0 — the tag-test workhorse (x64 `test reg, imm` + jcc
+// andi. ALWAYS sets CR0, the tag-test workhorse (x64 `test reg, imm` + jcc
 // becomes `andi. r0, reg, imm` + bne/beq; the result register is scratch r0).
 static inline void asmAndiDot(AssemblerBuffer *buffer, Register ra, Register rs, uint32_t ui)
 {
@@ -652,7 +630,7 @@ static inline void asmAndiDot(AssemblerBuffer *buffer, Register ra, Register rs,
 		| ((uint32_t) (ra & 31) << 16) | ui);
 }
 
-// addic. sets CR0 — the dec-and-branch loop counter (x64 dec+jnz).
+// addic. sets CR0, the dec-and-branch loop counter (x64 dec+jnz).
 static inline void asmAddicDot(AssemblerBuffer *buffer, Register rt, Register ra, ptrdiff_t si)
 {
 	asmPpcEmitWord(buffer, ppcDForm(13, (uint8_t) rt, (uint8_t) ra, si));
@@ -720,7 +698,7 @@ static inline void asmSradi(AssemblerBuffer *buffer, Register ra, Register rs, i
 }
 
 // Register-amount shifts. POWER semantics: amount >= 64 yields 0 (x64 masks
-// mod 64 instead — accepted divergence, DESIGN.md).
+// mod 64 instead, accepted divergence, DESIGN.md).
 static inline void asmSld(AssemblerBuffer *buffer, Register ra, Register rs, Register rb)
 {
 	asmPpcEmitWord(buffer, (31u << 26) | ((uint32_t) (rs & 31) << 21)
@@ -790,7 +768,7 @@ static inline void asmFmul(AssemblerBuffer *buffer, int frt, int fra, int frc)
 	asmPpcEmitWord(buffer, ppcAForm(frt, fra, 0, frc, 25));
 }
 
-// fcmpu crf, fra, frb — the unordered (NaN) outcome lands in the crf's SO
+// fcmpu crf, fra, frb, the unordered (NaN) outcome lands in the crf's SO
 // bit (BI = crf*4 + CR_SO): a DEDICATED bit, unlike x64's parity-flag dance.
 static inline void asmFcmpu(AssemblerBuffer *buffer, int crf, int fra, int frb)
 {
@@ -799,7 +777,7 @@ static inline void asmFcmpu(AssemblerBuffer *buffer, int crf, int fra, int frb)
 		| ((uint32_t) (fra & 31) << 16) | ((uint32_t) (frb & 31) << 11));
 }
 
-// Unconditional trap (tw 31,0,0) — the x64 int3 analog (InterruptPrimitive).
+// Unconditional trap (tw 31,0,0), the x64 int3 analog (InterruptPrimitive).
 static inline void asmTrap(AssemblerBuffer *buffer)
 {
 	asmPpcEmitWord(buffer, 0x7FE00008);
@@ -807,7 +785,7 @@ static inline void asmTrap(AssemblerBuffer *buffer)
 
 // ---- position capture ----------------------------------------------------------
 
-// bcl 20,31,$+4 — the PIC "load next address into LR" idiom (link-stack
+// bcl 20,31,$+4, the PIC "load next address into LR" idiom (link-stack
 // neutral form); pairs with mflr to materialize the current code position
 // (x64: lea rip+0). LR is dead inside JIT method bodies (DESIGN.md).
 static inline void asmBclNext(AssemblerBuffer *buffer)
@@ -818,7 +796,7 @@ static inline void asmBclNext(AssemblerBuffer *buffer)
 // ---- tagged-base doubleword access -----------------------------------------------
 // DS-form (ld/std) encodes only 4-aligned displacements, but the VM
 // constantly addresses fields off TAGGED heap pointers (base+1, field
-// offsets folded as offsetof-1 ≡ 3 mod 4 — x64's free trick). The ACCESS is
+// offsets folded as offsetof-1 ≡ 3 mod 4, x64's free trick). The ACCESS is
 // aligned; only the encoding isn't. These helpers keep the x64 addressing
 // idiom: aligned displacements emit one ld/std, tag-folded ones untag the
 // base into the dedicated TMP2 first (dst may alias base; TMP2 is owned by
@@ -849,7 +827,7 @@ static inline void asmStdT(AssemblerBuffer *buffer, Register src, ptrdiff_t disp
 
 // ---- composite helpers (the x64 push/pop/call vocabulary) ----------------------
 
-// push: ONE instruction (atomic decrement+store — nothing below r1 is ever
+// push: ONE instruction (atomic decrement+store, nothing below r1 is ever
 // live, signal-safe like x64 push).
 static inline void asmPush(AssemblerBuffer *buffer, Register src)
 {
@@ -867,7 +845,7 @@ static inline void asmDropStack(AssemblerBuffer *buffer, int slots)
 	asmAddi(buffer, R1, R1, slots * 8);
 }
 
-// Indirect call/jump through CTR. ⚠ bctrl CLOBBERS LR — see the LR
+// Indirect call/jump through CTR. ⚠ bctrl CLOBBERS LR, see the LR
 // discipline in DESIGN.md (method bodies: LR dead; framed primitives pushed
 // LR at entry; generateCCall saves/restores it itself).
 static inline void asmCallReg(AssemblerBuffer *buffer, Register target)
@@ -885,7 +863,7 @@ static inline void asmJumpReg(AssemblerBuffer *buffer, Register target)
 // TLS load delegate, same pattern as x64 (bound in the selected ABI's
 // Abi<Abi>Bind.c to gPpc64Abi->emitLoadTls). ⚠ Only meaningful in a ppc64
 // BUILD: host-compiled golden code must call the elfv1 instance hook
-// directly — in a foreign-arch binary this name resolves to the HOST
+// directly, in a foreign-arch binary this name resolves to the HOST
 // backend's TLS emitter.
 void asmLoadTls(AssemblerBuffer *buffer, Register dst, ptrdiff_t tpoff);
 

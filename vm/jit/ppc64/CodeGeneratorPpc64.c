@@ -1,13 +1,16 @@
-// ppc64 (big-endian, ELFv1) backend — the code generator. A mechanical
+// ppc64 backend (BOTH byte orders), the code generator. A mechanical
 // translation of vm/jit/x64/CodeGeneratorX64.c under the register/frame
-// mapping pinned in vm/jit/ppc64/DESIGN.md. Read that file first; the key
-// invariants are: frame layout byte-compatible with the x64 one (StackFrame.c
-// walker untouched), FP=r31/CTX=r30/TGT=r12/TMP=r11/TMP2=r10/result=r3, LR
-// discipline (bodies: LR dead after the prologue pushed it; generateCCall
-// stashes LR at 88(r1) of its ABI frame; framed primitives push LR first),
-// explicit big-endian emission, and tagged-base ld/std through asmLdT/StdT.
-#if !defined(__powerpc64__) || __BYTE_ORDER__ != __ORDER_BIG_ENDIAN__
-#error "vm/jit/ppc64/ is BIG-ENDIAN ppc64 only (ppc64le has its own backend) - check ST_ARCH in CMakeLists.txt"
+// mapping pinned in vm/jit/ppc64/DESIGN.md (ELFv2 deltas: DESIGN-elfv2.md).
+// Read those first; the key invariants are: frame layout byte-compatible
+// with the x64 one (StackFrame.c walker untouched),
+// FP=r31/CTX=r30/TGT=r12/TMP=r11/TMP2=r10/result=r3, LR discipline (bodies:
+// LR dead after the prologue pushed it; generateCCall PUSHES LR before FP so
+// [FP+8] is the IC the GC's frame walker reads; framed primitives push LR
+// first), instruction-word byte order from the AssemblerPpc64.h selector,
+// the C ABI behind the gPpc64Abi vtable, and tagged-base ld/std through
+// asmLdT/StdT.
+#ifndef __powerpc64__
+#error "vm/jit/ppc64/ is powerpc64-only code (both byte orders) - check ST_ARCH in CMakeLists.txt"
 #endif
 
 #include <stdio.h>
@@ -151,7 +154,7 @@ static void generateCode(CodeGenerator *generator)
 	if (!generator->regsAlloc.frameLess) {
 		generatePrologue(generator, generator->regsAlloc.frameSize);
 		generateContextDefinition(generator);
-		// Entry safepoint poll (framed methods only) — see the x64 original
+		// Entry safepoint poll (framed methods only), see the x64 original
 		// for the full rationale.
 		if (!generator->code.isBlock) {
 			generateSafepointPoll(generator, 0);
@@ -252,9 +255,9 @@ static void generateContextRestore(CodeGenerator *generator)
 }
 
 
-// Safepoint poll — see the x64 original for the full rationale. The
+// Safepoint poll, see the x64 original for the full rationale. The
 // safepointRequested field is an int: load the WORD and compare (the x64
-// low-byte test is a little-endian-only trick — DESIGN.md endianness rules).
+// low-byte test is a little-endian-only trick, DESIGN.md endianness rules).
 static void generateSafepointPoll(CodeGenerator *generator, _Bool atBackEdge)
 {
 	AssemblerBuffer *buffer = &generator->buffer;
@@ -271,13 +274,13 @@ static void generateSafepointPoll(CodeGenerator *generator, _Bool atBackEdge)
 	// Slow path (a peer is collecting): spill the ABI's caller-saved live
 	// set, park in heapGcPoll(heap, self), restore. `self` MUST be the
 	// RUNNING worker (TLS), not CTX->thread (stale after a migration).
-	abiEmitCallerSavedPush(&AbiPpc64ElfV1, buffer);
+	abiEmitCallerSavedPush(gPpc64Abi, buffer);
 	asmLoadTls(buffer, R4, gCurrentThreadTpoff);       // r4 = thread (C arg1)
 	asmLd(buffer, R3, offsetof(Thread, heap), R4);     // r3 = heap   (C arg0)
 	generator->overapproxStackmap = atBackEdge;
 	generateCCall(generator, (intptr_t) heapGcPoll, 2, 1);
 	generator->overapproxStackmap = 0;
-	abiEmitCallerSavedPop(&AbiPpc64ElfV1, buffer);
+	abiEmitCallerSavedPop(gPpc64Abi, buffer);
 
 	asmPpcLabelBind(buffer, &noGc, asmOffset(buffer));
 }
@@ -290,7 +293,7 @@ static void generateBody(CodeGenerator *generator)
 	BytecodeLabel *labels = malloc(sizeof(BytecodeLabel) * (generator->code.bytecodesSize + 1));
 	BytecodeLabel *currentLabel = labels;
 
-	// Backward-jump (loop back-edge) bookkeeping — identical to x64.
+	// Backward-jump (loop back-edge) bookkeeping, identical to x64.
 	size_t bcSize = generator->code.bytecodesSize;
 	ptrdiff_t *machineOffsetAt = malloc(sizeof(ptrdiff_t) * (bcSize + 1));
 	_Bool *isBackwardTarget = calloc(bcSize + 1, sizeof(_Bool));
@@ -576,7 +579,7 @@ static _Bool floatInlineEnabled(void)
 
 // Map an ordered-compare arith kind to the branch-if-taken (BO, BI) pair for
 // a cr0 cmpd/fcmpu result. NaN handling for floats is a SEPARATE dedicated
-// branch on cr0.SO (fcmpu's unordered bit) — cleaner than x64's parity flag.
+// branch on cr0.SO (fcmpu's unordered bit), cleaner than x64's parity flag.
 static void arithCompareBranch(int arithKind, int *bo, int *bi)
 {
 	switch (arithKind) {
@@ -652,7 +655,7 @@ static void generateFloatOperandLoad(AssemblerBuffer *buffer, Register reg, int 
 }
 
 
-// Inline Float fast path — see the x64 original. Operands on the stack
+// Inline Float fast path, see the x64 original. Operands on the stack
 // (receiver at 0(r1), arg at 8(r1)), TMP still holds the receiver on every
 // fall-through-to-dispatch path. Each operand may be a SmallFloat64 immediate
 // (decoded inline) or a BoxedFloat64 (lfd); an arithmetic result that fits the
@@ -661,7 +664,14 @@ static void generateFloatOperandLoad(AssemblerBuffer *buffer, Register reg, int 
 // operands: no FPR value survives the stub). GPR<->FPR moves use mtvsrd/mfvsrd
 // on ISA 2.07+, else the per-thread TLS scratch (970/POWER7 baseline). The
 // result lands in r3 on every committed path.
-static void generateFloatFastPath(CodeGenerator *generator, int arithKind, AssemblerLabel *arithMerge)
+// litArgBits, when non-NULL, are the IEEE bits of a SmallFloat64 LITERAL
+// argument (OPERAND_VALUE tagged 0b11), known at codegen time: the arg needs
+// no guard (it cannot miss) and no runtime decode, the constant is
+// materialized straight into f1 (li64 + the GPR->FPR move), both here and in
+// the re-decode after the boxing stub. The bits are plain data, not a heap
+// pointer: nothing to re-read, nothing for the GC to see.
+static void generateFloatFastPath(CodeGenerator *generator, int arithKind,
+	AssemblerLabel *arithMerge, const uint64_t *litArgBits)
 {
 	AssemblerBuffer *buffer = &generator->buffer;
 	AssemblerLabel tagMissR, tagMissA, immOkR, immOkA, classMissR, classMissA;
@@ -673,10 +683,12 @@ static void generateFloatFastPath(CodeGenerator *generator, int arithKind, Assem
 	asmInitLabel(&classMissA);
 
 	asmLd(buffer, R3, 0, R1);                    // receiver
-	asmLd(buffer, R4, sizeof(intptr_t), R1);     // arg
+	if (litArgBits == NULL) {
+		asmLd(buffer, R4, sizeof(intptr_t), R1); // arg
+	}
 	// Guard phase, the ONLY phase that can fall to dispatch: each operand must
 	// be a SmallFloat64 immediate (both tag bits set) or a pointer whose class
-	// word is BoxedFloat64.
+	// word is BoxedFloat64. A literal arg is a known immediate: no guard.
 	generateLoadObject(buffer, (RawObject *) Handles.BoxedFloat64->raw, R6, 0);  // BoxedFloat64 class (raw)
 	asmAndiDot(buffer, R0, R3, 1);
 	asmBeq(buffer, &tagMissR);               // 0b00/0b10: not a Float
@@ -686,14 +698,16 @@ static void generateFloatFastPath(CodeGenerator *generator, int arithKind, Assem
 	asmCmpd(buffer, 0, R0, R6);
 	asmBne(buffer, &classMissR);
 	asmPpcLabelBind(buffer, &immOkR, asmOffset(buffer));
-	asmAndiDot(buffer, R0, R4, 1);
-	asmBeq(buffer, &tagMissA);
-	asmAndiDot(buffer, R0, R4, 2);
-	asmBne(buffer, &immOkA);
-	asmLdT(buffer, R0, varOffset(RawObject, class), R4);
-	asmCmpd(buffer, 0, R0, R6);
-	asmBne(buffer, &classMissA);
-	asmPpcLabelBind(buffer, &immOkA, asmOffset(buffer));
+	if (litArgBits == NULL) {
+		asmAndiDot(buffer, R0, R4, 1);
+		asmBeq(buffer, &tagMissA);
+		asmAndiDot(buffer, R0, R4, 2);
+		asmBne(buffer, &immOkA);
+		asmLdT(buffer, R0, varOffset(RawObject, class), R4);
+		asmCmpd(buffer, 0, R0, R6);
+		asmBne(buffer, &classMissA);
+		asmPpcLabelBind(buffer, &immOkA, asmOffset(buffer));
+	}
 
 	// Committed: decode both operands into f0/f1. R5 = SMALLFLOAT_OFFSET
 	// (0x6 << 60); TMP2 = TLS base for the baseline GPR<->FPR path.
@@ -703,7 +717,12 @@ static void generateFloatFastPath(CodeGenerator *generator, int arithKind, Assem
 		asmLoadTls(buffer, TMP2, gCurrentThreadTpoff);
 	}
 	generateFloatOperandLoad(buffer, R3, 0, R5, TMP2);
-	generateFloatOperandLoad(buffer, R4, 1, R5, TMP2);
+	if (litArgBits == NULL) {
+		generateFloatOperandLoad(buffer, R4, 1, R5, TMP2);
+	} else {
+		asmLi64(buffer, R0, *litArgBits);
+		generateBitsToFpr(buffer, R0, 1, TMP2);
+	}
 
 	if (arithIsCompare(arithKind)) {
 		// No allocation: unbox both, fcmpu, load true/false. Unordered (NaN)
@@ -777,14 +796,21 @@ static void generateFloatFastPath(CodeGenerator *generator, int arithKind, Assem
 		asmLi(buffer, R5, 0);
 		generateStubCall(generator, &AllocateStub);   // r3 = new tagged Float
 		asmLd(buffer, R4, 0, R1);                     // reload receiver
-		asmLd(buffer, R6, sizeof(intptr_t), R1);      // reload arg
+		if (litArgBits == NULL) {
+			asmLd(buffer, R6, sizeof(intptr_t), R1);  // reload arg
+		}
 		asmLi(buffer, R5, 6);                         // offset again (R5 was the stub arg)
 		asmSldi(buffer, R5, R5, 60);
 		if (!gPpc64Cpu.hasGprVsrMoves) {
 			asmLoadTls(buffer, TMP2, gCurrentThreadTpoff);
 		}
 		generateFloatOperandLoad(buffer, R4, 0, R5, TMP2);
-		generateFloatOperandLoad(buffer, R6, 1, R5, TMP2);
+		if (litArgBits == NULL) {
+			generateFloatOperandLoad(buffer, R6, 1, R5, TMP2);
+		} else {
+			asmLi64(buffer, R0, *litArgBits);
+			generateBitsToFpr(buffer, R0, 1, TMP2);
+		}
 		switch (arithKind) {
 		case ARITH_ADD: asmFadd(buffer, 0, 0, 1); break;
 		case ARITH_SUB: asmFsub(buffer, 0, 0, 1); break;
@@ -819,8 +845,21 @@ static void generateSend(CodeGenerator *generator, BytecodesIterator *iterator)
 		? classifyArith(compiledCodeLiteralAt(&generator->code, selectorIndex)) : ARITH_NONE;
 	int identKind = classifyIdentity(compiledCodeLiteralAt(&generator->code, selectorIndex), argsSize);
 
+	// A SmallFloat64 LITERAL argument (OPERAND_VALUE tagged 0b11) is known at
+	// codegen time: the float fast path materializes it as a constant and skips
+	// its guard and decode, and the SmallInteger fast path is dead (its arg tag
+	// test can never pass). The Value is an immediate, not a heap pointer, so
+	// holding its bits across the pushes is GC-safe (see the x64 original).
+	_Bool floatLitArg = 0;
+	uint64_t litArgBits = 0;
 	for (uint8_t i = 0; i < argsSize; i++) {
-		pushOperand(generator, bytecodeNextOperand(iterator));
+		Operand arg = bytecodeNextOperand(iterator);
+		if (i == 0 && argsSize == 1 && arg.type == OPERAND_VALUE
+				&& valueTypeOf(arg.value, VALUE_FLOAT)) {
+			floatLitArg = 1;
+			litArgBits = doubleToBits(floatValueOf(arg.value));
+		}
+		pushOperand(generator, arg);
 	}
 	movOperand(generator, receiver, TMP);
 	asmPush(buffer, TMP);
@@ -828,7 +867,8 @@ static void generateSend(CodeGenerator *generator, BytecodesIterator *iterator)
 
 	// --- inline arithmetic/comparison fast paths (see x64) ------------------
 	_Bool identityInline = identKind != IDENT_NONE;
-	_Bool intInline = arithKind != ARITH_NONE && arithKind != ARITH_DIV;
+	// int has no inline '/'; a float-literal arg fails its arg tag test always
+	_Bool intInline = arithKind != ARITH_NONE && arithKind != ARITH_DIV && !floatLitArg;
 	_Bool floatInline = arithKind != ARITH_NONE && !arithIsBitOp(arithKind) && floatInlineEnabled();
 	_Bool anyInline = intInline || floatInline || identityInline;
 	AssemblerLabel arithMerge, floatMerge;
@@ -902,7 +942,8 @@ static void generateSend(CodeGenerator *generator, BytecodesIterator *iterator)
 	}
 
 	if (floatInline) {
-		generateFloatFastPath(generator, arithKind, &floatMerge);
+		generateFloatFastPath(generator, arithKind, &floatMerge,
+			floatLitArg ? &litArgBits : NULL);
 	}
 
 	if (identityInline) {
@@ -994,7 +1035,7 @@ void generateStoreCheck(CodeGenerator *generator, Register object, Register valu
 	asmAndiDot(buffer, R0, R0, TAG_REMEMBERED);
 	asmBne(buffer, &alreadyInSet);
 
-	// mark as remembered (byte RMW via r0 — logical ops read r0 as a
+	// mark as remembered (byte RMW via r0, logical ops read r0 as a
 	// register, unlike D-form bases)
 	asmLbz(buffer, R0, tagsOffset, object);
 	asmOri(buffer, R0, R0, TAG_REMEMBERED);
@@ -1005,18 +1046,18 @@ void generateStoreCheck(CodeGenerator *generator, Register object, Register valu
 	asmLd(buffer, TMP, blocksOffset, TMP);
 
 	// Grow BEFORE the store when the block is full (see x64). r0 = end,
-	// TMP2 = current — no push/pop dance needed (both are free scratch).
+	// TMP2 = current, no push/pop dance needed (both are free scratch).
 	asmLd(buffer, R0, offsetof(RememberedSetBlock, end), TMP);
 	asmLd(buffer, TMP2, offsetof(RememberedSetBlock, current), TMP);
 	asmCmpld(buffer, 0, R0, TMP2);
 	asmBgt(buffer, &notFull);              // end > current -> room
 
 	// grow via the C helper, then reload the head block
-	abiEmitCallerSavedPush(&AbiPpc64ElfV1, buffer);
+	abiEmitCallerSavedPush(gPpc64Abi, buffer);
 	asmLoadTls(buffer, TMP, gCurrentThreadTpoff);
 	asmAddi(buffer, R3, TMP, rememberedSetOffset);
 	generateCCall(generator, (intptr_t) rememberedSetGrow, 1, 0);
-	abiEmitCallerSavedPop(&AbiPpc64ElfV1, buffer);
+	abiEmitCallerSavedPop(gPpc64Abi, buffer);
 	asmLoadTls(buffer, TMP, gCurrentThreadTpoff);
 	asmLd(buffer, TMP, blocksOffset, TMP);
 
@@ -1050,14 +1091,14 @@ void generateMethodLookup(CodeGenerator *generator)
 
 	asmAddi(buffer, R3, R3, -1);   // untag class (also the C arg for the stub)
 
-	// hash class and selector — must match lookupHash() in Lookup.h
+	// hash class and selector, must match lookupHash() in Lookup.h
 	asmXor(buffer, R5, R3, R4);
 	asmSrdi(buffer, R5, R5, 4);
 	asmAndiDot(buffer, R5, R5, LOOKUP_CACHE_SIZE - 1);
 
 	// probe the RUNNING worker's own TLS LookupCache (see Lookup.h). The
-	// classes/selectors/codes arrays are 32 KB apart — past the DS-form
-	// range — so step the probe pointer with addis (+65536) instead of
+	// classes/selectors/codes arrays are 32 KB apart, past the DS-form
+	// range, so step the probe pointer with addis (+65536) instead of
 	// re-scaling: r6 = &classes[i]; r6+65536-32768 = &selectors[i];
 	// r6+65536 = &codes[i]. (DESIGN.md, lookup probe.)
 	asmLoadTls(buffer, TMP, gLookupCacheTpoff);
@@ -1090,7 +1131,7 @@ void generateLoadObject(AssemblerBuffer *buffer, RawObject *object, Register dst
 	asmLi64(buffer, dst, (uint64_t) ptr);
 	if (!isOldObject(object)) {
 		// The GC patches the 4 halfword immediates of the whole li64
-		// sequence — the offset points at its FIRST byte (TargetCodePatch).
+		// sequence, the offset points at its FIRST byte (TargetCodePatch).
 		asmAddPointerOffset(buffer, asmOffset(buffer) - 20);
 	}
 }
@@ -1682,7 +1723,7 @@ static void fillContext(CodeGenerator *generator, uint8_t level)
 			outer = context;
 		}
 		context->flags |= VAR_IN_REG;
-		// Never spill an outer (level>0) context — see x64.
+		// Never spill an outer (level>0) context, see x64.
 		if (level == 0) {
 			spillVar(generator, context);
 		}
@@ -1781,7 +1822,7 @@ void generateStackmap(CodeGenerator *generator)
 	size_t varsSize = generator->regsAlloc.varsSize;
 	for (size_t i = 0; i < varsSize; i++) {
 		Variable *var = variableAt(generator, i);
-		// gcEnd, not end — see the x64 original and worker-reflective-st-bug.
+		// gcEnd, not end, see the x64 original and worker-reflective-st-bug.
 		if (i == CONTEXT_INDEX || (var->frameOffset < 0 && (var->flags & VAR_ON_STACK) && var->start <= generator->bytecodeNumber && (generator->overapproxStackmap || generator->bytecodeNumber <= var->gcEnd))) {
 			ASSERT(var->frameOffset < -1);
 			size_t index = -var->frameOffset - 1;
@@ -1805,10 +1846,10 @@ void generateStackmap(CodeGenerator *generator)
 // C call from JIT code (ELFv1). The stack shape must mirror x64 EXACTLY,
 // because the GC's frame walker resolves each frame's stackmap through
 // [tempFP+8]: x64's `call` leaves the return address right above the pushed
-// RBP; on POWER the return address lives in LR, so it is PUSHED first —
+// RBP; on POWER the return address lives in LR, so it is PUSHED first ,
 // [tempFP+8] = the call-site IC (or the storeIp IP, pushed after it, exactly
 // like x64's [rbp+8]=IP / [rbp+16]=retaddr). Stashing LR anywhere else
-// breaks every scavenge that happens inside a C call (learned the hard way —
+// breaks every scavenge that happens inside a C call (learned the hard way ,
 // stale-pointer corruption at bootstrap). This also keeps LR alive across
 // the call for frameless primitives' store checks.
 void generateCCall(CodeGenerator *generator, intptr_t cFunction, size_t argsSize, _Bool storeIp)
@@ -1830,12 +1871,14 @@ void generateCCall(CodeGenerator *generator, intptr_t cFunction, size_t argsSize
 	asmMr(buffer, FP, R1);
 	asmPush(buffer, CTX);                      // spill current context
 	asmRldicr(buffer, R1, R1, 0, 59);          // 16-byte alignment
-	// ELFv1 callee frame: 48-byte header + 64-byte param save area (the
-	// callee stores its LR/CR in OUR header at 16/8(r1); 40(r1) is the TOC
-	// save slot emitCallCFunction uses).
-	asmStdu(buffer, R1, -112, R1);
+	// ABI callee frame (Abi.h cCallFrameSize): ELFv1 = 48-byte header +
+	// 64-byte param save area (the callee stores its LR/CR in OUR header at
+	// 16/8(r1); 40(r1) is the TOC save slot emitCallCFunction uses); ELFv2 =
+	// just the 32-byte header with the TOC save at 24(r1), no param save
+	// area needed for our prototyped, non-variadic, max-8-argument callees.
+	asmStdu(buffer, R1, -(ptrdiff_t) gPpc64Abi->cCallFrameSize, R1);
 
-	// exit frame for the C call — the RUNNING worker's thread (TLS)
+	// exit frame for the C call, the RUNNING worker's thread (TLS)
 	asmLoadTls(buffer, TMP, gCurrentThreadTpoff);
 	asmLd(buffer, TMP, offsetof(Thread, stackFramesTail), TMP);
 	asmStd(buffer, FP, offsetof(EntryStackFrame, exit), TMP);
@@ -1909,7 +1952,7 @@ void generateBlockContextAllocation(CodeGenerator *generator)
 	// setup thread
 	asmLdT(buffer, TMP, varOffset(RawContext, thread), TMP);
 	asmStdT(buffer, TMP, varOffset(RawContext, thread), CTX);
-	// load block (r6 — NOT r3, which holds the context; DESIGN.md)
+	// load block (r6, NOT r3, which holds the context; DESIGN.md)
 	asmLd(buffer, R6, 2 * sizeof(intptr_t), FP);
 	// move home context from block to new context
 	asmLdT(buffer, TMP, varOffset(RawBlock, homeContext), R6);
@@ -1983,7 +2026,7 @@ NativeCode *buildNativeCodeFromAssembler(AssemblerBuffer *buffer)
 	asmCopyBuffer(buffer, code->insts, size);
 	asmCopyPointersOffsets(buffer, nativeCodePointersOffsets(code));
 	// Single funnel for ALL code creation: publish to instruction fetch
-	// (dcbst/sync/icbi/isync via __builtin___clear_cache — REQUIRED on POWER).
+	// (dcbst/sync/icbi/isync via __builtin___clear_cache, REQUIRED on POWER).
 	osFlushICache(code->insts, size);
 	return code;
 }
@@ -1991,7 +2034,7 @@ NativeCode *buildNativeCodeFromAssembler(AssemblerBuffer *buffer)
 
 // Baked-pointer read/patch inside emitted code (jit/TargetCodePatch.h): the
 // immediate is SPLIT across the four 16-bit halves of the fixed asmLi64
-// shape — no contiguous word exists. Callers flush the icache after writes.
+// shape, no contiguous word exists. Callers flush the icache after writes.
 uint64_t targetReadCodePointer(const uint8_t *site)
 {
 	return asmLi64Read(site);

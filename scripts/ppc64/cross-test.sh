@@ -87,7 +87,7 @@ if [ "$MODE" = be ]; then
 else
 	echo "== ST_CPU_INFO (the ppc64le floor is POWER8: gprvsr everywhere):"
 	for cpu in power8 power9; do
-		QEMU_CPU=$cpu ST_CPU_INFO=1 ST_SMALLFLOAT_TEST=1 "$OUT/st" </dev/null | grep "ppc64le CPU"
+		QEMU_CPU=$cpu ST_CPU_INFO=1 ST_SMALLFLOAT_TEST=1 "$OUT/st" </dev/null | grep "ppc64 CPU"
 		QEMU_CPU=$cpu ST_CPU_INFO=1 ST_SMALLFLOAT_TEST=1 "$OUT/st" </dev/null | grep -q "gprvsr=1" \
 			|| { echo "FAIL: $cpu must have the GPR<->VSR moves"; exit 1; }
 	done
