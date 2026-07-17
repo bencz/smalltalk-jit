@@ -50,6 +50,7 @@ static PrimitiveResult stringAsciiCaseEqualsPrimitive(Value self, Value other);
 static PrimitiveResult stringStartsWithAsciiCasePrimitive(Value self, Value prefix);
 static PrimitiveResult stringCopyFromToPrimitive(Value self, Value start, Value stop);
 static PrimitiveResult stringToIntegerPrimitive(Value self);
+static PrimitiveResult stringSplitByPrimitive(Value self, Value delimiter);
 static PrimitiveResult becomePrimitive(Value object, Value other);
 static PrimitiveResult workerParallelPrimitive(Value self, Value blocks);
 static PrimitiveResult contextPositionDescriptorPrimitive(Value vContext);
@@ -330,6 +331,7 @@ Primitive Primitives[] = {
 	{"StringStartsWithAsciiCasePrimitive", CCALL, .cFunction = stringStartsWithAsciiCasePrimitive, 2},
 	{"StringCopyFromToPrimitive", CCALL, .cFunction = stringCopyFromToPrimitive, 3},
 	{"StringToIntegerPrimitive", CCALL, .cFunction = stringToIntegerPrimitive, 1},
+	{"StringSplitByPrimitive", CCALL, .cFunction = stringSplitByPrimitive, 2},
 };
 
 
@@ -654,6 +656,59 @@ static PrimitiveResult stringToIntegerPrimitive(Value vSelf)
 		val = val * 10 + d;
 	}
 	return primSuccess(tagInt((intptr_t) (sign * val)));
+}
+
+// `splitBy: aCharacter` for plain Strings: scan for the delimiter byte and build
+// the OrderedCollection of substrings entirely in C. Matches the .st semantics
+// exactly: empty segments (adjacent / leading / trailing delimiters) are dropped.
+// Uses the shared newOrdColl / ordCollAddObject helpers (same as the JSON parser)
+// so the collection is built barrier-safe. Guarded to a plain String receiver and
+// a Character delimiter; Symbol/Array/non-char fall through to the .st loop
+// (which preserves the receiver's species).
+static PrimitiveResult stringSplitByPrimitive(Value vSelf, Value vDelim)
+{
+	RawObject *rawSelf = asObject(vSelf);
+	if (rawSelf->class != Handles.String->raw) {
+		return primFailed();
+	}
+	if (!valueTypeOf(vDelim, VALUE_CHAR)) {
+		return primFailed();
+	}
+	uint8_t delim = (uint8_t) asCChar(vDelim);
+
+	HandleScope scope;
+	openHandleScope(&scope);
+	String *src = scopeHandle(rawSelf);
+	OrderedCollection *result = newOrdColl(8);
+	size_t size = src->raw->size;
+	size_t last = 0;
+	for (size_t i = 0; i < size; i++) {
+		if ((uint8_t) src->raw->contents[i] != delim) {
+			continue;
+		}
+		if (i != last) {                       // drop empty segment
+			HandleScope seg;
+			openHandleScope(&seg);
+			size_t len = i - last;
+			String *piece = newString(len);    // may GC; src/result handles stay valid
+			memcpy(piece->raw->contents, src->raw->contents + last, len);
+			ordCollAddObject(result, (Object *) piece);
+			closeHandleScope(&seg, NULL);       // piece now rooted by `result`
+		}
+		last = i + 1;
+	}
+	if (last < size) {                          // trailing non-empty segment
+		HandleScope seg;
+		openHandleScope(&seg);
+		size_t len = size - last;
+		String *piece = newString(len);
+		memcpy(piece->raw->contents, src->raw->contents + last, len);
+		ordCollAddObject(result, (Object *) piece);
+		closeHandleScope(&seg, NULL);
+	}
+	Value r = getTaggedPtr(result);
+	closeHandleScope(&scope, NULL);
+	return primSuccess(r);
 }
 
 

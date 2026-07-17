@@ -144,6 +144,10 @@ SequenceableCollection := Collection [
 
 
 	splitBy: anObject [
+		"C fast path for a plain String split on a Character (scan + build the
+		 OrderedCollection in one primitive). Array / Symbol / non-char delimiters
+		 fall through to the generic loop below."
+		<primitive: StringSplitByPrimitive>
 		| collection last |
 
 		collection := OrderedCollection new.
