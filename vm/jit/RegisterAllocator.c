@@ -318,6 +318,12 @@ static void examineOperand(Vars *vars, Operand operand, size_t offset)
 	case OPERAND_INST_VAR:
 		defineTmpVar(vars, SELF_INDEX, offset);
 		break;
+	case OPERAND_INST_VAR_OF:
+		// The tier-1 inliner's ivar form hangs off a spilled TEMP instance:
+		// this use must extend that temp's live range, or its register is
+		// recycled early and the access reads a stale home.
+		defineTmpVar(vars, operand.instance.index, offset);
+		break;
 	default:
 		;
 	}

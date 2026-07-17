@@ -132,6 +132,16 @@ else
 	fail=$((fail + 1))
 	failed="$failed ST_TIER_STATS_TEST(ST_NO_TIER)"
 fi
+# Inline-off isolation: the tier without the M2 inliner must still promote
+# (the M1 shape) and stay correct.
+if ST_TIER_INLINE_MAX=0 ST_TIER_STATS_TEST=1 "$BUILD/st" -s "$SNAP" </dev/null >/dev/null 2>&1; then
+	printf "  ${G}pass${Z}  %s\n" "ST_TIER_STATS_TEST(INLINE_MAX=0)"
+	pass=$((pass + 1))
+else
+	printf "  ${R}FAIL${Z}  %s\n" "ST_TIER_STATS_TEST(INLINE_MAX=0)"
+	fail=$((fail + 1))
+	failed="$failed ST_TIER_STATS_TEST(INLINE_MAX=0)"
+fi
 
 run_group() {
 	local title="$1"; shift

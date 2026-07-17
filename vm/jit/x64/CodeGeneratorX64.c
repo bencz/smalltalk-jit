@@ -21,6 +21,7 @@
 #include "compiler/Bytecodes.h"
 #include "compiler/Compiler.h"
 #include "jit/CodeDescriptors.h"
+#include "jit/SendClassify.h"
 #include "jit/Tier.h"
 #include "core/Thread.h"
 #include "core/Exception.h"
@@ -66,11 +67,12 @@ static Variable *specialVariableAt(CodeGenerator *generator, uint8_t type, ptrdi
 
 NativeCode *generateMethodCode(CompiledMethod *method)
 {
-	return generateMethodCodeTiered(method, NULL);
+	return generateMethodCodeTiered(method, NULL, NULL, 0);
 }
 
 
-NativeCode *generateMethodCodeTiered(CompiledMethod *method, NativeCode *feedback)
+NativeCode *generateMethodCodeTiered(CompiledMethod *method, NativeCode *feedback,
+	IcCell **siteMap, size_t siteMapSize)
 {
 	heapCodegenLockEnter(CurrentThread.heap); // serialize codegen across worker threads
 	HandleScope scope;
@@ -83,6 +85,8 @@ NativeCode *generateMethodCodeTiered(CompiledMethod *method, NativeCode *feedbac
 	pinCompiledCodeBytes(&generator.code); // the method object may move mid-codegen
 	generator.descriptors = newOrdColl(32);
 	generator.tierFeedback = feedback;
+	generator.tierSiteMap = siteMap;
+	generator.tierSiteMapSize = siteMapSize;
 	generateCode(&generator);
 
 	NativeCode *code = buildNativeCode(&generator);
@@ -414,7 +418,7 @@ static void generateBody(CodeGenerator *generator)
 		// windows in every configuration. x64-only: a frontend/uop-cache
 		// concern, meaningless under qemu on the POWER backend.
 		if (isBackwardTarget[offset]) {
-			while (asmOffset(&generator->buffer) % 16 != 0) {
+			while (asmOffset(&generator->buffer) % 32 != 0) {
 				asmEmitUint8(&generator->buffer, 0x90);
 			}
 		}
@@ -597,67 +601,9 @@ static void generateCopy(CodeGenerator *generator, BytecodesIterator *iterator)
 }
 
 
-static _Bool rawSelectorIs(RawObject *selector, const char *name, size_t len)
-{
-	return rawObjectSize(selector) == len
-		&& memcmp(getRawObjectIndexedVars(selector), name, len) == 0;
-}
-
-// SmallInteger selectors inlined at the call site (fast path in generateSend).
-// The bit-op kinds are int-only (never taken by the Float fast path).
-enum { ARITH_NONE = 0, ARITH_ADD, ARITH_SUB, ARITH_MUL, ARITH_DIV,
-       ARITH_LT, ARITH_LE, ARITH_GT, ARITH_GE, ARITH_EQ, ARITH_NE,
-       ARITH_BITAND, ARITH_BITOR, ARITH_BITXOR };
-
-static int classifyArith(RawObject *selector)
-{
-	size_t n = rawObjectSize(selector);
-	char *s = (char *) getRawObjectIndexedVars(selector);
-	if (n == 1) {
-		switch (s[0]) {
-		case '+': return ARITH_ADD;
-		case '-': return ARITH_SUB;
-		case '*': return ARITH_MUL;
-		case '/': return ARITH_DIV;   // Float only (single-instruction divsd); SmallInteger keeps dispatching
-		case '<': return ARITH_LT;
-		case '>': return ARITH_GT;
-		case '=': return ARITH_EQ;
-		}
-	} else if (n == 2 && s[1] == '=') {
-		switch (s[0]) {
-		case '<': return ARITH_LE;
-		case '>': return ARITH_GE;
-		case '~': return ARITH_NE;
-		}
-	} else {
-		if (rawSelectorIs(selector, "bitAnd:", 7)) return ARITH_BITAND;
-		if (rawSelectorIs(selector, "bitOr:", 6)) return ARITH_BITOR;
-		if (rawSelectorIs(selector, "bitXor:", 7)) return ARITH_BITXOR;
-	}
-	return ARITH_NONE;
-}
-
-static _Bool arithIsCompare(int kind) { return kind >= ARITH_LT && kind <= ARITH_NE; }
-static _Bool arithIsBitOp(int kind) { return kind >= ARITH_BITAND; }
-
-
-// Identity / nil tests inlined at the call site. `==`/`~~` are non-overridable
-// identity; `isNil`/`notNil` compile to `== nil`/`~~ nil` (the only kernel
-// definitions are identity-to-nil). Unlike the arithmetic fast paths these
-// ALWAYS resolve, so no class guard and no dispatch fallback are emitted.
-enum { IDENT_NONE = 0, IDENT_EQ, IDENT_NE, IDENT_ISNIL, IDENT_NOTNIL };
-
-static int classifyIdentity(RawObject *selector, uint8_t argsSize)
-{
-	if (argsSize == 1) {
-		if (rawSelectorIs(selector, "==", 2)) return IDENT_EQ;
-		if (rawSelectorIs(selector, "~~", 2)) return IDENT_NE;
-	} else if (argsSize == 0) {
-		if (rawSelectorIs(selector, "isNil", 5)) return IDENT_ISNIL;
-		if (rawSelectorIs(selector, "notNil", 6)) return IDENT_NOTNIL;
-	}
-	return IDENT_NONE;
-}
+// rawSelectorIs / classifyArith / classifyIdentity moved to the shared
+// jit/SendClassify.h: the tier-1 inliner must classify sends EXACTLY as this
+// backend does (site-to-cell correspondence), so there is one copy.
 
 
 // Float call-site intrinsic gate: unset ST_NO_INLINE_FLOAT => enabled.
@@ -985,17 +931,28 @@ static void generateIcSend(CodeGenerator *generator, uint8_t selectorIndex)
 static void generateIcSendPromoted(CodeGenerator *generator, uint8_t selectorIndex)
 {
 	AssemblerBuffer *buffer = &generator->buffer;
-	IcState *state = NULL;
-	if (generator->tierFeedback != NULL
+	// Feedback cell: by instruction number when the inliner rewrote the
+	// bytecodes (tierSiteMap), positionally against the superseded code's
+	// cells otherwise.
+	IcCell *cell = NULL;
+	if (generator->tierSiteMap != NULL) {
+		if ((size_t) generator->bytecodeNumber < generator->tierSiteMapSize) {
+			cell = generator->tierSiteMap[generator->bytecodeNumber];
+		}
+	} else if (generator->tierFeedback != NULL
 			&& buffer->icSitesSize < generator->tierFeedback->icCellsSize) {
-		IcCell *cells = nativeCodeIcCells(generator->tierFeedback);
-		IcState *seen = __atomic_load_n(&cells[buffer->icSitesSize].state, __ATOMIC_ACQUIRE);
+		cell = &nativeCodeIcCells(generator->tierFeedback)[buffer->icSitesSize];
+	}
+	IcState *state = NULL;
+	if (cell != NULL) {
+		IcState *seen = __atomic_load_n(&cell->state, __ATOMIC_ACQUIRE);
 		if (seen->kind == IC_KIND_MONO || seen->kind == IC_KIND_PIC) {
 			state = seen;
 		}
 	}
 	if (state == NULL) {
-		// Unlinked (a fresh STW reset), mega, or out of feedback: plain IC send.
+		// Unlinked (a fresh STW reset), mega, inlined-body send, or out of
+		// feedback: plain IC send.
 		if (generator->tierFeedback != NULL) {
 			gTierStats.unpromotedSites++;
 		}
@@ -1561,6 +1518,18 @@ static void pushOperand(CodeGenerator *generator, Operand operand)
 		break;
 	}
 
+	case OPERAND_INST_VAR_OF: {
+		// The tier-1 inliner's rewrite of a callee ivar access: the instance
+		// is always the spilled-receiver TEMP and the index is the absolute,
+		// pre-resolved slot (shape applied at optimization time, pinned by
+		// the site's exact-class guard).
+		ASSERT(operand.instance.type == OPERAND_TEMP_VAR);
+		Variable *instance = variableAt(generator, operand.instance.index);
+		ptrdiff_t offset = varOffset(RawObject, body) + operand.index * sizeof(Value);
+		asmPushqMem(buffer, asmMem(fillVarToReg(generator, instance, TMP), NO_REGISTER, SS_1, offset));
+		break;
+	}
+
 	case OPERAND_LITERAL:
 		generateLoadObject(buffer, compiledCodeLiteralAt(&generator->code, operand.index), TMP, 1);
 		asmPushq(buffer, TMP);
@@ -1634,6 +1603,17 @@ static void movOperand(CodeGenerator *generator, Operand operand, Register reg)
 		// `reg` may itself be TMP: the staged receiver is consumed by this very load,
 		// so overwriting it with the loaded inst var is fine.
 		asmMovqMem(buffer, asmMem(fillVarToReg(generator, self, TMP), NO_REGISTER, SS_1, offset), reg);
+		break;
+	}
+
+	case OPERAND_INST_VAR_OF: {
+		// Inliner-only form: absolute slot of the spilled-receiver TEMP (see
+		// pushOperand). `reg` may be TMP: the staged instance is consumed by
+		// this very load.
+		ASSERT(operand.instance.type == OPERAND_TEMP_VAR);
+		Variable *instance = variableAt(generator, operand.instance.index);
+		ptrdiff_t offset = varOffset(RawObject, body) + operand.index * sizeof(Value);
+		asmMovqMem(buffer, asmMem(fillVarToReg(generator, instance, TMP), NO_REGISTER, SS_1, offset), reg);
 		break;
 	}
 
@@ -1727,6 +1707,20 @@ static void movToOperand(CodeGenerator *generator, Register reg, Operand operand
 			generateStoreCheck(generator, selfReg, reg);
 		}
 		asmMovqToMem(buffer, reg, asmMem(selfReg, NO_REGISTER, SS_1, offset));
+		break;
+	}
+
+	case OPERAND_INST_VAR_OF: {
+		// Inliner-only form (see pushOperand): same store discipline as
+		// INST_VAR, instance staged in RSI so the write barrier can run.
+		ASSERT(operand.instance.type == OPERAND_TEMP_VAR);
+		Variable *instance = variableAt(generator, operand.instance.index);
+		ptrdiff_t offset = varOffset(RawObject, body) + operand.index * sizeof(Value);
+		Register instanceReg = fillVarToReg(generator, instance, RSI);
+		if (valueMayBePointer) {
+			generateStoreCheck(generator, instanceReg, reg);
+		}
+		asmMovqToMem(buffer, reg, asmMem(instanceReg, NO_REGISTER, SS_1, offset));
 		break;
 	}
 

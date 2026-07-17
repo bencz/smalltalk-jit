@@ -17,6 +17,8 @@
 #include "vm/os/Os.h"
 #include "vm/jit/InlineCache.h"
 #include "vm/jit/Tier.h"
+#include "vm/compiler/Optimizer.h"
+#include "vm/core/Class.h"
 #include <unistd.h>
 #include <string.h>
 #include <stdio.h>
@@ -136,21 +138,38 @@ static void runIcStatsTest(void *arg)
 // the compiler's own recompiled methods add noise, so assertions are lower
 // bounds and coarse ratios, like the IC test above.
 
-// TierHost>>double: holds TWO monomorphic dynamic sends to bump:. Answers are
-// asserted per iteration inside the loop (any old/new-code divergence counts),
-// each eval returns the number of WRONG iterations. A fresh eval per phase
-// gives a fresh unlinked call site, which binds to the CURRENT (post-recompile)
-// code without needing a GC to reset old cells. Class definitions are a
-// top-level construct: they go through parseSourceAndInitialize, not evalCode.
+// TierHost>>double: holds TWO monomorphic dynamic sends to bump:, an
+// ELIGIBLE leaf: under the default tier these sites are INLINED (M2), and
+// under ST_TIER_INLINE_MAX=0 they are promoted to direct calls (M1).
+// TierJumpy>>jProbe: contains an inlined conditional (JUMP bytecodes), so it
+// is never inlined and its sites exercise the M1 promotion counters in every
+// mode. Answers are asserted per iteration inside the loops (any old/new-code
+// divergence counts); each eval returns the number of WRONG iterations. A
+// fresh eval per phase gives a fresh unlinked call site, which binds to the
+// CURRENT (post-recompile) code without needing a GC to reset old cells.
+// Class definitions are a top-level construct: they go through
+// parseSourceAndInitialize, not evalCode. TierBlocky/TierNlry exist only for
+// the eligibility-filter unit assertions.
 #define TIER_DEFS \
 	"TierHost := Object [ bump: x [ ^x + 3 ] double: x [ ^(self bump: x) + (self bump: x) ] ]\n" \
-	"TierHostSub := TierHost [ bump: x [ ^x + 7 ] ]\n"
+	"TierHostSub := TierHost [ bump: x [ ^x + 7 ] ]\n" \
+	"TierJumpy := Object [ jProbe: x [ ^x > 0 ifTrue: [x + 3] ifFalse: [0 - x] ]" \
+	" jDouble: x [ ^(self jProbe: x) + (self jProbe: x) ] ]\n" \
+	"TierJumpySub := TierJumpy [ jProbe: x [ ^x + 7 ] ]\n" \
+	"TierBlocky := Object [ blocky: x [ ^[ x + 1 ] value ] ]\n" \
+	"TierNlry := Object [ nlry: x [ #(1) do: [:e | ^x + e ]. ^0 ] ]\n"
 #define TIER_MONO_WORKLOAD \
 	"[ | h wrong | h := TierHost new. wrong := 0." \
 	" 1 to: 5000 do: [:i | (h double: i) = (i * 2 + 6) ifFalse: [wrong := wrong + 1]]. wrong ] value"
 #define TIER_SUB_WORKLOAD \
 	"[ | h wrong | h := TierHostSub new. wrong := 0." \
 	" 1 to: 200 do: [:i | (h double: i) = (i * 2 + 14) ifFalse: [wrong := wrong + 1]]. wrong ] value"
+#define TIER_JUMPY_WORKLOAD \
+	"[ | h wrong | h := TierJumpy new. wrong := 0." \
+	" 1 to: 5000 do: [:i | (h jDouble: i) = (i * 2 + 6) ifFalse: [wrong := wrong + 1]]. wrong ] value"
+#define TIER_JUMPY_SUB_WORKLOAD \
+	"[ | h wrong | h := TierJumpySub new. wrong := 0." \
+	" 1 to: 200 do: [:i | (h jDouble: i) = (i * 2 + 14) ifFalse: [wrong := wrong + 1]]. wrong ] value"
 
 static int tierStatsFailures;
 
@@ -164,10 +183,48 @@ static void tierStatsCheck(_Bool ok, const char *what)
 
 static int tierStatsSelfTest(void)
 {
+	// Inlining is on unless ST_TIER_INLINE_MAX=0 (the M1-shape isolation mode).
+	char *inlineMax = getenv("ST_TIER_INLINE_MAX");
+	_Bool inlining = inlineMax == NULL || atol(inlineMax) > 0;
 	tierStatsFailures = 0;
 
 	Value defsResult;
 	tierStatsCheck(parseSourceAndInitialize(TIER_DEFS, &defsResult), "class defs failed to parse");
+
+	// Eligibility filter unit assertions (spec of tier M2): the probe exposes
+	// the real filter, so the rejects are tied to their reasons, not to
+	// statistics. basicSize is a kernel primitive method; blocky:/nlry: carry
+	// blocks (context), and nlry:'s block does a non-local return. Skipped in
+	// the inline-off mode, where the zero size cap rejects everything.
+	if (inlining) {
+		HandleScope scope;
+		openHandleScope(&scope);
+		Class *host = scopeHandle(asObject(evalObject("TierHost")));
+		Class *blocky = scopeHandle(asObject(evalObject("TierBlocky")));
+		Class *nlry = scopeHandle(asObject(evalObject("TierNlry")));
+		Class *jumpy = scopeHandle(asObject(evalObject("TierJumpy")));
+		CompiledMethod *bump = lookupSelector(host, getSymbol("bump:"));
+		CompiledMethod *blockyM = lookupSelector(blocky, getSymbol("blocky:"));
+		CompiledMethod *nlryM = lookupSelector(nlry, getSymbol("nlry:"));
+		CompiledMethod *jumpyM = lookupSelector(jumpy, getSymbol("jProbe:"));
+		CompiledMethod *primM = lookupSelector(host, getSymbol("basicSize"));
+		tierStatsCheck(bump != NULL && optimizerInlineEligibleForTest(bump, host),
+			"leaf callee rejected by the filter");
+		tierStatsCheck(blockyM != NULL && !optimizerInlineEligibleForTest(blockyM, blocky),
+			"filter accepted a callee with blocks/context");
+		tierStatsCheck(nlryM != NULL
+			&& (compiledMethodGetHeader(nlryM).outerReturns != 0
+				|| compiledMethodGetHeader(nlryM).hasContext)
+			&& !optimizerInlineEligibleForTest(nlryM, nlry),
+			"filter accepted a callee with outer returns");
+		tierStatsCheck(jumpyM != NULL && !optimizerInlineEligibleForTest(jumpyM, jumpy),
+			"filter accepted a callee with jumps");
+		tierStatsCheck(primM != NULL && compiledMethodGetHeader(primM).primitive != 0
+			&& !optimizerInlineEligibleForTest(primM, host),
+			"filter accepted a primitive callee");
+		closeHandleScope(&scope, NULL);
+	}
+
 	// Warmup: crosses the threshold mid-loop (the site keeps calling the
 	// superseded code afterwards, which stays valid forever; correctness across
 	// the crossing is the assertion).
@@ -177,6 +234,7 @@ static int tierStatsSelfTest(void)
 		// Kill-switch: no counters emitted, no trigger reachable, nothing fires.
 		tierStatsCheck(gTierStats.triggerCalls == 0 && gTierStats.recompiles == 0
 			&& gTierStats.promotedSites == 0 && gTierStats.unpromotedSites == 0
+			&& gTierStats.inlinedSites == 0
 			&& gTierStats.directCalls == 0 && gTierStats.guardFails == 0,
 			"ST_NO_TIER left nonzero counters");
 		tierStatsCheck(asCInt(evalCode(TIER_SUB_WORKLOAD)) == 0, "ST_NO_TIER sub wrong answers");
@@ -184,33 +242,41 @@ static int tierStatsSelfTest(void)
 	}
 
 	// The warmup invoked double: well past the threshold: it recompiled once
-	// (idempotent trigger) and both bump: sites were bound mono -> promoted.
+	// (idempotent trigger) and both bump: sites, bound mono to an eligible
+	// leaf, were INLINED (or, in the inline-off mode, promoted).
 	tierStatsCheck(gTierStats.recompiles >= 1, "no recompiles after hot warmup");
 	tierStatsCheck(gTierStats.triggerCalls >= gTierStats.recompiles, "triggers < recompiles");
-	tierStatsCheck(gTierStats.promotedSites >= 2, "double:'s bump: sites not promoted");
+	if (inlining) {
+		tierStatsCheck(gTierStats.inlinedSites >= 2, "double:'s bump: sites not inlined");
+	} else {
+		tierStatsCheck(gTierStats.inlinedSites == 0, "inline-off mode inlined a site");
+		tierStatsCheck(gTierStats.promotedSites >= 2, "double:'s bump: sites not promoted");
+	}
 
-	// Adoption gate: republishing does NOT touch bound IC cells nor the TLS
-	// LookupCache (both by design, the documented staleness), so a full GC
-	// stands in for the scavenges of a real workload: it resets every cell and
-	// bumps gcEpoch, and the next miss rebinds through getNativeCode to the
-	// tier-1 code.
-	evalCode("GarbageCollector collectGarbage");
-
-	// Measured mono run: a fresh call site binds to the tier-1 double:, whose
-	// promoted guards must carry ~all 2x5000 bump: dispatches; the fallback
-	// must stay rare (compiler noise only).
-	TierStats base = gTierStats;
+	// Correctness through the rewritten code, hot class and subclass: the sub
+	// run drives the inline guard's fallback send (bump: override).
 	tierStatsCheck(asCInt(evalCode(TIER_MONO_WORKLOAD)) == 0, "mono run wrong answers");
+	tierStatsCheck(asCInt(evalCode(TIER_SUB_WORKLOAD)) == 0, "sub run wrong answers");
+
+	// Promotion counters, exercised by a callee the inliner always REJECTS
+	// (jProbe: has jumps): jDouble:'s sites stay promoted direct calls in
+	// every mode. Warm up, force adoption (republishing touches neither bound
+	// cells nor the TLS LookupCache by design; a full GC stands in for the
+	// scavenges of a real workload), then measure.
+	tierStatsCheck(asCInt(evalCode(TIER_JUMPY_WORKLOAD)) == 0, "jumpy warmup wrong answers");
+	evalCode("GarbageCollector collectGarbage");
+	TierStats base = gTierStats;
+	tierStatsCheck(asCInt(evalCode(TIER_JUMPY_WORKLOAD)) == 0, "jumpy run wrong answers");
 	size_t direct = gTierStats.directCalls - base.directCalls;
 	size_t fails = gTierStats.guardFails - base.guardFails;
 	tierStatsCheck(direct > 9000, "promoted guards not taken (~2 per iteration expected)");
 	tierStatsCheck(fails < direct / 10, "stable mono site failing its guard");
 
-	// Guard-fail run: TierHostSub inherits double: (the same tier-1 code), so
-	// the promoted exact-TierHost guard must MISS for every send and the IC
-	// fallback must dispatch TierHostSub>>bump: correctly.
+	// Guard-fail run: TierJumpySub inherits jDouble: (the same tier-1 code),
+	// so the promoted exact-TierJumpy guard must MISS for every send and the
+	// IC fallback must dispatch TierJumpySub>>jProbe: correctly.
 	base = gTierStats;
-	tierStatsCheck(asCInt(evalCode(TIER_SUB_WORKLOAD)) == 0, "sub run wrong answers");
+	tierStatsCheck(asCInt(evalCode(TIER_JUMPY_SUB_WORKLOAD)) == 0, "jumpy sub wrong answers");
 	tierStatsCheck(gTierStats.guardFails - base.guardFails >= 300,
 		"subclass receiver did not take the guard-fail fallback (~400 expected)");
 

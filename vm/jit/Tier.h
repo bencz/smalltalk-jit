@@ -43,6 +43,7 @@ typedef struct {
 	size_t discardedRecompiles; // recompiles thrown away: zero sites promoted
 	size_t promotedSites;       // dynamic sends promoted to guarded direct calls
 	size_t unpromotedSites;     // tier-1 sends left as plain IC (no usable feedback)
+	size_t inlinedSites;        // dynamic sends replaced by a guarded inlined body
 	size_t directCalls;         // guard hits, JIT-emitted only under ST_TIER_STATS
 	size_t guardFails;          // guard misses -> IC fallback, same gating
 } TierStats;
@@ -95,6 +96,23 @@ static size_t tierThreshold(void)
 		threshold = value > 0 ? (size_t) value : 1000;
 	}
 	return threshold;
+}
+
+
+// Byte-size ceiling for a callee's bytecode stream to qualify for speculative
+// inlining (compiler/Optimizer.c). ST_TIER_INLINE_MAX=0 disables inlining
+// while keeping the rest of the tier (the isolation knob for A/B).
+static size_t tierInlineMax(void)
+{
+	static long limit = -1;
+	if (limit < 0) {
+		char *env = getenv("ST_TIER_INLINE_MAX");
+		limit = env != NULL ? atol(env) : 24;
+		if (limit < 0) {
+			limit = 0;
+		}
+	}
+	return (size_t) limit;
 }
 
 

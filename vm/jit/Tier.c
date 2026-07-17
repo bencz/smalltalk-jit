@@ -1,5 +1,6 @@
 #include "jit/Tier.h"
 #include "jit/CodeGenerator.h"
+#include "compiler/Optimizer.h"
 #include "core/CompiledCode.h"
 #include "core/Lookup.h"
 #include "core/Thread.h"
@@ -44,8 +45,20 @@ void tierRecompile(uint8_t *insts)
 		openHandleScope(&scope);
 		CompiledMethod *method = scopeHandle((RawCompiledMethod *) code->compiledCode);
 		size_t promotedBefore = gTierStats.promotedSites;
-		NativeCode *fresh = generateMethodCodeTiered(method, code);
-		if (gTierStats.promotedSites == promotedBefore) {
+		size_t inlinedBefore = gTierStats.inlinedSites;
+		// Speculative inlining first (compiler/Optimizer.c): when any mono
+		// site has an eligible leaf callee, the method's BYTECODES are
+		// rewritten and compiled instead, with the site map standing in for
+		// the positional cell pairing. Otherwise the original bytecodes
+		// compile exactly as in tier M1.
+		IcCell **siteMap = NULL;
+		size_t siteMapSize = 0;
+		CompiledMethod *optimized = optimizeMethod(method, code, &siteMap, &siteMapSize);
+		NativeCode *fresh = generateMethodCodeTiered(
+			optimized != NULL ? optimized : method, code, siteMap, siteMapSize);
+		free(siteMap);
+		if (gTierStats.promotedSites == promotedBefore
+				&& gTierStats.inlinedSites == inlinedBefore) {
 			// Nothing promoted (cells unlinked at recompile time, or every
 			// site megamorphic): the fresh code would be tier-0 minus the
 			// counter, and publishing it would only double this method's hot
@@ -85,6 +98,7 @@ void tierPrintStats(void)
 	printf("[TIER] discardedRecompiles %zu\n", gTierStats.discardedRecompiles);
 	printf("[TIER] promotedSites       %zu\n", gTierStats.promotedSites);
 	printf("[TIER] unpromotedSites     %zu\n", gTierStats.unpromotedSites);
+	printf("[TIER] inlinedSites        %zu\n", gTierStats.inlinedSites);
 	printf("[TIER] directCalls         %zu\n", gTierStats.directCalls);
 	printf("[TIER] guardFails          %zu\n", gTierStats.guardFails);
 }

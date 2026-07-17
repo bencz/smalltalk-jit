@@ -131,7 +131,7 @@ for cpu in $CPUS; do
 	         tests/IcGcPressureTest.st tests/IcHammerTest.st \
 	         tests/TierCorrectnessTest.st tests/TierGuardFailTest.st \
 	         tests/TierGcPressureTest.st tests/TierUnwindTest.st \
-	         tests/TierHammerTest.st; do
+	         tests/TierInlineTest.st tests/TierHammerTest.st; do
 		QEMU_CPU=$cpu timeout 900 "$OUT/st" -s "$IMG" -f "$t" </dev/null >/dev/null 2>&1 \
 			|| { echo "FAIL $t ($cpu)"; exit 1; }
 		echo "     pass $(basename "$t")"

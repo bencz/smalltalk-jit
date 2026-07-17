@@ -83,7 +83,11 @@ static void bytecodeCopy(AssemblerBuffer *buffer, Operand *source, Operand *dest
 	asmEnsureCapacity(buffer);
 	asmEmitUint8(buffer, BYTECODE_COPY);
 	bytecodeOperand(buffer, source);
-	ASSERT(dest->type == OPERAND_TEMP_VAR || dest->type == OPERAND_CONTEXT_VAR || dest->type == OPERAND_INST_VAR || dest->type == OPERAND_ASSOC);
+	// INST_VAR_OF destinations come only from the tier-1 inliner (a callee
+	// ivar store rewritten against the spilled receiver temp).
+	ASSERT(dest->type == OPERAND_TEMP_VAR || dest->type == OPERAND_CONTEXT_VAR
+		|| dest->type == OPERAND_INST_VAR || dest->type == OPERAND_ASSOC
+		|| dest->type == OPERAND_INST_VAR_OF);
 	bytecodeOperand(buffer, dest);
 	buffer->instOffset++;
 }
@@ -166,14 +170,20 @@ static void bytecodeOperand(AssemblerBuffer *buffer, Operand *operand)
 		asmEmitUint8(buffer, operand->index);
 		break;
 
-	case OPERAND_INST_VAR_OF:
+	case OPERAND_INST_VAR_OF: {
 		asmEmitUint8(buffer, operand->type);
 		asmEmitUint8(buffer, operand->index);
 		ASSERT(operand->instance.type != OPERAND_VALUE)
 		ASSERT(operand->instance.type != OPERAND_INST_VAR);
 		ASSERT(operand->instance.type != OPERAND_INST_VAR_OF);
-		bytecodeOperand(buffer, (Operand *) &operand->instance);
+		// A REAL Operand, not a cast of the nested struct: the layouts differ
+		// (Operand starts with isValid + padding), so the old cast emitted
+		// bytes read from beyond the instance fields.
+		Operand instance = { .isValid = 1, .type = operand->instance.type,
+			.index = operand->instance.index, .level = operand->instance.level };
+		bytecodeOperand(buffer, &instance);
 		break;
+	}
 
 	case OPERAND_CONTEXT_VAR:
 		asmEmitUint8(buffer, operand->type);

@@ -33,13 +33,21 @@ typedef struct CodeGenerator {
 	// compile. Non-NULL also suppresses the invocation-counter check (a method
 	// recompiles exactly once).
 	NativeCode *tierFeedback;
+	// When the tier-1 method was REWRITTEN by the inliner (compiler/
+	// Optimizer.c), the positional send-to-cell pairing no longer holds:
+	// this map, indexed by bytecode instruction number of the rewritten
+	// method, carries each send's feedback cell (NULL = none). NULL map =
+	// original bytecodes = positional pairing.
+	IcCell **tierSiteMap;
+	size_t tierSiteMapSize;
 } CodeGenerator;
 
 // Neutral initializer (jit/StubCode.c) — fresh buffer + zeroed frame state.
 void initCodeGenerator(CodeGenerator *generator);
 
 NativeCode *generateMethodCode(CompiledMethod *method);
-NativeCode *generateMethodCodeTiered(CompiledMethod *method, NativeCode *feedback);
+NativeCode *generateMethodCodeTiered(CompiledMethod *method, NativeCode *feedback,
+	IcCell **siteMap, size_t siteMapSize);
 void generateLoadObject(AssemblerBuffer *buffer, RawObject *object, Register dst, _Bool tag);
 void generateLoadClass(AssemblerBuffer *buffer, Register src, Register dst);
 void generateStoreCheck(CodeGenerator *generator, Register object, Register value);

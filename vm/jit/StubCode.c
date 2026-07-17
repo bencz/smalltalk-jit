@@ -23,6 +23,8 @@ void initCodeGenerator(CodeGenerator *generator)
 	generator->bytecodeNumber = 0;
 	generator->overapproxStackmap = 0;
 	generator->tierFeedback = NULL;
+	generator->tierSiteMap = NULL;
+	generator->tierSiteMapSize = 0;
 	generator->stackmaps = newOrdColl(8);
 	// NULL = "no bytecode descriptors" (stubs); method/block compilation
 	// allocates its own collection right after init.

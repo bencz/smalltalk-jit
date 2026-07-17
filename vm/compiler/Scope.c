@@ -510,7 +510,12 @@ static void analyzeVar(BlockScope *blockScope, LiteralNode *literal)
 	Value var = stringDictAt(blockScopeGetVars(blockScope), name);
 
 	if (!isTaggedNil(var)) {
-		if (getVarIndex(var) == CONTEXT_INDEX) {
+		// A reference to `thisContext` forces a real context. Match by TYPE:
+		// matching the INDEX alone also caught instance variable #0 (ivars
+		// enter this dict with their ivar index, see analyzeInstanceVars), so
+		// every method touching its class's FIRST ivar allocated a
+		// MethodContext for nothing on each call.
+		if (getVarType(var) == OPERAND_THIS_CONTEXT) {
 			blockScope->raw->header.hasContext = 1;
 		}
 		return;

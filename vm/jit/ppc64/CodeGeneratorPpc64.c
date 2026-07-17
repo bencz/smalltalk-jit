@@ -32,6 +32,7 @@
 #include "compiler/Bytecodes.h"
 #include "compiler/Compiler.h"
 #include "jit/CodeDescriptors.h"
+#include "jit/SendClassify.h"
 #include "jit/Tier.h"
 #include "core/Thread.h"
 #include "core/Exception.h"
@@ -105,11 +106,12 @@ static void emitLoadImm(AssemblerBuffer *buffer, Register reg, int64_t value)
 
 NativeCode *generateMethodCode(CompiledMethod *method)
 {
-	return generateMethodCodeTiered(method, NULL);
+	return generateMethodCodeTiered(method, NULL, NULL, 0);
 }
 
 
-NativeCode *generateMethodCodeTiered(CompiledMethod *method, NativeCode *feedback)
+NativeCode *generateMethodCodeTiered(CompiledMethod *method, NativeCode *feedback,
+	IcCell **siteMap, size_t siteMapSize)
 {
 	heapCodegenLockEnter(CurrentThread.heap); // serialize codegen across worker threads
 	HandleScope scope;
@@ -122,6 +124,8 @@ NativeCode *generateMethodCodeTiered(CompiledMethod *method, NativeCode *feedbac
 	pinCompiledCodeBytes(&generator.code); // the method object may move mid-codegen
 	generator.descriptors = newOrdColl(32);
 	generator.tierFeedback = feedback;
+	generator.tierSiteMap = siteMap;
+	generator.tierSiteMapSize = siteMapSize;
 	generateCode(&generator);
 
 	NativeCode *code = buildNativeCode(&generator);
@@ -571,62 +575,8 @@ static void generateCopy(CodeGenerator *generator, BytecodesIterator *iterator)
 }
 
 
-static _Bool rawSelectorIs(RawObject *selector, const char *name, size_t len)
-{
-	return rawObjectSize(selector) == len
-		&& memcmp(getRawObjectIndexedVars(selector), name, len) == 0;
-}
-
-// SmallInteger selectors inlined at the call site (fast path in generateSend).
-enum { ARITH_NONE = 0, ARITH_ADD, ARITH_SUB, ARITH_MUL, ARITH_DIV,
-       ARITH_LT, ARITH_LE, ARITH_GT, ARITH_GE, ARITH_EQ, ARITH_NE,
-       ARITH_BITAND, ARITH_BITOR, ARITH_BITXOR };
-
-static int classifyArith(RawObject *selector)
-{
-	size_t n = rawObjectSize(selector);
-	char *s = (char *) getRawObjectIndexedVars(selector);
-	if (n == 1) {
-		switch (s[0]) {
-		case '+': return ARITH_ADD;
-		case '-': return ARITH_SUB;
-		case '*': return ARITH_MUL;
-		case '/': return ARITH_DIV;   // Float only; SmallInteger keeps dispatching
-		case '<': return ARITH_LT;
-		case '>': return ARITH_GT;
-		case '=': return ARITH_EQ;
-		}
-	} else if (n == 2 && s[1] == '=') {
-		switch (s[0]) {
-		case '<': return ARITH_LE;
-		case '>': return ARITH_GE;
-		case '~': return ARITH_NE;
-		}
-	} else {
-		if (rawSelectorIs(selector, "bitAnd:", 7)) return ARITH_BITAND;
-		if (rawSelectorIs(selector, "bitOr:", 6)) return ARITH_BITOR;
-		if (rawSelectorIs(selector, "bitXor:", 7)) return ARITH_BITXOR;
-	}
-	return ARITH_NONE;
-}
-
-static _Bool arithIsCompare(int kind) { return kind >= ARITH_LT && kind <= ARITH_NE; }
-static _Bool arithIsBitOp(int kind) { return kind >= ARITH_BITAND; }
-
-
-enum { IDENT_NONE = 0, IDENT_EQ, IDENT_NE, IDENT_ISNIL, IDENT_NOTNIL };
-
-static int classifyIdentity(RawObject *selector, uint8_t argsSize)
-{
-	if (argsSize == 1) {
-		if (rawSelectorIs(selector, "==", 2)) return IDENT_EQ;
-		if (rawSelectorIs(selector, "~~", 2)) return IDENT_NE;
-	} else if (argsSize == 0) {
-		if (rawSelectorIs(selector, "isNil", 5)) return IDENT_ISNIL;
-		if (rawSelectorIs(selector, "notNil", 6)) return IDENT_NOTNIL;
-	}
-	return IDENT_NONE;
-}
+// rawSelectorIs / classifyArith / classifyIdentity moved to the shared
+// jit/SendClassify.h (one copy for both backends and the tier-1 inliner).
 
 
 static _Bool floatInlineEnabled(void)
@@ -969,17 +919,28 @@ static void generateIcSend(CodeGenerator *generator, uint8_t selectorIndex)
 static void generateIcSendPromoted(CodeGenerator *generator, uint8_t selectorIndex)
 {
 	AssemblerBuffer *buffer = &generator->buffer;
-	IcState *state = NULL;
-	if (generator->tierFeedback != NULL
+	// Feedback cell: by instruction number when the inliner rewrote the
+	// bytecodes (tierSiteMap), positionally against the superseded code's
+	// cells otherwise (see the x64 original).
+	IcCell *cell = NULL;
+	if (generator->tierSiteMap != NULL) {
+		if ((size_t) generator->bytecodeNumber < generator->tierSiteMapSize) {
+			cell = generator->tierSiteMap[generator->bytecodeNumber];
+		}
+	} else if (generator->tierFeedback != NULL
 			&& buffer->icSitesSize < generator->tierFeedback->icCellsSize) {
-		IcCell *cells = nativeCodeIcCells(generator->tierFeedback);
-		IcState *seen = __atomic_load_n(&cells[buffer->icSitesSize].state, __ATOMIC_ACQUIRE);
+		cell = &nativeCodeIcCells(generator->tierFeedback)[buffer->icSitesSize];
+	}
+	IcState *state = NULL;
+	if (cell != NULL) {
+		IcState *seen = __atomic_load_n(&cell->state, __ATOMIC_ACQUIRE);
 		if (seen->kind == IC_KIND_MONO || seen->kind == IC_KIND_PIC) {
 			state = seen;
 		}
 	}
 	if (state == NULL) {
-		// Unlinked (a fresh STW reset), mega, or out of feedback: plain IC send.
+		// Unlinked (a fresh STW reset), mega, inlined-body send, or out of
+		// feedback: plain IC send.
 		if (generator->tierFeedback != NULL) {
 			gTierStats.unpromotedSites++;
 		}
@@ -1520,6 +1481,19 @@ static void pushOperand(CodeGenerator *generator, Operand operand)
 		break;
 	}
 
+	case OPERAND_INST_VAR_OF: {
+		// The tier-1 inliner's rewrite of a callee ivar access: the instance
+		// is always the spilled-receiver TEMP and the index is the absolute,
+		// pre-resolved slot (see the x64 original).
+		ASSERT(operand.instance.type == OPERAND_TEMP_VAR);
+		Variable *instance = variableAt(generator, operand.instance.index);
+		ptrdiff_t offset = varOffset(RawObject, body) + operand.index * sizeof(Value);
+		fillVar(generator, instance);
+		asmLdT(buffer, TMP, offset, varReg(instance));
+		asmPush(buffer, TMP);
+		break;
+	}
+
 	case OPERAND_LITERAL:
 		generateLoadObject(buffer, compiledCodeLiteralAt(&generator->code, operand.index), TMP, 1);
 		asmPush(buffer, TMP);
@@ -1592,6 +1566,16 @@ static void movOperand(CodeGenerator *generator, Operand operand, Register reg)
 		ptrdiff_t offset = varOffset(RawObject, body) + (shape.payloadSize + operand.index + shape.isIndexed) * sizeof(Value);
 		fillVar(generator, self);
 		asmLdT(buffer, reg, offset, varReg(self));
+		break;
+	}
+
+	case OPERAND_INST_VAR_OF: {
+		// Inliner-only form: absolute slot of the spilled-receiver TEMP.
+		ASSERT(operand.instance.type == OPERAND_TEMP_VAR);
+		Variable *instance = variableAt(generator, operand.instance.index);
+		ptrdiff_t offset = varOffset(RawObject, body) + operand.index * sizeof(Value);
+		fillVar(generator, instance);
+		asmLdT(buffer, reg, offset, varReg(instance));
 		break;
 	}
 
@@ -1676,6 +1660,20 @@ static void movToOperand(CodeGenerator *generator, Register reg, Operand operand
 			generateStoreCheck(generator, varReg(self), reg);
 		}
 		asmStdT(buffer, reg, offset, varReg(self));
+		break;
+	}
+
+	case OPERAND_INST_VAR_OF: {
+		// Inliner-only form: same store discipline as INST_VAR (write barrier
+		// against the spilled-receiver TEMP's object).
+		ASSERT(operand.instance.type == OPERAND_TEMP_VAR);
+		Variable *instance = variableAt(generator, operand.instance.index);
+		ptrdiff_t offset = varOffset(RawObject, body) + operand.index * sizeof(Value);
+		fillVar(generator, instance);
+		if (valueMayBePointer) {
+			generateStoreCheck(generator, varReg(instance), reg);
+		}
+		asmStdT(buffer, reg, offset, varReg(instance));
 		break;
 	}
 
