@@ -80,6 +80,15 @@ Tests
 lists the syntax quirks worth knowing before writing any Smalltalk against this
 VM.
 
+Profiling
+---------
+
+The JIT compiles everything to machine code, so a stock profiler sees anonymous
+addresses. `docs/jit-profiling.md` covers `ST_PERF_MAP`, which emits a
+`/tmp/perf-<pid>.map` so `perf` resolves JIT frames to `Class>>selector`, how to
+profile the VM under load, and how to disassemble the code the JIT produced for
+any named method.
+
 Status
 ------
 

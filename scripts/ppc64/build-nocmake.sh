@@ -47,7 +47,7 @@ case "$TARGET_ARCH" in
 esac
 
 SOURCES=$(ls "$ROOT"/vm/compiler/*.c "$ROOT"/vm/concurrency/*.c "$ROOT"/vm/core/*.c \
-	"$ROOT"/vm/jit/InlineCache.c "$ROOT"/vm/jit/RegisterAllocator.c "$ROOT"/vm/jit/StubCode.c \
+	"$ROOT"/vm/jit/InlineCache.c "$ROOT"/vm/jit/PerfMap.c "$ROOT"/vm/jit/RegisterAllocator.c "$ROOT"/vm/jit/StubCode.c \
 	"$ROOT"/vm/jit/Tier.c \
 	"$ROOT"/vm/jit/$ARCH_DIR/*.c "$ROOT"/vm/memory/*.c "$ROOT"/vm/os/linux/*.c \
 	"$ROOT"/vm/runtime/*.c "$ROOT"/vm/tools/*.c)

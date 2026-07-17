@@ -34,6 +34,7 @@
 #include "jit/CodeDescriptors.h"
 #include "jit/SendClassify.h"
 #include "jit/Tier.h"
+#include "jit/PerfMap.h"
 #include "core/Thread.h"
 #include "core/Exception.h"
 #include "core/Assert.h"
@@ -2231,6 +2232,7 @@ NativeCode *buildNativeCode(CodeGenerator *generator)
 	if (generator->stackmaps != NULL) {
 		code->stackmaps = ordCollAsArray(generator->stackmaps)->raw;
 	}
+	perfMapEmit(code); // /tmp/perf-<pid>.map line for `perf` (no-op unless ST_PERF_MAP)
 	return code;
 }
 

@@ -187,6 +187,7 @@ set(vmSources
 	vm/core/StackFrame.c
 	vm/core/Thread.c
 	vm/jit/InlineCache.c
+	vm/jit/PerfMap.c
 	vm/jit/RegisterAllocator.c
 	vm/jit/StubCode.c
 	vm/jit/Tier.c
