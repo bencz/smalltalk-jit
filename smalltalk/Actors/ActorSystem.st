@@ -18,7 +18,11 @@ ActorSystem := Object [
 
 
 	initSystem [
-		registry := Dictionary new.
+		"registry is READ-MOSTLY: written on spawn/register/unregister, read on every
+		 message delivery (endpointFor:). ConcurrentDictionary makes those reads
+		 lock-free, so message delivery no longer serializes lookups on the global
+		 sync monitor (the actor-endpoint multicore ceiling)."
+		registry := ConcurrentDictionary new.
 		counter := 0.
 		guardianStrategy := OneForOneStrategy default.
 		deadLetters := DeadLetterProcess new.
@@ -54,29 +58,21 @@ ActorSystem := Object [
 		| id pid |
 		id := self nextId.
 		pid := Pid system: self id: id.
-		Processor monitorEnter.
-		registry at: id put: anEndpoint.
-		Processor monitorExit.
+		registry at: id put: anEndpoint. "ConcurrentDictionary: COW write, self-synchronized"
 		^pid
 	]
 
 
 	unregister: aPid [
-		"The registry is one shared Dictionary mutated by every worker; guard it (there are
-		 no concurrent collections yet, so the monitor serializes at:put:/removeKey:/at:)."
-		Processor monitorEnter.
+		"COW write on the registry; ConcurrentDictionary serializes writers itself."
 		registry removeKey: aPid id ifAbsent: [].
-		Processor monitorExit.
 		^self
 	]
 
 
 	endpointFor: aPid [
-		| e |
-		Processor monitorEnter.
-		e := registry at: aPid id ifAbsent: [nil].
-		Processor monitorExit.
-		^e
+		"LOCK-FREE read: the hot path of every message delivery. No monitor."
+		^registry at: aPid id ifAbsent: [nil]
 	]
 
 
@@ -121,9 +117,7 @@ ActorSystem := Object [
 		context system: self selfPid: pid parent: aParentPid props: aProps mailbox: mailbox.
 		context actor: aProps producer value.
 		mailbox invoker: context.
-		Processor monitorEnter.
-		registry at: id put: mailbox.
-		Processor monitorExit.
+		registry at: id put: mailbox. "ConcurrentDictionary: COW write, self-synchronized"
 		mailbox postSystem: ActorStarted.
 		mailbox start.
 		^pid

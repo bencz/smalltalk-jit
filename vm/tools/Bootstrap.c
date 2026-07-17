@@ -319,6 +319,7 @@ static _Bool parseKernelFiles(char *kernelDir)
 		"Concurrency/Channel.st",
 		"Concurrency/Worker.st",
 		"Concurrency/SharedDictionary.st", // thread-safe collection for shared state under the pool
+		"Concurrency/ConcurrentDictionary.st", // read-mostly, lock-free reads (actor registry / id->pid maps)
 
 		// actor framework (ProtoActor-style)
 		"Actors/SystemMessages.st",
