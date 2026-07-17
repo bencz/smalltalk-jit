@@ -104,7 +104,8 @@ static _Bool isRejectedClass(RawObject *cls)
 {
 	return cls == (RawObject *) Handles.Block->raw || cls == (RawObject *) Handles.BlockContext->raw
 		|| cls == (RawObject *) Handles.MethodContext->raw || cls == (RawObject *) Handles.CompiledMethod->raw
-		|| cls == (RawObject *) Handles.CompiledBlock->raw || cls == (RawObject *) Handles.ExceptionHandler->raw;
+		|| cls == (RawObject *) Handles.CompiledBlock->raw || cls == (RawObject *) Handles.ExceptionHandler->raw
+		|| cls == (RawObject *) Handles.UnwindHandler->raw;
 }
 
 static void writeName(Writer *w, RawObject *stringOrSymbol)

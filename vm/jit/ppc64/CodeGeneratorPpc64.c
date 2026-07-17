@@ -33,6 +33,7 @@
 #include "compiler/Compiler.h"
 #include "jit/CodeDescriptors.h"
 #include "core/Thread.h"
+#include "core/Exception.h"
 #include "core/Assert.h"
 #include <string.h>
 
@@ -1215,7 +1216,9 @@ void generateLoadClass(AssemblerBuffer *buffer, Register src, Register dst)
 static void generateOuterReturn(CodeGenerator *generator, BytecodesIterator *iterator)
 {
 	AssemblerLabel deathContext;
+	AssemblerLabel cut;
 	asmInitLabel(&deathContext);
+	asmInitLabel(&cut);
 
 	Variable *context = variableAt(generator, CONTEXT_INDEX);
 	AssemblerBuffer *buffer = &generator->buffer;
@@ -1232,7 +1235,25 @@ static void generateOuterReturn(CodeGenerator *generator, BytecodesIterator *ite
 	asmCmpd(buffer, 0, R0, varReg(context));
 	asmBne(buffer, &deathContext);
 
+	// pending ensure:/ifCurtailed: cleanups? (R6 is dead: the return leaves)
+	asmLoadTls(buffer, R6, gCurrentThreadTpoff);
+	asmLd(buffer, R6, offsetof(Thread, unwindHandler), R6);
+	asmCmpdi(buffer, 0, R6, 0);
+	asmBeq(buffer, &cut);
+
+	// slow path: run the cleanups below the home frame in C (r3 = the result
+	// already; the helper keeps it alive across cleanup-triggered GCs and
+	// answers it, possibly moved, in r3), then re-derive the home context from
+	// this frame's context slot, which the GC keeps fresh (the raw home-frame
+	// address itself is stable, but the context objects can move).
+	asmMr(buffer, R4, TMP); // home frame
+	generateCCall(generator, (intptr_t) nlrRunUnwindHandlers, 2, 1);
+	asmLd(buffer, varReg(context), -2 * (ptrdiff_t) sizeof(intptr_t), FP);
+	asmLdT(buffer, varReg(context), varOffset(RawContext, home), varReg(context));
+	asmLdT(buffer, TMP, varOffset(RawContext, frame), varReg(context));
+
 	// context is live: unwind straight to the home frame and return
+	asmPpcLabelBind(buffer, &cut, asmOffset(buffer));
 	asmMr(buffer, R1, TMP);
 	asmPop(buffer, FP);
 	asmPop(buffer, R0);

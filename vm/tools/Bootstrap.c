@@ -65,6 +65,7 @@ static void initSmalltalkStubs(void)
 	Handles.MethodContext = newStubClass(metaClass, ContextShape, 5);
 	Handles.BlockContext = newStubClass(metaClass, ContextShape, 5);
 	Handles.ExceptionHandler = newStubClass(metaClass, ExceptionHandlerShape, 2);
+	Handles.UnwindHandler = newStubClass(metaClass, UnwindHandlerShape, 3);
 	Handles.ClassNode = newStubClass(metaClass, FixedShape, 6);
 	Handles.MethodNode = newStubClass(metaClass, FixedShape, 5);
 	Handles.BlockNode = newStubClass(metaClass, FixedShape, 5);
@@ -123,6 +124,7 @@ static void initSmalltalkStubs(void)
 	setGlobal("BlockShape", *(Value *) &BlockShape);
 	setGlobal("ContextShape", *(Value *) &ContextShape);
 	setGlobal("ExceptionHandlerShape", *(Value *) &ExceptionHandlerShape);
+	setGlobal("UnwindHandlerShape", *(Value *) &UnwindHandlerShape);
 
 	setGlobalObject("Symbol", (Object *) Handles.Symbol);
 	setGlobalObject("String", (Object *) Handles.String);
@@ -143,6 +145,7 @@ static void initSmalltalkStubs(void)
 	setGlobalObject("MethodContext", (Object *) Handles.MethodContext);
 	setGlobalObject("BlockContext", (Object *) Handles.BlockContext);
 	setGlobalObject("ExceptionHandler", (Object *) Handles.ExceptionHandler);
+	setGlobalObject("UnwindHandler", (Object *) Handles.UnwindHandler);
 	setGlobalObject("ClassNode", (Object *) Handles.ClassNode);
 	setGlobalObject("MethodNode", (Object *) Handles.MethodNode);
 	setGlobalObject("BlockNode", (Object *) Handles.BlockNode);
@@ -278,6 +281,7 @@ static _Bool parseKernelFiles(char *kernelDir)
 		"MethodContext.st",
 		"BlockContext.st",
 		"ExceptionHandler.st",
+		"UnwindHandler.st",
 		"Message.st",
 		"SourceCode.st",
 		"FileSourceCode.st",

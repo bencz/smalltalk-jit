@@ -38,6 +38,8 @@ void initThread(Thread *thread)
 	thread->schedCurrent = NULL;
 	thread->exceptionHandler = 0; // empty on:do: chain
 	thread->schedExceptionHandler = &thread->exceptionHandler; // this thread's own handler-chain slot
+	thread->unwindHandler = 0; // empty ensure:/ifCurtailed: chain
+	thread->schedUnwindHandler = &thread->unwindHandler;
 	heapAddMutator(thread->heap, thread); // this thread now mutates (and roots) its heap
 	// Start with an empty TLAB (top == end) pointing at the fresh nursery top, so
 	// the first allocation takes the refill path and carves a real chunk.

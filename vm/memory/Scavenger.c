@@ -29,6 +29,7 @@ static void iterateThreadRoots(Scavenger *scavenger);
 static void iterateMutatorCurrentRoots(Scavenger *scavenger, Thread *m);
 static void iterateStackFrames(Scavenger *scavenger, EntryStackFrame *entryFrame);
 static void iterateExceptionHandlerSlot(Scavenger *scavenger, Value *slot);
+static void iterateUnwindHandlerSlot(Scavenger *scavenger, Value *slot);
 static void iterateHandleScopes(Scavenger *scavenger, HandleScope *scopes);
 static void iterateRememberedSet(Scavenger *scavenger);
 static void iterateNativeCode(Scavenger *scavenger);
@@ -323,6 +324,7 @@ static void iterateFiberRoots(Scavenger *scavenger, Fiber *fiber)
 	}
 	iterateStackFrames(scavenger, fiber->roots.stackFramesTail);
 	iterateExceptionHandlerSlot(scavenger, &fiber->roots.exceptionHandler);
+	iterateUnwindHandlerSlot(scavenger, &fiber->roots.unwindHandler);
 	iterateHandleScopes(scavenger, fiber->roots.handleScopes);
 	if (fiber->roots.context != 0) {
 		processTaggedPointer(scavenger, &fiber->roots.context);
@@ -377,6 +379,11 @@ static void iterateMutatorCurrentRoots(Scavenger *scavenger, Thread *m)
 	} else if (m->schedExceptionHandler != NULL) {
 		iterateExceptionHandlerSlot(scavenger, m->schedExceptionHandler);
 	}
+	if (m == &CurrentThread) {
+		iterateUnwindHandlerSlot(scavenger, &CurrentThread.unwindHandler);
+	} else if (m->schedUnwindHandler != NULL) {
+		iterateUnwindHandlerSlot(scavenger, m->schedUnwindHandler);
+	}
 }
 
 
@@ -407,6 +414,20 @@ static void iterateExceptionHandlerSlot(Scavenger *scavenger, Value *slot)
 		*slot = 0;
 	}
 
+	if (*slot != 0) {
+		processTaggedPointer(scavenger, slot);
+		noteYoungRoot(scavenger, *slot);
+	}
+}
+
+
+// Unlike the on:do: chain there is no stale-entry pruning here: the unwinders
+// (exception, non-local return, terminate) unlink unwind handlers as they run
+// them, so everything still chained is pending and frame-live. Scavenging the
+// head is enough; parent/context/block are ordinary pointer vars traced when
+// each handler object is scanned.
+static void iterateUnwindHandlerSlot(Scavenger *scavenger, Value *slot)
+{
 	if (*slot != 0) {
 		processTaggedPointer(scavenger, slot);
 		noteYoungRoot(scavenger, *slot);

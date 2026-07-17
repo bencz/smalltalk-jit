@@ -1229,6 +1229,69 @@ void generateBlockOnExceptionPrimitive(CodeGenerator *generator)
 }
 
 
+// valueUnwindProtected: aBlock (the ensure:/ifCurtailed: engine): evaluate the
+// receiver block with `aBlock` registered as a pending unwind cleanup on the
+// running fiber's chain. On normal completion the registration is unlinked and
+// the receiver's value answered; on any unwind (exception, non-local return,
+// terminate) the unwinder runs the cleanup while it cuts through this frame.
+// Same skeleton as on:do: above, minus the re-entry ip.
+void generateBlockUnwindPrimitive(CodeGenerator *generator)
+{
+	AssemblerBuffer *buffer = &generator->buffer;
+	generator->frameSize = 2;
+
+	// framed prologue with local slots
+	primFramedPrologue(buffer);
+	asmAddi(buffer, R1, R1, -(ptrdiff_t) (generator->frameSize * sizeof(intptr_t)));
+
+	// save native code
+	asmStd(buffer, TGT, -(ptrdiff_t) sizeof(intptr_t), FP);
+	generateMethodContextAllocation(generator, 0);
+
+	// allocate the unwind handler
+	generateLoadObject(buffer, (RawObject *) Handles.UnwindHandler->raw, R4, 0);
+	asmLi(buffer, R5, 0);
+	generateStubCall(generator, &AllocateStub);
+	// handler->context (freshly allocated handler: no store barrier needed)
+	asmLd(buffer, R8_PPC, -2 * (ptrdiff_t) sizeof(intptr_t), FP);
+	asmStdT(buffer, R8_PPC, varOffset(RawUnwindHandler, context), R3);
+	// handler->block = the cleanup argument
+	asmLd(buffer, R8_PPC, 3 * sizeof(intptr_t), FP);
+	asmStdT(buffer, R8_PPC, varOffset(RawUnwindHandler, block), R3);
+	// spill the unwind handler
+	asmPush(buffer, R3);
+	generator->frameSize++;
+
+	// link into the RUNNING worker's chain (TLS; same rationale as on:do:)
+	asmLoadTls(buffer, R6, gCurrentThreadTpoff);
+	asmLd(buffer, TMP, offsetof(Thread, unwindHandler), R6);
+	asmStdT(buffer, TMP, varOffset(RawUnwindHandler, parent), R3);
+	asmStd(buffer, R3, offsetof(Thread, unwindHandler), R6);
+
+	// value the protected block
+	generateLoadObject(buffer, (RawObject *) Handles.Block->raw, R3, 1);
+	generateLoadObject(buffer, (RawObject *) Handles.valueSymbol->raw, R4, 0);
+	asmLd(buffer, R0, 2 * sizeof(intptr_t), FP);
+	asmPush(buffer, R0);
+	generator->frameSize++;
+	generateMethodLookup(generator);
+	generator->frameSize--;
+	asmCallReg(buffer, TGT);
+	generateStackmap(generator);
+
+	// unlink on normal completion (the unwinders unlink on the abnormal paths)
+	asmLd(buffer, TMP, -3 * (ptrdiff_t) sizeof(intptr_t), FP);
+	asmLdT(buffer, TMP, varOffset(RawUnwindHandler, parent), TMP);
+	asmLoadTls(buffer, R6, gCurrentThreadTpoff);
+	asmStd(buffer, TMP, offsetof(Thread, unwindHandler), R6);
+
+	// epilogue
+	asmLdT(buffer, CTX, varOffset(RawContext, parent), CTX);
+	primFramedEpilogue(buffer);
+	asmBlr(buffer);
+}
+
+
 void generateExceptionSignalPrimitive(CodeGenerator *generator)
 {
 	AssemblerBuffer *buffer = &generator->buffer;
@@ -1287,6 +1350,19 @@ void generateExceptionSignalPrimitive(CodeGenerator *generator)
 	asmLdT(buffer, CTX, varOffset(RawExceptionHandler, context), R6);
 	asmLdT(buffer, FP, varOffset(RawContext, frame), CTX);
 	asmAddi(buffer, R1, FP, -2 * (ptrdiff_t) sizeof(intptr_t));
+	// the jump into the handler abandons everything below the handler frame,
+	// including nested C entry records / handle scopes created since (a cleanup
+	// that signals is the common source): drop them NOW, after the last read of
+	// a dying frame. unwindThreadStateTo never allocates, so the raw pushes of
+	// heap pointers around it are safe.
+	asmPush(buffer, R6);           // handler
+	asmPush(buffer, R8_PPC);       // exception
+	asmPush(buffer, R3);           // backtrace
+	asmMr(buffer, R3, FP);
+	generateCCall(generator, (intptr_t) unwindThreadStateTo, 1, 0);
+	asmPop(buffer, R3);
+	asmPop(buffer, R8_PPC);
+	asmPop(buffer, R6);
 	asmPush(buffer, R3);           // generated backtrace
 	asmPush(buffer, R8_PPC);       // signaled exception
 	// #value:value: (backtrace not passed to the handler block itself)
@@ -1301,6 +1377,13 @@ void generateExceptionSignalPrimitive(CodeGenerator *generator)
 	asmLd(buffer, R8_PPC, 2 * sizeof(intptr_t), FP);
 	asmLdT(buffer, FP, varOffset(RawContext, frame), CTX);
 	asmAddi(buffer, R1, FP, -2 * (ptrdiff_t) sizeof(intptr_t));
+	// drop the C-side records of the region being cut (see the backtrace path)
+	asmPush(buffer, R3);           // handler
+	asmPush(buffer, R8_PPC);       // exception
+	asmMr(buffer, R3, FP);
+	generateCCall(generator, (intptr_t) unwindThreadStateTo, 1, 0);
+	asmPop(buffer, R8_PPC);
+	asmPop(buffer, R3);
 	asmPush(buffer, R8_PPC);       // unused second argument slot
 	asmPush(buffer, R8_PPC);       // signaled exception
 	generateLoadObject(buffer, (RawObject *) Handles.value_Symbol->raw, R4, 0);

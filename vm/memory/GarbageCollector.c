@@ -71,6 +71,16 @@ static void iterateExceptionHandlerChain(MarkingQueue *queue, Thread *thread, Va
 }
 
 
+static void iterateUnwindHandlerChain(MarkingQueue *queue, Thread *thread, Value handlerValue)
+{
+	while (handlerValue != 0) {
+		RawUnwindHandler *handler = (RawUnwindHandler *) asObject(handlerValue);
+		markObject(queue, thread, (RawObject *) handler);
+		handlerValue = handler->parent;
+	}
+}
+
+
 // Mirror of the scavenger's stale-slot tolerance, for the mark phase's frame walk.
 // A back-edge safepoint poll records an OVER-APPROXIMATED stackmap (the linear-scan
 // liveness is control-flow-unaware), so a walked frame slot can be DEAD and hold a
@@ -186,6 +196,7 @@ static void iterateFiberStack(MarkingQueue *queue, Thread *thread, Fiber *fiber)
 	}
 	iterateStackFrames(queue, thread, fiber->roots.stackFramesTail);
 	iterateExceptionHandlerChain(queue, thread, fiber->roots.exceptionHandler);
+	iterateUnwindHandlerChain(queue, thread, fiber->roots.unwindHandler);
 }
 
 
@@ -215,6 +226,11 @@ static void iterateMutatorCurrentStack(MarkingQueue *queue, Thread *thread, Thre
 		iterateExceptionHandlerChain(queue, thread, CurrentExceptionHandler);
 	} else if (m->schedExceptionHandler != NULL) {
 		iterateExceptionHandlerChain(queue, thread, *m->schedExceptionHandler);
+	}
+	if (m == thread) {
+		iterateUnwindHandlerChain(queue, thread, CurrentThread.unwindHandler);
+	} else if (m->schedUnwindHandler != NULL) {
+		iterateUnwindHandlerChain(queue, thread, *m->schedUnwindHandler);
 	}
 }
 

@@ -22,6 +22,7 @@
 #include "compiler/Compiler.h"
 #include "jit/CodeDescriptors.h"
 #include "core/Thread.h"
+#include "core/Exception.h"
 #include "core/Assert.h"
 #include <string.h>
 
@@ -1236,7 +1237,9 @@ void generateLoadClass(AssemblerBuffer *buffer, Register src, Register dst)
 static void generateOuterReturn(CodeGenerator *generator, BytecodesIterator *iterator)
 {
 	AssemblerLabel deathContext;
+	AssemblerLabel cut;
 	asmInitLabel(&deathContext);
+	asmInitLabel(&cut);
 
 	Variable *context = variableAt(generator, CONTEXT_INDEX);
 	AssemblerBuffer *buffer = &generator->buffer;
@@ -1252,7 +1255,26 @@ static void generateOuterReturn(CodeGenerator *generator, BytecodesIterator *ite
 	asmCmpqMem(buffer, asmMem(TMP, NO_REGISTER, SS_1, -2 * sizeof(intptr_t)), context->reg);
 	asmJ(buffer, COND_NOT_EQUAL, &deathContext);
 
+	// pending ensure:/ifCurtailed: cleanups? (RDI is dead: the return leaves)
+	asmLoadTls(buffer, RDI, gCurrentThreadTpoff);
+	asmMovqMem(buffer, asmMem(RDI, NO_REGISTER, SS_1, offsetof(Thread, unwindHandler)), RDI);
+	asmTestq(buffer, RDI, RDI);
+	asmJ(buffer, COND_ZERO, &cut);
+
+	// slow path: run the cleanups below the home frame in C. The helper keeps
+	// the return value alive across cleanup-triggered GCs and answers it
+	// (possibly moved) in RAX; the home context is then re-derived from this
+	// frame's context slot, which the GC keeps fresh (the raw home-frame
+	// address itself is stable, but the context objects can move).
+	asmMovq(buffer, RAX, RDI); // result
+	asmMovq(buffer, TMP, RSI); // home frame
+	generateCCall(generator, (intptr_t) nlrRunUnwindHandlers, 2, 1);
+	asmMovqMem(buffer, asmMem(RBP, NO_REGISTER, SS_1, -2 * sizeof(intptr_t)), context->reg);
+	asmMovqMem(buffer, asmMem(context->reg, NO_REGISTER, SS_1, varOffset(RawContext, home)), context->reg);
+	asmMovqMem(buffer, asmMem(context->reg, NO_REGISTER, SS_1, varOffset(RawContext, frame)), TMP);
+
 	// context is a live so return
+	asmLabelBind(buffer, &cut, asmOffset(buffer));
 	asmMovq(buffer, TMP, RSP);
 	asmPopq(buffer, RBP);
 	asmRet(buffer);

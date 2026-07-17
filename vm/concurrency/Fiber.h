@@ -54,6 +54,7 @@ typedef struct FiberRoots {
 	struct HandleScope *handleScopes;
 	Value context;
 	Value exceptionHandler;
+	Value unwindHandler; // pending ensure:/ifCurtailed: chain (see Thread.h)
 } FiberRoots;
 
 typedef void (*FiberCEntry)(void *arg);

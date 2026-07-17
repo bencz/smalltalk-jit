@@ -90,20 +90,32 @@ Block := Object [
 
 	"guaranteed evaluation"
 
+	valueUnwindProtected: aBlock [
+		"Evaluate the receiver with aBlock registered as a pending unwind cleanup
+		on this fiber's chain. If any unwind cuts through this frame (an exception
+		unwinding to an outer handler, a non-local return, or Process terminate),
+		the unwinder runs aBlock during the unwind, innermost-first; on normal
+		completion nothing runs and the registration is unlinked."
+		<primitive: BlockUnwindPrimitive>
+	]
+
+
 	ensure: aBlock [
-		"Evaluate the receiver and answer its value, evaluating aBlock afterwards
-		whether the receiver completes normally or is unwound by an exception."
+		"Evaluate the receiver and answer its value; aBlock runs exactly once
+		afterwards, whether the receiver completes normally or is unwound (by an
+		exception, a non-local return, or termination)."
 		| result |
 
-		result := [self value] on: Exception do: [:ex | aBlock value. ex pass].
+		result := self valueUnwindProtected: aBlock.
 		aBlock value.
 		^result
 	]
 
 
 	ifCurtailed: aBlock [
-		"Evaluate aBlock only if the receiver is curtailed by an exception."
-		^[self value] on: Exception do: [:ex | aBlock value. ex pass]
+		"Evaluate aBlock only if the receiver is curtailed (unwound by an
+		exception, a non-local return, or termination)."
+		^self valueUnwindProtected: aBlock
 	]
 
 

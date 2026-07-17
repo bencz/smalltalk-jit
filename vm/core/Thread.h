@@ -45,6 +45,11 @@ typedef struct Thread {
 	// breaking on:do: on every other worker. A fiber's saved handler is loaded here on resume; the
 	// B2.5 context rebind keeps CTX->thread pointing at the running worker.
 	Value exceptionHandler;
+	// Head of this mutator's ensure:/ifCurtailed: unwind-handler chain (same discipline
+	// as exceptionHandler: per-mutator, reached from JIT code via TLS, saved/restored per
+	// fiber). Entries are UnwindHandler objects; the unwinders (exception, non-local
+	// return, terminate) run and unlink them, so everything on the chain is pending.
+	Value unwindHandler;
 	TLAB tlab; // per-OS-thread young allocation buffer (stays embedded, per-mutator)
 	// 8-byte scratch for the PPC baseline's GPR<->FPR raw bit moves (mtvsrd/
 	// mfvsrd only exist from ISA 2.07 on): the JIT stores and immediately
@@ -68,6 +73,8 @@ typedef struct Thread {
 	// the Smalltalk stack. NULL until published (initThread / schedulerInit / worker
 	// registration). Stale for a scheduler mutator parked in the scheduler context.
 	Value *schedExceptionHandler;
+	// Same publication for the unwind-handler chain head (see unwindHandler above).
+	Value *schedUnwindHandler;
 } Thread;
 
 extern __thread Thread CurrentThread;

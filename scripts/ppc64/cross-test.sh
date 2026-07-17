@@ -117,9 +117,14 @@ fi
 if [ "$MODE" = be ]; then CPUS="power7 power9"; else CPUS="power8 power9"; fi
 for cpu in $CPUS; do
 	echo "==   QEMU_CPU=$cpu:"
+	# The exception/unwind machinery is per-backend GEN code (ExceptionSignal,
+	# BlockOnException, BlockUnwind + the outer-return unwind hook), so its
+	# tests gate here too, not only on x64.
 	for t in tests/FloatTest.st tests/FloatEdgeTest.st tests/FloatCrossRepTest.st \
 	         tests/SmallFloat64BoundaryTest.st tests/FloatHashTest.st \
-	         tests/ScaledDecimalTest.st tests/LargeIntegerTest.st; do
+	         tests/ScaledDecimalTest.st tests/LargeIntegerTest.st \
+	         tests/ExceptionTest.st tests/ExceptionProtocolTest.st \
+	         tests/UnwindTest.st; do
 		QEMU_CPU=$cpu timeout 900 "$OUT/st" -s "$IMG" -f "$t" </dev/null >/dev/null 2>&1 \
 			|| { echo "FAIL $t ($cpu)"; exit 1; }
 		echo "     pass $(basename "$t")"

@@ -63,6 +63,7 @@ typedef struct SmalltalkHandles {
 	Class *MethodContext;
 	Class *BlockContext;
 	Class *ExceptionHandler;
+	Class *UnwindHandler;
 	Class *ClassNode;
 	Class *MethodNode;
 	Class *BlockNode;

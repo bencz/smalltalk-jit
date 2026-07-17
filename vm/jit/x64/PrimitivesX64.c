@@ -1224,6 +1224,70 @@ void generateBlockOnExceptionPrimitive(CodeGenerator *generator)
 }
 
 
+// valueUnwindProtected: aBlock (the ensure:/ifCurtailed: engine): evaluate the
+// receiver block with `aBlock` registered as a pending unwind cleanup on the
+// running fiber's chain. On normal completion the registration is unlinked and
+// the receiver's value answered; on any unwind (exception, non-local return,
+// terminate) the unwinder runs the cleanup while it cuts through this frame.
+// Same skeleton as on:do: above, minus the re-entry ip.
+void generateBlockUnwindPrimitive(CodeGenerator *generator)
+{
+	AssemblerBuffer *buffer = &generator->buffer;
+	generator->frameSize = 2;
+
+	// prologue
+	asmPushq(buffer, RBP);
+	asmMovq(buffer, RSP, RBP);
+	asmSubqImm(buffer, RSP, generator->frameSize * sizeof(intptr_t));
+
+	// save native code
+	asmMovqToMem(buffer, R11, asmMem(RBP, NO_REGISTER, SS_1, -sizeof(intptr_t)));
+	generateMethodContextAllocation(generator, 0);
+
+	// allocate the unwind handler
+	generateLoadObject(buffer, (RawObject *) Handles.UnwindHandler->raw, RSI, 0);
+	asmXorq(buffer, RDX, RDX);
+	generateStubCall(generator, &AllocateStub);
+	// handler->context (freshly allocated handler: no store barrier needed)
+	asmMovqMem(buffer, asmMem(RBP, NO_REGISTER, SS_1, -2 * sizeof(intptr_t)), R9);
+	asmMovqToMem(buffer, R9, asmMem(RAX, NO_REGISTER, SS_1, varOffset(RawUnwindHandler, context)));
+	// handler->block = the cleanup argument
+	asmMovqMem(buffer, asmMem(RBP, NO_REGISTER, SS_1, 3 * sizeof(intptr_t)), R9);
+	asmMovqToMem(buffer, R9, asmMem(RAX, NO_REGISTER, SS_1, varOffset(RawUnwindHandler, block)));
+	// spill the unwind handler
+	asmPushq(buffer, RAX);
+	generator->frameSize++;
+
+	// link into the RUNNING worker's chain (TLS; same rationale as on:do:)
+	asmLoadTls(buffer, RDI, gCurrentThreadTpoff);
+	asmMovqMem(buffer, asmMem(RDI, NO_REGISTER, SS_1, offsetof(Thread, unwindHandler)), TMP);
+	asmMovqToMem(buffer, TMP, asmMem(RAX, NO_REGISTER, SS_1, varOffset(RawUnwindHandler, parent)));
+	asmMovqToMem(buffer, RAX, asmMem(RDI, NO_REGISTER, SS_1, offsetof(Thread, unwindHandler)));
+
+	// value the protected block
+	generateLoadObject(buffer, (RawObject *) Handles.Block->raw, RDI, 1);
+	generateLoadObject(buffer, (RawObject *) Handles.valueSymbol->raw, RSI, 0);
+	asmPushqMem(buffer, asmMem(RBP, NO_REGISTER, SS_1, 2 * sizeof(intptr_t)));
+	generator->frameSize++;
+	generateMethodLookup(generator);
+	generator->frameSize--;
+	asmCallq(buffer, R11);
+	generateStackmap(generator);
+
+	// unlink on normal completion (the unwinders unlink on the abnormal paths)
+	asmMovqMem(buffer, asmMem(RBP, NO_REGISTER, SS_1, -3 * sizeof(intptr_t)), TMP);
+	asmMovqMem(buffer, asmMem(TMP, NO_REGISTER, SS_1, varOffset(RawUnwindHandler, parent)), TMP);
+	asmLoadTls(buffer, RDI, gCurrentThreadTpoff);
+	asmMovqToMem(buffer, TMP, asmMem(RDI, NO_REGISTER, SS_1, offsetof(Thread, unwindHandler)));
+
+	// epilogue
+	asmMovqMem(&generator->buffer, asmMem(CTX, NO_REGISTER, SS_1, varOffset(RawContext, parent)), CTX);
+	asmAddqImm(buffer, RSP, 4 * sizeof(intptr_t));
+	asmPopq(buffer, RBP);
+	asmRet(buffer);
+}
+
+
 void generateExceptionSignalPrimitive(CodeGenerator *generator)
 {
 	AssemblerBuffer *buffer = &generator->buffer;
@@ -1287,6 +1351,19 @@ void generateExceptionSignalPrimitive(CodeGenerator *generator)
 	// restore SP and BP
 	asmMovqMem(buffer, asmMem(CTX, NO_REGISTER, SS_1, varOffset(RawContext, frame)), RBP);
 	asmLeaq(buffer, asmMem(RBP, NO_REGISTER, SS_1, -2 * sizeof(intptr_t)), RSP);
+	// the jump into the handler abandons everything below the handler frame,
+	// including nested C entry records / handle scopes created since (a cleanup
+	// that signals is the common source): drop them NOW, after the last read of
+	// a dying frame. unwindThreadStateTo never allocates, so the raw pushes of
+	// heap pointers around it are safe.
+	asmPushq(buffer, RDI); // handler
+	asmPushq(buffer, RAX); // backtrace
+	asmPushq(buffer, R9);  // exception
+	asmMovq(buffer, RBP, RDI);
+	generateCCall(generator, (intptr_t) unwindThreadStateTo, 1, 0);
+	asmPopq(buffer, R9);
+	asmPopq(buffer, RAX);
+	asmPopq(buffer, RDI);
 	asmPushq(buffer, RAX); // push generated backtrace
 	asmPushq(buffer, R9); // push signaled exception
 	// load #value:value: as backtrace is not passed to the handler block
@@ -1302,6 +1379,13 @@ void generateExceptionSignalPrimitive(CodeGenerator *generator)
 	// restore SP and BP
 	asmMovqMem(buffer, asmMem(CTX, NO_REGISTER, SS_1, varOffset(RawContext, frame)), RBP);
 	asmLeaq(buffer, asmMem(RBP, NO_REGISTER, SS_1, -2 * sizeof(intptr_t)), RSP);
+	// drop the C-side records of the region being cut (see the backtrace path)
+	asmPushq(buffer, RAX); // handler
+	asmPushq(buffer, R9);  // exception
+	asmMovq(buffer, RBP, RDI);
+	generateCCall(generator, (intptr_t) unwindThreadStateTo, 1, 0);
+	asmPopq(buffer, R9);
+	asmPopq(buffer, RAX);
 	asmPushq(buffer, R9); // not used argument
 	asmPushq(buffer, R9); // push signaled exception
 	// load #value: as backtrace is not passed to the handler block

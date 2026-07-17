@@ -315,6 +315,7 @@ Primitive Primitives[] = {
 	// APPEND ONLY: the snapshot bakes primitive indices, never reorder
 	{"FloatExponentPrimitive", CCALL, .cFunction = floatExponentPrimitive, 1},
 	{"FloatTimesTwoPowerPrimitive", CCALL, .cFunction = floatTimesTwoPowerPrimitive, 2},
+	{"BlockUnwindPrimitive", GEN, generateBlockUnwindPrimitive},
 };
 
 

@@ -386,6 +386,7 @@ static void saveRoots(Fiber *fiber)
 	fiber->roots.handleScopes = CurrentThread.handleScopes;
 	fiber->roots.context = CurrentThread.context;
 	fiber->roots.exceptionHandler = CurrentExceptionHandler;
+	fiber->roots.unwindHandler = CurrentThread.unwindHandler;
 }
 
 
@@ -395,6 +396,7 @@ static void loadRoots(Fiber *fiber)
 	CurrentThread.handleScopes = fiber->roots.handleScopes;
 	CurrentThread.context = fiber->roots.context;
 	CurrentExceptionHandler = fiber->roots.exceptionHandler;
+	CurrentThread.unwindHandler = fiber->roots.unwindHandler;
 	// No context->thread rebind needed: JIT-generated code reaches per-mutator state
 	// (TLAB, remembered set, stackFramesTail, the dummy context, on:do: chain) via the
 	// running worker's TLS (%fs, see asmLoadTls), so a fiber that migrates OS threads
@@ -413,6 +415,7 @@ static void initFiberContext(Fiber *fiber)
 	fiber->roots.handleScopes = NULL;
 	fiber->roots.context = tagPtr(context);
 	fiber->roots.exceptionHandler = 0;
+	fiber->roots.unwindHandler = 0;
 }
 
 
@@ -596,6 +599,7 @@ void schedulerInit(void)
 	CurrentThread.schedFiberSlots = &gFiberSlots;
 	CurrentThread.schedCurrent = &gCurrent;
 	CurrentThread.schedExceptionHandler = &CurrentExceptionHandler; // this thread's own TLS slot
+	CurrentThread.schedUnwindHandler = &CurrentThread.unwindHandler;
 
 	fiberInitStackGrowth(commit); // caches page size + initial commit for fiberCreate
 
@@ -816,8 +820,16 @@ void schedulerTerminate(size_t id)
 {
 	if (!gActive) {
 		// Before the scheduler is running (e.g. an unhandled exception during
-		// bootstrap) terminating "the process" means exiting the VM.
+		// bootstrap) terminating "the process" means exiting the VM. No ensure:
+		// cleanups run on this path (there is no fiber to unwind).
 		exit(1);
+	}
+	if (gCurrent != NULL && gCurrent->id == id) {
+		// Self-terminate: run the pending ensure:/ifCurtailed: cleanups on this
+		// fiber's own (still live) stack before it is torn down. Runs before the
+		// lock: cleanups are arbitrary Smalltalk and may allocate, yield or park.
+		// Cleanups unlink as they run, so a terminate from inside one is bounded.
+		runAllUnwindHandlers();
 	}
 	schedLock();
 	Fiber *fiber = fiberFromId(id);
@@ -854,8 +866,19 @@ void schedulerTerminate(size_t id)
 		return;
 	}
 	fiber->state = FIBER_DONE;
+	// Capture the victim's pending ensure:/ifCurtailed: chain before it is
+	// unregistered; the cleanups run below, on THIS fiber, outside the lock.
+	// (A READY fiber that never ran has an empty chain.)
+	Value pendingUnwind = fiber->roots.unwindHandler;
+	fiber->roots.unwindHandler = 0;
 	unregisterFiber(fiber);
 	schedUnlock();
+	if (pendingUnwind != 0) {
+		// The victim never runs again, so its cleanups run on the terminator.
+		// The chain head is handle-protected inside before anything allocates;
+		// no safepoint can intervene between the unlock and that handle.
+		runUnwindHandlerChain(pendingUnwind);
+	}
 	fiberDestroy(fiber); // munmap outside the lock; the fiber is already unregistered
 }
 
@@ -1029,6 +1052,7 @@ static void *schedulerHelperMain(void *arg)
 	CurrentThread.nextMutator = NULL;
 	heapAddMutator(heap, &CurrentThread);                      // register before any allocation
 	CurrentThread.schedExceptionHandler = &CurrentExceptionHandler;
+	CurrentThread.schedUnwindHandler = &CurrentThread.unwindHandler;
 	// Handles are per-heap now (Handle.h): CurrentThread.heap == the shared heap, whose
 	// handles are already populated — no TLS copy needed.
 	gWorkerStackSize = s->workerStackSize;
