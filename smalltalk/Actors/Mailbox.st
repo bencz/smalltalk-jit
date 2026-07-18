@@ -42,7 +42,7 @@ Mailbox := Object [
 		"Enqueue + wake the runner atomically under the global sync monitor (posts come
 		 from any worker; the queue is a plain OrderedCollection and there are no concurrent
 		 collections yet, so the monitor serializes addLast against the runner's removeFirst)."
-		Processor monitorEnter.
+		Processor monitorEnterOn: self.
 		userQueue addLast: (Envelope message: aMessage sender: aSenderPid).
 		self schedule.
 		Processor monitorExit.
@@ -51,7 +51,7 @@ Mailbox := Object [
 
 
 	postSystem: aMessage [
-		Processor monitorEnter.
+		Processor monitorEnterOn: self.
 		systemQueue addLast: aMessage.
 		self schedule.
 		Processor monitorExit.
@@ -64,7 +64,7 @@ Mailbox := Object [
 	suspend [ suspended := true. ^self ]
 
 	resume [
-		Processor monitorEnter.
+		Processor monitorEnterOn: self.
 		suspended := false.
 		self schedule.
 		Processor monitorExit.
@@ -117,7 +117,7 @@ Mailbox := Object [
 		 that re-enters the non-recursive monitor. This coalesces the old separate
 		 takeSystem + takeUser probes into one acquisition per message."
 		| m |
-		Processor monitorEnter.
+		Processor monitorEnterOn: self.
 		(running and: [ systemQueue isEmpty not ])
 			ifTrue: [
 				lastWasSystem := true.
@@ -135,13 +135,13 @@ Mailbox := Object [
 
 
 	run [
-		Processor monitorEnter.
+		Processor monitorEnterOn: self.
 		runnerId := Processor currentId.
 		Processor monitorExit.
 		[ running ] whileTrue: [
 			self processBatch.
 			running ifTrue: [
-				Processor monitorEnter.
+				Processor monitorEnterOn: self.
 				self hasProcessable
 					ifTrue: [ Processor monitorExit. Processor yield ]
 					ifFalse: [ idle := true. Processor parkOnMonitor ] ] ].

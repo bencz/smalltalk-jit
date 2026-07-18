@@ -748,24 +748,25 @@ void schedulerSuspend(void)
 }
 
 
-// Park the current fiber like schedulerSuspend, but atomically release the per-heap
-// sync monitor as part of the park — this closes the lost-wakeup window for the
-// Smalltalk sync primitives. The caller MUST hold the monitor (heapMonitorEnter).
+// Park the current fiber like schedulerSuspend, but atomically release the sync monitor
+// STRIPE the fiber holds as part of the park — this closes the lost-wakeup window for the
+// Smalltalk sync primitives. The caller MUST hold monitorLocks[stripe] (heapMonitorEnterStripe).
 //
-// Ordering & why no wakeup is lost: the caller holds `monitor`; we take `sched->lock`
+// Ordering & why no wakeup is lost: the caller holds `stripe`; we take `sched->lock`
 // (always monitor→lock, never the reverse), publish FIBER_PARKING, THEN drop the
-// monitor, THEN drop sched->lock and switch. A signaller must hold the monitor to
+// stripe, THEN drop sched->lock and switch. A signaller must hold the SAME stripe to
 // touch the waiter queue and call resumeId:, so it cannot run its resume until we have
 // already published PARKING; schedulerResumeLocked then records parkPending and the run
 // loop re-queues us instead of leaving us parked forever. Mirrors schedulerSleep's
-// "register-the-wait and transition-to-PARKING under one lock hold" invariant.
-void schedulerParkAndUnlockMonitor(void)
+// "register-the-wait and transition-to-PARKING under one lock hold" invariant. The stripe
+// is passed in (computed once at monitorEnterOn:), never recomputed here.
+void schedulerParkAndUnlockMonitorStripe(size_t stripe)
 {
 	if (gCurrent == NULL) {
 		// No scheduler yet (bootstrap / main thread before schedulerRun): there is no
-		// peer to hand off to, so just drop the monitor — matches schedulerSuspend's
+		// peer to hand off to, so just drop the stripe — matches schedulerSuspend's
 		// gCurrent==NULL early-out (the "wait" becomes a no-op).
-		heapMonitorExit(CurrentThread.heap);
+		heapMonitorExitStripe(CurrentThread.heap, stripe);
 		return;
 	}
 	Fiber *self = gCurrent;
@@ -773,9 +774,15 @@ void schedulerParkAndUnlockMonitor(void)
 	self->parkIntent = PARK_SUSPEND;
 	self->parkPending = 0;
 	self->state = FIBER_PARKING;
-	heapMonitorExit(CurrentThread.heap); // release monitor AFTER PARKING is published, still under sched->lock
+	heapMonitorExitStripe(CurrentThread.heap, stripe); // release stripe AFTER PARKING is published, still under sched->lock
 	schedUnlock();
 	yieldToScheduler(); // committed to SUSPENDED (or re-queued if a resume raced)
+}
+
+// Legacy no-arg park == stripe 0.
+void schedulerParkAndUnlockMonitor(void)
+{
+	schedulerParkAndUnlockMonitorStripe(0);
 }
 
 

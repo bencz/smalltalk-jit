@@ -25,7 +25,7 @@ Channel := Object [
 	"sending"
 
 	send: anObject [
-		Processor monitorEnter.
+		Processor monitorEnterOn: self.
 		queue addLast: anObject.
 		Processor monitorExit.
 		itemsAvailable signal.
@@ -41,7 +41,7 @@ Channel := Object [
 		 before signal), so removeFirst under the monitor always finds an element."
 		| item |
 		itemsAvailable wait.
-		Processor monitorEnter.
+		Processor monitorEnterOn: self.
 		item := queue removeFirst.
 		Processor monitorExit.
 		^item
@@ -52,7 +52,7 @@ Channel := Object [
 
 	isEmpty [
 		| empty |
-		Processor monitorEnter.
+		Processor monitorEnterOn: self.
 		empty := queue isEmpty.
 		Processor monitorExit.
 		^empty
@@ -61,7 +61,7 @@ Channel := Object [
 
 	size [
 		| n |
-		Processor monitorEnter.
+		Processor monitorEnterOn: self.
 		n := queue size.
 		Processor monitorExit.
 		^n

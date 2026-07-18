@@ -52,7 +52,30 @@ void initHeap(Heap *heap, struct Thread *thread)
 	pthread_mutex_init(&heap->oldLock, NULL);
 	pthread_mutex_init(&heap->execLock, NULL);
 	pthread_mutex_init(&heap->codegenLock, NULL);
-	pthread_mutex_init(&heap->monitorLock, NULL);
+	pthread_mutex_init(&heap->monitorLock, NULL); // retained for ABI/offset stability; unused
+	// Striped sync monitor: N = ST_MONITOR_STRIPES (default 64), clamped to a power of 2
+	// in [1, 4096]. N=1 => one lock (legacy behavior / escape hatch). Parsed ONCE here so
+	// every worker of this heap agrees; stripeForSyncObject mixes obj->hash into [0,N).
+	{
+		size_t requested = 64;
+		const char *env = getenv("ST_MONITOR_STRIPES");
+		if (env != NULL && *env != '\0') {
+			long v = strtol(env, NULL, 10);
+			if (v >= 1) {
+				requested = (size_t) (v > 4096 ? 4096 : v);
+			}
+		}
+		size_t n = 1;
+		unsigned log2n = 0;
+		while (n * 2 <= requested) { n *= 2; log2n++; }
+		heap->monitorStripeCount = n;
+		heap->monitorStripeShift = (n <= 1) ? 0 : (32 - log2n);
+		heap->monitorLocks = malloc(n * sizeof(pthread_mutex_t));
+		ASSERT(heap->monitorLocks != NULL);
+		for (size_t i = 0; i < n; i++) {
+			pthread_mutex_init(&heap->monitorLocks[i], NULL);
+		}
+	}
 	pthread_mutex_init(&heap->symbolLock, NULL);
 	heap->symbolCount = 0;
 	heap->symbolCountValid = 0; // force a recount on first intern (snapshot restores the table only)
@@ -230,22 +253,33 @@ void heapCodegenLockLeave(Heap *heap)
 }
 
 
-// ---- Smalltalk sync monitor (Semaphore/Channel/...) ----
-// Acquisition mirrors heapCodegenLockEnter: a fiber holding the monitor may allocate
-// (the critical sections do `waiting addLast:` etc.) and thus trigger a scavenge, and a
-// fiber WAITING on the monitor must not stall the STW handshake — so it enters the
-// blocked state before locking. Unlike codegenLock this is NOT re-entrant: the sync
-// primitives keep their critical sections flat (never take the monitor while holding it).
+// ---- Smalltalk sync monitor (Semaphore/Channel/...), striped per sync-object ----
+// Acquisition mirrors heapCodegenLockEnter: a fiber holding a stripe may allocate (the
+// critical sections do `waiting addLast:` etc.) and thus trigger a scavenge, and a fiber
+// WAITING on a stripe must not stall the STW handshake — so it enters the blocked state
+// before locking. Still NOT re-entrant: the sync primitives keep their critical sections
+// FLAT (one stripe at a time, never nested), which keeps spBlocked (a boolean) correct.
+void heapMonitorEnterStripe(Heap *heap, size_t stripe)
+{
+	heapGcEnterBlocked(heap, &CurrentThread); // waiting on a stripe counts as safe
+	pthread_mutex_lock(&heap->monitorLocks[stripe]);
+	heapGcLeaveBlocked(heap, &CurrentThread);
+}
+
+void heapMonitorExitStripe(Heap *heap, size_t stripe)
+{
+	pthread_mutex_unlock(&heap->monitorLocks[stripe]);
+}
+
+// Legacy no-arg monitor == stripe 0 (the arity-1 primitives / any global use).
 void heapMonitorEnter(Heap *heap)
 {
-	heapGcEnterBlocked(heap, &CurrentThread); // waiting on monitorLock counts as safe
-	pthread_mutex_lock(&heap->monitorLock);
-	heapGcLeaveBlocked(heap, &CurrentThread);
+	heapMonitorEnterStripe(heap, 0);
 }
 
 void heapMonitorExit(Heap *heap)
 {
-	pthread_mutex_unlock(&heap->monitorLock);
+	heapMonitorExitStripe(heap, 0);
 }
 
 
@@ -281,6 +315,11 @@ void freeHeap(Heap *heap)
 	freePageSpace(&heap->execSpace);
 	rememberedSetFreeBlocks(heap->rememberedSet.blocks); // free the whole chain (incl. head)
 	heap->rememberedSet.blocks = NULL;
+	for (size_t i = 0; i < heap->monitorStripeCount; i++) {
+		pthread_mutex_destroy(&heap->monitorLocks[i]);
+	}
+	free(heap->monitorLocks);
+	heap->monitorLocks = NULL;
 	free(heap->handles);
 	heap->handles = NULL;
 }

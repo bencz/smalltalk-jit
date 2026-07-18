@@ -43,7 +43,7 @@ Future := Object [
 		"Under the multi-worker pool complete and await race, so both run under the global
 		 sync monitor: the completed-check + set + wake is atomic (fixes double-complete and
 		 the check-then-park lost-wakeup, exactly like Semaphore signal/wait)."
-		Processor monitorEnter.
+		Processor monitorEnterOn: self.
 		completed ifTrue: [ Processor monitorExit. ^self ].
 		completed := true.
 		value := aValue.
@@ -57,7 +57,7 @@ Future := Object [
 
 	await [
 		"Park the current process until the reply arrives."
-		Processor monitorEnter.
+		Processor monitorEnterOn: self.
 		completed ifTrue: [ | v | v := value. Processor monitorExit. ^v ].
 		waiterId := Processor currentId.
 		Processor parkOnMonitor.
@@ -67,7 +67,7 @@ Future := Object [
 
 	awaitFor: milliseconds [
 		"Park until the reply arrives or the timeout elapses (then answer nil)."
-		Processor monitorEnter.
+		Processor monitorEnterOn: self.
 		completed ifTrue: [ | v | v := value. Processor monitorExit. ^v ].
 		waiterId := Processor currentId.
 		[ (Delay forMilliseconds: milliseconds) wait. self complete: nil ] fork.

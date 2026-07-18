@@ -37,7 +37,7 @@ Semaphore := Object [
 
 	wait [
 		"Decrement the semaphore, blocking the current process while it is zero."
-		Processor monitorEnter.
+		Processor monitorEnterOn: self.
 		count > 0
 			ifTrue: [
 				count := count - 1.
@@ -55,7 +55,7 @@ Semaphore := Object [
 
 	signal [
 		"Wake one waiting process, or bump the count if none are waiting."
-		Processor monitorEnter.
+		Processor monitorEnterOn: self.
 		waiting isEmpty
 			ifTrue: [ count := count + 1 ]
 			ifFalse: [ Processor resumeId: waiting removeFirst ].

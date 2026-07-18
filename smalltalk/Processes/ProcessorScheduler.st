@@ -52,11 +52,21 @@ ProcessorScheduler := Object [
 	"synchronization monitor (thread-safe sync primitives)"
 
 	monitorEnter [
-		"Acquire the VM's global sync monitor. Under the multi-worker pool the sync
-		 primitives run their short critical sections under this monitor so that
-		 'check a condition then park' is atomic across OS-thread workers. Critical
-		 sections MUST stay flat — never send monitorEnter while already holding it."
+		"Acquire stripe 0 of the striped sync monitor (the legacy global lock). Prefer
+		 monitorEnterOn: with the sync object so unrelated objects do not serialize on one
+		 lock. Critical sections MUST stay flat — never send monitorEnter/On: while already
+		 holding the monitor."
 		<primitive: MonitorEnterPrimitive>
+	]
+
+
+	monitorEnterOn: anObject [
+		"Acquire the sync-monitor STRIPE for anObject (the sync object whose state this
+		 section protects and whose waiter this section may resume). Many unrelated sync
+		 objects run in parallel across the stripes instead of serializing on one global
+		 lock. The stripe is stashed, so the matching monitorExit/parkOnMonitor release it
+		 without needing the object again. Critical sections MUST stay flat."
+		<primitive: MonitorEnterOnPrimitive>
 	]
 
 

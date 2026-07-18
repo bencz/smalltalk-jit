@@ -88,7 +88,7 @@ ConcurrentDictionary := Object [
 
 	at: key put: anObject [
 		| copy |
-		Processor monitorEnter.
+		Processor monitorEnterOn: self.
 		copy := self copyOfSnapshot.
 		copy at: key put: anObject.
 		Atomic releaseFence.   "order the copy's construction before the pointer publish (POWER)"
@@ -100,7 +100,7 @@ ConcurrentDictionary := Object [
 
 	at: key ifAbsentPut: aBlock [
 		| v |
-		Processor monitorEnter.
+		Processor monitorEnterOn: self.
 		v := snapshot at: key ifAbsent: [ nil ].
 		v isNil ifTrue: [
 			| copy |
@@ -116,7 +116,7 @@ ConcurrentDictionary := Object [
 
 	removeKey: key ifAbsent: aBlock [
 		| copy v had |
-		Processor monitorEnter.
+		Processor monitorEnterOn: self.
 		had := snapshot includesKey: key.
 		had ifTrue: [
 			copy := self copyOfSnapshot.

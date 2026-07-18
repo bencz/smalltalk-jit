@@ -38,7 +38,7 @@ SharedDictionary := Object [
 	"accessing"
 
 	at: key put: anObject [
-		Processor monitorEnter.
+		Processor monitorEnterOn: self.
 		dict at: key put: anObject.
 		Processor monitorExit.
 		^anObject
@@ -47,7 +47,7 @@ SharedDictionary := Object [
 
 	at: key ifAbsent: aBlock [
 		| v |
-		Processor monitorEnter.
+		Processor monitorEnterOn: self.
 		v := dict at: key ifAbsent: [ absent ].
 		Processor monitorExit.
 		v == absent ifTrue: [ ^aBlock value ].
@@ -62,7 +62,7 @@ SharedDictionary := Object [
 
 	at: key ifPresent: aBlock [
 		| v |
-		Processor monitorEnter.
+		Processor monitorEnterOn: self.
 		v := dict at: key ifAbsent: [ absent ].
 		Processor monitorExit.
 		v == absent ifTrue: [ ^nil ].
@@ -74,7 +74,7 @@ SharedDictionary := Object [
 		"Atomically return the value for key, computing + storing aBlock's value if absent.
 		 aBlock is evaluated under the monitor, so it MUST NOT touch other synchronized state."
 		| v |
-		Processor monitorEnter.
+		Processor monitorEnterOn: self.
 		v := dict at: key ifAbsent: [ | nv | nv := aBlock value. dict at: key put: nv. nv ].
 		Processor monitorExit.
 		^v
@@ -85,7 +85,7 @@ SharedDictionary := Object [
 
 	removeKey: key ifAbsent: aBlock [
 		| v |
-		Processor monitorEnter.
+		Processor monitorEnterOn: self.
 		v := dict removeKey: key ifAbsent: [ absent ].
 		Processor monitorExit.
 		v == absent ifTrue: [ ^aBlock value ].
@@ -102,7 +102,7 @@ SharedDictionary := Object [
 
 	includesKey: key [
 		| r |
-		Processor monitorEnter.
+		Processor monitorEnterOn: self.
 		r := dict includesKey: key.
 		Processor monitorExit.
 		^r
@@ -111,7 +111,7 @@ SharedDictionary := Object [
 
 	size [
 		| n |
-		Processor monitorEnter.
+		Processor monitorEnterOn: self.
 		n := dict size.
 		Processor monitorExit.
 		^n
@@ -127,7 +127,7 @@ SharedDictionary := Object [
 
 	keys [
 		| k |
-		Processor monitorEnter.
+		Processor monitorEnterOn: self.
 		k := dict keys.
 		Processor monitorExit.
 		^k
@@ -136,7 +136,7 @@ SharedDictionary := Object [
 
 	values [
 		| v |
-		Processor monitorEnter.
+		Processor monitorEnterOn: self.
 		v := dict values.
 		Processor monitorExit.
 		^v
@@ -157,7 +157,7 @@ SharedDictionary := Object [
 
 	keysAndValuesDo: aBlock [
 		| snap |
-		Processor monitorEnter.
+		Processor monitorEnterOn: self.
 		snap := OrderedCollection new.
 		dict keysAndValuesDo: [:k :v | snap addLast: (k -> v) ].
 		Processor monitorExit.
@@ -168,7 +168,7 @@ SharedDictionary := Object [
 
 	associationsDo: aBlock [
 		| snap |
-		Processor monitorEnter.
+		Processor monitorEnterOn: self.
 		snap := OrderedCollection new.
 		dict associationsDo: [:assoc | snap addLast: assoc ].
 		Processor monitorExit.
@@ -178,7 +178,7 @@ SharedDictionary := Object [
 
 
 	printOn: aStream [
-		Processor monitorEnter.
+		Processor monitorEnterOn: self.
 		dict printOn: aStream.
 		Processor monitorExit.
 	]

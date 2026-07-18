@@ -108,6 +108,7 @@ static PrimitiveResult processCurrentIdPrimitive(Value self);
 static PrimitiveResult processSuspendPrimitive(Value self);
 static PrimitiveResult processSleepPrimitive(Value self, Value micros);
 static PrimitiveResult monitorEnterPrimitive(Value self);
+static PrimitiveResult monitorEnterOnPrimitive(Value self, Value syncObj);
 static PrimitiveResult monitorExitPrimitive(Value self);
 static PrimitiveResult monitorParkPrimitive(Value self);
 static PrimitiveResult floatAddPrimitive(Value self, Value arg);
@@ -354,6 +355,7 @@ Primitive Primitives[] = {
 	{"AtomicArrayCompareAndSetPrimitive", CCALL, .cFunction = atomicArrayCompareAndSetPrimitive, 4},
 	{"AtomicArrayGetAndSetPrimitive", CCALL, .cFunction = atomicArrayGetAndSetPrimitive, 3},
 	{"AtomicArrayGetAndAddPrimitive", CCALL, .cFunction = atomicArrayGetAndAddPrimitive, 3},
+	{"MonitorEnterOnPrimitive", CCALL, .cFunction = monitorEnterOnPrimitive, 2},
 };
 
 
@@ -1218,28 +1220,64 @@ static PrimitiveResult processSleepPrimitive(Value self, Value micros)
 }
 
 
-// ---- Sync monitor primitives (Semaphore/Channel/... thread-safety) ----
-// Acquire the one per-heap sync monitor (GC-safe: waiting counts as at-safepoint).
+// ---- Sync monitor primitives (Semaphore/Channel/... thread-safety), striped ----
+// Each sync object's logical monitor is backed by one of heap->monitorLocks[N], chosen
+// by mixing the object's GC-stable identity hash. The stripe is computed ONCE at
+// monitorEnterOn: and stashed on the thread; monitorExit/monitorPark read the stash and
+// never recompute, so enter/exit/park provably drop the same lock they took even across a
+// GC move or a become:. The Fibonacci mix (Knuth's 2654435761) decorrelates the
+// low-entropy, address-derived hash so stripes are used evenly; N<=1 forces stripe 0
+// (== the legacy single global monitor).
+static inline size_t stripeForSyncObject(Heap *heap, Value syncObj)
+{
+	if (heap->monitorStripeCount <= 1 || !valueTypeOf(syncObj, VALUE_POINTER)) {
+		return 0;
+	}
+	uint32_t h = asObject(syncObj)->hash;
+	return (size_t) ((uint32_t) (h * 2654435761u) >> heap->monitorStripeShift);
+}
+
+// Acquire the stripe for `syncObj` and stash it so the matching exit/park drop exactly
+// this lock (GC-safe: waiting counts as at-safepoint). Reentrancy is a bug — the sync
+// critical sections must stay FLAT (one stripe at a time) — so assert not-already-held.
+static PrimitiveResult monitorEnterOnPrimitive(Value self, Value syncObj)
+{
+	ASSERT(!CurrentThread.heldMonitor);
+	size_t stripe = stripeForSyncObject(CurrentThread.heap, syncObj);
+	heapMonitorEnterStripe(CurrentThread.heap, stripe);
+	CurrentThread.heldMonitorStripe = stripe;
+	CurrentThread.heldMonitor = 1;
+	return primSuccess(self);
+}
+
+// Acquire stripe 0 (legacy global monitor / any object-less use). Stash stripe 0.
 static PrimitiveResult monitorEnterPrimitive(Value self)
 {
-	heapMonitorEnter(CurrentThread.heap);
+	ASSERT(!CurrentThread.heldMonitor);
+	heapMonitorEnterStripe(CurrentThread.heap, 0);
+	CurrentThread.heldMonitorStripe = 0;
+	CurrentThread.heldMonitor = 1;
 	return primSuccess(self);
 }
 
 
-// Release the sync monitor.
+// Release the stripe this thread holds (stashed at enter).
 static PrimitiveResult monitorExitPrimitive(Value self)
 {
-	heapMonitorExit(CurrentThread.heap);
+	size_t stripe = CurrentThread.heldMonitorStripe;
+	CurrentThread.heldMonitor = 0;
+	heapMonitorExitStripe(CurrentThread.heap, stripe);
 	return primSuccess(self);
 }
 
 
-// Park the current fiber, atomically dropping the monitor (lost-wakeup-safe). The
-// caller must hold the monitor; it does NOT re-acquire it on wake.
+// Park the current fiber, atomically dropping the held stripe (lost-wakeup-safe). The
+// caller must hold the stripe; it does NOT re-acquire it on wake.
 static PrimitiveResult monitorParkPrimitive(Value self)
 {
-	schedulerParkAndUnlockMonitor();
+	size_t stripe = CurrentThread.heldMonitorStripe;
+	CurrentThread.heldMonitor = 0;
+	schedulerParkAndUnlockMonitorStripe(stripe);
 	return primSuccess(self);
 }
 

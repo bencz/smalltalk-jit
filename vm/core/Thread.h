@@ -75,6 +75,15 @@ typedef struct Thread {
 	Value *schedExceptionHandler;
 	// Same publication for the unwind-handler chain head (see unwindHandler above).
 	Value *schedUnwindHandler;
+	// Striped sync monitor bookkeeping. The stripe for a sync object is computed ONCE at
+	// monitorEnterOn: (mix of obj->hash) and stashed here; monitorExit/parkOnMonitor read
+	// it back and NEVER recompute — so enter/exit/park provably drop the same lock they
+	// took even if the object moved/was become:-d mid-critical-section. `heldMonitor`
+	// makes a reentrant monitorEnter fail-fast (critical sections must stay flat). Valid
+	// only while heldMonitor==1. APPENDED at struct end so JIT-baked field offsets are
+	// unchanged (the StoreCheck golden reads Thread offsets).
+	size_t heldMonitorStripe;
+	_Bool heldMonitor;
 } Thread;
 
 extern __thread Thread CurrentThread;

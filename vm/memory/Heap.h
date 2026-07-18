@@ -101,6 +101,16 @@ typedef struct Heap {
 	pthread_mutex_t safepointLock;
 	pthread_cond_t safepointCond;
 	int safepointRequested;
+	// Striped Smalltalk sync monitor: each sync object's logical monitor is backed by
+	// monitorLocks[stripe], stripe = mix(obj->hash) >> monitorStripeShift (see
+	// stripeForSyncObject in Primitives.c). N = monitorStripeCount from
+	// ST_MONITOR_STRIPES (power of 2; 1 = a single lock == the legacy global monitor).
+	// APPENDED here (not replacing monitorLock above) so the JIT-baked offset of
+	// safepointRequested stays fixed; monitorLock is now unused but retained for that ABI
+	// stability. monitorLocks[0] is the "stripe 0"/global lock used by the arity-1 prims.
+	pthread_mutex_t *monitorLocks;
+	size_t monitorStripeCount;    // N (power of 2)
+	unsigned monitorStripeShift;  // 32 - log2(N) for N>1; 0 for N==1 (stripe forced to 0)
 } Heap;
 
 void heapAddMutator(Heap *heap, struct Thread *thread);
@@ -111,8 +121,10 @@ void heapGcBegin(Heap *heap, struct Thread *self);
 void heapGcEnd(Heap *heap);
 void heapCodegenLockEnter(Heap *heap); // serialize JIT codegen across worker threads
 void heapCodegenLockLeave(Heap *heap);
-void heapMonitorEnter(Heap *heap); // GC-safe acquire of the Smalltalk sync monitor
+void heapMonitorEnter(Heap *heap); // GC-safe acquire of the sync monitor (stripe 0)
 void heapMonitorExit(Heap *heap);
+void heapMonitorEnterStripe(Heap *heap, size_t stripe); // GC-safe acquire of one monitor stripe
+void heapMonitorExitStripe(Heap *heap, size_t stripe);
 void heapSymbolLockEnter(Heap *heap); // re-entrant, GC-safe: serialize symbol interning
 void heapSymbolLockLeave(Heap *heap);
 void heapFillAllTlabTails(Heap *heap); // retire every mutator's TLAB tail (become: under STW)

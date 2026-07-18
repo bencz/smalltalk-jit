@@ -43,6 +43,7 @@ void schedulerSuspend(void);
 // the park (lost-wakeup-safe hand-off for the Smalltalk sync primitives). Caller MUST
 // hold the monitor via heapMonitorEnter.
 void schedulerParkAndUnlockMonitor(void);
+void schedulerParkAndUnlockMonitorStripe(size_t stripe);
 
 // Park the current fiber until at least `micros` microseconds have elapsed.
 void schedulerSleep(int64_t micros);
