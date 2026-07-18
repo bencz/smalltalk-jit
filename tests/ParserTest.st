@@ -1,62 +1,64 @@
+[ ParserRun := TestRun named: 'ParserTest'. ]
+
 MockNodeVisitor := Object [
 
 	visitClassNode: aNode [
-		Assert true: (aNode isKindOf: ClassNode).
+		ParserRun check: 'visitor gets ClassNode' that: [ aNode isKindOf: ClassNode ].
 	]
 
 
 	visitVariableNode: aNode [
-		Assert true: (aNode isKindOf: VariableNode).
+		ParserRun check: 'visitor gets VariableNode' that: [ aNode isKindOf: VariableNode ].
 	]
 
 
 	visitMethodNode: aNode [
-		Assert true: (aNode isKindOf: MethodNode).
+		ParserRun check: 'visitor gets MethodNode' that: [ aNode isKindOf: MethodNode ].
 	]
 
 
 	visitBlockNode: aNode [
-		Assert true: (aNode isKindOf: BlockNode).
+		ParserRun check: 'visitor gets BlockNode' that: [ aNode isKindOf: BlockNode ].
 	]
 
 
 	visitExpressionNode: aNode [
-		Assert true: (aNode isKindOf: ExpressionNode).
+		ParserRun check: 'visitor gets ExpressionNode' that: [ aNode isKindOf: ExpressionNode ].
 	]
 
 
 	visitIntegerNode: aNode [
-		Assert true: (aNode isKindOf: IntegerNode).
+		ParserRun check: 'visitor gets IntegerNode' that: [ aNode isKindOf: IntegerNode ].
 	]
 
 
 	visitMessageExpressionNode: aNode [
-		Assert true: (aNode isKindOf: MessageExpressionNode).
+		ParserRun check: 'visitor gets MessageExpressionNode' that: [ aNode isKindOf: MessageExpressionNode ].
 	]
 
 
 	visitArrayNode: aNode [
-		Assert true: (aNode isKindOf: ArrayNode).
+		ParserRun check: 'visitor gets ArrayNode' that: [ aNode isKindOf: ArrayNode ].
 	]
 
 
 	visitCharacterNode: aNode [
-		Assert true: (aNode isKindOf: CharacterNode).
+		ParserRun check: 'visitor gets CharacterNode' that: [ aNode isKindOf: CharacterNode ].
 	]
 
 
 	visitFalseNode: aNode [
-		Assert true: (aNode isKindOf: FalseNode).
+		ParserRun check: 'visitor gets FalseNode' that: [ aNode isKindOf: FalseNode ].
 	]
 
 
 	visitTrueNode: aNode [
-		Assert true: (aNode isKindOf: TrueNode).
+		ParserRun check: 'visitor gets TrueNode' that: [ aNode isKindOf: TrueNode ].
 	]
 
 
 	visitNilNode: aNode [
-		Assert true: (aNode isKindOf: NilNode).
+		ParserRun check: 'visitor gets NilNode' that: [ aNode isKindOf: NilNode ].
 	]
 
 ]
@@ -66,55 +68,55 @@ MockNodeVisitor := Object [
 	| parser |
 
 	parser := Parser parseString: 'Foo := Object []'.
-	Assert true: (parser parseClass isKindOf: ClassNode).
+	ParserRun check: 'parseClass answers ClassNode' that: [ parser parseClass isKindOf: ClassNode ].
 	parser := Parser parseString: 'foo []'.
-	Assert true: (parser parseMethod isKindOf: MethodNode).
+	ParserRun check: 'parseMethod answers MethodNode' that: [ parser parseMethod isKindOf: MethodNode ].
 	parser := Parser parseString: 'foo []'.
-	Assert true: (parser parseMethodOrBlock isKindOf: MethodNode).
+	ParserRun check: 'parseMethodOrBlock answers MethodNode for method' that: [ parser parseMethodOrBlock isKindOf: MethodNode ].
 	parser := Parser parseString: '[]'.
-	Assert true: (parser parseMethodOrBlock isKindOf: BlockNode).
+	ParserRun check: 'parseMethodOrBlock answers BlockNode for block' that: [ parser parseMethodOrBlock isKindOf: BlockNode ].
 ]
 
 [ "test empty input"
 	| parser |
 
 	parser := Parser parseString: ''.
-	Assert do: [parser parseClass] expect: ParseError.
+	ParserRun expect: 'parseClass on empty input' raises: ParseError in: [ parser parseClass ].
 	parser := Parser parseString: ''.
-	Assert do: [parser parseMethod] expect: ParseError.
+	ParserRun expect: 'parseMethod on empty input' raises: ParseError in: [ parser parseMethod ].
 	parser := Parser parseString: ''.
-	Assert do: [parser parseMethodOrBlock] expect: ParseError.
+	ParserRun expect: 'parseMethodOrBlock on empty input' raises: ParseError in: [ parser parseMethodOrBlock ].
 ]
 
 [ "test invalid smalltalk code"
 	| parser |
 
 	parser := Parser parseString: 'a'.
-	Assert do: [parser parseClass] expect: ParseError.
+	ParserRun expect: 'parseClass on bare identifier' raises: ParseError in: [ parser parseClass ].
 	parser := Parser parseString: 'Object subclass'.
-	Assert do: [parser parseClass] expect: ParseError.
+	ParserRun expect: 'parseClass on unary subclass form' raises: ParseError in: [ parser parseClass ].
 	parser := Parser parseString: 'Object subclass: Foo'.
-	Assert do: [parser parseClass] expect: ParseError.
+	ParserRun expect: 'parseClass on keyword subclass form' raises: ParseError in: [ parser parseClass ].
 	parser := Parser parseString: 'Object subclass: $'.
-	Assert do: [parser parseClass] expect: ParseError.
+	ParserRun expect: 'parseClass on truncated character literal' raises: ParseError in: [ parser parseClass ].
 
 	parser := Parser parseString: 'a'.
-	Assert do: [parser parseMethod] expect: ParseError.
+	ParserRun expect: 'parseMethod on bare identifier' raises: ParseError in: [ parser parseMethod ].
 	parser := Parser parseString: 'a ['.
-	Assert do: [parser parseMethod] expect: ParseError.
+	ParserRun expect: 'parseMethod on unterminated unary method' raises: ParseError in: [ parser parseMethod ].
 	parser := Parser parseString: 'a: ['.
-	Assert do: [parser parseMethod] expect: ParseError.
+	ParserRun expect: 'parseMethod on keyword selector missing arg' raises: ParseError in: [ parser parseMethod ].
 	parser := Parser parseString: '+ 1 ['.
-	Assert do: [parser parseMethod] expect: ParseError.
+	ParserRun expect: 'parseMethod on binary selector with literal arg' raises: ParseError in: [ parser parseMethod ].
 
 	parser := Parser parseString: 'a'.
-	Assert do: [parser parseMethodOrBlock] expect: ParseError.
+	ParserRun expect: 'parseMethodOrBlock on bare identifier' raises: ParseError in: [ parser parseMethodOrBlock ].
 	parser := Parser parseString: 'a ['.
-	Assert do: [parser parseMethodOrBlock] expect: ParseError.
+	ParserRun expect: 'parseMethodOrBlock on unterminated method' raises: ParseError in: [ parser parseMethodOrBlock ].
 	parser := Parser parseString: 'a: ['.
-	Assert do: [parser parseMethodOrBlock] expect: ParseError.
+	ParserRun expect: 'parseMethodOrBlock on keyword missing arg' raises: ParseError in: [ parser parseMethodOrBlock ].
 	parser := Parser parseString: '[x:]'.
-	Assert do: [parser parseMethodOrBlock] expect: ParseError.
+	ParserRun expect: 'parseMethodOrBlock on block arg missing body' raises: ParseError in: [ parser parseMethodOrBlock ].
 ]
 
 [ "extra long method selector"
@@ -124,9 +126,9 @@ MockNodeVisitor := Object [
 	stream next: 256 put: $a; nextPutAll: '[]'.
 
 	method := (Parser parseString: stream contents) parseMethod.
-	Assert true: method selector size = 256.
-	Assert true: (method selector at: 1) = $a.
-	Assert true: (method selector at: 256) = $a.
+	ParserRun check: 'long selector size' equals: 256 is: [ method selector size ].
+	ParserRun check: 'long selector first char' equals: $a is: [ method selector at: 1 ].
+	ParserRun check: 'long selector last char' equals: $a is: [ method selector at: 256 ].
 ]
 
 [ "visitor test"
@@ -135,3 +137,5 @@ MockNodeVisitor := Object [
 	parser := Parser parseString: 'Foo := Object [ bar: a [ | b | b := 1 + 2. #(1 $a). false. true. nil ] ]'.
 	parser parseClass acceptVisitor: MockNodeVisitor new.
 ]
+
+[ ^ParserRun report ]

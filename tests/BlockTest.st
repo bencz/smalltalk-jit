@@ -7,29 +7,34 @@ BlockTest := Object [
 ]
 
 [
-	Assert true: [] value isNil.
-	Assert true: [1] value = 1.
-	Assert true: BlockTest outerReturn = 1.
+	BlkRun := TestRun named: 'Block'.
+
+	BlkRun check: 'empty block value isNil' that: [[] value isNil].
+	BlkRun check: 'block value' equals: 1 is: [[1] value].
+	BlkRun check: 'outer return value' equals: 1 is: [BlockTest outerReturn].
 ]
 
 [
-	Assert do: [[ :a | ] value] expect: OutOfRangeError.
-	Assert do: [[ :a | ] value: 1 value: 2] expect: OutOfRangeError.
+	BlkRun expect: 'value with missing arg raises' raises: OutOfRangeError in: [[ :a | ] value].
+	BlkRun expect: 'value with extra arg raises' raises: OutOfRangeError in: [[ :a | ] value: 1 value: 2].
 ]
 
 [
 	| block |
 
 	block := [false].
-	Assert true: block whileTrue == block.
-	Assert true: (block whileTrue: []) == block.
+	BlkRun check: 'whileTrue returns receiver' that: [block whileTrue == block].
+	BlkRun check: 'whileTrue: returns receiver' that: [(block whileTrue: []) == block].
 ]
 
 [
-	Assert do: [[] whileTrue] expect: Error.
-	Assert do: [[1] whileTrue] expect: Error.
-	Assert do: [[Object] whileTrue] expect: Error.
-	Assert do: [[] whileTrue: []] expect: Error.
-	Assert do: [[1] whileTrue: []] expect: Error.
-	Assert do: [[Object] whileTrue: []] expect: Error.
+	BlkRun expect: 'whileTrue on nil result raises' raises: Error in: [[] whileTrue].
+	BlkRun expect: 'whileTrue on integer raises' raises: Error in: [[1] whileTrue].
+	BlkRun expect: 'whileTrue on class raises' raises: Error in: [[Object] whileTrue].
+	BlkRun expect: 'whileTrue: on nil result raises' raises: Error in: [[] whileTrue: []].
+	BlkRun expect: 'whileTrue: on integer raises' raises: Error in: [[1] whileTrue: []].
+	BlkRun expect: 'whileTrue: on class raises' raises: Error in: [[Object] whileTrue: []].
 ]
+
+
+[ ^BlkRun report ]

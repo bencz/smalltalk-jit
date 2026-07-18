@@ -1,9 +1,15 @@
-"Stress test for the actor system under a heavy message storm. Spawns many
- actors, floods them with fire-and-forget #tell messages, then drains their state
- via request/await round-trips. Every message allocation + mailbox hand-off
- drives the scheduler and the GC; correctness is verified by exact aggregate
- counts on the main process (assertions never live inside an actor, since
- supervision would swallow them)."
+"Stress test for the actor system under a heavy message storm, driven by the
+ kernel TestRun. Spawns many actors, floods them with fire-and-forget #tell
+ messages, then drains their state via request/await round-trips. Every
+ message allocation + mailbox hand-off drives the scheduler and the GC;
+ correctness is verified by exact aggregate counts on the main process.
+ Assertions NEVER live inside an actor: a failing assertion there would be
+ caught by supervision and swallowed instead of failing the test. Under the
+ multi-worker pool actors run in real parallelism, so all aggregation happens
+ on the main process from await results, and helper fibers are joined through
+ a Semaphore before the block ends."
+
+[ ActorStressRun := TestRun named: 'ActorStress' ]
 
 "a counter actor that also sums the integer values it is told"
 StressCounter := Actor [
@@ -45,23 +51,26 @@ StressEcho := Actor [
 		totalSum := totalSum + (a request: #sum) await ].
 
 	expectedSum := perActor * (perActor + 1) // 2.
-	Assert true: totalCount = (n * perActor).
-	Assert true: totalSum = (n * expectedSum).
+	ActorStressRun check: 'storm delivered every message' equals: n * perActor is: [ totalCount ].
+	ActorStressRun check: 'storm value sum is exact' equals: n * expectedSum is: [ totalSum ].
 	actors do: [:a | a stop ].
 ]
 
 "request/await fan-out: many concurrent round-trips through echo actors must
- return exactly what was sent, while a churner keeps GC pressure high"
+ return exactly what was sent, while a churner keeps GC pressure high; the
+ churner is joined before the block ends so it cannot leak into later blocks"
 [
-	| echoes n garbage ok |
+	| echoes n garbage ok churnDone |
 	n := 40.
 	echoes := OrderedCollection new.
 	1 to: n do: [:i | echoes addLast: (Actors spawn: (Props fromActorClass: StressEcho)) ].
 
+	churnDone := Semaphore new.
 	[ 1 to: 200 do: [:r |
 		garbage := OrderedCollection new.
 		1 to: 40 do: [:k | garbage addLast: (Array new: 4) ].
-		Processor yield ] ] fork.
+		Processor yield ].
+	  churnDone signal ] fork.
 
 	ok := 0.
 	1 to: n do: [:i |
@@ -71,7 +80,8 @@ StressEcho := Actor [
 			((a request: k * 1000 + i) await) = (k * 1000 + i)
 				ifTrue: [ ok := ok + 1 ] ] ].
 
-	Assert true: ok = (n * 25).
+	churnDone wait.
+	ActorStressRun check: 'echo round-trips all exact' equals: n * 25 is: [ ok ].
 	echoes do: [:a | a stop ].
 ]
 
@@ -89,5 +99,7 @@ StressEcho := Actor [
 		batch do: [:a | grandTotal := grandTotal + (a request: #count) await ].
 		batch do: [:a | a stop ] ].
 
-	Assert true: grandTotal = (waves * perWave * 40).
+	ActorStressRun check: 'wave churn counted every message' equals: waves * perWave * 40 is: [ grandTotal ].
 ]
+
+[ ^ActorStressRun report ]

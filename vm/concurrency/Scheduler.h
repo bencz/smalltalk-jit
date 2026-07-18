@@ -62,6 +62,13 @@ size_t schedulerCurrentId(void);
 // Entry point invoked (on the new fiber's own stack) by fiberTrampoline.
 void schedulerFiberMain(void);
 
+// Unhandled-error accounting (see gUnhandledErrors in Scheduler.c): bumped by
+// Exception>>defaultAction via primitive, folded into the process exit code by
+// main() in non-interactive mode; take = read-and-clear for deliberate probes.
+void schedulerNoteUnhandledError(void);
+int schedulerUnhandledErrors(void);
+int schedulerTakeUnhandledErrors(void);
+
 // ---- GC integration ------------------------------------------------------
 
 _Bool schedulerActive(void);

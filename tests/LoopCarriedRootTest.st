@@ -44,7 +44,9 @@ LoopCarried := Object [
 ]
 
 [
-	Assert true: LoopCarried booleanFlag = 2000000.
-	Assert true: LoopCarried earlyArrayRead = 1400000.
-	Transcript nextPutAll: 'LoopCarriedRootTest: OK'; lf.
+	LoopCarriedRun := TestRun named: 'LoopCarriedRootTest'.
+	LoopCarriedRun check: 'booleanFlag loop-carried slot survives GC' equals: 2000000 is: [ LoopCarried booleanFlag ].
+	LoopCarriedRun check: 'earlyArrayRead loop-carried slot survives GC' equals: 1400000 is: [ LoopCarried earlyArrayRead ].
 ]
+
+[ ^LoopCarriedRun report ]

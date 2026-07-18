@@ -154,7 +154,10 @@ ManyCls148 := Object [ v [ ^148 ] ]
 ManyCls149 := Object [ v [ ^149 ] ]
 
 [
-	Assert true: ManyCls0 new v = 0.
-	Assert true: ManyCls149 new v = 149.
-	Assert true: ManyCls77 new v = 77.
+	ManyClassesRun := TestRun named: 'ManyClassesTest'.
+	ManyClassesRun check: 'first class answers 0' equals: 0 is: [ ManyCls0 new v ].
+	ManyClassesRun check: 'last class answers 149' equals: 149 is: [ ManyCls149 new v ].
+	ManyClassesRun check: 'middle class answers 77' equals: 77 is: [ ManyCls77 new v ].
 ]
+
+[ ^ManyClassesRun report ]

@@ -35,6 +35,16 @@ ProcessorScheduler := Object [
 	]
 
 
+	"Read-and-clear the VM's unhandled-error counter (bumped by
+	 Exception>>defaultAction before it kills the signaling fiber). A nonzero
+	 count at process end forces a nonzero exit code, so a test that
+	 DELIBERATELY drives an error into defaultAction must take the count,
+	 assert on it, and thereby keep its run green."
+	takeUnhandledErrorCount [
+		<primitive: UnhandledErrorTakePrimitive>
+	]
+
+
 	"blocking"
 
 	suspendCurrent [

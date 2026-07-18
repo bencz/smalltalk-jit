@@ -1,37 +1,41 @@
 [
 	| stream view |
 
-	stream := CollectionStream on: 'abcdef'.
-	view := StreamView on: stream limit: 3.
-
-	Assert true: view peek = $a.
-	Assert true: view next = $a.
-	Assert true: (view next: 2) = 'bc'.
-	Assert do: [view next] expect: Error.
-	Assert do: [view next: 2] expect: Error.
-	Assert true: view peek = nil.
+	StreamViewRun := TestRun named: 'StreamView'.
 
 	stream := CollectionStream on: 'abcdef'.
 	view := StreamView on: stream limit: 3.
-	Assert true: view contents = 'abc'.
+
+	StreamViewRun check: 'peek first' equals: $a is: [ view peek ].
+	StreamViewRun check: 'next first' equals: $a is: [ view next ].
+	StreamViewRun check: 'next: 2 within limit' equals: 'bc' is: [ view next: 2 ].
+	StreamViewRun expect: 'next past limit raises' raises: Error in: [view next].
+	StreamViewRun expect: 'next: past limit raises' raises: Error in: [view next: 2].
+	StreamViewRun check: 'peek past limit is nil' equals: nil is: [ view peek ].
+
+	stream := CollectionStream on: 'abcdef'.
+	view := StreamView on: stream limit: 3.
+	StreamViewRun check: 'contents limited' equals: 'abc' is: [ view contents ].
 
 	stream := CollectionStream on: 'abcdef'.
 	view := StreamView on: stream limit: 3.
 	view position: 2.
-	Assert true: view next = $b.
+	StreamViewRun check: 'position: 2 then next' equals: $b is: [ view next ].
 	view position: 3.
-	Assert do: [view position: 4] expect: Error.
+	StreamViewRun expect: 'position: past limit raises' raises: Error in: [view position: 4].
 
 	stream := CollectionStream on: 'abcdef'.
 	view := StreamView on: stream limit: 3.
 	view next: 2.
 	view reset.
-	Assert true: view next = $a.
+	StreamViewRun check: 'reset then next' equals: $a is: [ view next ].
 
 	stream := CollectionStream on: 'abcdef'.
 	view := StreamView on: stream limit: 3.
 	view skip: 2.
-	Assert true: view next = $c.
+	StreamViewRun check: 'skip: 2 then next' equals: $c is: [ view next ].
 	view skip: -3.
-	Assert true: view next = $a.
+	StreamViewRun check: 'skip: negative then next' equals: $a is: [ view next ].
 ]
+
+[ ^StreamViewRun report ]

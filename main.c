@@ -27,6 +27,7 @@ static void bootstrapSmalltalk(char *snapshotFileName, char *bootstrapDir);
 typedef struct {
 	CliArgs *cliArgs;
 	int result;
+	_Bool interactive; // REPL session: unhandled errors do not poison the exit code
 } ProgramContext;
 
 
@@ -54,6 +55,7 @@ static void runProgram(void *arg)
 	} else if (cliArgs->eval != NULL) {
 		ctx->result = asCInt(evalCode(cliArgs->eval));
 	} else {
+		ctx->interactive = 1;
 		runRepl();
 	}
 }
@@ -121,6 +123,13 @@ int main(int argc, char **args)
 
 	freeHandles();
 	freeThread(&CurrentThread);
+	// Any fiber that died in Exception>>defaultAction (unhandled error) makes a
+	// non-interactive run FAIL, even though the main block's own return value
+	// was fine: an uncaught error must never exit 0 (the historical false-pass
+	// that let a printed backtrace count as success). The REPL is exempt.
+	if (!ctx.interactive && ctx.result == 0 && schedulerUnhandledErrors() > 0) {
+		ctx.result = EXIT_FAILURE;
+	}
 	return ctx.result;
 }
 

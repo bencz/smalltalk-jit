@@ -5,12 +5,14 @@
   2. Objects larger than a 256 KB heap page could not be allocated in /
      promoted to old space. Large arrays must now work."
 
+[ FloatStressRun := TestRun named: 'FloatStress' ]
+
 "---- A long hot Float loop (far more than 256 allocations) ----"
 [
 	| z |
 	z := 0.0.
 	1 to: 20000 do: [:i | z := z + 0.5].
-	Assert true: (z - 10000.0) abs < 0.001.
+	FloatStressRun check: 'hot loop sum' that: [ (z - 10000.0) abs < 0.001 ].
 ]
 
 "---- Many Floats kept live in an array, then read back (GC survival) ----"
@@ -21,7 +23,7 @@
 	sum := 0.0.
 	arr do: [:x | sum := sum + x].
 	"1 + 2 + ... + 5000 = 12502500"
-	Assert true: (sum - 12502500.0) abs < 1.0.
+	FloatStressRun check: 'array of floats survives GC' that: [ (sum - 12502500.0) abs < 1.0 ].
 ]
 
 "---- Float math functions in a loop ----"
@@ -29,8 +31,8 @@
 	| acc |
 	acc := 0.0.
 	1 to: 1000 do: [:i | acc := acc + (i asFloat sqrt)].
-	Assert true: acc > 21000.0.
-	Assert true: acc < 21100.0.
+	FloatStressRun check: 'sqrt loop lower bound' that: [ acc > 21000.0 ].
+	FloatStressRun check: 'sqrt loop upper bound' that: [ acc < 21100.0 ].
 ]
 
 "---- A single object larger than a 256 KB heap page ----"
@@ -39,9 +41,9 @@
 	big := Array new: 50000.        "~400 KB, larger than a page"
 	big at: 1 put: 'first'.
 	big at: 50000 put: 'last'.
-	Assert true: big size = 50000.
-	Assert true: (big at: 1) = 'first'.
-	Assert true: (big at: 50000) = 'last'.
+	FloatStressRun check: 'big array size' equals: 50000 is: [ big size ].
+	FloatStressRun check: 'big array first slot' equals: 'first' is: [ big at: 1 ].
+	FloatStressRun check: 'big array last slot' equals: 'last' is: [ big at: 50000 ].
 ]
 
 
@@ -53,6 +55,8 @@ handle bookkeeping (fromDoubleResult's pop) under allocation pressure."
 	| z |
 	z := 1.0e300.
 	1 to: 20000 do: [:i | z := (z + 1.0e290) - 1.0e290].
-	Assert true: z = 1.0e300.
-	Assert true: z class == BoxedFloat64.
+	FloatStressRun check: 'boxed loop value' equals: 1.0e300 is: [ z ].
+	FloatStressRun check: 'boxed loop class' that: [ z class == BoxedFloat64 ].
 ]
+
+[ ^FloatStressRun report ]

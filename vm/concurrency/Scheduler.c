@@ -38,6 +38,32 @@ static PER_ISOLATE Fiber *gCurrent = NULL;    // running fiber, NULL while in th
 static PER_ISOLATE _Bool gActive = 0;
 static PER_ISOLATE Value gExitResult = 0;
 
+// Process-wide (NOT per-worker TLS: any worker's fiber can die) count of
+// unhandled errors: Exception>>defaultAction bumps it just before terminating
+// the signaling fiber. main() folds a nonzero count into the process exit code
+// in non-interactive mode, so a test can no longer print a backtrace and still
+// exit 0 (the historical false-pass). Atomic: fibers on different workers can
+// fail simultaneously.
+static int gUnhandledErrors = 0;
+
+void schedulerNoteUnhandledError(void)
+{
+	__atomic_add_fetch(&gUnhandledErrors, 1, __ATOMIC_RELAXED);
+}
+
+int schedulerUnhandledErrors(void)
+{
+	return __atomic_load_n(&gUnhandledErrors, __ATOMIC_RELAXED);
+}
+
+// Read-and-clear, for tests that deliberately drive an error into
+// defaultAction (e.g. the unhandled-in-fiber probe in UnwindTest) and must
+// then both ASSERT it fired and keep the run's exit code clean.
+int schedulerTakeUnhandledErrors(void)
+{
+	return __atomic_exchange_n(&gUnhandledErrors, 0, __ATOMIC_RELAXED);
+}
+
 // timer min-heap entry: a fiber sleeping until a deadline (Delay wait)
 typedef struct {
 	int64_t deadline; // absolute microseconds

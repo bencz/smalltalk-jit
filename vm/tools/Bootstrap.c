@@ -381,6 +381,7 @@ static _Bool parseKernelFiles(char *kernelDir)
 		"Repl.st",
 		"Assert.st",
 		"AssertError.st",
+		"TestRun.st", // kernel unit-test runner (tests/*.st end with ^t report)
 	};
 
 	HandleScope scope;

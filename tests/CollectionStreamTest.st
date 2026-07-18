@@ -1,43 +1,47 @@
 [
 	| stream |
 
+	CollectionStreamRun := TestRun named: 'CollectionStream'.
+
 	stream := CollectionStream on: 'abbccdd'.
 
-	Assert true: stream peek = $a.
-	Assert true: stream peek = $a.
+	CollectionStreamRun check: 'peek first' equals: $a is: [ stream peek ].
+	CollectionStreamRun check: 'peek does not advance' equals: $a is: [ stream peek ].
 
-	Assert true: stream next = $a.
-	Assert true: (stream next: 2) = 'bb'.
-	Assert true: (stream next: 2) = 'cc'.
-	Assert true: stream next = $d.
-	Assert do: [stream next: 2] expect: OutOfRangeError.
+	CollectionStreamRun check: 'next first' equals: $a is: [ stream next ].
+	CollectionStreamRun check: 'next: 2 reads bb' equals: 'bb' is: [ stream next: 2 ].
+	CollectionStreamRun check: 'next: 2 reads cc' equals: 'cc' is: [ stream next: 2 ].
+	CollectionStreamRun check: 'next reads d' equals: $d is: [ stream next ].
+	CollectionStreamRun expect: 'next: past end raises' raises: OutOfRangeError in: [stream next: 2].
 
 	stream := CollectionStream on: 'foo' copy.
-	Assert true: stream contents = 'foo' copy.
-	Assert true: stream upToEnd = 'foo' copy.
+	CollectionStreamRun check: 'contents at start' equals: 'foo' copy is: [ stream contents ].
+	CollectionStreamRun check: 'upToEnd at start' equals: 'foo' copy is: [ stream upToEnd ].
 
 	stream next.
-	Assert true: stream contents = 'foo' copy.
-	Assert true: stream upToEnd = 'oo' copy.
+	CollectionStreamRun check: 'contents after next' equals: 'foo' copy is: [ stream contents ].
+	CollectionStreamRun check: 'upToEnd after next' equals: 'oo' copy is: [ stream upToEnd ].
 
 	stream := CollectionStream with: (String new: 1).
 	stream nextPut: $a; nextPut: $a.
 	stream nextPutAll: 'bb'.
-	Assert true: stream contents = 'aabb' copy.
+	CollectionStreamRun check: 'write stream grows' equals: 'aabb' copy is: [ stream contents ].
 
 	stream := CollectionStream on: 'abc' copy.
 	stream next; nextPut: $x.
-	Assert true: stream contents = 'axc' copy.
+	CollectionStreamRun check: 'nextPut: overwrites middle' equals: 'axc' copy is: [ stream contents ].
 	stream nextPutAll: 'xx'.
-	Assert true: stream contents = 'axxx' copy.
+	CollectionStreamRun check: 'nextPutAll: extends' equals: 'axxx' copy is: [ stream contents ].
 
 	stream := CollectionStream with: 'abc' copy.
-	Assert true: stream atEnd.
+	CollectionStreamRun check: 'with: starts atEnd' that: [ stream atEnd ].
 
 	stream := CollectionStream on: 'abc' copy.
-	Assert false: stream atEnd.
+	CollectionStreamRun check: 'on: not atEnd' that: [ stream atEnd = false ].
 	stream next: 2.
-	Assert false: stream atEnd.
+	CollectionStreamRun check: 'not atEnd after next: 2' that: [ stream atEnd = false ].
 	stream next.
-	Assert true: stream atEnd.
+	CollectionStreamRun check: 'atEnd after reading all' that: [ stream atEnd ].
 ]
+
+[ ^CollectionStreamRun report ]

@@ -113,6 +113,19 @@ else
 	failed="$failed ST_IC_STATS_TEST(ST_NO_IC)"
 fi
 
+# Gate-of-the-gate: an UNCAUGHT Smalltalk error must exit nonzero (the VM
+# counts fiber deaths in Exception>>defaultAction and main folds them into the
+# exit code). If this ever exits 0 again, every assertion-style test in the
+# suite can silently false-pass, so the suite itself must go red.
+if "$BUILD/st" -s "$SNAP" -e 'nil zork' </dev/null >/dev/null 2>&1; then
+	printf "  ${R}FAIL${Z}  %s\n" "UNCAUGHT_ERROR_EXITS_NONZERO"
+	fail=$((fail + 1))
+	failed="$failed UNCAUGHT_ERROR_EXITS_NONZERO"
+else
+	printf "  ${G}pass${Z}  %s\n" "UNCAUGHT_ERROR_EXITS_NONZERO"
+	pass=$((pass + 1))
+fi
+
 # Tier stats self-test (needs the image): first run proves the hot-method
 # recompile fires once and promoted guards carry the dispatches; the
 # ST_NO_TIER run proves the kill-switch zeroes the whole apparatus.

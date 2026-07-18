@@ -8,67 +8,69 @@ TestIndexedObject := Object [
 [
 	| object stream |
 
+	ObjRun := TestRun named: 'Object'.
+
 	object := Object new.
 
-	Assert do: [object at: -1] expect: OutOfRangeError.
-	Assert do: [object at: 0] expect: OutOfRangeError.
-	Assert do: [object at: 1] expect: OutOfRangeError.
+	ObjRun expect: 'at: -1 raises' raises: OutOfRangeError in: [object at: -1].
+	ObjRun expect: 'at: 0 raises' raises: OutOfRangeError in: [object at: 0].
+	ObjRun expect: 'at: 1 raises' raises: OutOfRangeError in: [object at: 1].
 
-	Assert do: [object at: -1 put: nil] expect: OutOfRangeError.
-	Assert do: [object at: 0 put: nil] expect: OutOfRangeError.
-	Assert do: [object at: 1 put: nil] expect: OutOfRangeError.
+	ObjRun expect: 'at: -1 put: raises' raises: OutOfRangeError in: [object at: -1 put: nil].
+	ObjRun expect: 'at: 0 put: raises' raises: OutOfRangeError in: [object at: 0 put: nil].
+	ObjRun expect: 'at: 1 put: raises' raises: OutOfRangeError in: [object at: 1 put: nil].
 
-	Assert do: [object basicAt: -1] expect: OutOfRangeError.
-	Assert do: [object basicAt: 0] expect: OutOfRangeError.
-	Assert do: [object basicAt: 1] expect: OutOfRangeError.
+	ObjRun expect: 'basicAt: -1 raises' raises: OutOfRangeError in: [object basicAt: -1].
+	ObjRun expect: 'basicAt: 0 raises' raises: OutOfRangeError in: [object basicAt: 0].
+	ObjRun expect: 'basicAt: 1 raises' raises: OutOfRangeError in: [object basicAt: 1].
 
-	Assert do: [object basicAt: -1 put: nil] expect: OutOfRangeError.
-	Assert do: [object basicAt: 0 put: nil] expect: OutOfRangeError.
-	Assert do: [object basicAt: 1 put: nil] expect: OutOfRangeError.
+	ObjRun expect: 'basicAt: -1 put: raises' raises: OutOfRangeError in: [object basicAt: -1 put: nil].
+	ObjRun expect: 'basicAt: 0 put: raises' raises: OutOfRangeError in: [object basicAt: 0 put: nil].
+	ObjRun expect: 'basicAt: 1 put: raises' raises: OutOfRangeError in: [object basicAt: 1 put: nil].
 
-	Assert true: object size == 0.
-	Assert true: object basicSize == 0.
-	Assert true: object yourself == object.
+	ObjRun check: 'size is 0' that: [object size == 0].
+	ObjRun check: 'basicSize is 0' that: [object basicSize == 0].
+	ObjRun check: 'yourself is receiver' that: [object yourself == object].
 
-	Assert do: [object instVarAt: -1] expect: OutOfRangeError.
-	Assert do: [object instVarAt: 0] expect: OutOfRangeError.
-	Assert do: [object instVarAt: 1] expect: OutOfRangeError.
+	ObjRun expect: 'instVarAt: -1 raises' raises: OutOfRangeError in: [object instVarAt: -1].
+	ObjRun expect: 'instVarAt: 0 raises' raises: OutOfRangeError in: [object instVarAt: 0].
+	ObjRun expect: 'instVarAt: 1 raises' raises: OutOfRangeError in: [object instVarAt: 1].
 
-	Assert do: [object instVarAt: -1 put: nil] expect: OutOfRangeError.
-	Assert do: [object instVarAt: 0 put: nil] expect: OutOfRangeError.
-	Assert do: [object instVarAt: 1 put: nil] expect: OutOfRangeError.
+	ObjRun expect: 'instVarAt: -1 put: raises' raises: OutOfRangeError in: [object instVarAt: -1 put: nil].
+	ObjRun expect: 'instVarAt: 0 put: raises' raises: OutOfRangeError in: [object instVarAt: 0 put: nil].
+	ObjRun expect: 'instVarAt: 1 put: raises' raises: OutOfRangeError in: [object instVarAt: 1 put: nil].
 
-	Assert true: object = object.
-	Assert false: object = nil.
+	ObjRun check: 'equals itself' that: [object = object].
+	ObjRun check: 'not equals nil' that: [(object = nil) = false].
 
-	Assert true: object == object.
-	Assert false: object == nil.
+	ObjRun check: 'identical to itself' that: [object == object].
+	ObjRun check: 'not identical to nil' that: [(object == nil) = false].
 
-	Assert true: object hash > 0.
+	ObjRun check: 'hash positive' that: [object hash > 0].
 
-	Assert false: object ~= object.
-	Assert true: object ~= nil.
+	ObjRun check: 'not unequal to itself' that: [(object ~= object) = false].
+	ObjRun check: 'unequal to nil' that: [object ~= nil].
 
-	Assert false: object ~~ object.
-	Assert true: object ~= nil.
+	ObjRun check: 'not nonidentical to itself' that: [(object ~~ object) = false].
+	ObjRun check: 'unequal to nil again' that: [object ~= nil].
 
-	Assert true: object identityHash > 0.
+	ObjRun check: 'identityHash positive' that: [object identityHash > 0].
 
-	Assert true: object class == Object.
-	Assert true: (object isKindOf: Object).
-	Assert false: (object isKindOf: SmallInteger).
-	Assert true: (1 isKindOf: Object).
-	Assert true: (object isMemberOf: Object).
-	Assert false: (object isMemberOf: SmallInteger).
-	Assert true: (object respondsTo: #size).
-	Assert false: (object respondsTo: #foo).
+	ObjRun check: 'class is Object' that: [object class == Object].
+	ObjRun check: 'isKindOf Object' that: [object isKindOf: Object].
+	ObjRun check: 'not isKindOf SmallInteger' that: [(object isKindOf: SmallInteger) = false].
+	ObjRun check: '1 isKindOf Object' that: [1 isKindOf: Object].
+	ObjRun check: 'isMemberOf Object' that: [object isMemberOf: Object].
+	ObjRun check: 'not isMemberOf SmallInteger' that: [(object isMemberOf: SmallInteger) = false].
+	ObjRun check: 'respondsTo size' that: [object respondsTo: #size].
+	ObjRun check: 'not respondsTo foo' that: [(object respondsTo: #foo) = false].
 
 	"Assert do: [object doesNotUnderstand: ]"
 
-	Assert true: object printString = 'an Object'.
+	ObjRun check: 'printString' equals: 'an Object' is: [object printString].
 	stream := CollectionStream with: (String new: 32).
 	object examineOn: stream.
-	Assert true: stream contents = ('an Object' copyWith: Character lf).
+	ObjRun check: 'examineOn contents' equals: ('an Object' copyWith: Character lf) is: [stream contents].
 ]
 
 
@@ -77,23 +79,23 @@ TestIndexedObject := Object [
 
 	object := TestIndexedObject new: 8.
 
-	Assert do: [object at: -1] expect: OutOfRangeError.
-	Assert true: (object at: 1) == nil.
-	Assert true: (object at: 8) == nil.
-	Assert do: [object at: 9] expect: OutOfRangeError.
+	ObjRun expect: 'indexed at: -1 raises' raises: OutOfRangeError in: [object at: -1].
+	ObjRun check: 'indexed at: 1 starts nil' that: [(object at: 1) == nil].
+	ObjRun check: 'indexed at: 8 starts nil' that: [(object at: 8) == nil].
+	ObjRun expect: 'indexed at: 9 raises' raises: OutOfRangeError in: [object at: 9].
 
-	Assert do: [object at: -1 put: nil] expect: OutOfRangeError.
-	Assert do: [object at: 9 put: nil] expect: OutOfRangeError.
+	ObjRun expect: 'indexed at: -1 put: raises' raises: OutOfRangeError in: [object at: -1 put: nil].
+	ObjRun expect: 'indexed at: 9 put: raises' raises: OutOfRangeError in: [object at: 9 put: nil].
 
 	object at: 1 put: 1.
-	Assert true: (object at: 1) == 1.
+	ObjRun check: 'indexed at: 1 stores' that: [(object at: 1) == 1].
 	object at: 8 put: 2.
-	Assert true: (object at: 8) == 2.
+	ObjRun check: 'indexed at: 8 stores' that: [(object at: 8) == 2].
 
-	Assert true: object size == 8.
-	Assert true: object basicSize == 8.
+	ObjRun check: 'indexed size is 8' that: [object size == 8].
+	ObjRun check: 'indexed basicSize is 8' that: [object basicSize == 8].
 
-	Assert true: object printString = 'a TestIndexedObject'.
+	ObjRun check: 'indexed printString' equals: 'a TestIndexedObject' is: [object printString].
 ]
 
 
@@ -103,7 +105,7 @@ TestIndexedObject := Object [
 	object := Object new.
 	object2 := Object new.
 	object become: object2.
-	Assert true: object identityHash == object2 identityHash.
+	ObjRun check: 'become swaps identityHash' that: [object identityHash == object2 identityHash].
 ]
 
 
@@ -114,7 +116,7 @@ TestIndexedObject := Object [
 	object2 := TestIndexedObject new: 1.
 
 	object become: object2.
-	Assert true: object identityHash == object2 identityHash.
+	ObjRun check: 'become swaps indexed identityHash' that: [object identityHash == object2 identityHash].
 ]
 
 
@@ -123,13 +125,16 @@ TestIndexedObject := Object [
 
 	object := Object new.
 
-	Assert false: object == object shallowCopy.
-	Assert false: object = object shallowCopy.
+	ObjRun check: 'shallowCopy not identical' that: [(object == object shallowCopy) = false].
+	ObjRun check: 'plain object shallowCopy not equal' that: [(object = object shallowCopy) = false].
 
 	object := Array new: 16.
 	object at: 1 put: Object new.
-	Assert false: object == object shallowCopy.
-	Assert true: object = object shallowCopy.
-	Assert true: (object at: 1) == (object shallowCopy at: 1).
-	Assert false: (object at: 1) == (object deepCopy at: 1).
+	ObjRun check: 'array shallowCopy not identical' that: [(object == object shallowCopy) = false].
+	ObjRun check: 'array shallowCopy equal' that: [object = object shallowCopy].
+	ObjRun check: 'shallowCopy shares elements' that: [(object at: 1) == (object shallowCopy at: 1)].
+	ObjRun check: 'deepCopy copies elements' that: [((object at: 1) == (object deepCopy at: 1)) = false].
 ]
+
+
+[ ^ObjRun report ]

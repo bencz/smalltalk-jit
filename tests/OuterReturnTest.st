@@ -24,8 +24,13 @@ OuterReturnTest := Object [
 
 
 [
-	Assert do: [OuterReturnTest createBlock value] expect: Error.
-	Assert true: OuterReturnTest outerReturn = 4.
-	Assert true: OuterReturnTest outerReturn2 = 1.
-	Assert true: OuterReturnTest outerReturn3 = 2.
+	OuterRun := TestRun named: 'OuterReturn'.
+
+	OuterRun expect: 'escaped block outer return raises' raises: Error in: [OuterReturnTest createBlock value].
+	OuterRun check: 'nested outer return' equals: 4 is: [OuterReturnTest outerReturn].
+	OuterRun check: 'ifTrue outer return' equals: 1 is: [OuterReturnTest outerReturn2].
+	OuterRun check: 'ifFalse skips outer return' equals: 2 is: [OuterReturnTest outerReturn3].
 ]
+
+
+[ ^OuterRun report ]

@@ -1,8 +1,14 @@
-"Stress test for Channel under heavy concurrent load. Thousands of blocking
- send/receive hand-offs (each a fiber suspend/resume) plus steady allocation
- force many scavenges while fibers are parked. Every scenario checks an exact
- sum/count on the main process, so any lost, duplicated, or GC-corrupted item
- fails the test."
+"Stress test for Channel under heavy concurrent load, driven by the kernel
+ TestRun. Thousands of blocking send/receive hand-offs (each a fiber
+ suspend/resume) plus steady allocation force many scavenges while fibers are
+ parked. Every scenario checks an exact sum/count on the main process, so any
+ lost, duplicated, or GC-corrupted item fails the test. Under the multi-worker
+ pool fibers run in real parallelism: cross-fiber results go into DISJOINT
+ slots of a preallocated Array (never a shared growing collection), joins use
+ Semaphores the fibers signal (never counted yields), and helper fibers are
+ joined before their block ends."
+
+[ ChanStressRun := TestRun named: 'ChannelStress' ]
 
 "worker pool: sum of 1..N computed across many workers over one channel pair"
 [
@@ -35,11 +41,12 @@
 			ifFalse: [ total := total + r ] ].
 
 	expected := jobs * (jobs + 1) // 2.
-	Assert true: total = expected.
+	ChanStressRun check: 'worker pool fold is exact' equals: expected is: [ total ].
 ]
 
 "pipeline: producer -> even-filter -> collector over chained channels; the exact
- set of even numbers must survive the two hand-offs"
+ set of even numbers must survive the two hand-offs (the collector runs on the
+ main process, so `collected` has a single mutator)"
 [
 	| source evens collected running total |
 	source := Channel new.
@@ -65,19 +72,22 @@
 			ifTrue: [ running := false ]
 			ifFalse: [ collected addLast: n ] ].
 
-	Assert true: collected size = 2500.
+	ChanStressRun check: 'pipeline kept every even number' equals: 2500 is: [ collected size ].
 	total := 0.
 	collected do: [:n | total := total + n ].
-	Assert true: total = (2 * (2500 * 2501 // 2)).
+	ChanStressRun check: 'pipeline sum is exact' equals: 2 * (2500 * 2501 // 2) is: [ total ].
 ]
 
 "many independent channels, each handed off between a dedicated producer and
- consumer fiber, all interleaved under GC pressure from a churner fiber"
+ consumer fiber, all interleaved under GC pressure from a churner fiber; each
+ consumer owns a disjoint sums slot and signals a join semaphore"
 [
-	| n channels sums garbage grandTotal |
+	| n channels sums garbage grandTotal consDone churnDone |
 	n := 60.
 	channels := OrderedCollection new.
-	sums := OrderedCollection new.
+	sums := Array new: n.
+	consDone := Semaphore new.
+	churnDone := Semaphore new.
 
 	1 to: n do: [:i |
 		| ch |
@@ -86,23 +96,31 @@
 		[ | s |
 		  s := 0.
 		  1 to: 150 do: [:k | s := s + ch receive ].
-		  sums addLast: s ] fork ].
+		  sums at: i put: s.
+		  consDone signal ] fork ].
 
 	[ 1 to: 300 do: [:r |
 		garbage := OrderedCollection new.
 		1 to: 30 do: [:k | garbage addLast: (Array new: 4) ].
-		Processor yield ] ] fork.
+		Processor yield ].
+	  churnDone signal ] fork.
 
 	1 to: n do: [:i |
 		| ch |
 		ch := channels at: i.
 		[ 1 to: 150 do: [:k | ch send: k ] ] fork ].
 
-	1 to: 80 do: [:i | Processor yield ].
+	1 to: n do: [:i | consDone wait ].
+	churnDone wait.
 
-	Assert true: sums size = n.
+	ChanStressRun check: 'every consumer slot was filled' that: [
+		| ok | ok := true.
+		1 to: n do: [:i | (sums at: i) isNil ifTrue: [ ok := false ] ].
+		ok ].
 	grandTotal := 0.
-	sums do: [:s | grandTotal := grandTotal + s ].
+	1 to: n do: [:i | grandTotal := grandTotal + (sums at: i) ].
 	"each consumer sums 1..150 = 11325"
-	Assert true: grandTotal = (n * 11325).
+	ChanStressRun check: 'grand total across channels is exact' equals: n * 11325 is: [ grandTotal ].
 ]
+
+[ ^ChanStressRun report ]

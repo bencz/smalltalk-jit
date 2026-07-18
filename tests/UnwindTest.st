@@ -284,8 +284,11 @@ UnwindTest := Object [
 		"pinned regression (also passes pre-fix, where the emulation caught the
 		 exception): an UNHANDLED exception in a fiber must still run pending
 		 ensures before the fiber dies. Post-fix this exercises defaultAction ->
-		 terminate -> unwind. Prints the intentional backtrace noise."
-		| fails flag tries |
+		 terminate -> unwind. Prints the intentional backtrace noise.
+		 The probe DELIBERATELY drives defaultAction, which counts an unhandled
+		 error that would fail this run's exit code: take the counter, ASSERT
+		 the death was recorded exactly once, and leave the run green."
+		| fails flag tries taken |
 		fails := 0.
 		flag := false.
 		[[UnwindError signal: 'intentional: unhandled in fiber probe'] ensure: [flag := true]] fork.
@@ -294,6 +297,11 @@ UnwindTest := Object [
 			tries := tries + 1.
 			Processor yield].
 		flag ifFalse: [fails := fails + 1].
+		taken := Processor takeUnhandledErrorCount.
+		taken = 1 ifFalse: [
+			Transcript nextPutAll: 'unhandledInFiber: expected 1 recorded unhandled error, got '.
+			Transcript nextPutAll: taken printString; lf.
+			fails := fails + 1].
 		^fails
 	]
 

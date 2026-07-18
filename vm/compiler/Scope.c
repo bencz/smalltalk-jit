@@ -392,7 +392,17 @@ static _Bool exprHasRealBlock(ExpressionNode *e)
 	HandleScope scope;
 	openHandleScope(&scope);
 	_Bool whileInlined = expressionIsInlinableWhile(e);
-	_Bool found = nodeHasRealBlock((Object *) expressionNodeGetReceiver(e));
+	Object *receiver = (Object *) expressionNodeGetReceiver(e);
+	_Bool found = nodeHasRealBlock(receiver);
+	// A block literal in RECEIVER position is a real closure too: [ ... ] fork,
+	// [ ... ] value, x := [ ... ]. Only the spliced condition of an inlined
+	// whileTrue:/whileFalse: is exempt. Missing this case let a to:do: whose
+	// body forks a closure stay inlined, so every forked fiber read the loop
+	// variable's FINAL value (all fibers saw the same last index) instead of
+	// its own per-iteration binding.
+	if (!found && !whileInlined && receiver->raw->class == Handles.BlockNode->raw) {
+		found = 1;
+	}
 	Iterator it;
 	initOrdCollIterator(&it, expressionNodeGetMessageExpressions(e), 0, 0);
 	while (!found && iteratorHasNext(&it)) {

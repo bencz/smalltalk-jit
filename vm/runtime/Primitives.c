@@ -202,6 +202,22 @@ static PrimitiveResult contextTemporaryAt(Value vContext, Value vIndex)
 }
 
 
+// Unhandled-error accounting (Scheduler.c gUnhandledErrors): note is called by
+// Exception>>defaultAction right before it terminates the signaling fiber;
+// take is the read-and-clear used by VMTools for deliberate probes.
+static PrimitiveResult unhandledErrorNotePrimitive(Value receiver)
+{
+	schedulerNoteUnhandledError();
+	return primSuccess(receiver);
+}
+
+
+static PrimitiveResult unhandledErrorTakePrimitive(Value receiver)
+{
+	return primSuccess(tagInt(schedulerTakeUnhandledErrors()));
+}
+
+
 
 
 Primitive Primitives[] = {
@@ -356,6 +372,10 @@ Primitive Primitives[] = {
 	{"AtomicArrayGetAndSetPrimitive", CCALL, .cFunction = atomicArrayGetAndSetPrimitive, 3},
 	{"AtomicArrayGetAndAddPrimitive", CCALL, .cFunction = atomicArrayGetAndAddPrimitive, 3},
 	{"MonitorEnterOnPrimitive", CCALL, .cFunction = monitorEnterOnPrimitive, 2},
+	// Appended (NEVER reorder this table): unhandled-error accounting for honest
+	// process exit codes (see gUnhandledErrors in Scheduler.c).
+	{"UnhandledErrorNotePrimitive", CCALL, .cFunction = unhandledErrorNotePrimitive, 1},
+	{"UnhandledErrorTakePrimitive", CCALL, .cFunction = unhandledErrorTakePrimitive, 1},
 };
 
 

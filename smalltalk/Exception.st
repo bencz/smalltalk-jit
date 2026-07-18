@@ -161,7 +161,16 @@ Exception := Object [
 	defaultAction [
 		Transcript nextPutAll: self messageText; lf.
 		self signalingContext printBacktrace.
+		"Count this death so main folds it into a nonzero process exit code
+		 (non-interactive runs): a test can no longer print a backtrace and
+		 still report success. Resumable defaults (Warning) never reach here."
+		self noteUnhandled.
 		Processor thisProcess terminate.
+	]
+
+
+	noteUnhandled [
+		<primitive: UnhandledErrorNotePrimitive>
 	]
 
 

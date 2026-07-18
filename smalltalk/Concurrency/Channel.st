@@ -4,7 +4,13 @@
  is mutated only under the global sync monitor, and item availability is tracked by
  an internal Semaphore (itself monitor-protected). The queue mutation and the
  semaphore op are kept as separate flat critical sections (never nested), since the
- monitor is not re-entrant."
+ monitor is not re-entrant.
+ WARNING: with multiple receivers an item goes to WHICHEVER receiver consumes a
+ permit first; there is no addressing. In particular, never use one channel for
+ both request and reply traffic: the requester's receive races the consumer for
+ the requester's own still-queued items and can steal one as the 'reply'
+ (deterministic only under a single cooperative worker, which is not the default).
+ Use a dedicated reply channel per direction."
 Channel := Object [
 
 	| queue itemsAvailable |
