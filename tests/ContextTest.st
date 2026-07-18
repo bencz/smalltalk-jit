@@ -56,9 +56,12 @@ TestRun := Object [
  ContextCopy snapshots. Live Context field reads are only valid while the frame
  is on the stack, so every method below computes a plain value INSIDE the
  handler and returns that; ContextCopy is used for anything inspected later.
- WARNING: sending #receiver or #method to a signalingContext home MethodContext
- recurses into a VM stack-overflow crash, so home/outer are only queried for
- #class here (see the report accompanying this file)."
+ A context whose frame is dead (escaped its activation) or was never framed
+ (the thread's dummy root context, captured as home by closures made in
+ methods that do not materialize a context) answers nil from the frame-reading
+ accessors (receiver / parent / argumentAt: / temporaryAt:) instead of
+ crashing the VM. A home context of a method that DOES materialize a context
+ (a block captures one of its temps) answers real values."
 CtxFixture := Object [
     | tag |
     tag: x [ tag := x. ^self ]
@@ -83,6 +86,9 @@ CtxFixture := Object [
     blockIsCode     [ ^[ self boom ] on: Error do: [:ex | | c | c := ex signalingContext. c block == c code ] ]
     copyInside      [ ^[ self boom ] on: Error do: [:ex | ex signalingContext copy ] ]
     homeCtxInside   [ ^[ self boom ] on: Error do: [:ex | ex signalingContext home ] ]
+    homeRecvDummy   [ ^[ self boom ] on: Error do: [:ex | ex signalingContext home receiver ] ]
+    homeRecvReal    [ | v | v := 7. ^[ self boom. v ] on: Error do: [:ex | ex signalingContext home receiver ] ]
+    homeSelReal     [ | v | v := 7. ^[ self boom. v ] on: Error do: [:ex | ex signalingContext home code selector ] ]
     backtraceInside [ ^[ self deep ] on: Error do: [:ex | ex generateBacktrace ] ]
 
     backtraceHasSelf [
@@ -119,9 +125,14 @@ CtxFixture := Object [
     t check: 'block thisContext code is a CompiledBlock' that: [ [ thisContext ] value code class == CompiledBlock ].
     t check: 'block thisContext isKindOf Context' that: [ [ thisContext ] value isKindOf: Context ].
     t check: 'top-level thisContext code ownerClass is UndefinedObject' that: [ [ thisContext ] value code ownerClass == UndefinedObject ].
-    "WARNING: [ thisContext ] value receiver and ... value parent both segfault the
-     VM (stack overflow) on a raw value'd block context, so they are covered via
-     the exception path (signalingContext) below instead of here."
+    "--- dead contexts: frame-reading accessors answer nil, never crash ---
+     These four used to segfault the VM (NULL / dangling frame pointer read):
+     a value'd block context has already escaped its activation."
+    t check: 'dead block context receiver is nil' that: [ [ thisContext ] value receiver isNil ].
+    t check: 'dead block context parent is nil' that: [ [ thisContext ] value parent isNil ].
+    t check: 'dead block context argumentAt: 0 is nil' that: [ ([ thisContext ] value argumentAt: 0) isNil ].
+    t check: 'dead framed block context receiver is nil' that: [ | c | c := [ :x | thisContext parent. thisContext ] value: 5. c receiver isNil ].
+    t check: 'dead context temporaryAt: does not crash' that: [ [ :x | thisContext ] value: 9. true ].
 
     "--- signalingContext: a live context observed inside the handler ---"
     t check: 'signalingContext receiver is the handler self' that: [ inst recvInside == inst ].
@@ -139,6 +150,13 @@ CtxFixture := Object [
     t check: 'signalingContext arguments isKindOf Array' equals: true is: [ inst argsIsArray ].
     t check: 'handler block context has one argument' equals: 1 is: [ inst argsSizeInside ].
     t check: 'signalingContext temporaries size is SmallInteger' that: [ inst tempsSizeInside isKindOf: SmallInteger ].
+
+    "--- home context frame-reading accessors (used to crash the VM) ---
+     A dummy home (method without a materialized context) answers nil; a real
+     home (method whose temp is captured by the block) answers live values."
+    t check: 'dummy home receiver is nil or self, no crash' that: [ | r | r := inst homeRecvDummy. r isNil or: [ r == inst ] ].
+    t check: 'real home receiver is the method receiver' that: [ inst homeRecvReal == inst ].
+    t check: 'real home code selector' that: [ inst homeSelReal == #homeSelReal ].
 
     "--- BlockContext specific accessor ---"
     t check: 'BlockContext block answers its code' equals: true is: [ inst blockIsCode ].

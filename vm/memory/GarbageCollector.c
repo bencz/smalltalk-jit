@@ -264,8 +264,8 @@ static void iterateHandleScopes(MarkingQueue *queue, Thread *thread, HandleScope
 	initHandleScopeIterator(&handleScopeIterator, scopes);
 	while (handleScopeIteratorHasNext(&handleScopeIterator)) {
 		HandleScope *scope = handleScopeIteratorNext(&handleScopeIterator);
-		for (ptrdiff_t i = 0; i < scope->size; i++) {
-			markObject(queue, thread, scope->handles[i].raw);
+		for (size_t i = 0; i < scope->size; i++) {
+			markObject(queue, thread, handleScopeAt(scope, i)->raw);
 		}
 	}
 }
@@ -377,7 +377,7 @@ static void iterateNativeCode(MarkingQueue *queue, Thread *thread)
 	for (Thread *m = thread->heap->mutators; m != NULL; m = m->nextMutator) {
 		for (CodegenSites *sites = m->codegenSites; sites != NULL; sites = sites->next) {
 			for (size_t i = 0; i < *sites->count; i++) {
-				Value value = (Value) targetReadCodePointer(*sites->insts + sites->offsets[i]);
+				Value value = (Value) targetReadCodePointer(*sites->insts + (*sites->offsets)[i]);
 				if (valueTypeOf(value, VALUE_POINTER)) {
 					markObject(queue, thread, asObject(value));
 				} else {

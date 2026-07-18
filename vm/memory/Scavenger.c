@@ -442,8 +442,8 @@ static void iterateHandleScopes(Scavenger *scavenger, HandleScope *scopes)
 	initHandleScopeIterator(&handleScopeIterator, scopes);
 	while (handleScopeIteratorHasNext(&handleScopeIterator)) {
 		HandleScope *scope = handleScopeIteratorNext(&handleScopeIterator);
-		for (ptrdiff_t i = 0; i < scope->size; i++) {
-			RawObject *obj = processPointer(scavenger, &scope->handles[i].raw);
+		for (size_t i = 0; i < scope->size; i++) {
+			RawObject *obj = processPointer(scavenger, &handleScopeAt(scope, i)->raw);
 			if (isNewObject(obj)) {
 				scavenger->fiberHasYoungRoot = 1;
 			}
@@ -601,7 +601,7 @@ static void iterateNativeCode(Scavenger *scavenger)
 	// a FORWARDED #monitorEnter selector reaching dispatch (ActorStressTest).
 	for (Thread *m = scavenger->heap->mutators; m != NULL; m = m->nextMutator) {
 		for (CodegenSites *sites = m->codegenSites; sites != NULL; sites = sites->next) {
-			processPointerSites(scavenger, *sites->insts, sites->offsets, *sites->count);
+			processPointerSites(scavenger, *sites->insts, *sites->offsets, *sites->count);
 		}
 	}
 }

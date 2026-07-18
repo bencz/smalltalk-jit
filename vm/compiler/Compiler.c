@@ -78,9 +78,9 @@ Object *compileMethod(MethodNode *node, Class *class)
 	// A method and every block nested in it share ONE literal pool, referenced by a
 	// 16-bit bytecode index, so at most 65535 distinct literals are addressable.
 	// Past that the index wraps and a release build (ASSERT compiled out) would
-	// SILENTLY read the wrong literal and miscompile. Fail loudly here instead. In
-	// practice a method this large first exhausts the compile handle scope
-	// (Handle.h), which aborts earlier; this is the last-line backstop.
+	// SILENTLY read the wrong literal and miscompile. Fail loudly here instead.
+	// (The compile handle scope spills to heap chunks now, so nothing aborts
+	// before this backstop.)
 	if (ordCollSize(compiler.literals) > 65535) {
 		fprintf(stderr, "Compile error: a method plus its nested blocks reference %zu "
 			"distinct literals, but the literal index addresses at most 65535. "
@@ -254,7 +254,7 @@ static void processVariables(Compiler *compiler)
 	Iterator iterator;
 	Operand src;
 	Operand dst = { .isValid = 1, .type = OPERAND_CONTEXT_VAR, .level = 0 };
-	uint8_t index = compiler->header.argsSize + 2; // +1 for thisContext and self
+	size_t index = compiler->header.argsSize + 2; // +1 for thisContext and self
 
 	initDictIterator(&iterator, blockScopeGetVars(compiler->scope));
 	while (iteratorHasNext(&iterator)) {
@@ -272,6 +272,14 @@ static void processVariables(Compiler *compiler)
 		}
 	}
 
+	// Same uint8 ceiling as createTmpVar: fail loudly rather than wrap.
+	if (index > 255) {
+		fprintf(stderr, "Compile error: a method's arguments plus declared "
+			"temporaries need %zu frame slots, but the temp index is a byte "
+			"(max 255). Split it into smaller methods.\n", index);
+		fflush(NULL);
+		FAIL();
+	}
 	compiler->header.tempsSize = index;
 	closeHandleScope(&scope, NULL);
 }
@@ -347,6 +355,18 @@ static void findResultTmpVar(Compiler *compiler, OrderedCollection *assigments, 
 
 static void createTmpVar(Compiler *compiler, Operand *operand)
 {
+	// During compilation header.tempsSize counts ALL frame slots (args + self/
+	// context + temps, see compileMethodBody's final adjustment). The field is a
+	// uint8, so the 256th slot would WRAP and silently alias temp 0: a long
+	// expression chain (each intermediate result takes a compiler temp) gets a
+	// clean compile error instead. Same spirit as the 65535-literal backstop.
+	if (compiler->header.tempsSize >= 255) {
+		fprintf(stderr, "Compile error: a method needs more than 255 frame slots "
+			"(arguments + temporaries + compiler intermediates), but the temp "
+			"index is a byte. Split the expression into smaller methods.\n");
+		fflush(NULL);
+		FAIL();
+	}
 	operand->isValid = 1;
 	operand->type = OPERAND_TEMP_VAR;
 	operand->index = compiler->header.tempsSize++;

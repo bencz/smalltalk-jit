@@ -25,10 +25,12 @@ typedef struct TLAB {
 // registers its sites here (asmInitBuffer/asmFreeBuffer, LIFO since block
 // codegen nests inside method codegen) and both collectors walk the list of
 // every registered mutator. Indirections, not copies: the buffer reallocs on
-// growth (insts) and keeps baking (count).
+// growth (insts AND offsets, both heap arrays now) and keeps baking (count).
+// The walk only happens with the world stopped (the owning mutator is parked),
+// so the double dereference always observes the post-realloc pointers.
 typedef struct CodegenSites {
 	uint8_t **insts;              // &buffer->buffer
-	uint32_t *offsets;            // buffer->pointersOffsets (inline array, stable)
+	uint32_t **offsets;           // &buffer->pointersOffsets (array reallocs on growth)
 	size_t *count;                // &buffer->pointersOffsetsSize
 	struct CodegenSites *next;
 } CodegenSites;

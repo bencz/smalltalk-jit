@@ -49,5 +49,6 @@ Value stackFrameGetSlot(StackFrame *frame, ptrdiff_t index);
 Value *stackFrameGetSlotPtr(StackFrame *frame, ptrdiff_t index);
 NativeCode *stackFrameGetNativeCode(StackFrame *frame);
 _Bool contextHasValidFrame(RawContext *context);
+_Bool contextFrameOnCurrentStack(RawContext *context);
 
 #endif

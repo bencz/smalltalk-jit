@@ -145,7 +145,7 @@ static PrimitiveResult floatTimesTwoPowerPrimitive(Value self, Value arg);
 static PrimitiveResult contextParentPrimitive(Value vContext)
 {
 	RawContext *context = (RawContext *) asObject(vContext);
-	if (!contextHasValidFrame(context)) {
+	if (!contextFrameOnCurrentStack(context)) {
 		return primSuccess(getTaggedPtr(Handles.nil));
 	}
 
@@ -165,7 +165,7 @@ static PrimitiveResult contextParentPrimitive(Value vContext)
 static PrimitiveResult contextArgumentAt(Value vContext, Value vIndex)
 {
 	RawContext *context = (RawContext *) asObject(vContext);
-	if (!contextHasValidFrame(context)) {
+	if (!contextFrameOnCurrentStack(context)) {
 		return primSuccess(getTaggedPtr(Handles.nil));
 	}
 	RawCompiledMethod *code = (RawCompiledMethod *) asObject(context->code);
@@ -180,7 +180,7 @@ static PrimitiveResult contextArgumentAt(Value vContext, Value vIndex)
 static PrimitiveResult contextTemporaryAt(Value vContext, Value vIndex)
 {
 	RawContext *context = (RawContext *) asObject(vContext);
-	if (!contextHasValidFrame(context)) {
+	if (!contextFrameOnCurrentStack(context)) {
 		return primSuccess(getTaggedPtr(Handles.nil));
 	}
 	RawCompiledMethod *code = (RawCompiledMethod *) asObject(context->code);

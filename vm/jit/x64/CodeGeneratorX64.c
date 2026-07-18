@@ -131,6 +131,9 @@ static void generateCode(CodeGenerator *generator)
 #endif
 
 	if (generator->code.header.primitive > 0) {
+		// vars[] is heap-sized by computeRegsAlloc below; the primitive prologue
+		// runs first and needs slot 0, so make sure the array exists.
+		regsAllocEnsure(&generator->regsAlloc, 1, 0);
 		generator->regsAlloc.varsSize = 1;
 		generator->regsAlloc.vars[0].flags |= VAR_DEFINED | VAR_ON_STACK;
 		generator->regsAlloc.vars[0].frameOffset = -2;
@@ -169,6 +172,7 @@ static void generateCode(CodeGenerator *generator)
 static void freeCodeGenerator(CodeGenerator *generator)
 {
 	asmFreeBuffer(&generator->buffer);
+	regsAllocFree(&generator->regsAlloc);
 }
 
 
@@ -450,7 +454,7 @@ static void generateBody(CodeGenerator *generator)
 		// register across the whole range and must be kept — clearing it would read
 		// an unwritten slot / nil.
 		if (isJumpTarget) {
-			for (uint8_t i = 0; i < generator->regsAlloc.varsSize; i++) {
+			for (size_t i = 0; i < generator->regsAlloc.varsSize; i++) {
 				Variable *v = &generator->regsAlloc.vars[i];
 				if ((v->flags & VAR_ON_STACK) || v->type != VAR_TMP) {
 					v->flags &= ~VAR_IN_REG;
@@ -2371,6 +2375,10 @@ NativeCode *generateDoesNotUnderstand(String *selector)
 	asmJmpq(&buffer, R11);
 
 	NativeCode *code = buildNativeCodeFromAssembler(&buffer);
+	// Unlink sitesNode from CurrentThread.codegenSites and release the arrays:
+	// without this the list kept a node inside THIS returned stack frame, and
+	// the next GC walked dead stack memory (latent corruption), plus the leak.
+	asmFreeBuffer(&buffer);
 	heapCodegenLockLeave(CurrentThread.heap);
 	return code;
 }

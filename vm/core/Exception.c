@@ -143,6 +143,9 @@ void unwindThreadStateTo(uint8_t *targetFrame)
 	}
 	while (CurrentThread.handleScopes != NULL
 			&& (uint8_t *) CurrentThread.handleScopes < targetFrame) {
+		// The scope is abandoned without closeHandleScope: release its heap
+		// overflow chunks here or they leak.
+		handleScopeFreeChunks(CurrentThread.handleScopes);
 		CurrentThread.handleScopes = CurrentThread.handleScopes->parent;
 	}
 }

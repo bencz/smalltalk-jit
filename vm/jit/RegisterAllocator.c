@@ -10,20 +10,25 @@
 #define PRINT_ALLOCATION 0
 
 typedef struct {
-	uint8_t varsSize;
+	size_t varsSize;
+	size_t capacity;   // upper bound on the number of DEFINED variables
 	Variable *vars;
-	Variable *(* specialVars)[256];
-	Variable *order[256];
+	Variable ***specialVars; // the RegsAlloc's two rows
+	Variable **order;  // heap, `capacity` entries: definition order
 	Variable **last;
 	size_t maxOffset;
 	_Bool frameLess;
 	ptrdiff_t frameSize;
 } Vars;
 
-#define SORTED_VARS_SIZE 256
-
+// (SORTED_VARS_SIZE is gone: the worklist below is sized per method.)
+// Live-interval worklist. Entries are added once per variable (either end) and
+// slide down on removal, so a buffer of 2 * capacity with both cursors starting
+// at the midpoint can never overrun in either direction.
 typedef struct {
-	Variable *vars[SORTED_VARS_SIZE];
+	Variable **vars; // heap, 2 * capacity entries
+	Variable **base;
+	Variable **end;
 	Variable **first;
 	Variable **last;
 } SortedVars;
@@ -39,11 +44,12 @@ static void printAllocation(Vars *vars);
 static void scanCode(Vars *vars, CompiledCode *code);
 static void examineCopyOperands(Vars *vars, Operand src, Operand dst, size_t offset);
 static void examineOperand(Vars *vars, Operand operand, size_t offset);
-static void defineTmpVar(Vars *vars, uint8_t index, size_t offset);
-static Variable *defineSpecialVar(Vars *vars, uint8_t type, uint8_t index, size_t offset);
-static Variable *defineVar(Vars *vars, uint8_t type, uint8_t index, size_t offset);
+static void defineTmpVar(Vars *vars, uint16_t index, size_t offset);
+static Variable *defineSpecialVar(Vars *vars, uint8_t type, uint16_t index, size_t offset);
+static Variable *defineVar(Vars *vars, uint8_t type, size_t index, size_t offset);
 static void scanRegisters(Vars *vars, AvailableRegs *regs);
-static void initSortedVars(SortedVars *sortedVars);
+static void initSortedVars(SortedVars *sortedVars, size_t capacity);
+static void freeSortedVars(SortedVars *sortedVars);
 static Variable *getFirstVar(SortedVars *sortedVars);
 static void addFirstVar(SortedVars *sortedVars, Variable *var);
 static void addLastVar(SortedVars *sortedVars, Variable *var);
@@ -74,15 +80,39 @@ v        a msg.		a
 
 void computeRegsAlloc(RegsAlloc *alloc, AvailableRegs *regs, CompiledCode *code)
 {
-	ASSERT(SORTED_VARS_SIZE / 2 >= code->header.tempsSize);
+	// Upper bound on defined variables: the temp index space (args + temps +
+	// self/context), one context var per nesting level, and in the worst case
+	// one association var per literal. The 16-bit Variable.index caps the total
+	// (the literal pool is itself capped at 65535 by the compiler, so only a
+	// pathological combination can trip this; fail loudly, never wrap).
+	size_t tempSpace = (size_t) code->header.argsSize + code->header.tempsSize + 2;
+	size_t literalsCount = code->literals != NULL ? objectSize((Object *) code->literals) : 0;
+	size_t capacity = tempSpace + REGS_ALLOC_CONTEXT_LEVELS + literalsCount;
+	if (capacity > UINT16_MAX) {
+		FAIL();
+	}
+	regsAllocEnsure(alloc, capacity, literalsCount);
 
 	Vars vars;
 	memset(&vars, 0, sizeof(vars));
-	memset(alloc, 0, sizeof(*alloc));
+	memset(alloc->vars, 0, alloc->varsCapacity * sizeof(*alloc->vars));
+	memset(alloc->specialVars[VAR_CONTEXT], 0, REGS_ALLOC_CONTEXT_LEVELS * sizeof(Variable *));
+	if (alloc->assocCapacity > 0) {
+		memset(alloc->specialVars[VAR_ASSOC], 0, alloc->assocCapacity * sizeof(Variable *));
+	}
+	alloc->regs = NULL;
+	alloc->varsSize = 0;
+	alloc->frameSize = 0;
+	alloc->frameLess = 0;
 
-	vars.varsSize = code->header.argsSize + code->header.tempsSize + 2;
+	vars.varsSize = tempSpace;
+	vars.capacity = capacity;
 	vars.vars = alloc->vars;
 	vars.specialVars = alloc->specialVars;
+	vars.order = malloc(capacity * sizeof(Variable *));
+	if (vars.order == NULL) {
+		FAIL();
+	}
 	vars.last = vars.order;
 	vars.maxOffset = 0;
 	vars.frameLess = 1;
@@ -133,6 +163,43 @@ void computeRegsAlloc(RegsAlloc *alloc, AvailableRegs *regs, CompiledCode *code)
 	alloc->varsSize = vars.varsSize;
 	alloc->frameSize = -vars.frameSize - 1;
 	alloc->frameLess = vars.frameLess;
+	free(vars.order);
+}
+
+
+void regsAllocEnsure(RegsAlloc *alloc, size_t varsCapacity, size_t assocCapacity)
+{
+	if (alloc->vars == NULL || alloc->varsCapacity < varsCapacity) {
+		free(alloc->vars);
+		alloc->vars = calloc(varsCapacity, sizeof(Variable));
+		alloc->varsCapacity = varsCapacity;
+	}
+	if (alloc->specialVars[VAR_CONTEXT] == NULL) {
+		alloc->specialVars[VAR_CONTEXT] = calloc(REGS_ALLOC_CONTEXT_LEVELS, sizeof(Variable *));
+	}
+	if (assocCapacity > 0
+			&& (alloc->specialVars[VAR_ASSOC] == NULL || alloc->assocCapacity < assocCapacity)) {
+		free(alloc->specialVars[VAR_ASSOC]);
+		alloc->specialVars[VAR_ASSOC] = calloc(assocCapacity, sizeof(Variable *));
+		alloc->assocCapacity = assocCapacity;
+	}
+	if (alloc->vars == NULL || alloc->specialVars[VAR_CONTEXT] == NULL
+			|| (assocCapacity > 0 && alloc->specialVars[VAR_ASSOC] == NULL)) {
+		FAIL();
+	}
+}
+
+
+void regsAllocFree(RegsAlloc *alloc)
+{
+	free(alloc->vars);
+	free(alloc->specialVars[VAR_CONTEXT]);
+	free(alloc->specialVars[VAR_ASSOC]);
+	alloc->vars = NULL;
+	alloc->varsCapacity = 0;
+	alloc->specialVars[VAR_CONTEXT] = NULL;
+	alloc->specialVars[VAR_ASSOC] = NULL;
+	alloc->assocCapacity = 0;
 }
 
 
@@ -330,7 +397,7 @@ static void examineOperand(Vars *vars, Operand operand, size_t offset)
 }
 
 
-static void defineTmpVar(Vars *vars, uint8_t index, size_t offset)
+static void defineTmpVar(Vars *vars, uint16_t index, size_t offset)
 {
 	if ((vars->vars[index].flags & VAR_DEFINED) == 0) {
 		defineVar(vars, VAR_TMP, index, offset);
@@ -346,7 +413,7 @@ static void defineTmpVar(Vars *vars, uint8_t index, size_t offset)
 }
 
 
-static Variable *defineSpecialVar(Vars *vars, uint8_t type, uint8_t index, size_t offset)
+static Variable *defineSpecialVar(Vars *vars, uint8_t type, uint16_t index, size_t offset)
 {
 	if (vars->specialVars[type][index] == NULL) {
 		if (type == VAR_CONTEXT) {
@@ -369,11 +436,12 @@ static Variable *defineSpecialVar(Vars *vars, uint8_t type, uint8_t index, size_
 }
 
 
-static Variable *defineVar(Vars *vars, uint8_t type, uint8_t index, size_t offset)
+static Variable *defineVar(Vars *vars, uint8_t type, size_t index, size_t offset)
 {
+	ASSERT(index < vars->capacity);
 	Variable *var = &vars->vars[index];
 	var->flags = VAR_DEFINED;
-	var->index = index;
+	var->index = (uint16_t) index;
 	var->reg = SPILLED_REG;
 	var->start = var->end = var->gcEnd = offset;
 	// VAR_ASSOC gets no frame slot on purpose: a spilled association is rebuilt from
@@ -381,8 +449,8 @@ static Variable *defineVar(Vars *vars, uint8_t type, uint8_t index, size_t offse
 	if (type == VAR_TMP || type == VAR_CONTEXT) {
 		var->frameOffset = vars->frameSize--;
 	}
+	ASSERT(vars->last < vars->order + vars->capacity);
 	*vars->last++ = var;
-	ASSERT(vars->last < vars->order + 255);
 	return var;
 }
 
@@ -393,7 +461,7 @@ static void scanRegisters(Vars *vars, AvailableRegs *regs)
 	RegsPool regsPool;
 	Variable *var;
 
-	initSortedVars(&sortedVars);
+	initSortedVars(&sortedVars, vars->capacity);
 	initRegsPool(&regsPool, regs);
 
 	// The context variable is PINNED to the backend's dedicated context
@@ -423,13 +491,27 @@ static void scanRegisters(Vars *vars, AvailableRegs *regs)
 			spilledVar->reg = SPILLED_REG;
 		}
 	}
+
+	freeSortedVars(&sortedVars);
 }
 
 
-static void initSortedVars(SortedVars *sortedVars)
+static void initSortedVars(SortedVars *sortedVars, size_t capacity)
 {
-	memset(sortedVars, 0, sizeof(*sortedVars));
-	sortedVars->first = sortedVars->last = sortedVars->vars + SORTED_VARS_SIZE / 2;
+	size_t entries = 2 * capacity;
+	sortedVars->vars = calloc(entries, sizeof(Variable *));
+	if (sortedVars->vars == NULL) {
+		FAIL();
+	}
+	sortedVars->base = sortedVars->vars;
+	sortedVars->end = sortedVars->vars + entries;
+	sortedVars->first = sortedVars->last = sortedVars->vars + capacity;
+}
+
+
+static void freeSortedVars(SortedVars *sortedVars)
+{
+	free(sortedVars->vars);
 }
 
 
@@ -441,14 +523,14 @@ static Variable *getFirstVar(SortedVars *sortedVars)
 
 static void addFirstVar(SortedVars *sortedVars, Variable *var)
 {
-	ASSERT(sortedVars->first >= sortedVars->vars);
+	ASSERT(sortedVars->first > sortedVars->base);
 	*--sortedVars->first = var;
 }
 
 
 static void addLastVar(SortedVars *sortedVars, Variable *var)
 {
-	ASSERT(sortedVars->last < (sortedVars->vars + SORTED_VARS_SIZE));
+	ASSERT(sortedVars->last < sortedVars->end);
 	*sortedVars->last++ = var;
 }
 
@@ -552,7 +634,7 @@ static uint8_t nextReg(RegsPool *regsPool)
 
 void invalidateRegs(RegsAlloc *alloc)
 {
-	for (uint8_t i = 0; i < alloc->varsSize; i++) {
+	for (size_t i = 0; i < alloc->varsSize; i++) {
 		alloc->vars[i].flags = alloc->vars[i].flags & ~VAR_IN_REG;
 	}
 }

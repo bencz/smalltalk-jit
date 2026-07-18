@@ -25,7 +25,7 @@ typedef enum {
 } VariableFlags;
 
 typedef struct {
-	uint8_t index;
+	uint16_t index; // 16-bit: variable indexes follow the 16-bit operand index space
 	uint8_t type;
 	VariableFlags flags;
 	int8_t reg;
@@ -40,16 +40,32 @@ typedef struct {
 	ptrdiff_t frameOffset;
 } Variable;
 
+// Context levels are a block-nesting depth (a uint8 in the operand encoding),
+// so that specialVars row keeps a fixed size; the VAR_ASSOC row is indexed by
+// LITERAL index (16-bit) and is sized per-method from its literal count.
+#define REGS_ALLOC_CONTEXT_LEVELS 256
+
+// All arrays are heap-allocated per compilation (computeRegsAlloc computes the
+// real capacity from the method: args + temps + specials); the old fixed
+// vars[256]/specialVars[2][256] capped a method at ~256 variables and silently
+// aliased associations whose literal index exceeded 255.
 typedef struct {
 	AvailableRegs *regs;
-	uint8_t varsSize;
-	Variable vars[256];
-	Variable *specialVars[2][256]; // rows: VAR_CONTEXT, VAR_ASSOC
+	size_t varsSize;
+	size_t varsCapacity;
+	Variable *vars;
+	Variable **specialVars[2]; // rows: VAR_CONTEXT (fixed levels), VAR_ASSOC (per-literal)
+	size_t assocCapacity;      // entries in the VAR_ASSOC row
 	size_t frameSize;
 	_Bool frameLess;
 } RegsAlloc;
 
 void computeRegsAlloc(RegsAlloc *alloc, AvailableRegs *regs, CompiledCode *code);
 void invalidateRegs(RegsAlloc *alloc);
+// Grow (never shrink) the alloc's arrays to at least the given capacities.
+// Also the pre-computeRegsAlloc hook for the primitive prologue, which touches
+// vars[0] before the real capacities are known.
+void regsAllocEnsure(RegsAlloc *alloc, size_t varsCapacity, size_t assocCapacity);
+void regsAllocFree(RegsAlloc *alloc);
 
 #endif

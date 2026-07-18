@@ -50,16 +50,24 @@ typedef struct {
 	ptrdiff_t instOffset;
 	AssemblerFixup fixups[8];
 	uint8_t fixupsSize;
-	uint32_t pointersOffsets[1024]; // TODO: get rid of fixed size buffer?
+	// Heap array, grown by doubling: a method's site count is bounded only by
+	// its size (a big bootstrap-style method bakes thousands). The GC reaches
+	// it THROUGH sitesNode (&pointersOffsets), so growth just reallocs and
+	// stores the new pointer: the walk only runs with this mutator parked at a
+	// safepoint, never mid-realloc (see CodegenSites in Thread.h).
+	uint32_t *pointersOffsets;
 	size_t pointersOffsetsSize;
+	size_t pointersOffsetsCapacity;
 	// Offsets of inline-cache cell-address immediates (same per-arch encoding
 	// convention as pointersOffsets: x64 = the imm64, ppc64 = first byte of the
 	// li64 shape). Deliberately NOT in pointersOffsets: a cell address is not a
 	// heap pointer, so the GC must not forward it, and the in-flight CodegenSites
 	// walk must skip the zero placeholders. Patched exactly once, with the cell
 	// array's final address, in buildNativeCodeFromAssembler before publication.
-	uint32_t icSites[1024];
+	// Same heap-array-with-doubling shape as pointersOffsets (GC never reads it).
+	uint32_t *icSites;
 	size_t icSitesSize;
+	size_t icSitesCapacity;
 	CodegenSites sitesNode; // GC visibility of the baked pointers (see Thread.h)
 } AssemblerBuffer;
 
@@ -84,6 +92,9 @@ static void asmEnsureCapacity(AssemblerBuffer *buffer);
 static void asmBindFixup(AssemblerBuffer *buffer, AssemblerFixup *fixup, int64_t value);
 
 
+#define ASM_POINTERS_OFFSETS_INITIAL 64
+#define ASM_IC_SITES_INITIAL 32
+
 static void asmInitBuffer(AssemblerBuffer *buffer, size_t size)
 {
 	buffer->buffer = malloc(size + ASM_BUFFER_GAP);
@@ -91,14 +102,21 @@ static void asmInitBuffer(AssemblerBuffer *buffer, size_t size)
 	buffer->p = buffer->buffer;
 	buffer->instOffset = 0;
 	buffer->fixupsSize = 0;
+	buffer->pointersOffsets = malloc(ASM_POINTERS_OFFSETS_INITIAL * sizeof(uint32_t));
 	buffer->pointersOffsetsSize = 0;
+	buffer->pointersOffsetsCapacity = ASM_POINTERS_OFFSETS_INITIAL;
+	buffer->icSites = malloc(ASM_IC_SITES_INITIAL * sizeof(uint32_t));
 	buffer->icSitesSize = 0;
+	buffer->icSitesCapacity = ASM_IC_SITES_INITIAL;
+	if (buffer->buffer == NULL || buffer->pointersOffsets == NULL || buffer->icSites == NULL) {
+		FAIL();
+	}
 	// Codegen runs GC-active and allocates (stackmaps, descriptors), so a
 	// scavenge can move objects whose addresses were already baked in here.
 	// Register the pointer sites so the collectors can fix them mid-flight
 	// (see CodegenSites in Thread.h). Harmless without a heap (golden tests).
 	buffer->sitesNode.insts = &buffer->buffer;
-	buffer->sitesNode.offsets = buffer->pointersOffsets;
+	buffer->sitesNode.offsets = &buffer->pointersOffsets;
 	buffer->sitesNode.count = &buffer->pointersOffsetsSize;
 	buffer->sitesNode.next = CurrentThread.codegenSites;
 	CurrentThread.codegenSites = &buffer->sitesNode;
@@ -116,6 +134,8 @@ static void asmFreeBuffer(AssemblerBuffer *buffer)
 		*link = buffer->sitesNode.next;
 	}
 	free(buffer->buffer);
+	free(buffer->pointersOffsets);
+	free(buffer->icSites);
 }
 
 
@@ -243,7 +263,17 @@ static void asmAddPointerOffset(AssemblerBuffer *buffer, ptrdiff_t offset)
 	// sends crossed it on ppc64 when the POWER7 GPR<->FPR memory path lengthened
 	// the float fast path.
 	ASSERT(0 <= offset && offset <= UINT32_MAX);
-	ASSERT(buffer->pointersOffsetsSize < 1024);
+	if (buffer->pointersOffsetsSize == buffer->pointersOffsetsCapacity) {
+		buffer->pointersOffsetsCapacity *= 2;
+		uint32_t *grown = realloc(buffer->pointersOffsets,
+			buffer->pointersOffsetsCapacity * sizeof(uint32_t));
+		if (grown == NULL) {
+			FAIL();
+		}
+		// Publish through the location sitesNode points at; the GC only walks
+		// it with this mutator parked, so it always sees the fresh pointer.
+		buffer->pointersOffsets = grown;
+	}
 	buffer->pointersOffsets[buffer->pointersOffsetsSize++] = (uint32_t) offset;
 }
 
@@ -257,7 +287,14 @@ static void asmCopyPointersOffsets(AssemblerBuffer *buffer, uint32_t *dest)
 static void asmAddIcSite(AssemblerBuffer *buffer, ptrdiff_t offset)
 {
 	ASSERT(0 <= offset && offset <= UINT32_MAX);
-	ASSERT(buffer->icSitesSize < 1024);
+	if (buffer->icSitesSize == buffer->icSitesCapacity) {
+		buffer->icSitesCapacity *= 2;
+		uint32_t *grown = realloc(buffer->icSites, buffer->icSitesCapacity * sizeof(uint32_t));
+		if (grown == NULL) {
+			FAIL();
+		}
+		buffer->icSites = grown;
+	}
 	buffer->icSites[buffer->icSitesSize++] = (uint32_t) offset;
 }
 

@@ -16,8 +16,11 @@ void initCodeGenerator(CodeGenerator *generator)
 {
 	asmInitBuffer(&generator->buffer, 256);
 	generator->code.methodOrBlock = NULL;
-	generator->regsAlloc.varsSize = 0;
-	generator->regsAlloc.frameSize = generator->frameSize = 0;
+	// The RegsAlloc arrays are heap-allocated lazily (regsAllocEnsure /
+	// computeRegsAlloc) and released by freeCodeGenerator's regsAllocFree;
+	// stubs never allocate them.
+	memset(&generator->regsAlloc, 0, sizeof(generator->regsAlloc));
+	generator->frameSize = 0;
 	generator->frameRawAreaSize = 0;
 	generator->tmpVar = 0;
 	generator->bytecodeNumber = 0;

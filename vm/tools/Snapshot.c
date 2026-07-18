@@ -180,8 +180,8 @@ static void iterateHandles(Snapshot *snapshot)
 	initHandleScopeIterator(&handleScopeIterator, CurrentThread.handleScopes);
 	while (handleScopeIteratorHasNext(&handleScopeIterator)) {
 		HandleScope *scope = handleScopeIteratorNext(&handleScopeIterator);
-		for (ptrdiff_t i = 0; i < scope->size; i++) {
-			writeNewObject(snapshot, scope->handles[i].raw);
+		for (size_t i = 0; i < scope->size; i++) {
+			writeNewObject(snapshot, handleScopeAt(scope, i)->raw);
 		}
 	}
 }

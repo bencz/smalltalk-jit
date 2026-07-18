@@ -8,19 +8,35 @@
 
 #define REMEMBER_SCOPE_POSITION 0
 
+// Inline capacity of a scope (on the C stack) and the size of each heap
+// overflow chunk appended once the inline part is full. The inline part is
+// back at the original 256 (it was raised to 1024 while overflow meant a hard
+// FAIL): now that a full scope spills to chunks, a small inline part costs
+// giant methods one malloc while every recursive C frame (parser, analyzer,
+// codegen) carries 2KB instead of 8KB, which directly buys AST depth on the
+// growable fiber stacks.
+#define HANDLE_SCOPE_INLINE 256
+#define HANDLE_CHUNK_SIZE 1024
+
 typedef struct Handle {
 	void *object;
 	struct Handle *prev;
 	struct Handle *next;
 } Handle;
 
+// Heap overflow for a scope that outgrew its inline array (a giant method's
+// literals, a long `,` chain). Chunked so already-issued handle pointers never
+// move; the chain is NEWEST chunk first, every chunk but the newest is full.
+typedef struct HandleChunk {
+	struct HandleChunk *next; // the previous (older, full) chunk
+	Object handles[HANDLE_CHUNK_SIZE];
+} HandleChunk;
+
 typedef struct HandleScope {
 	struct HandleScope *parent;
-	Object handles[1024];   // scopeHandle hard-bounds size < 1024. Raised from 256 so
-	                        // compiling a method with many distinct literals (now a
-	                        // 16-bit index) does not exhaust one scope. 8KB/scope on the
-	                        // C stack (this was the original size before it was shrunk).
-	size_t size;
+	Object handles[HANDLE_SCOPE_INLINE]; // 2KB/scope on the C stack; the common case
+	size_t size;                         // total, inline part plus all chunks
+	HandleChunk *overflow;               // NULL until the scope outgrows the inline part
 #if REMEMBER_SCOPE_POSITION
 	char *file;
 	size_t line;
@@ -142,6 +158,7 @@ HandleScope *handleScopeIteratorNext(HandleScopeIterator *iterator);
 	static void _openHandleScope(HandleScope *scope, char *file, size_t line)
 	{
 		scope->size = 0;
+		scope->overflow = NULL;
 		scope->parent = CurrentThread.handleScopes;
 		scope->file = file;
 		scope->line = line;
@@ -151,34 +168,89 @@ HandleScope *handleScopeIteratorNext(HandleScopeIterator *iterator);
 	static void openHandleScope(HandleScope *scope)
 	{
 		scope->size = 0;
+		scope->overflow = NULL;
 		scope->parent = CurrentThread.handleScopes;
 		CurrentThread.handleScopes = scope;
 	}
 #endif
 
 
+// Free a scope's heap overflow chunks: on every path that retires a scope,
+// closeHandleScope AND the exception unwinder (unwindThreadStateTo), which
+// pops scopes without closing them.
+static void handleScopeFreeChunks(HandleScope *scope)
+{
+	HandleChunk *chunk = scope->overflow;
+	while (chunk != NULL) {
+		HandleChunk *next = chunk->next;
+		free(chunk);
+		chunk = next;
+	}
+	scope->overflow = NULL;
+}
+
+
+// The handle at global index `index` of a scope, inline part or overflow
+// chunk. O(1) for the inline part; beyond it walks the newest-first chain
+// (rare: only scopes past 1024 live handles, and the GC walk stays O(chunks)
+// per access). Used by the collectors and the snapshot writer.
+static inline Object *handleScopeAt(HandleScope *scope, size_t index)
+{
+	if (index < HANDLE_SCOPE_INLINE) {
+		return &scope->handles[index];
+	}
+	size_t overflowIndex = index - HANDLE_SCOPE_INLINE;
+	size_t overflowSize = scope->size - HANDLE_SCOPE_INLINE;
+	size_t chunkCount = (overflowSize + HANDLE_CHUNK_SIZE - 1) / HANDLE_CHUNK_SIZE;
+	size_t ordinal = overflowIndex / HANDLE_CHUNK_SIZE; // 0-based from the OLDEST chunk
+	HandleChunk *chunk = scope->overflow;               // newest first
+	for (size_t back = chunkCount - 1; back > ordinal; back--) {
+		chunk = chunk->next;
+	}
+	return &chunk->handles[overflowIndex % HANDLE_CHUNK_SIZE];
+}
+
+
 static void *closeHandleScope(HandleScope *scope, void *handle)
 {
 	ASSERT(CurrentThread.handleScopes == scope);
 	CurrentThread.handleScopes = CurrentThread.handleScopes->parent;
+	void *result = NULL;
 	if (handle != NULL) {
 		ASSERT(CurrentThread.handleScopes != NULL);
-		return scopeHandle(((Object *) handle)->raw);
+		// Re-home into the parent BEFORE freeing: `handle` may live in a chunk.
+		result = scopeHandle(((Object *) handle)->raw);
 	}
-	return NULL;
+	handleScopeFreeChunks(scope);
+	return result;
 }
 
 
 static void *scopeHandle(void *object)
 {
 	ASSERT(CurrentThread.handleScopes != NULL);
-	// HARD bound (survives -DNDEBUG): handles[] is exactly 1024, so a 1025th handle
-	// would corrupt the stack. FAIL() aborts instead.
-	if (CurrentThread.handleScopes->size >= 1024) {
-		FAIL();
+	HandleScope *scope = CurrentThread.handleScopes;
+	if (scope->size < HANDLE_SCOPE_INLINE) {
+		Object *handle = &scope->handles[scope->size++];
+		handle->raw = object;
+		return handle;
 	}
-	Object *handle = &CurrentThread.handleScopes->handles[CurrentThread.handleScopes->size++];
+	// Inline part exhausted: spill to heap chunks (entries never move, so
+	// previously returned handle pointers stay valid). Replaces the old hard
+	// FAIL() at 1024: a giant compiled method or a deep `,` chain now just
+	// grows the scope.
+	size_t index = (scope->size - HANDLE_SCOPE_INLINE) % HANDLE_CHUNK_SIZE;
+	if (index == 0) {
+		HandleChunk *chunk = malloc(sizeof(HandleChunk));
+		if (chunk == NULL) {
+			FAIL();
+		}
+		chunk->next = scope->overflow;
+		scope->overflow = chunk;
+	}
+	Object *handle = &scope->overflow->handles[index];
 	handle->raw = object;
+	scope->size++;
 	return handle;
 }
 

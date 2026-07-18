@@ -96,7 +96,47 @@ NativeCode *stackFrameGetNativeCode(StackFrame *frame)
 
 _Bool contextHasValidFrame(RawContext *context)
 {
+	// A block's closure doubles as its BlockContext, and a closure that was
+	// never activated by a FRAMED prologue (frameless block, or not yet called)
+	// still has the zero frame pointer from allocation: dereferencing it faults.
+	if (context->frame == NULL) {
+		return 0;
+	}
 	return stackFrameGetSlot(context->frame, CONTEXT_SLOT) == tagPtr(context);
+}
+
+
+// Validity check for the reflective Context accessors (Context>>parent,
+// receiver, argumentAt:, temporaryAt:). Those can be handed a context that
+// ESCAPED its activation: the frame pointer then dangles into popped stack,
+// another fiber's stack (which can be reclaimed at any moment), or the
+// munmapped stack of a dead fiber. contextHasValidFrame alone is not enough,
+// because it must READ the frame's context slot to decide, and that read
+// itself faults on unmapped memory. Only accept a frame inside the CURRENT
+// fiber's active stack span: below the outermost Smalltalk entry frame and
+// above this very C frame (the primitive runs deeper on the same fiber
+// stack, so anything in between is mapped). The slot match then rejects the
+// popped-but-mapped frames. Contexts living on OTHER fibers' stacks are
+// conservatively reported dead: nil beats racing their owner.
+_Bool contextFrameOnCurrentStack(RawContext *context)
+{
+	uintptr_t frame = (uintptr_t) context->frame;
+	if (frame == 0) {
+		return 0;
+	}
+	EntryStackFrame *entry = CurrentThread.stackFramesTail;
+	if (entry == NULL) {
+		return 0;
+	}
+	while (entry->prev != NULL) {
+		entry = entry->prev;
+	}
+	uintptr_t hi = (uintptr_t) entry->entry;
+	uintptr_t lo = (uintptr_t) __builtin_frame_address(0);
+	if (frame <= lo || frame > hi) {
+		return 0;
+	}
+	return contextHasValidFrame(context);
 }
 
 

@@ -44,8 +44,9 @@
 // only attempted when the worst case (every callee literal fresh + the guard
 // class) still fits.
 #define OPT_MAX_LITERALS 240
-// Merged temp budget: computeRegsAlloc asserts tempsSize <= 128 and every var
-// index must stay a byte with head-room for the specialVars appended after.
+// Merged temp budget: CompiledCodeHeader.tempsSize is a uint8, so the merged
+// caller + inline-area count must stay under 256 (the register allocator itself
+// is sized per method now). Conservative head-room kept from the old limit.
 #define OPT_MAX_TEMPS 120
 
 typedef struct {
