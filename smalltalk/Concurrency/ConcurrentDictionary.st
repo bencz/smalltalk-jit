@@ -15,12 +15,14 @@
  soon as no reader still holds it, and the GC reclaims it: the collector IS the
  reclamation grace period, so no hazard pointers or epochs are needed.
 
- Memory model: correct on x86-64 (TSO). The writer fully builds the snapshot
- before storing the pointer, so a reader that observes the new pointer also
- observes a fully-built snapshot, and the reader's slot loads are address-dependent
- on the pointer load. On a weakly-ordered target (POWER) the publish would need a
- release fence before the ivar store; the VM's multi-worker scheduler runs on
- x86-64, so that is documented rather than emitted here.
+ Memory model: the writer fully builds the snapshot, issues a release fence
+ (Atomic releaseFence), THEN publishes the pointer with a plain store. A reader does
+ a bare `snapshot` load followed by address-dependent slot loads. On x86-64 (TSO)
+ the fence is free (stores are already ordered); on weakly-ordered POWER it emits an
+ lwsync, which together with the reader's address dependency guarantees a reader that
+ observes the new pointer also observes the fully-built snapshot — with NO reader-side
+ fence, so the lock-free read path stays a bare ivar load. This is the standard
+ hardware publication pattern (release + dependent load), correct on both targets.
 
  Cost model: writes are O(n) (they rebuild the inner dictionary), so this is for
  READ-MOSTLY maps only. For write-heavy shared state use SharedDictionary."
@@ -89,6 +91,7 @@ ConcurrentDictionary := Object [
 		Processor monitorEnter.
 		copy := self copyOfSnapshot.
 		copy at: key put: anObject.
+		Atomic releaseFence.   "order the copy's construction before the pointer publish (POWER)"
 		snapshot := copy.
 		Processor monitorExit.
 		^anObject
@@ -104,6 +107,7 @@ ConcurrentDictionary := Object [
 			v := aBlock value.
 			copy := self copyOfSnapshot.
 			copy at: key put: v.
+			Atomic releaseFence.
 			snapshot := copy ].
 		Processor monitorExit.
 		^v
@@ -117,6 +121,7 @@ ConcurrentDictionary := Object [
 		had ifTrue: [
 			copy := self copyOfSnapshot.
 			v := copy removeKey: key ifAbsent: [ nil ].
+			Atomic releaseFence.
 			snapshot := copy ].
 		Processor monitorExit.
 		had ifFalse: [ ^aBlock value ].

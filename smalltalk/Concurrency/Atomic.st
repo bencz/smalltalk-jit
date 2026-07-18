@@ -30,6 +30,18 @@ Atomic := Object [
 	]
 
 
+	class releaseFence [
+		"A release memory fence: stores issued before it become visible to another
+		 thread before any store issued after it. The publish half of a lock-free handoff
+		 without wrapping the target in a cell: a writer builds a structure, sends
+		 releaseFence, then publishes the pointer with a plain store; a reader does a bare
+		 load + address-dependent loads (no reader-side fence). Free on x86-TSO, an lwsync
+		 on POWER. Used by ConcurrentDictionary to publish its snapshot correctly on
+		 weakly-ordered targets while keeping reads bare (off the hot path)."
+		<primitive: MemoryReleaseFencePrimitive>
+	]
+
+
 	initAtomic [
 		"nil is a permanent (old-space) object, so publishing it never needs a barrier."
 		value := nil.

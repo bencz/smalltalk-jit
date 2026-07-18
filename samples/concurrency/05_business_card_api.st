@@ -191,8 +191,8 @@ CardDirectory := Object [
 		 assumption no longer holds."
 		users := SharedDictionary new.
 		cards := SharedDictionary new.
-		userSeq := 0.
-		cardSeq := 0.
+		userSeq := AtomicInteger new.
+		cardSeq := AtomicInteger new.
 		^self
 	]
 
@@ -200,9 +200,10 @@ CardDirectory := Object [
 	lookupUser: anId [ ^users at: anId ifAbsent: [ nil ] ]
 	lookupCard: anId [ ^cards at: anId ifAbsent: [ nil ] ]
 
-	"atomic id generation (a bare `seq := seq + 1` races across workers → duplicate ids)"
-	nextUserId [ | id | Processor monitorEnter. userSeq := userSeq + 1. id := userSeq. Processor monitorExit. ^id ]
-	nextCardId [ | id | Processor monitorEnter. cardSeq := cardSeq + 1. id := cardSeq. Processor monitorExit. ^id ]
+	"atomic id generation: a lock-free fetch-add (AtomicInteger) instead of the global
+	 sync monitor -- a bare `seq := seq + 1` races across workers into duplicate ids."
+	nextUserId [ ^userSeq incrementAndGet ]
+	nextCardId [ ^cardSeq incrementAndGet ]
 
 	"writes -- atomic id + concurrent-safe store; the spawn runs between them (no lock held)"
 	registerUserName: aName email: anEmail [

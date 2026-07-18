@@ -64,7 +64,7 @@ AtomStack := Object [
 	isEmpty [ ^cell get isNil ]
 ]
 
-[ | fails check nWorkers perWorker counter results total perStack stack expectedSum expectedCount gotSum gotCount |
+[ | fails check nWorkers perWorker counter results total perStack stack expectedSum expectedCount gotSum gotCount aa slotSum |
 	fails := 0.
 	check := [:cond :label |
 		cond ifFalse: [ fails := fails + 1. Transcript nextPutAll: 'FAIL: '; nextPutAll: label; lf ] ].
@@ -119,6 +119,22 @@ AtomStack := Object [
 	check value: (gotCount = expectedCount) value: 'Treiber: every node popped exactly once (count)'.
 	check value: (gotSum = expectedSum) value: 'Treiber: no lost/duplicated node (sum)'.
 	check value: (stack isEmpty) value: 'Treiber: stack drained empty'.
+
+	"---- 4. AtomicArray: contended shared slot + per-worker slots -------------"
+	aa := AtomicArray new: nWorkers.
+	1 to: nWorkers do: [:w | aa at: w put: 0 ].
+	Worker parallel: ((1 to: nWorkers) collect: [:w |
+		[ 1 to: perWorker do: [:i |
+			aa at: 1 getAndAdd: 1.      "contended: every worker hammers slot 1"
+			aa at: w getAndAdd: 1 ].    "per-worker slot (w=1 also lands on slot 1)"
+		  perWorker ] ]).
+	"slot 1 = N*M (shared) + M (worker 1's own slot IS slot 1) = (N+1)*M"
+	check value: ((aa at: 1) = ((nWorkers + 1) * perWorker))
+		value: 'AtomicArray: contended slot has no lost add'.
+	slotSum := 0.
+	2 to: nWorkers do: [:w | slotSum := slotSum + (aa at: w) ].
+	check value: (slotSum = ((nWorkers - 1) * perWorker))
+		value: 'AtomicArray: per-slot fetch-add exact'.
 
 	fails = 0 ifTrue: [ Transcript nextPutAll: 'AtomicStressTest: OK'; lf ].
 	^fails

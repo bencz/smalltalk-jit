@@ -4,7 +4,7 @@
  lock-free / GC-barrier behaviour under real workers lives in AtomicStressTest.st,
  which the runner drives inside the resource sandbox."
 
-[ | fails check a i j n |
+[ | fails check a i j n arr o |
 	fails := 0.
 	check := [:cond :label |
 		cond ifFalse: [ fails := fails + 1. Transcript nextPutAll: 'FAIL: '; nextPutAll: label; lf ] ].
@@ -71,6 +71,35 @@
 	n := AtomicInteger new.
 	1 to: 1000 do: [:k | n incrementAndGet ].
 	check value: (n get = 1000) value: 'serial 1000 increments'.
+
+	"---- AtomicArray: per-index atomics --------------------------------------"
+	arr := AtomicArray new: 4.
+	check value: (arr size = 4) value: 'AtomicArray size'.
+	check value: ((arr at: 1) isNil) value: 'AtomicArray slot starts nil'.
+
+	arr at: 1 put: 10.
+	check value: ((arr at: 1) = 10) value: 'AtomicArray at:put:'.
+	check value: ((arr at: 2) isNil) value: 'AtomicArray other slot untouched'.
+
+	check value: ((arr at: 1 getAndSet: 20) = 10) value: 'AtomicArray getAndSet returns old'.
+	check value: ((arr at: 1) = 20) value: 'AtomicArray getAndSet stored new'.
+
+	check value: ((arr at: 1 compareAndSet: 20 with: 30) = true) value: 'AtomicArray CAS hit'.
+	check value: ((arr at: 1) = 30) value: 'AtomicArray CAS applied'.
+	check value: ((arr at: 1 compareAndSet: 999 with: 40) = false) value: 'AtomicArray CAS miss'.
+	check value: ((arr at: 1) = 30) value: 'AtomicArray CAS miss left value'.
+
+	arr at: 3 put: 100.
+	check value: ((arr at: 3 getAndAdd: 5) = 100) value: 'AtomicArray getAndAdd returns old'.
+	check value: ((arr at: 3) = 105) value: 'AtomicArray getAndAdd applied'.
+	check value: ((arr incrementAndGetAt: 3) = 106) value: 'AtomicArray incrementAndGet'.
+	check value: ((arr at: 3 getAndAdd: -6) = 106) value: 'AtomicArray negative getAndAdd'.
+	check value: ((arr at: 3) = 100) value: 'AtomicArray negative applied'.
+
+	"object ref + identity in a slot"
+	o := Object new.
+	arr at: 4 put: o.
+	check value: ((arr at: 4) == o) value: 'AtomicArray holds object ref'.
 
 	fails = 0 ifTrue: [ Transcript nextPutAll: 'AtomicTest: OK'; lf ].
 	^fails

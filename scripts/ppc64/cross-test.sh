@@ -122,7 +122,7 @@ for cpu in $CPUS; do
 	# tests gate here too, not only on x64. Same for the per-site inline caches
 	# (generateIcSend is per-backend emission; the Ic* tests cover bind, DNU,
 	# GC reset and the multi-worker hammer on the POWER code paths).
-	for t in tests/FloatTest.st tests/FloatEdgeTest.st tests/FloatCrossRepTest.st \
+	for t in tests/AtomicTest.st tests/FloatTest.st tests/FloatEdgeTest.st tests/FloatCrossRepTest.st \
 	         tests/SmallFloat64BoundaryTest.st tests/FloatHashTest.st \
 	         tests/ScaledDecimalTest.st tests/LargeIntegerTest.st \
 	         tests/ExceptionTest.st tests/ExceptionProtocolTest.st \

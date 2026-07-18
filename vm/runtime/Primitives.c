@@ -56,6 +56,12 @@ static PrimitiveResult atomicStorePrimitive(Value self, Value v);
 static PrimitiveResult atomicCompareAndSetPrimitive(Value self, Value expected, Value newValue);
 static PrimitiveResult atomicGetAndSetPrimitive(Value self, Value v);
 static PrimitiveResult atomicGetAndAddPrimitive(Value self, Value delta);
+static PrimitiveResult memoryReleaseFencePrimitive(Value self);
+static PrimitiveResult atomicArrayAtPrimitive(Value self, Value index);
+static PrimitiveResult atomicArrayAtPutPrimitive(Value self, Value index, Value v);
+static PrimitiveResult atomicArrayCompareAndSetPrimitive(Value self, Value index, Value expected, Value newValue);
+static PrimitiveResult atomicArrayGetAndSetPrimitive(Value self, Value index, Value v);
+static PrimitiveResult atomicArrayGetAndAddPrimitive(Value self, Value index, Value delta);
 static PrimitiveResult becomePrimitive(Value object, Value other);
 static PrimitiveResult workerParallelPrimitive(Value self, Value blocks);
 static PrimitiveResult contextPositionDescriptorPrimitive(Value vContext);
@@ -342,6 +348,12 @@ Primitive Primitives[] = {
 	{"AtomicCompareAndSetPrimitive", CCALL, .cFunction = atomicCompareAndSetPrimitive, 3},
 	{"AtomicGetAndSetPrimitive", CCALL, .cFunction = atomicGetAndSetPrimitive, 2},
 	{"AtomicGetAndAddPrimitive", CCALL, .cFunction = atomicGetAndAddPrimitive, 2},
+	{"MemoryReleaseFencePrimitive", CCALL, .cFunction = memoryReleaseFencePrimitive, 1},
+	{"AtomicArrayAtPrimitive", CCALL, .cFunction = atomicArrayAtPrimitive, 2},
+	{"AtomicArrayAtPutPrimitive", CCALL, .cFunction = atomicArrayAtPutPrimitive, 3},
+	{"AtomicArrayCompareAndSetPrimitive", CCALL, .cFunction = atomicArrayCompareAndSetPrimitive, 4},
+	{"AtomicArrayGetAndSetPrimitive", CCALL, .cFunction = atomicArrayGetAndSetPrimitive, 3},
+	{"AtomicArrayGetAndAddPrimitive", CCALL, .cFunction = atomicArrayGetAndAddPrimitive, 3},
 };
 
 
@@ -1334,6 +1346,104 @@ static PrimitiveResult atomicGetAndAddPrimitive(Value self, Value delta)
 	}
 	Value old = __atomic_fetch_add(atomicCellSlot(self), delta, __ATOMIC_ACQ_REL);
 	return primSuccess(old);
+}
+
+// Release memory fence: prior mutator stores are ordered before any store issued
+// after the fence, so a lock-free publisher can build a structure, fence, then
+// publish a pointer with a plain (JIT-emitted) store — a reader that observes the
+// pointer via a bare load + address-dependent loads sees the fully-built structure
+// with NO reader-side fence. Free on x86-TSO (compiles to a compiler barrier only);
+// an lwsync on weakly-ordered POWER. Governs JIT-emitted mutator memory ops, so the
+// hardware model (not the C abstract machine) is what matters: lwsync + dependent
+// load is the standard hardware publication pattern.
+static PrimitiveResult memoryReleaseFencePrimitive(Value self)
+{
+	__atomic_thread_fence(__ATOMIC_RELEASE);
+	return primSuccess(self);
+}
+
+// ---- AtomicArray: per-index atomics on a wrapped Array ------------------------
+// An AtomicArray wraps a plain Array in its first slot; these primitives atomically
+// operate on element `index` (1-based) of that Array, reusing the same memory orders
+// and write barrier as the scalar Atomic. The Array's element slots (RawArray.vars,
+// after the header + size word) are 8-byte aligned, so 64-bit __atomic doubleword
+// ops are correctly aligned. Answers NULL (→ primFailed, Smalltalk raises) for a
+// non-integer or out-of-range index; `*arrOut` is the backing Array (the barrier
+// container). GC is STW at safepoints, so these never race a moving collector.
+static inline Value *atomicArraySlot(Value self, Value index, RawObject **arrOut)
+{
+	if (!valueTypeOf(index, VALUE_INT)) {
+		return NULL;
+	}
+	RawObject *arr = asObject(getRawObjectVars(asObject(self))[0]);
+	intptr_t idx = asCInt(index) - 1; // Smalltalk indices are 1-based
+	if (idx < 0 || (size_t) idx >= rawObjectSize(arr)) {
+		return NULL;
+	}
+	*arrOut = arr;
+	return &((RawArray *) arr)->vars[idx];
+}
+
+static PrimitiveResult atomicArrayAtPrimitive(Value self, Value index)
+{
+	RawObject *arr;
+	Value *slot = atomicArraySlot(self, index, &arr);
+	if (slot == NULL) {
+		return primFailed();
+	}
+	return primSuccess(__atomic_load_n(slot, __ATOMIC_ACQUIRE));
+}
+
+static PrimitiveResult atomicArrayAtPutPrimitive(Value self, Value index, Value v)
+{
+	RawObject *arr;
+	Value *slot = atomicArraySlot(self, index, &arr);
+	if (slot == NULL) {
+		return primFailed();
+	}
+	__atomic_store_n(slot, v, __ATOMIC_RELEASE);
+	atomicRememberIfNeeded(arr, v);
+	return primSuccess(v);
+}
+
+static PrimitiveResult atomicArrayCompareAndSetPrimitive(Value self, Value index, Value expected, Value newValue)
+{
+	RawObject *arr;
+	Value *slot = atomicArraySlot(self, index, &arr);
+	if (slot == NULL) {
+		return primFailed();
+	}
+	_Bool ok = __atomic_compare_exchange_n(slot, &expected, newValue, 0,
+			__ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+	if (ok) {
+		atomicRememberIfNeeded(arr, newValue);
+	}
+	return primSuccess(getTaggedPtr(ok ? Handles.true : Handles.false));
+}
+
+static PrimitiveResult atomicArrayGetAndSetPrimitive(Value self, Value index, Value v)
+{
+	RawObject *arr;
+	Value *slot = atomicArraySlot(self, index, &arr);
+	if (slot == NULL) {
+		return primFailed();
+	}
+	Value old = __atomic_exchange_n(slot, v, __ATOMIC_ACQ_REL);
+	atomicRememberIfNeeded(arr, v);
+	return primSuccess(old);
+}
+
+static PrimitiveResult atomicArrayGetAndAddPrimitive(Value self, Value index, Value delta)
+{
+	if (!valueTypeOf(delta, VALUE_INT)) {
+		return primFailed();
+	}
+	RawObject *arr;
+	Value *slot = atomicArraySlot(self, index, &arr);
+	if (slot == NULL) {
+		return primFailed();
+	}
+	return primSuccess(__atomic_fetch_add(slot, delta, __ATOMIC_ACQ_REL));
 }
 
 

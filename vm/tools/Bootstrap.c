@@ -317,6 +317,7 @@ static _Bool parseKernelFiles(char *kernelDir)
 		// synchronisation primitives
 		"Concurrency/Atomic.st", // generic lock-free atomic cell (load/store/CAS/exchange)
 		"Concurrency/AtomicInteger.st", // Atomic subclass: lock-free fetch-add counters
+		"Concurrency/AtomicArray.st", // fixed array of atomic slots (per-index CAS/fetch-add)
 		"Concurrency/Semaphore.st",
 		"Concurrency/Channel.st",
 		"Concurrency/Worker.st",
