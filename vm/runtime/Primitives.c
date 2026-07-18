@@ -51,6 +51,11 @@ static PrimitiveResult stringStartsWithAsciiCasePrimitive(Value self, Value pref
 static PrimitiveResult stringCopyFromToPrimitive(Value self, Value start, Value stop);
 static PrimitiveResult stringToIntegerPrimitive(Value self);
 static PrimitiveResult stringSplitByPrimitive(Value self, Value delimiter);
+static PrimitiveResult atomicLoadPrimitive(Value self);
+static PrimitiveResult atomicStorePrimitive(Value self, Value v);
+static PrimitiveResult atomicCompareAndSetPrimitive(Value self, Value expected, Value newValue);
+static PrimitiveResult atomicGetAndSetPrimitive(Value self, Value v);
+static PrimitiveResult atomicGetAndAddPrimitive(Value self, Value delta);
 static PrimitiveResult becomePrimitive(Value object, Value other);
 static PrimitiveResult workerParallelPrimitive(Value self, Value blocks);
 static PrimitiveResult contextPositionDescriptorPrimitive(Value vContext);
@@ -332,6 +337,11 @@ Primitive Primitives[] = {
 	{"StringCopyFromToPrimitive", CCALL, .cFunction = stringCopyFromToPrimitive, 3},
 	{"StringToIntegerPrimitive", CCALL, .cFunction = stringToIntegerPrimitive, 1},
 	{"StringSplitByPrimitive", CCALL, .cFunction = stringSplitByPrimitive, 2},
+	{"AtomicLoadPrimitive", CCALL, .cFunction = atomicLoadPrimitive, 1},
+	{"AtomicStorePrimitive", CCALL, .cFunction = atomicStorePrimitive, 2},
+	{"AtomicCompareAndSetPrimitive", CCALL, .cFunction = atomicCompareAndSetPrimitive, 3},
+	{"AtomicGetAndSetPrimitive", CCALL, .cFunction = atomicGetAndSetPrimitive, 2},
+	{"AtomicGetAndAddPrimitive", CCALL, .cFunction = atomicGetAndAddPrimitive, 2},
 };
 
 
@@ -1219,6 +1229,111 @@ static PrimitiveResult monitorParkPrimitive(Value self)
 {
 	schedulerParkAndUnlockMonitor();
 	return primSuccess(self);
+}
+
+
+// ---- Generic atomics (Atomic / AtomicInteger) --------------------------------
+// A one-slot cell whose `value` ivar (slot 0) is mutated with machine atomics
+// instead of the global sync monitor. This is a general runtime facility (id
+// counters, flags, seqlocks, lock-free structures); the actor system is just one
+// client. Memory orders mirror the tree's palette (acquire load / release store /
+// relaxed) and add ACQ_REL for the read-modify-write ops (exchange/fetch-add and
+// CAS-success), which both consume the old value and publish the new one — correct
+// on x86-TSO and on weakly-ordered POWER alike. GC is stop-the-world at safepoints,
+// so these mutator ops never race a moving collector.
+
+// Address of the cell's single Value slot. asObject strips only the pointer tag; a
+// young object's slot stays at (base|SPACE_TAG)+16, i.e. 8-mod-16 → 8-byte aligned,
+// so 64-bit __atomic DOUBLEWORD ops are correctly aligned (do NOT widen to 16 bytes:
+// young slots are only 8-mod-16).
+static inline Value *atomicCellSlot(Value self)
+{
+	return &getRawObjectVars(asObject(self))[0];
+}
+
+// Generational write barrier for an atomic POINTER publish: if an OLD cell now holds
+// a YOUNG referent, remember the cell. The TAG_REMEMBERED claim is an atomic OR so
+// concurrent publishers to the same shared cell remember it exactly once; the winner
+// appends to its OWN per-thread remembered set (per-thread cursor → no cross-thread
+// race). Immediates never need a barrier. Runs only between safepoints (STW GC).
+static inline void atomicRememberIfNeeded(RawObject *cell, Value stored)
+{
+	if (!valueTypeOf(stored, VALUE_POINTER)) {
+		return;
+	}
+	RawObject *referent = asObject(stored);
+	if (!isOldObject(cell) || !isNewObject(referent)) {
+		return;
+	}
+	uint8_t prev = __atomic_fetch_or(&cell->tags, TAG_REMEMBERED, __ATOMIC_RELAXED);
+	if ((prev & TAG_REMEMBERED) != 0) {
+		return; // another publisher already remembered this cell
+	}
+	// Append to this thread's remembered set. Mirrors rememberedSetAdd's body minus
+	// the tag set we just did atomically (and its assert, which a racing publisher
+	// would otherwise trip).
+	RememberedSet *rememberedSet = &CurrentThread.rememberedSet;
+	RememberedSetBlock *block = rememberedSet->blocks;
+	if (block->current >= block->end) {
+		rememberedSetGrow(rememberedSet);
+		block = rememberedSet->blocks;
+	}
+	*block->current++ = tagPtr(cell);
+}
+
+// Atomic acquire load of the cell's value.
+static PrimitiveResult atomicLoadPrimitive(Value self)
+{
+	return primSuccess(__atomic_load_n(atomicCellSlot(self), __ATOMIC_ACQUIRE));
+}
+
+// Atomic release store of `v` into the cell (+ write barrier on a pointer publish).
+static PrimitiveResult atomicStorePrimitive(Value self, Value v)
+{
+	RawObject *cell = asObject(self);
+	__atomic_store_n(&getRawObjectVars(cell)[0], v, __ATOMIC_RELEASE);
+	atomicRememberIfNeeded(cell, v);
+	return primSuccess(self);
+}
+
+// Atomic compare-and-set: if the cell holds `expected`, replace it with `newValue`.
+// Answers true/false; barrier on a successful pointer publish. CAS-failure order is
+// ACQUIRE (≤ the ACQ_REL success order) but the failed value is not returned — a
+// retry loop re-reads through `get` (acquire).
+static PrimitiveResult atomicCompareAndSetPrimitive(Value self, Value expected, Value newValue)
+{
+	RawObject *cell = asObject(self);
+	Value *slot = &getRawObjectVars(cell)[0];
+	_Bool ok = __atomic_compare_exchange_n(slot, &expected, newValue, 0,
+			__ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+	if (ok) {
+		atomicRememberIfNeeded(cell, newValue);
+	}
+	return primSuccess(getTaggedPtr(ok ? Handles.true : Handles.false));
+}
+
+// Atomic exchange: store `v`, answer the previous value. Barrier on a pointer publish.
+static PrimitiveResult atomicGetAndSetPrimitive(Value self, Value v)
+{
+	RawObject *cell = asObject(self);
+	Value old = __atomic_exchange_n(&getRawObjectVars(cell)[0], v, __ATOMIC_ACQ_REL);
+	atomicRememberIfNeeded(cell, v);
+	return primSuccess(old);
+}
+
+// Atomic fetch-add for AtomicInteger. The delta arrives ALREADY tagged (k<<2) and the
+// slot holds a tagged SmallInt (i<<2); adding the raw words yields (i+k)<<2 with the
+// tag bits (00) preserved, a valid tagged SmallInt, for positive or negative deltas.
+// Answers the previous (tagged) value. Fails for a non-integer delta so the Smalltalk
+// fallback reports the misuse. No barrier (immediates only). 62-bit range: a raw add
+// does not promote to LargeInteger on overflow.
+static PrimitiveResult atomicGetAndAddPrimitive(Value self, Value delta)
+{
+	if (!valueTypeOf(delta, VALUE_INT)) {
+		return primFailed();
+	}
+	Value old = __atomic_fetch_add(atomicCellSlot(self), delta, __ATOMIC_ACQ_REL);
+	return primSuccess(old);
 }
 
 

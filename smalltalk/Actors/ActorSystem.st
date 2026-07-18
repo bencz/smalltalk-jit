@@ -4,7 +4,7 @@
  instance is published as the global `Actors` at bootstrap."
 ActorSystem := Object [
 
-	| registry deadLetters guardianStrategy counter |
+	| registry deadLetters guardianStrategy idCounter |
 
 
 	class initialize [
@@ -23,7 +23,7 @@ ActorSystem := Object [
 		 lock-free, so message delivery no longer serializes lookups on the global
 		 sync monitor (the actor-endpoint multicore ceiling)."
 		registry := ConcurrentDictionary new.
-		counter := 0.
+		idCounter := AtomicInteger new.
 		guardianStrategy := OneForOneStrategy default.
 		deadLetters := DeadLetterProcess new.
 		^self
@@ -42,14 +42,12 @@ ActorSystem := Object [
 	"------------------------------------------------------ registry"
 
 	nextId [
-		"Unique id generation. Under the multi-worker pool `counter := counter + 1` is a
-		 racy read-modify-write (→ duplicate Pids), so it runs under the global sync monitor."
-		| id |
-		Processor monitorEnter.
-		counter := counter + 1.
-		id := counter.
-		Processor monitorExit.
-		^id
+		"Unique id generation. A lock-free atomic fetch-add replaces the old
+		 monitor-guarded `counter := counter + 1`: no global sync monitor on the request
+		 path (every Future's pid) or on spawn/register, and still race-free across the
+		 worker pool. Ids stay globally unique, which registerEndpoint:/spawnProps: rely
+		 on (they key the registry by id)."
+		^idCounter incrementAndGet
 	]
 
 

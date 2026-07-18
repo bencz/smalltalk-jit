@@ -10,7 +10,7 @@
  post-then-resume each run without an intervening context switch."
 Mailbox := Object [
 
-	| systemQueue userQueue suspended idle running runnerId invoker throughput |
+	| systemQueue userQueue suspended idle running runnerId invoker throughput lastWasSystem |
 
 
 	class new [
@@ -25,6 +25,7 @@ Mailbox := Object [
 		idle := false.
 		running := true.
 		throughput := 30.
+		lastWasSystem := false.
 		^self
 	]
 
@@ -106,23 +107,28 @@ Mailbox := Object [
 	]
 
 
-	takeSystem [
-		"Atomically dequeue the next system message (or nil) under the monitor, so it can't
-		 race a concurrent post; the invocation itself runs OUTSIDE the monitor."
+	takeNext: userCount [
+		"Dequeue the next message under ONE monitor hold, SYSTEM PRIORITY: a system
+		 message if any (system directives ignore suspension and the throughput bound);
+		 otherwise the next user message if the mailbox is running, not suspended, and the
+		 per-batch throughput bound is not yet reached. Answer the message or nil, and tag
+		 it via lastWasSystem (meaningful only when the answer is notNil). Fully releases
+		 the monitor before returning: the invoke that follows runs arbitrary actor code
+		 that re-enters the non-recursive monitor. This coalesces the old separate
+		 takeSystem + takeUser probes into one acquisition per message."
 		| m |
 		Processor monitorEnter.
-		m := (running and: [ systemQueue isEmpty not ])
-			ifTrue: [ systemQueue removeFirst ] ifFalse: [ nil ].
-		Processor monitorExit.
-		^m
-	]
-
-
-	takeUser [
-		| m |
-		Processor monitorEnter.
-		m := (running and: [ suspended not and: [ userQueue isEmpty not ] ])
-			ifTrue: [ userQueue removeFirst ] ifFalse: [ nil ].
+		(running and: [ systemQueue isEmpty not ])
+			ifTrue: [
+				lastWasSystem := true.
+				m := systemQueue removeFirst ]
+			ifFalse: [
+				(running and: [ suspended not and: [ userCount < throughput
+						and: [ userQueue isEmpty not ] ] ])
+					ifTrue: [
+						lastWasSystem := false.
+						m := userQueue removeFirst ]
+					ifFalse: [ m := nil ] ].
 		Processor monitorExit.
 		^m
 	]
@@ -144,17 +150,18 @@ Mailbox := Object [
 
 
 	processBatch [
-		"System messages first (always), then a bounded run of user messages. Each message is
-		 dequeued under the monitor (take*) but INVOKED outside it — invoke* runs arbitrary
-		 actor code that posts/sends, re-entering the (non-recursive) monitor."
-		| m count |
-		[ (m := self takeSystem) notNil ] whileTrue: [ invoker invokeSystem: m ].
+		"One loop pulling messages under the monitor (takeNext:) and INVOKING them outside
+		 it — invoke* runs arbitrary actor code that posts/sends, re-entering the
+		 (non-recursive) monitor. takeNext: gives system messages priority and enforces the
+		 throughput bound on user messages, so this reproduces the old 'drain system, then a
+		 bounded run of user messages, draining system after each user' with ONE monitor
+		 acquisition per message instead of two."
+		| item count |
 		count := 0.
-		[ count < throughput and: [ (m := self takeUser) notNil ] ] whileTrue: [
-			invoker invokeUser: m.
-			"a user message may enqueue system messages (e.g. a failure); drain them"
-			[ (m := self takeSystem) notNil ] whileTrue: [ invoker invokeSystem: m ].
-			count := count + 1 ].
+		[ (item := self takeNext: count) notNil ] whileTrue: [
+			lastWasSystem
+				ifTrue: [ invoker invokeSystem: item ]
+				ifFalse: [ invoker invokeUser: item. count := count + 1 ] ].
 		^self
 	]
 ]

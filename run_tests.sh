@@ -154,6 +154,7 @@ run_group() {
 		[ "$base" = "CompilerTestFile.st" ] && continue   # included by CompilerTest, not standalone
 		[ "$base" = "IcHammerTest.st" ] && continue   # OS-thread stress: sandboxed group below
 		[ "$base" = "TierHammerTest.st" ] && continue   # OS-thread stress: sandboxed group below
+		[ "$base" = "AtomicStressTest.st" ] && continue   # OS-thread stress: sandboxed group below
 		[ "$base" = "06_business_card_server.st" ] && continue   # standalone server, runs forever
 		out="$(timeout 120 "$BUILD/st" -s "$SNAP" -f "$f" </dev/null 2>&1)"
 		if [ $? -eq 0 ]; then
@@ -176,7 +177,7 @@ run_sandboxed_hammer() {
 	local f base out
 	echo ""
 	echo "${B}tests (sandboxed)${Z}"
-	for f in tests/IcHammerTest.st tests/TierHammerTest.st; do
+	for f in tests/IcHammerTest.st tests/TierHammerTest.st tests/AtomicStressTest.st; do
 		base="$(basename "$f")"
 		if command -v systemd-run >/dev/null 2>&1; then
 			out="$(systemd-run --user --scope -q -p MemoryMax=6G -p TasksMax=300 \
