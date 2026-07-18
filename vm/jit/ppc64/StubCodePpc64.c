@@ -422,7 +422,10 @@ static void generateDoesNotUnderstandStub(CodeGenerator *generator)
 	asmPpcLabelBind(buffer, &loop, asmOffset(buffer));
 	asmSldi(buffer, R0, R9_PPC, 3);
 	asmAdd(buffer, TMP2, FP, R0);
-	asmLd(buffer, TMP, 3 * sizeof(intptr_t), TMP2);
+	// arg (R9-1) lives at FP + R9*word + 2*word (receiver at FP + 2*word, arg 0
+	// at FP + 3*word). Mirrors the x64 stub. (Was 3*word: an off-by-one that
+	// dropped the first argument and appended a trailing garbage slot.)
+	asmLd(buffer, TMP, 2 * sizeof(intptr_t), TMP2);
 	asmSldi(buffer, R0, R9_PPC, 3);
 	asmAdd(buffer, TMP2, R3, R0);
 	asmStdT(buffer, TMP, varOffset(RawArray, vars) - sizeof(intptr_t), TMP2);

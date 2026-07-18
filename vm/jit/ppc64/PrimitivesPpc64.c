@@ -740,9 +740,11 @@ void generateIntModPrimitive(CodeGenerator *generator)
 	AssemblerLabel notInt;
 	AssemblerLabel negativeResult;
 	AssemblerLabel divZero;
+	AssemblerLabel zeroRem;
 	asmInitLabel(&notInt);
 	asmInitLabel(&negativeResult);
 	asmInitLabel(&divZero);
+	asmInitLabel(&zeroRem);
 
 	movArg(buffer, 1, R4);
 	testInt(generator, R4);
@@ -755,10 +757,16 @@ void generateIntModPrimitive(CodeGenerator *generator)
 	asmMulld(buffer, R5, R5, R4);      // q * b
 	asmSubf(buffer, R3, R5, R3);       // rem = a - q*b (tagged)
 
-	// x64 sign fixup, kept bug-compatible: rem ^ divisor < 0 -> rem += divisor
-	asmXor(buffer, R0, R3, R4);
+	// Floored modulo sign fixup (mirrors x64): add the divisor only when the
+	// remainder is non-zero AND its sign differs from the divisor's. The non-zero
+	// guard fixes `x \\ -1` (remainder 0, negative divisor), which used to answer
+	// -1 instead of 0.
+	asmCmpdi(buffer, 0, R3, 0);        // remainder == 0 -> already floored
+	asmBeq(buffer, &zeroRem);
+	asmXor(buffer, R0, R3, R4);        // rem ^ divisor < 0 -> signs differ
 	asmCmpdi(buffer, 0, R0, 0);
 	asmBlt(buffer, &negativeResult);
+	asmPpcLabelBind(buffer, &zeroRem, asmOffset(buffer));
 	asmBlr(buffer);
 
 	asmPpcLabelBind(buffer, &negativeResult, asmOffset(buffer));

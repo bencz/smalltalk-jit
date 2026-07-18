@@ -75,6 +75,20 @@ Object *compileMethod(MethodNode *node, Class *class)
 		return closeHandleScope(&scope, (Object *) compiler.error);
 	}
 
+	// A method and every block nested in it share ONE literal pool, referenced by a
+	// 16-bit bytecode index, so at most 65535 distinct literals are addressable.
+	// Past that the index wraps and a release build (ASSERT compiled out) would
+	// SILENTLY read the wrong literal and miscompile. Fail loudly here instead. In
+	// practice a method this large first exhausts the compile handle scope
+	// (Handle.h), which aborts earlier; this is the last-line backstop.
+	if (ordCollSize(compiler.literals) > 65535) {
+		fprintf(stderr, "Compile error: a method plus its nested blocks reference %zu "
+			"distinct literals, but the literal index addresses at most 65535. "
+			"Split it into smaller methods.\n", ordCollSize(compiler.literals));
+		fflush(NULL);
+		FAIL();
+	}
+
 	result = (Object *) createMethod(&compiler, node, class);
 	freeCompiler(&compiler);
 	return closeHandleScope(&scope, result);
@@ -501,8 +515,8 @@ static void compileInlinedControlFlow(Compiler *compiler, Operand *receiver, int
 	case CF_OR:            falseBlk = blocks[0]; trueConst.type = OPERAND_TRUE; break;
 	}
 
-	uint8_t trueClassIdx = ordCollAddObjectIfNotExists(compiler->literals, (Object *) Handles.True);
-	uint8_t falseClassIdx = ordCollAddObjectIfNotExists(compiler->literals, (Object *) Handles.False);
+	uint16_t trueClassIdx = ordCollAddObjectIfNotExists(compiler->literals, (Object *) Handles.True);
+	uint16_t falseClassIdx = ordCollAddObjectIfNotExists(compiler->literals, (Object *) Handles.False);
 
 	AssemblerLabel lFalse, lNotBool, lEnd1, lEnd2;
 	asmInitLabel(&lFalse);
@@ -531,7 +545,7 @@ static void compileInlinedControlFlow(Compiler *compiler, Operand *receiver, int
 
 	// neither true nor false -> #mustBeBoolean (raises)
 	asmLabelBind(buffer, &lNotBool, asmOffset(buffer));
-	uint8_t mbbIdx = ordCollAddObjectIfNotExists(compiler->literals, (Object *) asSymbol(asString("mustBeBoolean")));
+	uint16_t mbbIdx = ordCollAddObjectIfNotExists(compiler->literals, (Object *) asSymbol(asString("mustBeBoolean")));
 	bytecodeSend(buffer, mbbIdx, receiver, NULL, 0);
 
 	asmLabelBind(buffer, &lEnd1, asmOffset(buffer));
@@ -591,9 +605,9 @@ static void compileInlinedLoop(Compiler *compiler, Operand *receiver, MessageExp
 	Operand cond;
 	createTmpVar(compiler, &cond);
 	Operand one = { .isValid = 1, .type = OPERAND_VALUE, .value = tagInt(1) };
-	uint8_t leIdx = ordCollAddObjectIfNotExists(compiler->literals, (Object *) asSymbol(asString("<=")));
-	uint8_t plusIdx = ordCollAddObjectIfNotExists(compiler->literals, (Object *) asSymbol(asString("+")));
-	uint8_t trueClassIdx = ordCollAddObjectIfNotExists(compiler->literals, (Object *) Handles.True);
+	uint16_t leIdx = ordCollAddObjectIfNotExists(compiler->literals, (Object *) asSymbol(asString("<=")));
+	uint16_t plusIdx = ordCollAddObjectIfNotExists(compiler->literals, (Object *) asSymbol(asString("+")));
+	uint16_t trueClassIdx = ordCollAddObjectIfNotExists(compiler->literals, (Object *) Handles.True);
 
 	AssemblerLabel loop, end;
 	asmInitLabel(&loop);
@@ -663,9 +677,9 @@ static void compileInlinedWhile(Compiler *compiler, ExpressionNode *node, Operan
 
 	Operand cond;
 	createTmpVar(compiler, &cond);
-	uint8_t contClassIdx = ordCollAddObjectIfNotExists(compiler->literals,
+	uint16_t contClassIdx = ordCollAddObjectIfNotExists(compiler->literals,
 		(Object *) (isWhileTrue ? Handles.True : Handles.False));
-	uint8_t exitClassIdx = ordCollAddObjectIfNotExists(compiler->literals,
+	uint16_t exitClassIdx = ordCollAddObjectIfNotExists(compiler->literals,
 		(Object *) (isWhileTrue ? Handles.False : Handles.True));
 
 	AssemblerLabel loop, lNotCont, lNotBool, lEnd;
@@ -686,7 +700,7 @@ static void compileInlinedWhile(Compiler *compiler, ExpressionNode *node, Operan
 	bytecodeJump(buffer, &lEnd);
 
 	asmLabelBind(buffer, &lNotBool, asmOffset(buffer));
-	uint8_t mbbIdx = ordCollAddObjectIfNotExists(compiler->literals,
+	uint16_t mbbIdx = ordCollAddObjectIfNotExists(compiler->literals,
 		(Object *) asSymbol(asString("mustBeBoolean")));
 	bytecodeSend(buffer, mbbIdx, &cond, NULL, 0);
 
@@ -729,7 +743,7 @@ static void compileMessageExpression(Compiler *compiler, Operand *receiver, Mess
 	}
 
 	String *selector = messageExpressionNodeGetSelector(node);
-	uint8_t literalIndex = ordCollAddObjectIfNotExists(compiler->literals, (Object *) asSymbol(selector));
+	uint16_t literalIndex = ordCollAddObjectIfNotExists(compiler->literals, (Object *) asSymbol(selector));
 	notePosition(compiler, messageExpressionNodeGetSourceCode(node));
 	if (result == NULL) {
 		bytecodeSend(buffer, literalIndex, receiver, args, iteratorIndex(&iterator));

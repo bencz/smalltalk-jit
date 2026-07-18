@@ -92,7 +92,7 @@ Dictionary := HashedCollection [
 	"removing"
 
 	remove: anAssociation ifAbsent: aBlock [
-		self removeKey: anAssociation key ifAbsent: aBlock.
+		self removeKey: anAssociation key ifAbsent: [^aBlock value].
 		^anAssociation
 	]
 

@@ -48,7 +48,7 @@ typedef struct {
 static NativeCode *generateBlockCode(CompiledBlock *block, CodeGenerator *parentGenerator);
 static void generateSafepointPoll(CodeGenerator *generator, _Bool atBackEdge);
 static void generateTierCheck(CodeGenerator *generator);
-static void generateIcSendPromoted(CodeGenerator *generator, uint8_t selectorIndex);
+static void generateIcSendPromoted(CodeGenerator *generator, uint16_t selectorIndex);
 static void generateCode(CodeGenerator *generator);
 static void freeCodeGenerator(CodeGenerator *generator);
 static void generatePrologue(CodeGenerator *generator, size_t frameSize);
@@ -383,7 +383,7 @@ static void generateBody(CodeGenerator *generator)
 				break;
 			case BYTECODE_SEND:
 			case BYTECODE_SEND_WITH_STORE: {
-				bytecodeNextByte(&pre);
+				bytecodeNextUint16(&pre);
 				uint8_t a = bytecodeNextByte(&pre);
 				bytecodeNextOperand(&pre);
 				for (uint8_t k = 0; k < a; k++) {
@@ -407,7 +407,7 @@ static void generateBody(CodeGenerator *generator)
 				break;
 			}
 			case BYTECODE_JUMP_NOT_MEMBER_OF: {
-				bytecodeNextByte(&pre);
+				bytecodeNextUint16(&pre);
 				bytecodeNextOperand(&pre);
 				int32_t d = bytecodeNextInt32(&pre);
 				ptrdiff_t t = bytecodeOffset(&pre) + d;
@@ -504,7 +504,7 @@ static void generateBody(CodeGenerator *generator)
 		}
 
 		case BYTECODE_JUMP_NOT_MEMBER_OF: {
-			RawObject *class = compiledCodeLiteralAt(&generator->code, bytecodeNextByte(&iterator));
+			RawObject *class = compiledCodeLiteralAt(&generator->code, bytecodeNextUint16(&iterator));
 			Operand receiver = bytecodeNextOperand(&iterator);
 			int32_t disp = bytecodeNextInt32(&iterator);
 			ptrdiff_t target = bytecodeOffset(&iterator) + disp;
@@ -882,7 +882,7 @@ static void generateFloatFastPath(CodeGenerator *generator, int arithKind,
 // loads off the state pointer, which POWER orders for free against the
 // CAS-release publishes; no isync needed. Any way-0 miss goes through the
 // shared PicProbeStub (pic walk, mega global probe, or C transition).
-static void generateIcSend(CodeGenerator *generator, uint8_t selectorIndex)
+static void generateIcSend(CodeGenerator *generator, uint16_t selectorIndex)
 {
 	AssemblerBuffer *buffer = &generator->buffer;
 	AssemblerLabel miss, callFromHit;
@@ -924,7 +924,7 @@ static void generateIcSend(CodeGenerator *generator, uint8_t selectorIndex)
 // moves) and a direct baked entry on the hit; the miss falls back to the full
 // generateIcSend. Site identity, the emission-time cell read and the
 // staleness contract are documented on the x64 original.
-static void generateIcSendPromoted(CodeGenerator *generator, uint8_t selectorIndex)
+static void generateIcSendPromoted(CodeGenerator *generator, uint16_t selectorIndex)
 {
 	AssemblerBuffer *buffer = &generator->buffer;
 	// Feedback cell: by instruction number when the inliner rewrote the
@@ -995,7 +995,7 @@ static void generateSend(CodeGenerator *generator, BytecodesIterator *iterator)
 	// BLOCK argument compiles the whole block right here, which allocates and
 	// can scavenge; a raw pointer captured before that would be baked stale
 	// below (see x64 generateSend). Classification runs BEFORE the pushes.
-	uint8_t selectorIndex = bytecodeNextByte(iterator);
+	uint16_t selectorIndex = bytecodeNextUint16(iterator);
 	uint8_t argsSize = bytecodeNextByte(iterator);
 	Operand receiver = bytecodeNextOperand(iterator);
 	int arithKind = argsSize == 1
@@ -1129,9 +1129,20 @@ static void generateSend(CodeGenerator *generator, BytecodesIterator *iterator)
 		generator->frameSize -= argsSize + 1;
 	} else {
 		RawClass *class = compiledCodeResolveOperandClass(&generator->code, receiver);
+		RawObject *selector = compiledCodeLiteralAt(&generator->code, selectorIndex);
+		// Devirtualize a known-class send ONLY when the target method truly exists;
+		// a compile-time miss would bake the doesNotUnderstand trampoline (allocated
+		// during this codegen) and segfault on a caught-then-resumed unwind. Route
+		// misses through the IC path, which raises/unwinds DNU correctly. See x64.
+		_Bool devirtualize = 0;
 		if (class != NULL) {
-			asmLi64(buffer, TGT, (uint64_t) (uintptr_t) lookupNativeCode(class,
-				(RawString *) compiledCodeLiteralAt(&generator->code, selectorIndex)));
+			HandleScope probe;
+			openHandleScope(&probe);
+			devirtualize = lookupSelector(scopeHandle(class), scopeHandle(selector)) != NULL;
+			closeHandleScope(&probe, NULL);
+		}
+		if (devirtualize) {
+			asmLi64(buffer, TGT, (uint64_t) (uintptr_t) lookupNativeCode(class, (RawString *) selector));
 		} else {
 			// Always recompute the receiver's class from TMP (see x64).
 			generateLoadClass(buffer, TMP, R3);
@@ -1139,8 +1150,7 @@ static void generateSend(CodeGenerator *generator, BytecodesIterator *iterator)
 				generateIcSendPromoted(generator, selectorIndex);
 			} else {
 				// ST_NO_IC: exactly the pre-IC sequence
-				generateLoadObject(buffer,
-					compiledCodeLiteralAt(&generator->code, selectorIndex), R4, 0);
+				generateLoadObject(buffer, selector, R4, 0);
 				generateMethodLookup(generator);
 			}
 		}

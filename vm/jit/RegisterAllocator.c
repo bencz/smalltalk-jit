@@ -214,7 +214,7 @@ static void scanCode(Vars *vars, CompiledCode *code)
 		case BYTECODE_SEND:
 		case BYTECODE_SEND_WITH_STORE:;
 			vars->frameLess = 0;
-			bytecodeNextByte(&iterator); // skip selector
+			bytecodeNextUint16(&iterator); // skip selector
 			uint8_t argsSize = bytecodeNextByte(&iterator);
 
 			Operand receiver = bytecodeNextOperand(&iterator);
@@ -250,7 +250,7 @@ static void scanCode(Vars *vars, CompiledCode *code)
 		}
 
 		case BYTECODE_JUMP_NOT_MEMBER_OF: {
-			bytecodeNextByte(&iterator); // skip literal
+			bytecodeNextUint16(&iterator); // skip literal
 			examineOperand(vars, bytecodeNextOperand(&iterator), bytecodeNumber(&iterator));
 			int32_t disp = bytecodeNextInt32(&iterator);
 			if (disp < 0) {

@@ -24,6 +24,13 @@
 #define TARGET_BIG_ENDIAN 0
 #endif
 
+static inline uint16_t loadU16(const void *p)
+{
+	uint16_t v;
+	memcpy(&v, p, sizeof(v));
+	return v;
+}
+
 static inline uint32_t loadU32(const void *p)
 {
 	uint32_t v;
@@ -43,6 +50,11 @@ static inline uint64_t loadU64(const void *p)
 	uint64_t v;
 	memcpy(&v, p, sizeof(v));
 	return v;
+}
+
+static inline void storeU16(void *p, uint16_t v)
+{
+	memcpy(p, &v, sizeof(v));
 }
 
 static inline void storeU32(void *p, uint32_t v)

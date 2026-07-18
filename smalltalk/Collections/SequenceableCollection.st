@@ -57,7 +57,7 @@ SequenceableCollection := Collection [
 	collect: aBlock [
 		| newCollection |
 
-		newCollection := self class new: self size.
+		newCollection := self species new: self size.
 		1 to: self size do: [ :index | newCollection at: index put: (aBlock value: (self at: index))].
 		^newCollection
 	]
@@ -86,7 +86,7 @@ SequenceableCollection := Collection [
 
 
 	indexOf: anObject ifAbsent: aBlock [
-		^self indexOf: anObject startingAt: 1 ifAbsent: [0]
+		^self indexOf: anObject startingAt: 1 ifAbsent: aBlock
 	]
 
 

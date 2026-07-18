@@ -46,7 +46,7 @@ _Bool tierMethodHasDynamicSend(CompiledCode *code)
 			break;
 		case BYTECODE_SEND:
 		case BYTECODE_SEND_WITH_STORE: {
-			uint8_t selectorIndex = bytecodeNextByte(&iterator);
+			uint16_t selectorIndex = bytecodeNextUint16(&iterator);
 			uint8_t argsSize = bytecodeNextByte(&iterator);
 			Operand receiver = bytecodeNextOperand(&iterator);
 			for (uint8_t i = 0; i < argsSize; i++) {
@@ -70,7 +70,7 @@ _Bool tierMethodHasDynamicSend(CompiledCode *code)
 			bytecodeNextInt32(&iterator);
 			break;
 		case BYTECODE_JUMP_NOT_MEMBER_OF:
-			bytecodeNextByte(&iterator);
+			bytecodeNextUint16(&iterator);
 			bytecodeNextOperand(&iterator);
 			bytecodeNextInt32(&iterator);
 			break;

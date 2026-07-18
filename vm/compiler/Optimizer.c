@@ -82,7 +82,7 @@ static void setSourcePos(Optimizer *opt, ptrdiff_t origInstruction);
 static void noteInstructions(Optimizer *opt);
 static void emitRawInstruction(Optimizer *opt, uint8_t *start, size_t length);
 static void mapSet(Optimizer *opt, size_t instruction, IcCell *cell);
-static _Bool tryInlineSite(Optimizer *opt, IcCell *cell, uint8_t selectorIndex,
+static _Bool tryInlineSite(Optimizer *opt, IcCell *cell, uint16_t selectorIndex,
 	uint8_t argsSize, Operand receiver, Operand *streamArgs, Operand result,
 	_Bool withStore);
 static _Bool inlineEligible(CompiledCode *callee, InstanceShape shape);
@@ -149,7 +149,7 @@ CompiledMethod *optimizeMethod(CompiledMethod *method, NativeCode *oldCode,
 
 		case BYTECODE_SEND:
 		case BYTECODE_SEND_WITH_STORE: {
-			uint8_t selectorIndex = bytecodeNextByte(&iterator);
+			uint16_t selectorIndex = bytecodeNextUint16(&iterator);
 			uint8_t argsSize = bytecodeNextByte(&iterator);
 			Operand receiver = bytecodeNextOperand(&iterator);
 			Operand streamArgs[OPT_MAX_ARGS];
@@ -220,7 +220,7 @@ CompiledMethod *optimizeMethod(CompiledMethod *method, NativeCode *oldCode,
 		}
 
 		case BYTECODE_JUMP_NOT_MEMBER_OF: {
-			uint8_t classIndex = bytecodeNextByte(&iterator);
+			uint16_t classIndex = bytecodeNextUint16(&iterator);
 			Operand operand = bytecodeNextOperand(&iterator);
 			int32_t disp = bytecodeNextInt32(&iterator);
 			ptrdiff_t target = bytecodeOffset(&iterator) + disp;
@@ -348,7 +348,7 @@ static void mapSet(Optimizer *opt, size_t instruction, IcCell *cell)
 }
 
 
-static _Bool tryInlineSite(Optimizer *opt, IcCell *cell, uint8_t selectorIndex,
+static _Bool tryInlineSite(Optimizer *opt, IcCell *cell, uint16_t selectorIndex,
 	uint8_t argsSize, Operand receiver, Operand *streamArgs, Operand result,
 	_Bool withStore)
 {
@@ -420,18 +420,18 @@ static _Bool tryInlineSite(Optimizer *opt, IcCell *cell, uint8_t selectorIndex,
 
 	// Exact-class guard on the ORIGINAL receiver operand; any other class
 	// takes the untouched original send below.
-	bytecodeJumpNotMemberOf(&opt->buffer, &receiver, (uint8_t) classLiteral, &fallback);
+	bytecodeJumpNotMemberOf(&opt->buffer, &receiver, (uint16_t) classLiteral, &fallback);
 	noteInstructions(opt);
 
 	// Single evaluation: receiver and arguments (stream order is REVERSED
 	// source order) spill into fresh temps before the body runs; the body
 	// never touches caller state except through these.
-	Operand selfTemp = { .isValid = 1, .type = OPERAND_TEMP_VAR, .index = (uint8_t) base };
+	Operand selfTemp = { .isValid = 1, .type = OPERAND_TEMP_VAR, .index = (uint16_t) base };
 	bytecodeCopy(&opt->buffer, &receiver, &selfTemp);
 	noteInstructions(opt);
 	for (uint8_t k = 0; k < argsSize; k++) {
 		Operand argTemp = { .isValid = 1, .type = OPERAND_TEMP_VAR,
-			.index = (uint8_t) (base + 1 + k) };
+			.index = (uint16_t) (base + 1 + k) };
 		bytecodeCopy(&opt->buffer, &streamArgs[argsSize - 1 - k], &argTemp);
 		noteInstructions(opt);
 	}
@@ -515,7 +515,7 @@ static _Bool inlineEligible(CompiledCode *callee, InstanceShape shape)
 		}
 		case BYTECODE_SEND:
 		case BYTECODE_SEND_WITH_STORE: {
-			bytecodeNextByte(&iterator);
+			bytecodeNextUint16(&iterator);
 			uint8_t argsSize = bytecodeNextByte(&iterator);
 			if (argsSize > OPT_MAX_ARGS) {
 				return 0;
@@ -592,7 +592,7 @@ static void emitInlinedBody(InlineContext *ctx, CompiledCode *callee, Operand re
 		case BYTECODE_SEND:
 		case BYTECODE_SEND_WITH_STORE: {
 			_Bool withStore = bytecode == BYTECODE_SEND_WITH_STORE;
-			uint8_t selectorIndex = bytecodeNextByte(&iterator);
+			uint16_t selectorIndex = bytecodeNextUint16(&iterator);
 			uint8_t argsSize = bytecodeNextByte(&iterator);
 			Operand receiver = bytecodeNextOperand(&iterator);
 			adjustOperand(ctx, &receiver);
@@ -611,10 +611,10 @@ static void emitInlinedBody(InlineContext *ctx, CompiledCode *callee, Operand re
 			if (withStore) {
 				Operand dst = bytecodeNextOperand(&iterator);
 				adjustOperand(ctx, &dst);
-				bytecodeSendWithStore(&opt->buffer, (uint8_t) selector, &receiver,
+				bytecodeSendWithStore(&opt->buffer, (uint16_t) selector, &receiver,
 					&dst, sourceArgs, argsSize);
 			} else {
-				bytecodeSend(&opt->buffer, (uint8_t) selector, &receiver,
+				bytecodeSend(&opt->buffer, (uint16_t) selector, &receiver,
 					sourceArgs, argsSize);
 			}
 			noteInstructions(opt);
@@ -643,7 +643,7 @@ static void emitInlinedBody(InlineContext *ctx, CompiledCode *callee, Operand re
 	if (!returned && result.isValid) {
 		// Fell off the end: a method answers self.
 		Operand selfTemp = { .isValid = 1, .type = OPERAND_TEMP_VAR,
-			.index = (uint8_t) ctx->base };
+			.index = (uint16_t) ctx->base };
 		bytecodeCopy(&opt->buffer, &selfTemp, &result);
 		noteInstructions(opt);
 	}
@@ -665,22 +665,22 @@ static void adjustOperand(InlineContext *ctx, Operand *operand)
 
 	case OPERAND_TEMP_VAR:
 		ASSERT(operand->index >= 2 + ctx->calleeArgs);
-		operand->index = (uint8_t) (ctx->base + 1 + ctx->calleeArgs
+		operand->index = (uint16_t) (ctx->base + 1 + ctx->calleeArgs
 			+ (operand->index - 2 - ctx->calleeArgs));
 		break;
 
 	case OPERAND_ARG_VAR:
 		operand->type = OPERAND_TEMP_VAR;
 		operand->index = operand->index == SELF_INDEX
-			? (uint8_t) ctx->base
-			: (uint8_t) (ctx->base + 1 + (operand->index - 2));
+			? (uint16_t) ctx->base
+			: (uint16_t) (ctx->base + 1 + (operand->index - 2));
 		break;
 
 	case OPERAND_INST_VAR:
 		operand->instance.type = OPERAND_TEMP_VAR;
-		operand->instance.index = (uint8_t) ctx->base;
+		operand->instance.index = (uint16_t) ctx->base;
 		operand->instance.level = 0;
-		operand->index = (uint8_t) (ctx->shape.payloadSize + operand->index
+		operand->index = (uint16_t) (ctx->shape.payloadSize + operand->index
 			+ ctx->shape.isIndexed);
 		operand->type = OPERAND_INST_VAR_OF;
 		break;
@@ -690,7 +690,7 @@ static void adjustOperand(InlineContext *ctx, Operand *operand)
 		ptrdiff_t index = ordCollAddObjectIfNotExists(ctx->opt->literals,
 			arrayObjectAt(ctx->calleeLiterals, operand->index));
 		ASSERT(index <= 255);
-		operand->index = (uint8_t) index;
+		operand->index = (uint16_t) index;
 		break;
 	}
 

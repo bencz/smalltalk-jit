@@ -1067,6 +1067,7 @@ static _Bool isArrayLiteral(Token *token)
 {
 	switch (token->type) {
 	case TOKEN_DIGIT:
+	case TOKEN_MINUS:   // a leading '-' inside #( ... ) starts a negative number literal
 	case TOKEN_SYMBOL_START:
 	case TOKEN_STRING:
 	case TOKEN_CHAR:

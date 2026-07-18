@@ -32,6 +32,7 @@ Association := Object [
 
 	value: anObject [
 		value := anObject.
+		^anObject
 	]
 
 

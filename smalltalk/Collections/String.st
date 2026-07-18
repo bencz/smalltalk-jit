@@ -87,12 +87,20 @@ String := ArrayedCollection [
 	]
 
 
+	asString [
+		"A String is already a string; answer self. Symbol overrides this to answer
+		 a fresh, mutable, plain String (dropping its interned/immutable identity)."
+		^self
+	]
+
+
 	asLowercase [
 		"C fast path: pure ASCII fold (A-Z -> a-z). The Smalltalk fallback runs
-		 for non-String byte shapes (e.g. Symbol) so the receiver species is kept."
+		 for non-String byte shapes (e.g. Symbol), building a plain String via the
+		 receiver species (a Symbol answers a String, since it is immutable)."
 		<primitive: StringAsciiLowercasePrimitive>
 		| newString |
-		newString := self class new: self size.
+		newString := self species new: self size.
 		1 to: self size do: [ :i | newString at: i put: (self at: i) asLowercase].
 		^newString
 	]
@@ -101,7 +109,7 @@ String := ArrayedCollection [
 	asUppercase [
 		<primitive: StringAsciiUppercasePrimitive>
 		| newString |
-		newString := self class new: self size.
+		newString := self species new: self size.
 		1 to: self size do: [ :i | newString at: i put: (self at: i) asUppercase].
 		^newString
 	]

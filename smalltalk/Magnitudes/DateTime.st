@@ -62,45 +62,26 @@ DateTime := Magnitude [
 
 
 	computeDate [
-		| resultYear resultMonth days yd1 yd2 yd3 isLeap daysUntilMonth result |
+		"Days-to-civil (Howard Hinnant's public-domain algorithm), on a March-based
+		 400-year era so the leap day falls at the era's end. Correct for every
+		 date, including Jan 1 of leap years and 400-year boundaries, and for
+		 pre-epoch dates (floored // and \\). Answers {year. month. day}; the
+		 hour/minute/second accessors handle the time of day separately.
+		 The prior hand-rolled -1/+1 version rendered Jan 1 of every leap year as
+		 Dec 31 of the previous year."
+		| z era doe yoe y doy mp d m |
 
-		resultYear := 0.
-		resultMonth := 0.
-
-		days := milliSeconds // MillisecondsPerDay + DaysOffset.
-
-		resultYear := 400 * (days // DaysIn400Years) - YearsOffset.
-
-		days := days \\ DaysIn400Years - 1.
-		yd1 := days // DaysIn100Years.
-		days := days \\ DaysIn100Years.
-
-		resultYear := resultYear + (100 * yd1).
-
-		days := days + 1.
-		yd2 := days // DaysIn4Years.
-		days := days \\ DaysIn4Years.
-		resultYear := resultYear + (4 * yd2).
-
-		days := days - 1.
-		yd3 := days // 365.
-		days := days \\ 365.
-		resultYear := resultYear + yd3.
-
-		isLeap := (yd1 = 0 or: [yd2 ~= 0]) and: [yd3 = 0].
-		isLeap ifTrue: [days := days + 1].
-
-		daysUntilMonth := isLeap
-			ifTrue: [#(0 31 60 91 121 152 182 213 244 274 305 335)]
-			ifFalse: [#(0 31 59 90 120 151 181 212 243 273 304 334)].
-		resultMonth := 12.
-		[(daysUntilMonth at: resultMonth) > days] whileTrue: [resultMonth := resultMonth - 1].
-
-		result := Array new: 3.
-		result at: 1 put: resultYear.
-		result at: 2 put: resultMonth.
-		result at: 3 put: days - (daysUntilMonth at: resultMonth) + 1.
-		^result
+		z := (milliSeconds // MillisecondsPerDay) + 719468.
+		era := z // 146097.
+		doe := z - (era * 146097).
+		yoe := (doe - (doe // 1460) + (doe // 36524) - (doe // 146096)) // 365.
+		y := yoe + (era * 400).
+		doy := doe - ((365 * yoe) + (yoe // 4) - (yoe // 100)).
+		mp := ((5 * doy) + 2) // 153.
+		d := (doy - (((153 * mp) + 2) // 5)) + 1.
+		m := mp < 10 ifTrue: [mp + 3] ifFalse: [mp - 9].
+		m <= 2 ifTrue: [y := y + 1].
+		^Array with: y with: m with: d
 	]
 
 

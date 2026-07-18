@@ -712,10 +712,12 @@ void generateIntModPrimitive(CodeGenerator *generator)
 	AssemblerLabel negativeResult;
 	AssemblerLabel negativeDivisor;
 	AssemblerLabel divZero;
+	AssemblerLabel zeroRem;
 	asmInitLabel(&notInt);
 	asmInitLabel(&negativeResult);
 	asmInitLabel(&negativeDivisor);
 	asmInitLabel(&divZero);
+	asmInitLabel(&zeroRem);
 
 	movArg(buffer, 1, RDI);
 	testInt(generator, DIL);
@@ -725,15 +727,22 @@ void generateIntModPrimitive(CodeGenerator *generator)
 
 	movArg(buffer, 0, RAX);
 	asmCqo(buffer);
-	asmIdivq(buffer, RDI);
-	asmMovq(buffer, RDX, RAX);
+	asmIdivq(buffer, RDI);                       // RAX = quotient, RDX = remainder (sign of dividend)
+	asmMovq(buffer, RDX, RAX);                    // RAX = remainder
 
-	asmXorq(buffer, RDI, RDX);
+	// Floored modulo: the remainder takes the sign of the DIVISOR. Add the divisor
+	// ONLY when the remainder is non-zero AND its sign differs from the divisor's.
+	// Without the non-zero guard, `x \\ -1` (remainder 0, negative divisor) wrongly
+	// took the adjustment and answered -1 instead of 0.
+	asmTestq(buffer, RDX, RDX);                   // remainder == 0 -> already floored
+	asmJ(buffer, COND_ZERO, &zeroRem);
+	asmXorq(buffer, RDI, RDX);                    // sign(divisor) != sign(remainder)?
 	asmCmpqImm(buffer, RDX, 0);
 	asmJ(buffer, COND_LESS, &negativeResult);
+	asmLabelBind(buffer, &zeroRem, asmOffset(buffer));
 	asmRet(buffer);
 
-	// negative
+	// remainder sign differs from divisor: add the divisor to floor it
 	asmLabelBind(buffer, &negativeResult, asmOffset(buffer));
 	asmLabelBind(buffer, &negativeDivisor, asmOffset(buffer));
 	asmAddq(buffer, RDI, RAX);

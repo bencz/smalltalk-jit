@@ -6,16 +6,15 @@
 typedef struct {
 	uint8_t tag;
 	uint8_t type;
-	uint8_t index;
+	uint16_t index;   // 16-bit: a method can reference up to 65535 literals/selectors
 	uint8_t level;
 	uint8_t ctxCopy;
-	uint8_t unused0;
 	uint8_t unused1;
 	uint8_t unused2;
 } Variable;
 
 
-static Value defineVariable(uint8_t type, uint8_t index, uint8_t level)
+static Value defineVariable(uint8_t type, uint16_t index, uint8_t level)
 {
 	Variable tmp;
 	tmp.tag = 0;
@@ -23,7 +22,6 @@ static Value defineVariable(uint8_t type, uint8_t index, uint8_t level)
 	tmp.index = index;
 	tmp.level = level;
 	tmp.ctxCopy = 0;
-	tmp.unused0 = 0;
 	tmp.unused1 = 0;
 	tmp.unused2 = 0;
 	return *(Value *) &tmp;
@@ -42,13 +40,13 @@ static uint8_t getVarType(Value var)
 }
 
 
-static void setVarIndex(Value *var, uint8_t index)
+static void setVarIndex(Value *var, uint16_t index)
 {
 	((Variable *) var)->index = index;
 }
 
 
-static uint8_t getVarIndex(Value var)
+static uint16_t getVarIndex(Value var)
 {
 	return ((Variable *) &var)->index;
 }

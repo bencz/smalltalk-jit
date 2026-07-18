@@ -16,7 +16,10 @@ typedef struct Handle {
 
 typedef struct HandleScope {
 	struct HandleScope *parent;
-	Object handles[256];   // scopeHandle hard-bounds size < 256 (was [1024], 4× oversized)
+	Object handles[1024];   // scopeHandle hard-bounds size < 1024. Raised from 256 so
+	                        // compiling a method with many distinct literals (now a
+	                        // 16-bit index) does not exhaust one scope. 8KB/scope on the
+	                        // C stack (this was the original size before it was shrunk).
 	size_t size;
 #if REMEMBER_SCOPE_POSITION
 	char *file;
@@ -169,9 +172,9 @@ static void *closeHandleScope(HandleScope *scope, void *handle)
 static void *scopeHandle(void *object)
 {
 	ASSERT(CurrentThread.handleScopes != NULL);
-	// HARD bound (survives -DNDEBUG): handles[] is exactly 256, so a 257th handle
+	// HARD bound (survives -DNDEBUG): handles[] is exactly 1024, so a 1025th handle
 	// would corrupt the stack. FAIL() aborts instead.
-	if (CurrentThread.handleScopes->size >= 256) {
+	if (CurrentThread.handleScopes->size >= 1024) {
 		FAIL();
 	}
 	Object *handle = &CurrentThread.handleScopes->handles[CurrentThread.handleScopes->size++];

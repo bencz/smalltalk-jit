@@ -372,7 +372,12 @@ static void generateDoesNotUnderstandStub(CodeGenerator *generator)
 	asmTestq(buffer, RBX, RBX);
 	asmJ(buffer, COND_ZERO, &zeroArgs);
 	asmLabelBind(buffer, &loop, asmOffset(buffer));
-	asmMovqMem(buffer, asmMem(RBP, RBX, SS_8, 3 * sizeof(intptr_t)), TMP);
+	// args sit above the frame at RBP + 2*word + i*word (receiver is at RBP +
+	// 2*word, arg 0 at RBP + 3*word). The loop counts RBX from argsSize down to
+	// 1 and fills element RBX-1, so the source of element RBX-1 is arg (RBX-1),
+	// i.e. RBP + RBX*word + 2*word. (Was 3*word: an off-by-one that dropped the
+	// first argument and appended a trailing garbage slot.)
+	asmMovqMem(buffer, asmMem(RBP, RBX, SS_8, 2 * sizeof(intptr_t)), TMP);
 	asmMovqToMem(buffer, TMP, asmMem(RAX, RBX, SS_8, varOffset(RawArray, vars) - sizeof(intptr_t)));
 	asmDecq(buffer, RBX);
 	asmJ(buffer, COND_NOT_ZERO, &loop);

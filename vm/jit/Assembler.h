@@ -10,7 +10,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define ASM_BUFFER_GAP 32
+#define ASM_BUFFER_GAP 64
 
 // Fixup "size" tag for a baked 64-bit immediate that is NOT a contiguous
 // 8-byte word in the instruction stream (ppc64's 5-instruction asmLi64,
@@ -76,6 +76,7 @@ static void asmAddPointerOffset(AssemblerBuffer *buffer, ptrdiff_t offset);
 static void asmCopyPointersOffsets(AssemblerBuffer *buffer, uint32_t *dest);
 static void asmEmitInt8(AssemblerBuffer *buffer, int8_t v);
 static void asmEmitUint8(AssemblerBuffer *buffer, uint8_t v);
+static void asmEmitUint16(AssemblerBuffer *buffer, uint16_t v);
 static void asmEmitInt32(AssemblerBuffer *buffer, int32_t v);
 static void asmEmitUint64(AssemblerBuffer *buffer, uint64_t v);
 
@@ -272,6 +273,15 @@ static void asmEmitUint8(AssemblerBuffer *buffer, uint8_t v)
 {
 	*(uint8_t *) buffer->p = v;
 	buffer->p++;
+}
+
+
+// memcpy-based (unaligned-safe, see asmEmitInt32): literal/selector indices in
+// the bytecode stream are 16-bit and sit at arbitrary offsets.
+static void asmEmitUint16(AssemblerBuffer *buffer, uint16_t v)
+{
+	storeU16(buffer->p, v);
+	buffer->p += sizeof(uint16_t);
 }
 
 
