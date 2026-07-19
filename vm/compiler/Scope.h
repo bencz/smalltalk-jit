@@ -14,10 +14,14 @@ typedef struct RawBlockScope {
 	Value ownerClass;
 	Value literals;
 	Value error;
+	Value namespace; // resolution context for globals; nil means Core
 } RawBlockScope;
 OBJECT_HANDLE(BlockScope);
 
 BlockScope *analyzeMethod(MethodNode *node, Class *class);
+// Analyze resolving globals in `ns` (own bindings -> imports -> core).
+// ns == NULL falls back to the class's home namespace, then DefaultNamespace.
+BlockScope *analyzeMethodIn(MethodNode *node, Class *class, Namespace *ns);
 
 
 static void blockScopeSetHeader(BlockScope *blockScope, CompiledCodeHeader header)
@@ -95,6 +99,18 @@ static CompileError *blockScopeGetError(BlockScope *blockScope)
 static _Bool blockScopeHasError(BlockScope *blockScope)
 {
 	return !isTaggedNil(blockScope->raw->error);
+}
+
+
+static void blockScopeSetNamespace(BlockScope *blockScope, Namespace *ns)
+{
+	objectStorePtr((Object *) blockScope,  &blockScope->raw->namespace, (Object *) ns);
+}
+
+
+static Namespace *blockScopeGetNamespace(BlockScope *blockScope)
+{
+	return (Namespace *) scopeHandle(asObject(blockScope->raw->namespace));
 }
 
 #endif

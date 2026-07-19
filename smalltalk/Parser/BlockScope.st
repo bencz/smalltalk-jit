@@ -1,5 +1,5 @@
 BlockScope := Object [
 
-	| header parent vars ownerClass literals error |
+	| header parent vars ownerClass literals error namespace |
 
 ]

@@ -4,3 +4,4 @@
 st
 /build
 /build-*
+.stbuild/

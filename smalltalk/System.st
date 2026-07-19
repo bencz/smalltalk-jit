@@ -121,6 +121,24 @@ System := Object [
 	]
 
 
+	class executablePath [
+		"Absolute path of the running st binary, or nil when the platform
+		 cannot tell. Anchors the distributed package store (PackageLoader
+		 packageRoots) and the default image search."
+		<primitive: ExecutablePathPrimitive>
+		^nil
+	]
+
+
+	class flushSendCaches [
+		"Reset every JIT send cache (inline caches and per-worker lookup
+		 caches) under a stop-the-world bracket. Escape hatch for reflective
+		 method-dictionary surgery; class builds, redefinitions and extensions
+		 invalidate automatically."
+		<primitive: FlushSendCachesPrimitive>
+	]
+
+
 	class primitiveMonotonicNanos [
 		<primitive: MonotonicNanoTimePrimitive>
 	]

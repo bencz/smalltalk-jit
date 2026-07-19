@@ -2,6 +2,7 @@
 #include "compiler/Variable.h"
 #include "runtime/Dictionary.h"
 #include "compiler/Compiler.h"
+#include "core/Namespace.h"
 #include "core/Smalltalk.h"
 #include "memory/Heap.h"
 #include "core/Handle.h"
@@ -36,10 +37,17 @@ static _Bool analyzeContextVar(BlockScope *blockScope, String *name);
 static void setupBlockMetasAsContexts(BlockScope *blockScope, BlockScope *upTo);
 static _Bool analyzeGlobalVar(BlockScope *blockScope, String *name);
 static _Bool analyzeDictionaryVar(BlockScope *blockScope, Dictionary *dict, String *name);
+static void bindAssociation(BlockScope *blockScope, String *name, Association *assoc);
 static BlockScope *createBlockScope(BlockScope *parent);
 
 
 BlockScope *analyzeMethod(MethodNode *node, Class *class)
+{
+	return analyzeMethodIn(node, class, NULL);
+}
+
+
+BlockScope *analyzeMethodIn(MethodNode *node, Class *class, Namespace *ns)
 {
 	HandleScope scope;
 	openHandleScope(&scope);
@@ -52,6 +60,15 @@ BlockScope *analyzeMethod(MethodNode *node, Class *class)
 	} else {
 		blockScopeSetOwnerClass(blockScope, class);
 	}
+
+	// No explicit namespace: the method belongs to its class's home namespace
+	// (single-method recompiles of package classes resolve at home), falling
+	// back to the session default (Core until a project image changes it).
+	if (ns == NULL) {
+		Namespace *home = classGetNamespace(blockScopeGetOwnerClass(blockScope));
+		ns = isNil(home) ? defaultNamespace() : home;
+	}
+	blockScopeSetNamespace(blockScope, ns);
 
 	blockScopeSetLiterals(blockScope, newOrdColl(64));
 
@@ -507,6 +524,7 @@ static void analyzeLiteral(BlockScope *blockScope, Object *literal)
 	} else if (literal->raw->class == Handles.BlockNode->raw) {
 		BlockScope *blockMeta = createBlockScope(blockScope);
 		blockScopeSetOwnerClass(blockMeta, blockScopeGetOwnerClass(blockScope));
+		blockScopeSetNamespace(blockMeta, blockScopeGetNamespace(blockScope));
 		blockScopeSetLiterals(blockMeta, blockScopeGetLiterals(blockScope));
 		analyzeBlock(blockMeta, (BlockNode *) literal);
 		blockScopeSetError(blockScope, blockScopeGetError(blockMeta));
@@ -596,15 +614,21 @@ static void setupBlockMetasAsContexts(BlockScope *blockScope, BlockScope *upTo)
 
 static _Bool analyzeGlobalVar(BlockScope *blockScope, String *name)
 {
-	Value var;
+	Namespace *ns = blockScopeGetNamespace(blockScope);
+	Namespace *activeNs = isNil(ns) ? NULL : ns;
 
-	if (analyzeDictionaryVar(blockScope, Handles.Smalltalk, name)) {
+	Association *assoc = namespaceResolveAssoc(activeNs, name);
+	if (!isNil(assoc)) {
+		bindAssociation(blockScope, name, assoc);
 		return 1;
-	} else if (name->raw->contents[0] >= 'A' && name->raw->contents[0] <= 'Z') {
-		OrderedCollection *literals = blockScopeGetLiterals(blockScope);
-		Association *assoc = symbolDictAtPutObject(Handles.Smalltalk, asSymbol(name), Handles.nil);
-		var = defineVariable(OPERAND_ASSOC, ordCollAddObjectIfNotExists(literals, (Object *) assoc), 0);
-		stringDictAtPut(blockScopeGetVars(blockScope), name, var);
+	}
+	if (name->raw->contents[0] >= 'A' && name->raw->contents[0] <= 'Z') {
+		// Unknown uppercase name: vivify a nil binding so forward references
+		// work, into the ACTIVE namespace's own bindings. Only reachable when
+		// the WHOLE chain (own, imports, core) missed, so a package can never
+		// shadow a core or imported name by typo.
+		assoc = namespaceAtPutObject(activeNs, name, Handles.nil);
+		bindAssociation(blockScope, name, assoc);
 		return 1;
 	}
 	return 0;
@@ -614,16 +638,25 @@ static _Bool analyzeGlobalVar(BlockScope *blockScope, String *name)
 static _Bool analyzeDictionaryVar(BlockScope *blockScope, Dictionary *dict, String *name)
 {
 	Association *assoc = symbolDictAssocAt(dict, asSymbol(name));
-	Value var;
 
 	if (isNil(assoc)) {
 		return 0;
 	} else {
-		OrderedCollection *literals = blockScopeGetLiterals(blockScope);
-		var = defineVariable(OPERAND_ASSOC, ordCollAddObjectIfNotExists(literals, (Object *) assoc), 0);
-		stringDictAtPut(blockScopeGetVars(blockScope), name, var);
+		bindAssociation(blockScope, name, assoc);
 		return 1;
 	}
+}
+
+
+// Bind a resolved variable Association into the method's literal pool: this
+// is the Smalltalk-80 binding model, reads and stores go through the
+// Association's value slot, so a later installClass fills earlier-compiled
+// references in place.
+static void bindAssociation(BlockScope *blockScope, String *name, Association *assoc)
+{
+	OrderedCollection *literals = blockScopeGetLiterals(blockScope);
+	Value var = defineVariable(OPERAND_ASSOC, ordCollAddObjectIfNotExists(literals, (Object *) assoc), 0);
+	stringDictAtPut(blockScopeGetVars(blockScope), name, var);
 }
 
 

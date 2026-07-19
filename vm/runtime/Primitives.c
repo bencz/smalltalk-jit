@@ -1,5 +1,6 @@
 #include "runtime/Primitives.h"
 #include "jit/CodeGenerator.h"
+#include "jit/InlineCache.h"
 #include "core/Object.h"
 #include "core/Class.h"
 #include "memory/Heap.h"
@@ -99,6 +100,13 @@ static PrimitiveResult parserAtEndPrimitive(Value receiver);
 static PrimitiveResult buildClassPrimitive(Value receiver, Value vNode);
 static PrimitiveResult compileMethodPrimitive(Value receiver, Value vNode, Value class);
 static PrimitiveResult collectGarbagePrimitive(Value receiver);
+static PrimitiveResult flushSendCachesPrimitive(Value receiver);
+static PrimitiveResult executablePathPrimitive(Value receiver);
+static PrimitiveResult classRemoveSelectorPrimitive(Value receiver, Value vSelector);
+static PrimitiveResult buildClassInPrimitive(Value receiver, Value vNode, Value vNs);
+static PrimitiveResult compileMethodInPrimitive(Value receiver, Value vNode, Value class, Value vNs);
+static PrimitiveResult defaultNamespacePrimitive(Value receiver);
+static PrimitiveResult setDefaultNamespacePrimitive(Value receiver, Value vNs);
 static PrimitiveResult printHeapPrimitive(Value receiver);
 static PrimitiveResult lastGcStatsPrimitive(Value receiver);
 static PrimitiveResult processSpawnPrimitive(Value block);
@@ -413,6 +421,22 @@ Primitive Primitives[] = {
 	{"FileGetCwdPrimitive", CCALL, .cFunction = fileGetCwdPrimitive, 1},
 	{"FileChdirPrimitive", CCALL, .cFunction = fileChdirPrimitive, 2},
 	{"FileRealpathPrimitive", CCALL, .cFunction = fileRealpathPrimitive, 2},
+	// Appended (NEVER reorder this table): send-cache invalidation for
+	// reflective method-dictionary surgery (jit/InlineCache.h). Class builds,
+	// redefinitions and extensions invalidate automatically; this is the
+	// manual escape hatch.
+	{"FlushSendCachesPrimitive", CCALL, .cFunction = flushSendCachesPrimitive, 1},
+	// Appended (NEVER reorder this table): namespace-aware compilation for
+	// the package loader (vm/core/Namespace.h) and the session default
+	// namespace that eval/parseFile compile against.
+	{"BuildClassInPrimitive", CCALL, .cFunction = buildClassInPrimitive, 3},
+	{"CompileMethodInPrimitive", CCALL, .cFunction = compileMethodInPrimitive, 4},
+	{"DefaultNamespacePrimitive", CCALL, .cFunction = defaultNamespacePrimitive, 1},
+	{"SetDefaultNamespacePrimitive", CCALL, .cFunction = setDefaultNamespacePrimitive, 2},
+	{"ExecutablePathPrimitive", CCALL, .cFunction = executablePathPrimitive, 1},
+	// Appended (NEVER reorder this table): dev-reload surgery behind
+	// Behavior>>removeSelector:, invalidating like extend/redefine do.
+	{"ClassRemoveSelectorPrimitive", CCALL, .cFunction = classRemoveSelectorPrimitive, 2},
 };
 
 
@@ -1641,8 +1665,14 @@ static void freeParserWithinParserObject(ParserObject *parserObj, Parser *parser
 		ASSERT(parser->tokenizer.isFile);
 		FileStream *stream = scopeHandle(asObject(parserObj->raw->stream));
 		FILE *file = parser->tokenizer.source.file;
-		streamSetPosition(asCInt(stream->raw->descriptor), currentToken(&parser->tokenizer)->position - 1);
+		size_t restart = currentToken(&parser->tokenizer)->position - 1;
+		// fclose FIRST: the FILE* wraps a dup of the stream's descriptor, so
+		// they SHARE one file offset, and closing a read FILE* seeks that
+		// offset back to its own buffered logical position. Restoring before
+		// the fclose let that sync silently clobber the restart position,
+		// which broke the second parseClass of any multi-class file.
 		fclose(file);
+		streamSetPosition(asCInt(stream->raw->descriptor), restart);
 	}
 	freeParser(parser);
 }
@@ -1675,6 +1705,66 @@ static PrimitiveResult buildClassPrimitive(Value receiver, Value vNode)
 }
 
 
+static PrimitiveResult buildClassInPrimitive(Value receiver, Value vNode, Value vNs)
+{
+	HandleScope scope;
+	openHandleScope(&scope);
+
+	ClassNode *node = scopeHandle(asObject(vNode));
+	Namespace *ns = scopeHandle(asObject(vNs));
+	if (node->raw->class != Handles.ClassNode->raw
+			|| ns->raw->class != Handles.Namespace->raw) {
+		closeHandleScope(&scope, NULL);
+		return primFailed();
+	}
+	Object *class = buildClassIn(node, ns);
+	Value result = getTaggedPtr(class);
+	closeHandleScope(&scope, NULL);
+	return primSuccess(result);
+}
+
+
+static PrimitiveResult compileMethodInPrimitive(Value receiver, Value vNode, Value class, Value vNs)
+{
+	HandleScope scope;
+	openHandleScope(&scope);
+
+	MethodNode *node = scopeHandle(asObject(vNode));
+	Namespace *ns = scopeHandle(asObject(vNs));
+	if (node->raw->class != Handles.MethodNode->raw
+			|| ns->raw->class != Handles.Namespace->raw) {
+		closeHandleScope(&scope, NULL);
+		return primFailed();
+	}
+	Value result = getTaggedPtr(compileMethodIn(node, scopeHandle(asObject(class)), ns));
+	closeHandleScope(&scope, NULL);
+	return primSuccess(result);
+}
+
+
+static PrimitiveResult defaultNamespacePrimitive(Value receiver)
+{
+	return primSuccess(Handles.DefaultNamespace->raw->value);
+}
+
+
+static PrimitiveResult setDefaultNamespacePrimitive(Value receiver, Value vNs)
+{
+	HandleScope scope;
+	openHandleScope(&scope);
+
+	Namespace *ns = scopeHandle(asObject(vNs));
+	if (ns->raw->class != Handles.Namespace->raw) {
+		closeHandleScope(&scope, NULL);
+		return primFailed();
+	}
+	objectStorePtr((Object *) Handles.DefaultNamespace,
+		&Handles.DefaultNamespace->raw->value, (Object *) ns);
+	closeHandleScope(&scope, NULL);
+	return primSuccess(receiver);
+}
+
+
 static PrimitiveResult compileMethodPrimitive(Value receiver, Value vNode, Value class)
 {
 	HandleScope scope;
@@ -1695,6 +1785,53 @@ static PrimitiveResult collectGarbagePrimitive(Value receiver)
 {
 	collectGarbage(&CurrentThread);
 	return primSuccess(receiver);
+}
+
+
+static PrimitiveResult flushSendCachesPrimitive(Value receiver)
+{
+	icInvalidateAllSends(NULL, NULL);
+	return primSuccess(receiver);
+}
+
+
+static PrimitiveResult classRemoveSelectorPrimitive(Value receiver, Value vSelector)
+{
+	HandleScope scope;
+	openHandleScope(&scope);
+
+	Object *holder = scopeHandle(asObject(receiver));
+	String *selector = scopeHandle(asObject(vSelector));
+	// receiver must be a Class (its class is a metaclass) or a MetaClass
+	_Bool isClass = holder->raw->class != NULL
+		&& holder->raw->class->class == Handles.MetaClass->raw;
+	_Bool isMetaClass = holder->raw->class == Handles.MetaClass->raw;
+	if ((!isClass && !isMetaClass)
+			|| (selector->raw->class != Handles.Symbol->raw
+				&& selector->raw->class != Handles.String->raw)) {
+		closeHandleScope(&scope, NULL);
+		return primFailed();
+	}
+	if (!classRemoveSelector(holder, selector)) {
+		closeHandleScope(&scope, NULL);
+		return primFailed();
+	}
+	closeHandleScope(&scope, NULL);
+	return primSuccess(receiver);
+}
+
+
+static PrimitiveResult executablePathPrimitive(Value receiver)
+{
+	char buffer[4096];
+	if (!osExecutablePath(buffer, sizeof(buffer))) {
+		return primFailed();
+	}
+	HandleScope scope;
+	openHandleScope(&scope);
+	Value result = getTaggedPtr(asString(buffer));
+	closeHandleScope(&scope, NULL);
+	return primSuccess(result);
 }
 
 

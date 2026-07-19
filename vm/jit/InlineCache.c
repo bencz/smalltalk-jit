@@ -204,6 +204,55 @@ void icResetNativeCodeCells(struct NativeCode *code)
 // concurrently and is simply skipped (the next sweep evens it out). Peers
 // with a stale TLS LookupCache may rebind a retired cell back to the old
 // entry until their next epoch flush: documented staleness, not corruption.
+// Install-time invalidation for method-dictionary mutation: class
+// redefinition, additive extension, selector removal. Closes the staleness
+// window icResetNativeCodeCells documents (method ADDITION invalidated
+// nothing between scavenges). Stop the world exactly like objectBecome
+// (core/Smalltalk.c): gcLock + safepoint park of every peer, run the caller's
+// mutation on the frozen graph, then reset EVERY class-keyed IC cell in the
+// exec space (satisfying icResetNativeCodeCells' STW-only precondition) and
+// bump gcEpoch so parked peers flush their TLS LookupCaches on resume
+// (lookupCacheOnGcResume); the calling worker flushes its own before
+// resuming the world. Mega cells stay mega: their class-independent probe
+// re-resolves through the flushed lookup path. The mutation callback MUST
+// NOT allocate: the world is stopped with gcLock held.
+void icInvalidateAllSends(void (*mutate)(void *ctx), void *ctx)
+{
+	Heap *heap = CurrentThread.heap;
+	_Bool multi = (heap->mutators != NULL && heap->mutators->nextMutator != NULL);
+	heapGcEnterBlocked(heap, &CurrentThread);
+	pthread_mutex_lock(&heap->gcLock);
+	heapGcLeaveBlocked(heap, &CurrentThread);
+	if (multi) {
+		heapGcBegin(heap, &CurrentThread);
+	}
+	heapFillAllTlabTails(heap);
+
+	if (mutate != NULL) {
+		mutate(ctx);
+	}
+
+	PageSpaceIterator iterator;
+	pageSpaceIteratorInit(&iterator, &heap->execSpace);
+	NativeCode *code = (NativeCode *) pageSpaceIteratorNext(&iterator);
+	while (code != NULL) {
+		if ((code->tags & TAG_FREESPACE) == 0) {
+			icResetNativeCodeCells((struct NativeCode *) code);
+		}
+		code = (NativeCode *) pageSpaceIteratorNext(&iterator);
+	}
+
+	heap->gcEpoch++; // parked peers epoch-flush their TLS LookupCaches on resume
+	CurrentThread.lookupCacheEpoch = heap->gcEpoch;
+	flushLookupCache();
+
+	if (multi) {
+		heapGcEnd(heap);
+	}
+	pthread_mutex_unlock(&heap->gcLock);
+}
+
+
 void icRetireCellsTargeting(struct NativeCode *oldCode)
 {
 	uint8_t *entry = ((NativeCode *) oldCode)->insts;

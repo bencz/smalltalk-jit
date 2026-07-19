@@ -119,7 +119,9 @@ void printParseError(Parser *parser, char *filename)
 
 
 /**
- * classHeader := identifier "subclass:" identifier "[" pragmas vars
+ * class := identifier ":=" identifier "[" pragmas vars methods "]"
+ *        | identifier "extend" "[" methods "]"
+ *        | identifier ":=" "Namespace" "[" classes "]"
  */
 ClassNode *parseClass(Parser *parser)
 {
@@ -135,10 +137,47 @@ ClassNode *parseClass(Parser *parser)
 	EXPECT_TOKEN(TOKEN_IDENTIFIER, closeHandleScope(&scope, NULL));
 	classNodeSetName(class, parseVariable(parser));
 
+	// `Name extend [ methods ]`: additive extension of an existing class.
+	// No superclass, no pragmas, no variable section: an extension cannot
+	// change the target's shape by construction.
+	if (currentToken(&parser->tokenizer)->type == TOKEN_IDENTIFIER
+			&& strcmp(currentToken(&parser->tokenizer)->content, "extend") == 0) {
+		classNodeSetIsExtension(class, 1);
+		classNodeSetPragmas(class, newOrdColl(0));
+		classNodeSetVars(class, newOrdColl(0));
+		nextToken(&parser->tokenizer);
+
+		SKIP_TOKEN(TOKEN_OPEN_SQUARE_BRACKET, closeHandleScope(&scope, NULL));
+		CATCH(tmp = parseMethods(parser), closeHandleScope(&scope, NULL));
+		classNodeSetMethods(class, tmp);
+		SKIP_TOKEN(TOKEN_CLOSE_SQUARE_BRACKET, closeHandleScope(&scope, NULL));
+		computeSourceCodeSize(sourceCode, parser);
+		return closeHandleScope(&scope, class);
+	}
+	classNodeSetIsExtension(class, 0);
+
 	SKIP_TOKEN(TOKEN_ASSIGN, closeHandleScope(&scope, NULL));
 
 	EXPECT_TOKEN(TOKEN_IDENTIFIER, closeHandleScope(&scope, NULL));
 	classNodeSetSuperName(class, parseVariable(parser));
+
+	// `Name := Namespace [ classDefs ]` declares (or reopens) a namespace and
+	// compiles the enclosed class definitions into it. Like the "nil"
+	// superclass of the metacircular roots, the name Namespace is recognized
+	// in this one position; a class subclassing the Namespace mirror class is
+	// not expressible by syntax.
+	if (stringEqualsC(literalNodeGetStringValue(classNodeGetSuperName(class)), "Namespace")) {
+		OrderedCollection *members = newOrdColl(16);
+		classNodeSetMembers(class, members);
+		SKIP_TOKEN(TOKEN_OPEN_SQUARE_BRACKET, closeHandleScope(&scope, NULL));
+		while (currentToken(&parser->tokenizer)->type == TOKEN_IDENTIFIER) {
+			CATCH(ClassNode *member = parseClass(parser), closeHandleScope(&scope, NULL));
+			ordCollAddObject(members, (Object *) member);
+		}
+		SKIP_TOKEN(TOKEN_CLOSE_SQUARE_BRACKET, closeHandleScope(&scope, NULL));
+		computeSourceCodeSize(sourceCode, parser);
+		return closeHandleScope(&scope, class);
+	}
 
 	SKIP_TOKEN(TOKEN_OPEN_SQUARE_BRACKET, closeHandleScope(&scope, NULL));
 

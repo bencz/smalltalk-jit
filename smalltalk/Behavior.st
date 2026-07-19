@@ -67,6 +67,16 @@ Behavior := Object [
 	]
 
 
+	removeSelector: aSymbol [
+		"Remove aSymbol from the receiver's OWN method dictionary, under a
+		 full send-cache invalidation (dev reload; the additive counterpart is
+		 the `Name extend [ ... ]` syntax). Signals when the selector is not
+		 defined here."
+		<primitive: ClassRemoveSelectorPrimitive>
+		(NotFoundError value: aSymbol) signal
+	]
+
+
 	"testing class hierarchy"
 
 	inheritsFrom: aClass [

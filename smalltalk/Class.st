@@ -1,12 +1,25 @@
 Class := ClassDescription [
 
-	| name comment category classVariables |
+	| name comment category classVariables namespace |
 
 
 	"accessing"
 
 	name [
 		^name
+	]
+
+
+	namespace [
+		^namespace
+	]
+
+
+	qualifiedName [
+		"NsName.ClassName for a class living outside Core; the plain name for
+		 kernel classes."
+		(namespace isNil or: [namespace == (Namespaces at: #Core)]) ifTrue: [^name].
+		^namespace name, '.', name
 	]
 
 
@@ -23,7 +36,7 @@ Class := ClassDescription [
 	"printing"
 
 	printOn: aStream [
-		aStream nextPutAll: name.
+		aStream nextPutAll: self qualifiedName.
 	]
 
 ]

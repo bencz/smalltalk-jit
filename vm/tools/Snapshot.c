@@ -273,9 +273,16 @@ static void registerBuiltinObjects(Snapshot *snapshot)
 {
 	Object **handle = (Object **) &Handles.nil;
 	Object **end = handle + sizeof(Handles) / sizeof(*handle);
+	int64_t position = 0;
 
 	while (handle < end) {
-		registerObject(snapshot, (*handle)->raw, 0);
+		SnapshotAssoc *assoc = registerObject(snapshot, (*handle)->raw, 0);
+		// The read side rebuilds Handles positionally (createBuiltinObjectsHandles:
+		// field i <- snapshot ID i), which only holds while every Handles field is
+		// a DISTINCT object: a duplicate raw collapses to one ID here and silently
+		// shifts the mapping for every later field. Fail at image-write time.
+		ASSERT(assoc->value == position);
+		position++;
 		handle++;
 	}
 }
@@ -304,6 +311,11 @@ static SnapshotAssoc *registerObject(Snapshot *snapshot, RawObject *object, _Boo
 }
 
 
+// AOT seam: `Snapshot.file` is the ONLY FILE* coupling of the read path
+// (readObject/readField/readInt64 all funnel through fread on it). The
+// planned embed-in-executable feature needs snapshotReadFromMemory(buffer,
+// size); route these reads through a tiny reader indirection (file vs memory
+// cursor) when building it, a mechanical refactor by design.
 void snapshotRead(FILE *file)
 {
 	Snapshot snapshot;

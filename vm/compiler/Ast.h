@@ -19,6 +19,9 @@ typedef struct
 	Value vars;
 	Value methods;
 	Value sourceCode;
+	Value isExtension; // true for `Name extend [ ... ]` (no super, no vars)
+	Value members;     // `Name := Namespace [ ... ]`: OrderedCollection of the
+	                   // enclosed ClassNodes; nil for ordinary class nodes
 } RawClassNode;
 OBJECT_HANDLE(ClassNode);
 
@@ -96,6 +99,11 @@ static void classNodeSetMethods(ClassNode *class, OrderedCollection *methods);
 static OrderedCollection *classNodeGetMethods(ClassNode *class);
 static void classNodeSetSourceCode(ClassNode *class, SourceCode *sourceCode);
 static SourceCode *classNodeGetSourceCode(ClassNode *class);
+static void classNodeSetIsExtension(ClassNode *class, _Bool isExtension);
+static _Bool classNodeIsExtension(ClassNode *class);
+static void classNodeSetMembers(ClassNode *class, OrderedCollection *members);
+static OrderedCollection *classNodeGetMembers(ClassNode *class);
+static _Bool classNodeIsNamespace(ClassNode *class);
 
 static void methodNodeSetClassName(MethodNode *method, String *className);
 static String *methodNodeGetClassName(MethodNode *method);
@@ -169,6 +177,36 @@ static void classNodeSetName(ClassNode *class, LiteralNode *name)
 static LiteralNode *classNodeGetName(ClassNode *class)
 {
 	return (LiteralNode *) scopeHandle(asObject(class->raw->name));
+}
+
+
+static void classNodeSetIsExtension(ClassNode *class, _Bool isExtension)
+{
+	objectStorePtr((Object *) class,  &class->raw->isExtension, asBool(isExtension));
+}
+
+
+static _Bool classNodeIsExtension(ClassNode *class)
+{
+	return asObject(class->raw->isExtension) == Handles.true->raw;
+}
+
+
+static void classNodeSetMembers(ClassNode *class, OrderedCollection *members)
+{
+	objectStorePtr((Object *) class,  &class->raw->members, (Object *) members);
+}
+
+
+static OrderedCollection *classNodeGetMembers(ClassNode *class)
+{
+	return (OrderedCollection *) scopeHandle(asObject(class->raw->members));
+}
+
+
+static _Bool classNodeIsNamespace(ClassNode *class)
+{
+	return !isTaggedNil(class->raw->members);
 }
 
 

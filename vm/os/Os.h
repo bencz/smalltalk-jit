@@ -102,6 +102,17 @@ void osInstallSegvHandler(_Bool (*cb)(uintptr_t faultAddr));
 // Writing to a peer-closed fd must return EPIPE, not kill the process.
 void osIgnoreBrokenPipe(void);
 
+// ---- process ----------------------------------------------------------------
+
+// Absolute path of the running executable, NUL-terminated into buffer.
+// Returns 1 on success, 0 when the platform cannot tell or the path does not
+// fit (buffer contents are then undefined). Used to anchor the default
+// snapshot and the distributed package store next to the installed binary.
+// PORT_ME(exe-path): Linux reads /proc/self/exe; macOS _NSGetExecutablePath,
+// FreeBSD sysctl KERN_PROC_PATHNAME, Windows GetModuleFileName, AIX has no
+// reliable answer (return 0 and the callers fall back to CWD-relative paths).
+_Bool osExecutablePath(char *buffer, size_t size);
+
 // ---- scheduling ----------------------------------------------------------------
 
 // CPUs this process may actually run on — respects taskset/cgroup limits

@@ -116,6 +116,7 @@ if(ST_OS STREQUAL "linux")
 		vm/os/linux/OsCpu.c
 		vm/os/linux/OsEvents.c
 		vm/os/linux/OsMemory.c
+		vm/os/linux/OsProcess.c
 		vm/os/linux/OsRandom.c
 		vm/os/linux/OsSignals.c
 		vm/os/linux/OsTime.c)
@@ -184,6 +185,7 @@ set(vmSources
 	vm/core/Exception.c
 	vm/core/Handle.c
 	vm/core/Lookup.c
+	vm/core/Namespace.c
 	vm/core/Smalltalk.c
 	vm/core/StackFrame.c
 	vm/core/Thread.c

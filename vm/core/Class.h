@@ -10,6 +10,13 @@
 union CompiledMethod;
 
 Object *buildClass(ClassNode *node);
+// Build into `ns` (NULL = DefaultNamespace): superclass and shape names
+// resolve through the namespace chain, methods compile with it, and the
+// class installs into the namespace's own bindings.
+Object *buildClassIn(ClassNode *node, Namespace *ns);
+// Remove a selector from a Class/MetaClass's own method dictionary under a
+// full send-cache invalidation; 0 when the selector is not defined there.
+_Bool classRemoveSelector(Object *holder, String *selector);
 union CompiledMethod *lookupSelector(Class *startClass, String *selector);
 void printClassName(RawClass *class);
 static RawClass *getClassOf(Value value);
@@ -183,6 +190,18 @@ static void classSetClassVariables(Class *class, Dictionary *classVars)
 static Dictionary *classGetClassVariables(Class *class)
 {
 	return (Dictionary *) scopeHandle(asObject(class->raw->classVariables));
+}
+
+
+static void classSetNamespace(Class *class, Namespace *ns)
+{
+	objectStorePtr((Object *) class,  &class->raw->namespace, (Object *) ns);
+}
+
+
+static Namespace *classGetNamespace(Class *class)
+{
+	return (Namespace *) scopeHandle(asObject(class->raw->namespace));
 }
 
 

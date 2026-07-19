@@ -77,6 +77,7 @@ typedef struct RawClass {
 	Value comment;
 	Value category;
 	Value classVariables;
+	Value namespace; // home Namespace; nil or Core for kernel classes
 } RawClass;
 OBJECT_HANDLE(Class);
 
@@ -117,6 +118,20 @@ typedef struct {
 	Value value;
 } RawAssociation;
 OBJECT_HANDLE(Association);
+
+// A package's name universe: `bindings` maps Symbol -> Association exactly
+// like the core Smalltalk dictionary, `imports` lists the namespaces of the
+// package's DIRECT dependencies in manifest order. Resolution walks own
+// bindings, then imports (first import wins), then the core globals, which
+// every namespace sees implicitly (vm/core/Namespace.h). The Core namespace
+// wraps Handles.Smalltalk itself, same Dictionary identity.
+typedef struct {
+	OBJECT_HEADER;
+	Value name;     // Symbol
+	Value bindings; // Dictionary: Symbol -> Association
+	Value imports;  // Array of Namespace
+} RawNamespace;
+OBJECT_HANDLE(Namespace);
 
 typedef struct {
 	OBJECT_HEADER;

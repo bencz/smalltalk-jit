@@ -19,7 +19,13 @@
 // byte-swapping, the loader REFUSES a foreign-endian or legacy image with an
 // actionable message. See PORTING.md "endianness".
 #define SNAPSHOT_MAGIC "STIM"
-#define SNAPSHOT_FORMAT_VERSION 2
+// v3: SmalltalkHandles grew the namespace roots (Namespace, CoreNamespace,
+// Namespaces, DefaultNamespace) appended at the end of the struct.
+// v4: RawClass gained the `namespace` ivar and RawBlockScope the `namespace`
+// slot, so v3 class objects no longer match the C layout.
+// v5: RawClassNode gained `isExtension` and `members` (extend syntax and
+// namespace declarations).
+#define SNAPSHOT_FORMAT_VERSION 5
 #define SNAPSHOT_BYTE_ORDER_LITTLE 1
 #define SNAPSHOT_BYTE_ORDER_BIG 2
 

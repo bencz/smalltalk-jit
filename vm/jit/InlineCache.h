@@ -91,6 +91,9 @@ extern IcStats gIcStats;
 uint8_t *inlineCacheMiss(Value taggedClass, RawString *selector, IcCell *cell);
 void icResetNativeCodeCells(struct NativeCode *code); // STW collectors only
 void icRetireCellsTargeting(struct NativeCode *oldCode); // codegenLock holders only
+// STW bracket for method-dict mutation: parks peers, runs `mutate`, resets
+// every IC cell + flushes lookup caches. Callback must not allocate.
+void icInvalidateAllSends(void (*mutate)(void *ctx), void *ctx);
 void icPrintStats(void);
 
 

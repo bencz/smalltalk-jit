@@ -35,6 +35,14 @@ File := Object [
 	]
 
 
+	class realpath: aPath [
+		"The canonical absolute path (symlinks and dot segments resolved), or
+		 the path unchanged when the OS cannot resolve it."
+		<primitive: FileRealpathPrimitive>
+		^aPath
+	]
+
+
 	class modificationTime: aPath [
 		"The last-modified time as a DateTime, or nil when the path is missing."
 		| ms |

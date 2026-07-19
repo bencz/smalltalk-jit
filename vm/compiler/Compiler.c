@@ -59,11 +59,17 @@ static void printSourceCode(SourceCode *source);
 
 Object *compileMethod(MethodNode *node, Class *class)
 {
+	return compileMethodIn(node, class, NULL);
+}
+
+
+Object *compileMethodIn(MethodNode *node, Class *class, Namespace *ns)
+{
 	HandleScope scope;
 	openHandleScope(&scope);
 
 	Compiler compiler;
-	BlockScope *blockScope = analyzeMethod(node, class);
+	BlockScope *blockScope = analyzeMethodIn(node, class, ns);
 	Object *result;
 
 	if (blockScopeHasError(blockScope)) {

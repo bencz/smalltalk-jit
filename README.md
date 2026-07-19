@@ -67,6 +67,26 @@ One quirk to know early: the value of the last top-level block becomes the
 process exit code, so the `inject:into:` line above both prints 55 and exits
 with 55.
 
+Projects and packages
+---------------------
+
+The kernel is only the core; libraries live in packages (the shipped stdlib
+is `packages/Std.*`), and applications are packages with an entry point:
+
+```sh
+build/st new todo && cd todo     # package.st + src/Main.st + tests/
+build/st run                     # builds .stbuild/program.img if stale, runs Main main:
+build/st test                    # runs the project's testFiles
+build/st repl                    # REPL inside the project image
+```
+
+Dependencies are declared by name in `package.st` (`requires: 'Std.Http'`)
+and resolved against `ST_PACKAGE_PATH`, `~/.st/packages` and the `packages/`
+directory next to the executable; each package loads into its own namespace,
+importing its direct requirements, with the core visible everywhere. A
+package can also extend classes it can see (`String extend [ ... ]`).
+`docs/packages.md` and `docs/namespaces.md` have the details.
+
 Tests
 -----
 

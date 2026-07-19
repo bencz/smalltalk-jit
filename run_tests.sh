@@ -64,6 +64,21 @@ if ! "$BUILD/st" -s "$SNAP" -b smalltalk </dev/null >/dev/null 2>&1; then
 	echo "${R}BOOTSTRAP FAILED${Z}"; exit 1
 fi
 
+# The fat development image: core + every shipped Std.* package (devimage/).
+# Samples run against it, exactly like the pre-package era where everything
+# was in the kernel. Fresh core.img is always newer than the cached project
+# image, so this rebuilds every run (cheap, and the point of the gate).
+SNAP_ABS="$(cd "$(dirname "$SNAP")" && pwd)/$(basename "$SNAP")"
+ST_ABS="$(cd "$BUILD" && pwd)/st"
+DEVSNAP="$ROOT/devimage/.stbuild/program.img"
+echo "${B}building dev image (core + Std packages)...${Z}"
+if ! (cd devimage && ST_PACKAGE_PATH="$ROOT/packages" ST_IMAGE="$SNAP_ABS" \
+		"$ST_ABS" build >/dev/null 2>&1); then
+	echo "${R}DEV IMAGE BUILD FAILED${Z}"
+	(cd devimage && ST_PACKAGE_PATH="$ROOT/packages" ST_IMAGE="$SNAP_ABS" "$ST_ABS" build)
+	exit 1
+fi
+
 pass=0
 fail=0
 failed=""
@@ -126,6 +141,76 @@ else
 	pass=$((pass + 1))
 fi
 
+# Project tooling e2e gate: the whole st new/build/run/test flow against the
+# fresh image. Covers scaffold, build, the up-to-date fast path, staleness on
+# a touched source, entry-point exit-code propagation, requires-by-name
+# resolution through ST_PACKAGE_PATH, and st test fail counts.
+project_e2e() {
+	# the subshells cd around, so every path here must be absolute
+	local dir SNAP ST
+	SNAP="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+	ST="$(cd "$BUILD" && pwd)/st"
+	dir="$(cd "$BUILD" && pwd)/e2e-project"
+	rm -rf "$dir"
+	mkdir -p "$dir/roots/E2e.Lib/src"
+	printf 'PackageSpec new\n\tname: %s;\n\tfiles: #(%s);\n\tyourself\n' \
+		"'E2e.Lib'" "'src/Lib.st'" > "$dir/roots/E2e.Lib/package.st"
+	printf 'E2eGreeter := Object [\n\tclass greet [ ^%s ]\n]\n' "'lib says hi'" \
+		> "$dir/roots/E2e.Lib/src/Lib.st"
+	( cd "$dir" \
+		&& ST_IMAGE="$SNAP" "$ST" new hello >/dev/null 2>&1 \
+		&& cd hello \
+		&& ST_IMAGE="$SNAP" "$ST" build 2>&1 | grep -q "^built " \
+		&& ST_IMAGE="$SNAP" "$ST" build 2>&1 | grep -q "up to date" \
+		&& ST_IMAGE="$SNAP" "$ST" run 2>&1 | grep -q "hello from hello" \
+		&& ST_IMAGE="$SNAP" "$ST" test >/dev/null 2>&1 \
+		&& sed -i "s/\\^0/^7/" src/Main.st \
+		&& ST_IMAGE="$SNAP" "$ST" run >/dev/null 2>&1; [ $? -eq 7 ] ) || return 1
+	( cd "$dir/hello" \
+		&& sed -i "s/entry: #Main;/requires: 'E2e.Lib'; entry: #Main;/" package.st \
+		&& sed -i "s/\\^7/Transcript nextPutAll: E2eGreeter greet; lf. ^0/" src/Main.st \
+		&& ST_PACKAGE_PATH="$dir/roots" ST_IMAGE="$SNAP" "$ST" run 2>&1 | grep -q "lib says hi" \
+		&& sed -i "s/that: \\[true\\]/that: [false]/" tests/MainTest.st \
+		&& ST_PACKAGE_PATH="$dir/roots" ST_IMAGE="$SNAP" "$ST" test >/dev/null 2>&1; [ $? -eq 1 ] ) || return 1
+	return 0
+}
+if project_e2e "$SNAP"; then
+	printf "  ${G}pass${Z}  %s\n" "PROJECT_TOOLING_E2E"
+	pass=$((pass + 1))
+else
+	printf "  ${R}FAIL${Z}  %s\n" "PROJECT_TOOLING_E2E"
+	fail=$((fail + 1))
+	failed="$failed PROJECT_TOOLING_E2E"
+fi
+
+# The committed project samples must keep building and answering what
+# samples/projects/README.md promises: declared namespaces plus the
+# reflective listing (namespaces/), package modules with imports and
+# first-import-wins shadowing (modules/), and the minimal app (hello/).
+project_samples() {
+	rm -rf "$ROOT"/samples/projects/*/.stbuild "$ROOT"/samples/projects/modules/*/.stbuild
+	( cd "$ROOT/samples/projects/namespaces" \
+		&& ST_IMAGE="$SNAP_ABS" "$ST_ABS" run 2>&1 | grep -q "class format:" \
+		&& ST_IMAGE="$SNAP_ABS" "$ST_ABS" test >/dev/null 2>&1 ) || return 1
+	( cd "$ROOT/samples/projects/modules/app" \
+		&& ST_IMAGE="$SNAP_ABS" "$ST_ABS" run 2>&1 | grep -q "Plain.Formatter" \
+		&& ST_IMAGE="$SNAP_ABS" "$ST_ABS" test >/dev/null 2>&1 ) || return 1
+	( cd "$ROOT/samples/projects/hello" \
+		&& ST_IMAGE="$SNAP_ABS" "$ST_ABS" run 2>&1 | grep -q "hello from a project" ) || return 1
+	( cd "$ROOT/samples/projects/store" \
+		&& ST_IMAGE="$SNAP_ABS" "$ST_ABS" run 2>&1 | grep -q "totals agree" \
+		&& ST_IMAGE="$SNAP_ABS" "$ST_ABS" test >/dev/null 2>&1 ) || return 1
+	return 0
+}
+if project_samples; then
+	printf "  ${G}pass${Z}  %s\n" "PROJECT_SAMPLES"
+	pass=$((pass + 1))
+else
+	printf "  ${R}FAIL${Z}  %s\n" "PROJECT_SAMPLES"
+	fail=$((fail + 1))
+	failed="$failed PROJECT_SAMPLES"
+fi
+
 # Tier stats self-test (needs the image): first run proves the hot-method
 # recompile fires once and promoted guards carry the dispatches; the
 # ST_NO_TIER run proves the kill-switch zeroes the whole apparatus.
@@ -156,8 +241,12 @@ else
 	failed="$failed ST_TIER_STATS_TEST(INLINE_MAX=0)"
 fi
 
+# run_group <title> <image> <files...>: each file through the -f path against
+# the given image (core tests run on the core image; samples run on the fat
+# devimage so unqualified lib references resolve).
 run_group() {
 	local title="$1"; shift
+	local image="$1"; shift
 	echo ""
 	echo "${B}${title}${Z}"
 	local f base out
@@ -168,8 +257,9 @@ run_group() {
 		[ "$base" = "IcHammerTest.st" ] && continue   # OS-thread stress: sandboxed group below
 		[ "$base" = "TierHammerTest.st" ] && continue   # OS-thread stress: sandboxed group below
 		[ "$base" = "AtomicStressTest.st" ] && continue   # OS-thread stress: sandboxed group below
+		[ "$base" = "ExtendHammerTest.st" ] && continue   # OS-thread stress: sandboxed group below
 		[ "$base" = "06_business_card_server.st" ] && continue   # standalone server, runs forever
-		out="$(timeout 120 "$BUILD/st" -s "$SNAP" -f "$f" </dev/null 2>&1)"
+		out="$(timeout 120 "$BUILD/st" -s "$image" -f "$f" </dev/null 2>&1)"
 		if [ $? -eq 0 ]; then
 			printf "  ${G}pass${Z}  %s\n" "$base"
 			pass=$((pass + 1))
@@ -182,6 +272,30 @@ run_group() {
 	done
 }
 
+# Every shipped package's own tests, through the real st test flow (build the
+# lib if stale, compile its testFiles into <Name>Tests importing the package
+# and its direct deps, sum the fail counts).
+run_package_tests() {
+	echo ""
+	echo "${B}package tests (st test)${Z}"
+	local p name out
+	for p in packages/*/; do
+		[ -f "$p/package.st" ] || continue
+		name="$(basename "$p")"
+		out="$( (cd "$p" && ST_PACKAGE_PATH="$ROOT/packages" ST_IMAGE="$SNAP_ABS" \
+			timeout 300 "$ST_ABS" test) </dev/null 2>&1 )"
+		if [ $? -eq 0 ]; then
+			printf "  ${G}pass${Z}  %s\n" "$name"
+			pass=$((pass + 1))
+		else
+			printf "  ${R}FAIL${Z}  %s\n" "$name"
+			echo "$out" | sed 's/^/        /'
+			fail=$((fail + 1))
+			failed="$failed $name"
+		fi
+	done
+}
+
 # The hammers drive Worker parallel: (real OS threads); project rule after
 # the 2026-07-13 desktop freeze: run them PINNED inside a resource sandbox,
 # never loose. Falls back to bare taskset (or a plain run) where systemd-run
@@ -190,7 +304,7 @@ run_sandboxed_hammer() {
 	local f base out
 	echo ""
 	echo "${B}tests (sandboxed)${Z}"
-	for f in tests/IcHammerTest.st tests/TierHammerTest.st tests/AtomicStressTest.st; do
+	for f in tests/IcHammerTest.st tests/TierHammerTest.st tests/AtomicStressTest.st tests/ExtendHammerTest.st; do
 		base="$(basename "$f")"
 		if command -v systemd-run >/dev/null 2>&1; then
 			out="$(systemd-run --user --scope -q -p MemoryMax=6G -p TasksMax=300 \
@@ -214,12 +328,13 @@ run_sandboxed_hammer() {
 	done
 }
 
-[ "$RUN_TESTS" -eq 1 ] && run_group "tests" tests/*.st
+[ "$RUN_TESTS" -eq 1 ] && run_group "tests" "$SNAP" tests/*.st
+[ "$RUN_TESTS" -eq 1 ] && run_package_tests
 [ "$RUN_TESTS" -eq 1 ] && run_sandboxed_hammer
 if [ "$RUN_SAMPLES" -eq 1 ]; then
-	run_group "samples" samples/*.st
-	run_group "samples/advanced" samples/advanced/*.st
-	run_group "samples/concurrency" samples/concurrency/*.st
+	run_group "samples" "$DEVSNAP" samples/*.st
+	run_group "samples/advanced" "$DEVSNAP" samples/advanced/*.st
+	run_group "samples/concurrency" "$DEVSNAP" samples/concurrency/*.st
 fi
 
 # Benchmarks self-verify their results (a wrong sum raises), so they are a

@@ -13,6 +13,8 @@
 #include "core/Handle.h"
 #include "runtime/Iterator.h"
 #include "core/Assert.h"
+#include "core/Namespace.h"
+#include "compiler/Scope.h"
 #include <errno.h>
 
 static void initSmalltalkStubs(void);
@@ -36,7 +38,7 @@ static void initSmalltalkStubs(void)
 	openHandleScope(&scope);
 
 	Handles.nil = newStubObject(sizeof(struct { OBJECT_HEADER; }));
-	Class *metaClass = newStubMetaClass(FixedShape, 9);
+	Class *metaClass = newStubMetaClass(FixedShape, 10);
 
 	Handles.MetaClass = newStubClass(metaClass, FixedShape, 6);
 	Handles.UndefinedObject = newStubClass(metaClass, FixedShape, 0);
@@ -54,7 +56,7 @@ static void initSmalltalkStubs(void)
 	Handles.Association = newStubClass(metaClass, FixedShape, 2);
 	Handles.Dictionary = newStubClass(metaClass, FixedShape, 2);
 	Handles.OrderedCollection = newStubClass(metaClass, FixedShape, 3);
-	Handles.Class = newStubClass(metaClass, FixedShape, 9);
+	Handles.Class = newStubClass(metaClass, FixedShape, 10);
 	Handles.TypeFeedback = newStubClass(metaClass, FixedShape, 2);
 	Handles.CompiledMethod = newStubClass(metaClass, CompiledCodeShape, 6);
 	Handles.CompiledBlock = newStubClass(metaClass, CompiledCodeShape, 4);
@@ -66,10 +68,10 @@ static void initSmalltalkStubs(void)
 	Handles.BlockContext = newStubClass(metaClass, ContextShape, 5);
 	Handles.ExceptionHandler = newStubClass(metaClass, ExceptionHandlerShape, 2);
 	Handles.UnwindHandler = newStubClass(metaClass, UnwindHandlerShape, 3);
-	Handles.ClassNode = newStubClass(metaClass, FixedShape, 6);
+	Handles.ClassNode = newStubClass(metaClass, FixedShape, 8);
 	Handles.MethodNode = newStubClass(metaClass, FixedShape, 5);
 	Handles.BlockNode = newStubClass(metaClass, FixedShape, 5);
-	Handles.BlockScope = newStubClass(metaClass, FixedShape, 6);
+	Handles.BlockScope = newStubClass(metaClass, FixedShape, 7);
 	Handles.ExpressionNode = newStubClass(metaClass, FixedShape, 5);
 	Handles.MessageExpressionNode = newStubClass(metaClass, FixedShape, 3);
 	Handles.NilNode = newStubClass(metaClass, FixedShape, 2);
@@ -87,6 +89,7 @@ static void initSmalltalkStubs(void)
 	Handles.ReadonlyVariableError = newStubClass(metaClass, FixedShape, 2);
 	Handles.InvalidPragmaError = newStubClass(metaClass, FixedShape, 2);
 	Handles.IoError = newStubClass(metaClass, FixedShape, 1);
+	Handles.Namespace = newStubClass(metaClass, FixedShape, 3);
 
 	Handles.nil->raw->class = Handles.UndefinedObject->raw;
 	Handles.true = persistHandle(newObject(Handles.True, 0));
@@ -103,6 +106,21 @@ static void initSmalltalkStubs(void)
 	Handles.handlesSymbol = persistHandle(getSymbol("handles:"));
 	Handles.generateBacktraceSymbol = persistHandle(getSymbol("generateBacktrace"));
 	Handles.runHandledBySymbol = persistHandle(getSymbol("runHandledBy:"));
+
+	// The Core namespace WRAPS the core dictionary (same identity), sits in
+	// the registry under #Core, and starts as the default compile target.
+	// DefaultNamespace is an indirection CELL, never a second handle to the
+	// namespace object: Handles fields must stay distinct (see Handle.h).
+	Handles.Namespaces = persistHandle(newDictionary(16));
+	Handles.CoreNamespace = persistHandle(
+		newNamespace(getSymbol("Core"), Handles.Smalltalk, newArray(0)));
+	Association *defaultCell = (Association *) newObject(Handles.Association, 0);
+	objectStorePtr((Object *) defaultCell, &defaultCell->raw->key,
+		(Object *) getSymbol("DefaultNamespace"));
+	objectStorePtr((Object *) defaultCell, &defaultCell->raw->value,
+		(Object *) Handles.CoreNamespace);
+	Handles.DefaultNamespace = persistHandle(defaultCell);
+	symbolDictAtPutObject(Handles.Namespaces, getSymbol("Core"), (Object *) Handles.CoreNamespace);
 
 	setGlobalObject("UndefinedObject", (Object *) Handles.UndefinedObject);
 	setGlobalObject("nil", Handles.nil);
@@ -168,6 +186,8 @@ static void initSmalltalkStubs(void)
 	setGlobalObject("ReadonlyVariableError", (Object *) Handles.ReadonlyVariableError);
 	setGlobalObject("InvalidPragmaError", (Object *) Handles.InvalidPragmaError);
 	setGlobalObject("IoError", (Object *) Handles.IoError);
+	setGlobalObject("Namespace", (Object *) Handles.Namespace);
+	setGlobalObject("Namespaces", (Object *) Handles.Namespaces);
 	setGlobalObject("SymbolTable", (Object *) Handles.SymbolTable);
 	setGlobalObject("Smalltalk", (Object *) Handles.Smalltalk);
 
@@ -190,6 +210,7 @@ static Class *newStubClass(Class *metaClass, InstanceShape shape, size_t instanc
 	objectStorePtr((Object *) class,  &class->raw->comment, (Object *) Handles.nil);
 	objectStorePtr((Object *) class,  &class->raw->category, (Object *) Handles.nil);
 	objectStorePtr((Object *) class,  &class->raw->classVariables, (Object *) Handles.nil);
+	objectStorePtr((Object *) class,  &class->raw->namespace, (Object *) Handles.nil);
 	return class;
 }
 
@@ -284,6 +305,7 @@ static _Bool parseKernelFiles(char *kernelDir)
 		"Collections/Queue.st",
 		"Collections/Heap.st",
 		"Random.st",
+		"Namespace.st",
 		"CompiledCode.st",
 		"CompiledBlock.st",
 		"CompiledMethod.st",
@@ -308,15 +330,8 @@ static _Bool parseKernelFiles(char *kernelDir)
 		"Streams/ServerSocket.st",
 		"Streams/InternetAddress.st",
 
-		// HTTP framework (server + client) on top of the non-blocking sockets.
-		// (Json is referenced only inside method BODIES here — late-bound — so it
-		// can load later, after the exception hierarchy its error classes need.)
-		"Http/HttpRequest.st",
-		"Http/HttpConnection.st",
-		"Http/HttpResponse.st",
-		"Http/HttpRouter.st",
-		"Http/HttpServer.st",
-		"Http/HttpClient.st",
+		// The HTTP framework moved out of the kernel: packages/Std.Http/,
+		// loaded on demand by the package system (devimage/ for the dev image).
 
 		"GarbageCollector.st",
 
@@ -335,17 +350,7 @@ static _Bool parseKernelFiles(char *kernelDir)
 		"Concurrency/SharedDictionary.st", // thread-safe collection for shared state under the pool
 		"Concurrency/ConcurrentDictionary.st", // read-mostly, lock-free reads (actor registry / id->pid maps)
 
-		// actor framework (ProtoActor-style)
-		"Actors/SystemMessages.st",
-		"Actors/Pid.st",
-		"Actors/Mailbox.st",
-		"Actors/Actor.st",
-		"Actors/Supervision.st",
-		"Actors/Props.st",
-		"Actors/ActorContext.st",
-		"Actors/Future.st",
-		"Actors/DeadLetters.st",
-		"Actors/ActorSystem.st",
+		// The actor framework moved out of the kernel: packages/Std.Actors/.
 
 		"Exception.st",
 		"HandlerEscape.st",
@@ -365,9 +370,8 @@ static _Bool parseKernelFiles(char *kernelDir)
 		"SubClassResponsibility.st",
 		"IoError.st",
 
-		// general-purpose JSON codec (used by the HTTP framework, but standalone);
-		// after the exception classes: JsonError/JsonParseError subclass Error
-		"Json.st",
+		// The JSON codec moved out of the kernel: packages/Std.Json (its C
+		// primitives stay registered in the VM and resolve by name).
 
 		"Parser/ParseError.st",
 		"Parser/Parser.st",
@@ -408,8 +412,15 @@ static _Bool parseKernelFiles(char *kernelDir)
 		"Files/Path.st",
 		"Files/File.st",
 		"Files/Directory.st",
-		"Uuid.st",
-		"Base64.st",
+		// Uuid and Base64 moved out of the kernel: packages/Std.Uuid,
+		// packages/Std.Base64.
+
+		// package system tooling (manifest, loader, CLI driver): core so that
+		// st build can run it on top of the base image
+		"Packages/PackageRequirement.st",
+		"Packages/PackageSpec.st",
+		"Packages/PackageLoader.st",
+		"Packages/ProjectTool.st",
 	};
 
 	HandleScope scope;
@@ -425,6 +436,7 @@ static _Bool parseKernelFiles(char *kernelDir)
 	arrayAtPutObject(classInstanceVariables, 6, (Object *) asString("comment"));
 	arrayAtPutObject(classInstanceVariables, 7, (Object *) asString("category"));
 	arrayAtPutObject(classInstanceVariables, 8, (Object *) asString("classVariables"));
+	arrayAtPutObject(classInstanceVariables, 9, (Object *) asString("namespace"));
 	classSetInstanceVariables(Handles.Class, classInstanceVariables);
 
 	size_t kernelDirNameSize = strlen(kernelDir);
@@ -455,6 +467,18 @@ static _Bool parseKernelFiles(char *kernelDir)
 		}
 		closeHandleScope(&scope2, NULL);
 	}
+
+	// Layout drift guards for VM-known objects: the C struct, the bootstrap
+	// stub size and the .st mirror must agree. The mirror's ivar count landed
+	// in instanceShape.varsSize when its class definition rebuilt the stub.
+	ASSERT(classGetInstanceShape(Handles.Namespace).varsSize
+		== (sizeof(RawNamespace) - HEADER_SIZE) / sizeof(Value));
+	ASSERT(classGetInstanceShape(Handles.Class).varsSize
+		== (sizeof(RawClass) - HEADER_SIZE) / sizeof(Value));
+	ASSERT(classGetInstanceShape(Handles.BlockScope).varsSize
+		== (sizeof(RawBlockScope) - HEADER_SIZE) / sizeof(Value));
+	ASSERT(classGetInstanceShape(Handles.ClassNode).varsSize
+		== (sizeof(RawClassNode) - HEADER_SIZE) / sizeof(Value));
 
 	closeHandleScope(&scope, NULL);
 	return 1;

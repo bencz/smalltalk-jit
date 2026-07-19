@@ -116,6 +116,18 @@ typedef struct SmalltalkHandles {
 	String *handlesSymbol;
 	String *generateBacktraceSymbol;
 	String *runHandledBySymbol;
+	// Namespace machinery (vm/core/Namespace.h). APPEND ONLY from here on:
+	// the snapshot serializes this struct positionally, and every field must
+	// be a DISTINCT object (registerBuiltinObjects asserts it): two fields
+	// sharing one raw would collapse to one snapshot ID and shift the
+	// positional rebuild for every later field.
+	Class *Namespace;
+	Namespace *CoreNamespace;         // #Core, bindings == Handles.Smalltalk
+	Dictionary *Namespaces;           // registry: Symbol name -> Namespace
+	// Indirection cell (an Association, value = the active default namespace)
+	// rather than a second handle to the namespace itself, honoring the
+	// distinct-object rule above. Read via defaultNamespace().
+	Association *DefaultNamespace;
 } SmalltalkHandles;
 
 // The well-known handles are per-HEAP (shared by all worker OS threads of a heap),

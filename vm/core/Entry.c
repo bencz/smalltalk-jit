@@ -9,6 +9,7 @@
 #include "runtime/Iterator.h"
 #include "memory/Heap.h"
 #include "core/Smalltalk.h"
+#include "core/Namespace.h"
 #include "core/Thread.h"
 #include <string.h>
 #include <errno.h>
@@ -104,7 +105,7 @@ Value evalCode(char *source)
 	}
 
 	patchMethodNode(node);
-	Object *method = compileMethod(node, Handles.UndefinedObject);
+	Object *method = compileMethodIn(node, Handles.UndefinedObject, defaultNamespace());
 	if (method->raw->class == Handles.CompiledMethod->raw) {
 		EntryArgs args = { .size = 0 };
 		entryArgsAddObject(&args, Handles.nil);
@@ -150,7 +151,7 @@ Value evalObject(char *source)
 	Value result = tagInt(0);
 	if (node != NULL) {
 		patchMethodNode(node);
-		Object *method = compileMethod(node, Handles.UndefinedObject);
+		Object *method = compileMethodIn(node, Handles.UndefinedObject, defaultNamespace());
 		if (method->raw->class == Handles.CompiledMethod->raw) {
 			EntryArgs args = { .size = 0 };
 			entryArgsAddObject(&args, Handles.nil);
@@ -266,7 +267,10 @@ _Bool parseFile(char *filename, OrderedCollection *classes, OrderedCollection *b
 				return 0;
 			}
 
-			if (classes != NULL) {
+			// extensions and namespace declarations initialize nothing here:
+			// extensions add methods to an EXISTING class, and a namespace
+			// declaration initializes its own members itself
+			if (classes != NULL && !classNodeIsExtension(node) && !classNodeIsNamespace(node)) {
 				ordCollAddObject(classes, class);
 			}
 		}
@@ -321,7 +325,8 @@ _Bool parseSource(char *source, OrderedCollection *classes, OrderedCollection *b
 				closeHandleScope(&scope, NULL);
 				return 0;
 			}
-			if (classes != NULL) {
+			// extensions/namespace declarations initialize nothing here (see parseFile)
+			if (classes != NULL && !classNodeIsExtension(node) && !classNodeIsNamespace(node)) {
 				ordCollAddObject(classes, class);
 			}
 		}
@@ -379,7 +384,7 @@ static Value evalBlockNode(BlockNode *block)
 	methodNodeSetBody(node, block);
 	methodNodeSetSourceCode(node, blockNodeGetSourceCode(block));
 
-	Object *method = compileMethod(node, Handles.UndefinedObject);
+	Object *method = compileMethodIn(node, Handles.UndefinedObject, defaultNamespace());
 	if (method->raw->class == Handles.CompiledMethod->raw) {
 		EntryArgs args = { .size = 0 };
 		entryArgsAddObject(&args, Handles.nil);

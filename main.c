@@ -12,6 +12,8 @@
 #include "vm/core/Exception.h"
 #include "vm/os/Os.h"
 #include "vm/tools/Cli.h"
+#include "vm/tools/Project.h"
+#include "vm/memory/GarbageCollector.h"
 #include "vm/runtime/Primitives.h"
 #include "vm/jit/TargetCpu.h"
 #include "vm/jit/InlineCache.h"
@@ -32,6 +34,69 @@ typedef struct {
 } ProgramContext;
 
 
+// Pre-flight for the project subcommands, BEFORE any image I/O: build/run/
+// test require a project root (package.st found walking upward); repl runs
+// in the project when there is one and as the plain base REPL otherwise.
+static _Bool planProject(CliArgs *cliArgs, ProjectPlan *plan)
+{
+	char *subcommand = cliArgs->subcommand;
+	_Bool wantsProject = strcmp(subcommand, "build") == 0 || strcmp(subcommand, "run") == 0
+		|| strcmp(subcommand, "test") == 0 || strcmp(subcommand, "repl") == 0;
+	if (!wantsProject) {
+		return 1;
+	}
+	if (!projectFindRoot(plan->root, sizeof(plan->root))) {
+		if (strcmp(subcommand, "repl") == 0) {
+			return 1;
+		}
+		printf("st %s: no %s found from the current directory upward\n",
+			subcommand, PROJECT_MANIFEST);
+		return 0;
+	}
+	plan->hasProject = 1;
+	projectBuildPath(plan->image, sizeof(plan->image), plan->root, PROJECT_IMAGE);
+	plan->force = cliArgs->force;
+	plan->stale = plan->force || projectIsStale(plan->root, cliArgs->snapshotFileName);
+	return 1;
+}
+
+
+// st test: the image decides WHICH files run (ProjectTool prepareTests
+// answers newline-joined paths and points the session default namespace at
+// <Root>Tests); each file then goes through the exact -f path, so TestRun
+// test files work unchanged inside projects. Exit code = summed fail counts.
+static int runProjectTests(void)
+{
+	static char paths[65536];
+	if (!projectEvalToCString("ProjectTool prepareTests", paths, sizeof(paths))) {
+		return EXIT_FAILURE;
+	}
+	int total = 0;
+	char *cursor = paths;
+	while (*cursor != '\0') {
+		char *newline = strchr(cursor, '\n');
+		if (newline != NULL) {
+			*newline = '\0';
+		}
+		if (*cursor != '\0') {
+			printf("test %s\n", cursor);
+			fflush(stdout); // Smalltalk output below writes unbuffered
+			Value blockResult = tagInt(0);
+			if (!parseFileAndInitialize(cursor, &blockResult)) {
+				total += 1;
+			} else if (valueTypeOf(blockResult, VALUE_INT)) {
+				total += (int) asCInt(blockResult);
+			}
+		}
+		if (newline == NULL) {
+			break;
+		}
+		cursor = newline + 1;
+	}
+	return total;
+}
+
+
 // Runs the user program on the main fiber. Everything the program does
 // (compiling, evaluating, the REPL) executes as fiber #0 so that forked
 // processes can be scheduled cooperatively alongside it.
@@ -46,6 +111,21 @@ static void runProgram(void *arg)
 		ctx->result = EXIT_FAILURE;
 	} else if (cliArgs->printHelp) {
 		printCliHelp();
+	} else if (cliArgs->subcommand != NULL && strcmp(cliArgs->subcommand, "repl") != 0) {
+		// Project subcommands: thin eval bridges into ProjectTool
+		// (smalltalk/Packages/ProjectTool.st); `st repl` falls through to the
+		// ordinary REPL below, already inside the project image when one is
+		// loaded. Uncaught errors still poison the exit code through the
+		// scheduler's unhandled-error accounting.
+		if (strcmp(cliArgs->subcommand, "new") == 0) {
+			ctx->result = projectEvalToInt("ProjectTool scaffold");
+		} else if (strcmp(cliArgs->subcommand, "run") == 0) {
+			ctx->result = projectEvalToInt("ProjectTool run");
+		} else if (strcmp(cliArgs->subcommand, "test") == 0) {
+			ctx->result = runProjectTests();
+		} else {
+			ctx->result = EXIT_FAILURE;
+		}
 	} else if (cliArgs->fileName != NULL) {
 		Value blockResult;
 		if (parseFileAndInitialize(cliArgs->fileName, &blockResult)) {
@@ -76,10 +156,37 @@ int main(int argc, char **args)
 	targetCpuDetect();
 
 	parseCliArgs(&cliArgs, argc, args);
+	resolveSnapshotPath(&cliArgs);
+
+	// Subcommand early dispatch (vm/tools/Cli.h). `st help`, argument errors
+	// and the project pre-flight (root discovery + staleness) all answer
+	// before any image is loaded; `st build` on a fresh project never boots a
+	// heap at all.
+	ProjectPlan plan = { 0 };
+	if (cliArgs.subcommand != NULL) {
+		if (cliArgs.error != NULL) {
+			printf(cliArgs.error, cliArgs.operand);
+			printf("\n");
+			return EXIT_FAILURE;
+		}
+		if (strcmp(cliArgs.subcommand, "help") == 0) {
+			printCliHelp();
+			return EXIT_SUCCESS;
+		}
+		if (!planProject(&cliArgs, &plan)) {
+			return EXIT_FAILURE;
+		}
+		if (strcmp(cliArgs.subcommand, "build") == 0 && !plan.stale) {
+			printf("up to date\n");
+			return EXIT_SUCCESS;
+		}
+	}
 
 	// Script-visible command line (CommandLinePrimitive): everything left after
-	// the options, e.g. `st -f prog.st alpha beta` -> #('alpha' 'beta').
-	primitivesSetCommandLine(argc - optind, args + optind);
+	// the subcommand word (if any) and the options, e.g. `st -f prog.st alpha
+	// beta` -> #('alpha' 'beta').
+	primitivesSetCommandLine(cliArgs.argcAdjusted - cliArgs.argShift - optind,
+		args + cliArgs.argShift + optind);
 
 	// The C-level self-test battery (ST_*_TEST env vars) lives in
 	// vm/tests/SelfTests.c; -1 means "no self-test requested".
@@ -91,7 +198,42 @@ int main(int argc, char **args)
 	}
 
 	initThread(&CurrentThread);
-	bootstrapSmalltalk(cliArgs.snapshotFileName, cliArgs.bootstrapDir);
+	// Project runs against a FRESH cache load the built project image; a stale
+	// (or first) build loads the base image and rebuilds below. Everything
+	// else loads the resolved base image.
+	{
+		char *image = cliArgs.snapshotFileName;
+		if (plan.hasProject && !plan.stale) {
+			image = plan.image;
+		}
+		bootstrapSmalltalk(image, cliArgs.bootstrapDir);
+	}
+
+	// Stale project: build PRE-scheduler, mirroring the -b bootstrap path, so
+	// the image is snapshotted with zero fibers ever started. ProjectTool
+	// build loads the package graph, records the entry point and the default
+	// namespace IN the image, and answers the output path; C then collects
+	// the builder transients and writes the snapshot. st run/test/repl
+	// continue in the same process on the freshly built in-memory image.
+	if (plan.hasProject && plan.stale) {
+		char out[PROJECT_PATH_MAX];
+		if (!projectEvalToCString("ProjectTool build", out, sizeof(out))) {
+			return EXIT_FAILURE; // the image already printed the build error
+		}
+		collectGarbage(&CurrentThread);
+		FILE *image = fopen(out, "w+");
+		if (image == NULL) {
+			printf("Cannot write project image: '%s'\n", out);
+			return EXIT_FAILURE;
+		}
+		snapshotWrite(image);
+		fclose(image);
+		printf("built %s\n", out);
+		fflush(stdout); // program output below writes unbuffered
+		if (strcmp(cliArgs.subcommand, "build") == 0) {
+			return EXIT_SUCCESS;
+		}
+	}
 
 	// Image idempotence probe (scripts/check-image-idempotence.sh): re-save the
 	// just-loaded image and exit — a load->save round trip must be a fixpoint.

@@ -19,6 +19,9 @@ typedef struct {
 OBJECT_HANDLE(CompileError);
 
 Object *compileMethod(MethodNode *node, Class *class);
+// Compile resolving globals in `ns`; NULL defaults to the class's home
+// namespace, then DefaultNamespace (see analyzeMethodIn).
+Object *compileMethodIn(MethodNode *node, Class *class, Namespace *ns);
 CompileError *createUndefinedVariableError(LiteralNode *node);
 CompileError *createRedefinitionError(LiteralNode *var);
 void compileErrorSetVariable(CompileError *error, LiteralNode *node);
