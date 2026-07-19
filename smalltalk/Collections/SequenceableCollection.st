@@ -311,4 +311,243 @@ SequenceableCollection := Collection [
 		^result
 	]
 
+
+	with: aCollection do: aBlock [
+		1 to: self size do: [ :i |
+			aBlock value: (self at: i) value: (aCollection at: i)].
+	]
+
+
+	"enumerating with index (Pharo order: element then index)"
+
+	doWithIndex: aBlock [
+		1 to: self size do: [ :i | aBlock value: (self at: i) value: i].
+	]
+
+
+	withIndexDo: aBlock [
+		self doWithIndex: aBlock.
+	]
+
+
+	"accessing prefixes and suffixes"
+
+	first: n [
+		^self copyFrom: 1 to: n
+	]
+
+
+	last: n [
+		^self copyFrom: self size - n + 1 to: self size
+	]
+
+
+	allButFirst [
+		^self allButFirst: 1
+	]
+
+
+	allButLast [
+		^self allButLast: 1
+	]
+
+
+	allButFirst: n [
+		^self copyFrom: n + 1 to: self size
+	]
+
+
+	allButLast: n [
+		^self copyFrom: 1 to: self size - n
+	]
+
+
+	"testing"
+
+	endsWith: aCollection [
+		| offset |
+
+		aCollection isEmpty ifTrue: [^false].
+		aCollection size > self size ifTrue: [^false].
+		offset := self size - aCollection size.
+		1 to: aCollection size do: [ :i |
+			(self at: offset + i) = (aCollection at: i) ifFalse: [^false]].
+		^true
+	]
+
+
+	"bulk mutation"
+
+	atAll: indexCollection put: anObject [
+		indexCollection do: [ :i | self at: i put: anObject].
+		^anObject
+	]
+
+
+	atAllPut: anObject [
+		1 to: self size do: [ :i | self at: i put: anObject].
+		^anObject
+	]
+
+
+	"copying"
+
+	copyWithout: oldObject [
+		| kept |
+
+		kept := OrderedCollection new.
+		self do: [ :v | v = oldObject ifFalse: [kept add: v]].
+		^self species withAll: kept
+	]
+
+
+	copyReplaceAll: oldSubCollection with: newSubCollection [
+		"Replace every non-overlapping occurrence of oldSubCollection with
+		 newSubCollection, scanning left to right with the existing
+		 indexOfSubCollection:startingAt:."
+		| result index found |
+
+		oldSubCollection isEmpty ifTrue: [^self copyFrom: 1 to: self size].
+		result := OrderedCollection new.
+		index := 1.
+		[index <= self size] whileTrue: [
+			found := self indexOfSubCollection: oldSubCollection startingAt: index.
+			found = 0
+				ifTrue: [
+					index to: self size do: [ :i | result add: (self at: i)].
+					index := self size + 1]
+				ifFalse: [
+					index to: found - 1 do: [ :i | result add: (self at: i)].
+					newSubCollection do: [ :e | result add: e].
+					index := found + oldSubCollection size]].
+		^self species withAll: result
+	]
+
+
+	"sorting"
+
+	isSorted [
+		^self isSorted: [ :a :b | a <= b]
+	]
+
+
+	isSorted: aSortBlock [
+		| prev first |
+
+		first := true.
+		self do: [ :each |
+			first
+				ifTrue: [first := false]
+				ifFalse: [(aSortBlock value: prev value: each) ifFalse: [^false]].
+			prev := each].
+		^true
+	]
+
+
+	sort [
+		^self sort: [ :a :b | a <= b]
+	]
+
+
+	sort: aSortBlock [
+		"Stable in-place merge sort. Requires at:put: on the receiver; species
+		 without it (e.g. Interval) raise their natural error."
+		| work |
+
+		self size <= 1 ifTrue: [^self].
+		work := Array new: self size.
+		self mergeSortFrom: 1 to: self size by: aSortBlock into: work.
+		^self
+	]
+
+
+	mergeSortFrom: low to: high by: aSortBlock into: work [
+		| mid i j k |
+
+		low >= high ifTrue: [^self].
+		mid := (low + high) // 2.
+		self mergeSortFrom: low to: mid by: aSortBlock into: work.
+		self mergeSortFrom: mid + 1 to: high by: aSortBlock into: work.
+		low to: high do: [ :x | work at: x put: (self at: x)].
+		i := low.
+		j := mid + 1.
+		k := low.
+		[k <= high] whileTrue: [
+			(j > high or: [i <= mid and: [aSortBlock value: (work at: i) value: (work at: j)]])
+				ifTrue: [self at: k put: (work at: i). i := i + 1]
+				ifFalse: [self at: k put: (work at: j). j := j + 1].
+			k := k + 1].
+	]
+
+
+	sorted [
+		^self sorted: [ :a :b | a <= b]
+	]
+
+
+	sorted: aSortBlock [
+		"Answer a sorted copy as an Array; the receiver is left unchanged."
+		| array |
+
+		array := self asArray.
+		array sort: aSortBlock.
+		^array
+	]
+
+
+	"shuffling and random access"
+
+	shuffle [
+		^self shuffleWith: Random default
+	]
+
+
+	shuffleWith: aRandom [
+		"In-place Fisher-Yates."
+		| j tmp |
+
+		self size to: 2 by: -1 do: [ :i |
+			j := aRandom nextInteger: i.
+			tmp := self at: i.
+			self at: i put: (self at: j).
+			self at: j put: tmp].
+		^self
+	]
+
+
+	shuffled [
+		^self asArray shuffleWith: Random default
+	]
+
+
+	atRandom [
+		^self atRandom: Random default
+	]
+
+
+	atRandom: aRandom [
+		self emptyCheck.
+		^self at: (aRandom nextInteger: self size)
+	]
+
+
+	pairsDo: aBlock [
+		"Evaluate aBlock with each consecutive non-overlapping pair of elements."
+		1 to: self size - 1 by: 2 do: [ :i |
+			aBlock value: (self at: i) value: (self at: i + 1)].
+	]
+
+
+	"streaming"
+
+	readStream [
+		^CollectionStream on: self
+	]
+
+
+	writeStream [
+		"A write stream over a fresh growable buffer of the same species."
+		^CollectionStream with: (self species new: 16)
+	]
+
 ]

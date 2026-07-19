@@ -35,13 +35,21 @@ SortedCollection := OrderedCollection [
 	"adding - insertion keeps the collection ordered"
 
 	add: anObject [
-		| index limit |
+		"Binary search for the insertion point. To stay stable, anObject is
+		 inserted AFTER every element the sort block already ranks before-or-
+		 equal to it: the search keeps moving low past any index where
+		 sortBlock(element, anObject) holds."
+		| low high mid block |
 
-		limit := self size.
-		index := 1.
-		[index <= limit and: [self sortBlock value: (self at: index) value: anObject]]
-			whileTrue: [index := index + 1].
-		self add: anObject beforeIndex: index.
+		block := self sortBlock.
+		low := 1.
+		high := self size.
+		[low <= high] whileTrue: [
+			mid := (low + high) // 2.
+			(block value: (self at: mid) value: anObject)
+				ifTrue: [low := mid + 1]
+				ifFalse: [high := mid - 1]].
+		self add: anObject beforeIndex: low.
 		^anObject
 	]
 

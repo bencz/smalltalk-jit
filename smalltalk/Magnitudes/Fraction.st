@@ -15,7 +15,7 @@ Fraction := Number [
 		reduces to 1."
 		| num den g |
 
-		d = 0 ifTrue: [^self error: 'division by zero'].
+		d = 0 ifTrue: [^ZeroDivide new signal].
 		num := n.
 		den := d.
 		den < 0 ifTrue: [num := num negated. den := den negated].
@@ -90,7 +90,7 @@ Fraction := Number [
 
 	/ aNumber [
 		(aNumber isKindOf: Integer) ifTrue: [
-			aNumber = 0 ifTrue: [^self error: 'division by zero'].
+			aNumber = 0 ifTrue: [^ZeroDivide new signal].
 			^Fraction numerator: numerator denominator: denominator * aNumber].
 		(aNumber isKindOf: Fraction) ifTrue: [
 			^Fraction

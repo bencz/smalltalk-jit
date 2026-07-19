@@ -257,7 +257,12 @@ static _Bool parseKernelFiles(char *kernelDir)
 		"Magnitudes/BoxedFloat64.st",
 		"Magnitudes/Character.st",
 		"Magnitudes/DateTime.st",
+		"Magnitudes/Duration.st",
+		"Magnitudes/Date.st",
+		"Magnitudes/Time.st",
+		"Magnitudes/Stopwatch.st",
 		"Iterator.st",
+		"LazySequence.st",
 		"Collections/Association.st",
 		"Collections/Collection.st",
 		"Collections/SequenceableCollection.st",
@@ -273,6 +278,12 @@ static _Bool parseKernelFiles(char *kernelDir)
 		"Collections/OrderedCollection.st",
 		"Collections/SortedCollection.st",
 		"Collections/Interval.st",
+		"Collections/IdentitySet.st",
+		"Collections/IdentityDictionary.st",
+		"Collections/Stack.st",
+		"Collections/Queue.st",
+		"Collections/Heap.st",
+		"Random.st",
 		"CompiledCode.st",
 		"CompiledBlock.st",
 		"CompiledMethod.st",
@@ -339,6 +350,13 @@ static _Bool parseKernelFiles(char *kernelDir)
 		"Exception.st",
 		"HandlerEscape.st",
 		"Error.st",
+		// arithmetic error family: ArithmeticError < Error, ZeroDivide < ArithmeticError
+		"ArithmeticError.st",
+		"ZeroDivide.st",
+		// minimal system-error classes (kernel adoption is deferred to a later wave)
+		"InvalidArgumentError.st",
+		"NotYetImplementedError.st",
+		"EmptyCollectionError.st",
 		"Warning.st",
 		"MessageNotUnderstood.st",
 		"OutOfRangeError.st",
@@ -382,6 +400,16 @@ static _Bool parseKernelFiles(char *kernelDir)
 		"Assert.st",
 		"AssertError.st",
 		"TestRun.st", // kernel unit-test runner (tests/*.st end with ^t report)
+
+		// System / file-system / Uuid / Base64 utilities: loaded last, after the
+		// Streams, DateTime and Random they build on. Class-side wrappers over the
+		// OS primitives appended in earlier waves.
+		"System.st",
+		"Files/Path.st",
+		"Files/File.st",
+		"Files/Directory.st",
+		"Uuid.st",
+		"Base64.st",
 	};
 
 	HandleScope scope;

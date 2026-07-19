@@ -1,25 +1,27 @@
-"DateTime in this VM is a thin wrapper over a milliseconds-since-1970-UTC
- integer (see DateTime.st). It exposes year/month/day/hour/minute/second and
- printOn:, and is constructed either by DateTime now (wall clock) or by
- sending initializeMilliSeconds: to a fresh instance (returns self). Tests use
- FIXED millisecond values cross-checked against real UTC so they are fully
- deterministic; DateTime now is only probed for protocol invariants, never
- exact values.
+"DateTime is a thin wrapper over an integer of absolute milliseconds since
+ 1970-01-01 UTC (see DateTime.st). It exposes year/month/day/hour/minute/second
+ plus printOn:, is comparable and hashable by that instant, and now parses and
+ renders ISO 8601. Tests use FIXED millisecond values cross-checked against real
+ UTC so they are fully deterministic; DateTime now is only probed for protocol
+ invariants, never exact values.
 
- NOTE on semantics: DateTime subclasses Magnitude but overrides NEITHER < NOR
- =, so ordering raises SubClassResponsibility (an Error) and equality is
- Object identity, not value. Both are asserted below as the real behaviour.
- KNOWN BUG (excluded to stay green, documented in the report): computeDate is
- off by one day at exactly Jan 1 of a year divisible by 400 (2000-01-01 and
- 2400-01-01 both render as Dec 31 of the previous year). Neighbouring dates
- and ordinary year boundaries such as 2001-01-01 are correct, so this suite
- stays clear of that single boundary."
+ HISTORY: an earlier revision of this suite documented DateTime as having
+ IDENTITY equality (no < or = override) and a KNOWN off-by-one BUG at Jan 1 of
+ 400-divisible years (2000-01-01 rendering as 1999-12-31). Both claims are now
+ obsolete: DateTime overrides < = hash (value semantics via milliSeconds), and
+ the Hinnant computeDate renders 2000-01-01 correctly. The asserts below were
+ INVERTED on purpose to lock in the corrected behaviour, and 2000-01-01 is now
+ exercised directly. Evidence for the 400-year verdict: 2000-01-01 00:00:00 UTC
+ is exactly 946684800000 ms, which computeDate decomposes to year 2000, month 1,
+ day 1 (checked below)."
 
 [ DtRun := TestRun named: 'DateTime'.
   "epoch (0 ms) and one day later"
   DtRun check: 'epoch year' equals: 1970 is: [ | d | d := DateTime new initializeMilliSeconds: 0. d year ].
   DtRun check: 'epoch month' equals: 1 is: [ | d | d := DateTime new initializeMilliSeconds: 0. d month ].
   DtRun check: 'epoch day' equals: 1 is: [ | d | d := DateTime new initializeMilliSeconds: 0. d day ].
+  DtRun check: 'epoch is a Thursday (dayOfWeek 5)' equals: 5 is: [ | d | d := DateTime new initializeMilliSeconds: 0. d dayOfWeek ].
+  DtRun check: 'epoch weekday name' equals: 'Thursday' is: [ | d | d := DateTime new initializeMilliSeconds: 0. d weekdayName ].
   DtRun check: 'epoch hour/min/sec all 0' that: [ | d | d := DateTime new initializeMilliSeconds: 0.
       (d hour = 0) and: [ (d minute = 0) and: [ d second = 0 ] ] ].
   DtRun check: 'epoch printString' equals: '1970-01-01 00:00:00' is: [ | d | d := DateTime new initializeMilliSeconds: 0. d printString ].
@@ -59,40 +61,86 @@
   DtRun check: 'pre-epoch day' equals: 31 is: [ | d | d := DateTime new initializeMilliSeconds: 86400000 negated. d day ].
 ]
 
-[ "printing determinism, identity semantics, ordering behaviour, ms arithmetic
-   consistency and DateTime now protocol invariants"
+[ "The former KNOWN BUG boundary, now exercised directly: Jan 1 of 400-divisible
+   years. 2000-01-01 00:00:00 UTC is exactly 946684800000 ms and it IS a Saturday."
+  DtRun check: '2000-01-01 ms is 946684800000' equals: 946684800000 is: [
+      (DateTime year: 2000 month: 1 day: 1) asMilliseconds ].
+  DtRun check: '2000-01-01 year' equals: 2000 is: [ | d | d := DateTime new initializeMilliSeconds: 946684800000. d year ].
+  DtRun check: '2000-01-01 month' equals: 1 is: [ | d | d := DateTime new initializeMilliSeconds: 946684800000. d month ].
+  DtRun check: '2000-01-01 day' equals: 1 is: [ | d | d := DateTime new initializeMilliSeconds: 946684800000. d day ].
+  DtRun check: '2000-01-01 is a Saturday (dayOfWeek 7)' equals: 7 is: [ | d | d := DateTime new initializeMilliSeconds: 946684800000. d dayOfWeek ].
+  DtRun check: '2000-01-01 dayOfYear 1' equals: 1 is: [ | d | d := DateTime new initializeMilliSeconds: 946684800000. d dayOfYear ].
+  DtRun check: '2000 is a leap year' that: [ DateTime isLeapYear: 2000 ].
+  DtRun check: '1900 is NOT a leap year' that: [ (DateTime isLeapYear: 1900) not ].
+  DtRun check: '2004 is a leap year' that: [ DateTime isLeapYear: 2004 ].
+  DtRun check: '2001 is NOT a leap year' that: [ (DateTime isLeapYear: 2001) not ].
+  DtRun check: '2000-02-29 exists (Feb has 29 days)' equals: 29 is: [ DateTime daysInMonth: 2 year: 2000 ].
+  DtRun check: '1900-02 has 28 days' equals: 28 is: [ DateTime daysInMonth: 2 year: 1900 ].
+  DtRun check: '2000-02-29 round-trips' that: [ | d |
+      d := DateTime year: 2000 month: 2 day: 29.
+      (d year = 2000) and: [ (d month = 2) and: [ d day = 29 ] ] ].
+]
+
+[ "value comparison, ordering and hashing (INVERTED from the old identity asserts)"
   DtRun check: 'printString is stable for equal ms' that: [ | a b |
       a := DateTime new initializeMilliSeconds: 1592224245000.
       b := DateTime new initializeMilliSeconds: 1592224245000.
       a printString = b printString ].
-  DtRun check: 'a date equals itself (identity)' that: [ | a |
+  DtRun check: 'a date equals itself' that: [ | a |
       a := DateTime new initializeMilliSeconds: 1592224245000. a = a ].
   DtRun check: 'a date == itself' that: [ | a |
       a := DateTime new initializeMilliSeconds: 1592224245000. a == a ].
-  DtRun check: 'distinct instances of same ms are NOT = (identity semantics)' that: [ | a b |
+  DtRun check: 'distinct instances of same ms ARE = (value semantics)' that: [ | a b |
       a := DateTime new initializeMilliSeconds: 1592224245000.
       b := DateTime new initializeMilliSeconds: 1592224245000.
-      (a = b) not ].
-  DtRun check: 'distinct instances of same ms are ~=' that: [ | a b |
+      a = b ].
+  DtRun check: 'distinct instances of same ms are NOT ~=' that: [ | a b |
       a := DateTime new initializeMilliSeconds: 1592224245000.
       b := DateTime new initializeMilliSeconds: 1592224245000.
-      a ~= b ].
-  DtRun expect: 'ordering < raises (Magnitude abstract, not overridden)' raises: Error in: [ | a b |
+      (a ~= b) not ].
+  DtRun check: 'ordering < works (Magnitude via milliSeconds)' that: [ | a b |
       a := DateTime new initializeMilliSeconds: 1.
       b := DateTime new initializeMilliSeconds: 2.
       a < b ].
-  "adding exactly one day of ms advances the day and preserves the time"
-  DtRun check: 'plus one day -> day 16' equals: 16 is: [ | d |
-      d := DateTime new initializeMilliSeconds: 1592224245000 + 86400000. d day ].
-  DtRun check: 'plus one day keeps month' equals: 6 is: [ | d |
-      d := DateTime new initializeMilliSeconds: 1592224245000 + 86400000. d month ].
-  DtRun check: 'plus one day keeps year' equals: 2020 is: [ | d |
-      d := DateTime new initializeMilliSeconds: 1592224245000 + 86400000. d year ].
-  DtRun check: 'plus one day preserves time-of-day' that: [ | d |
-      d := DateTime new initializeMilliSeconds: 1592224245000 + 86400000.
-      (d hour = 12) and: [ (d minute = 30) and: [ d second = 45 ] ] ].
-  DtRun check: 'add then subtract a day returns the original day' equals: 15 is: [ | d |
-      d := DateTime new initializeMilliSeconds: 1592224245000 + 86400000 - 86400000. d day ].
+  DtRun check: 'ordering > derived' that: [ | a b |
+      a := DateTime new initializeMilliSeconds: 2.
+      b := DateTime new initializeMilliSeconds: 1.
+      a > b ].
+  DtRun check: 'equal instances share hash' that: [ | a b |
+      a := DateTime new initializeMilliSeconds: 1592224245000.
+      b := DateTime new initializeMilliSeconds: 1592224245000.
+      a hash = b hash ].
+  DtRun check: 'usable as a Set element (dedups by value)' equals: 1 is: [ | s |
+      s := Set new.
+      s add: (DateTime new initializeMilliSeconds: 1592224245000).
+      s add: (DateTime new initializeMilliSeconds: 1592224245000).
+      s size ].
+  DtRun check: 'usable as a Dictionary key' equals: 'hit' is: [ | dic |
+      dic := Dictionary new.
+      dic at: (DateTime new initializeMilliSeconds: 111) put: 'hit'.
+      dic at: (DateTime new initializeMilliSeconds: 111) ].
+]
+
+[ "ISO 8601 parsing and rendering round-trips"
+  DtRun check: 'fromString date only year' equals: 2020 is: [ (DateTime fromString: '2020-06-15') year ].
+  DtRun check: 'fromString date only month' equals: 6 is: [ (DateTime fromString: '2020-06-15') month ].
+  DtRun check: 'fromString date only day' equals: 15 is: [ (DateTime fromString: '2020-06-15') day ].
+  DtRun check: 'fromString with time hour' equals: 12 is: [ (DateTime fromString: '2020-06-15T12:30:45') hour ].
+  DtRun check: 'fromString with time minute' equals: 30 is: [ (DateTime fromString: '2020-06-15T12:30:45') minute ].
+  DtRun check: 'fromString with time second' equals: 45 is: [ (DateTime fromString: '2020-06-15T12:30:45') second ].
+  DtRun check: 'fromString with millis' equals: 123 is: [ (DateTime fromString: '2020-06-15T12:30:45.123') millisecond ].
+  DtRun check: 'fromString with Z is UTC instant' equals: 1592224245000 is: [ (DateTime fromString: '2020-06-15T12:30:45Z') asMilliseconds ].
+  DtRun check: 'fromString +02:00 shifts to UTC' equals: 1592217045000 is: [ (DateTime fromString: '2020-06-15T12:30:45+02:00') asMilliseconds ].
+  DtRun check: 'fromString -05:00 shifts to UTC' equals: 1592242245000 is: [ (DateTime fromString: '2020-06-15T12:30:45-05:00') asMilliseconds ].
+  DtRun check: 'printIso8601 round-trips Z' equals: '2020-06-15T12:30:45Z' is: [ (DateTime fromString: '2020-06-15T12:30:45Z') printIso8601 ].
+  DtRun check: 'printIso8601 round-trips +02:00' equals: '2020-06-15T12:30:45+02:00' is: [ (DateTime fromString: '2020-06-15T12:30:45+02:00') printIso8601 ].
+  DtRun check: 'printIso8601 date-only midnight' equals: '2020-06-15T00:00:00Z' is: [ (DateTime fromString: '2020-06-15') printIso8601 ].
+  DtRun check: 'printFormat pattern' equals: '2020-06-15 12:30:45' is: [
+      (DateTime fromString: '2020-06-15T12:30:45Z') printFormat: 'yyyy-MM-dd HH:mm:ss' ].
+  DtRun check: 'printFormat literal letters' equals: '2020X06X15' is: [
+      (DateTime fromString: '2020-06-15') printFormat: 'yyyyXMMXdd' ].
+  DtRun check: 'printFormat yy short year' equals: '20', '/06/15' is: [
+      (DateTime fromString: '2020-06-15') printFormat: 'yy/MM/dd' ].
   "DateTime now: protocol invariants only (never exact wall-clock values)"
   DtRun check: 'now is a DateTime' that: [ DateTime now isKindOf: DateTime ].
   DtRun check: 'now month in 1..12' that: [ DateTime now month between: 1 and: 12 ].
@@ -101,5 +149,52 @@
   DtRun check: 'now minute in 0..59' that: [ DateTime now minute between: 0 and: 59 ].
   DtRun check: 'now second in 0..59' that: [ DateTime now second between: 0 and: 59 ].
   DtRun check: 'now year is positive' that: [ DateTime now year > 0 ].
+  DtRun check: 'nowLocal same instant as now (within a second)' that: [ | a b |
+      a := DateTime now. b := DateTime nowLocal.
+      (a asMilliseconds - b asMilliseconds) abs <= 1000 ].
+  DtRun check: 'asLocal asUtc preserves instant' that: [ | a |
+      a := DateTime new initializeMilliSeconds: 1592224245000.
+      a asLocal asUtc asMilliseconds = a asMilliseconds ].
+  DtRun check: 'offset stays within 16h' that: [ | a |
+      a := (DateTime new initializeMilliSeconds: 1592224245000) asLocal.
+      a offsetSeconds abs <= (16 * 3600) ].
+]
+
+[ "Date: a calendar day with no time of day"
+  DtRun check: 'Date components' that: [ | d |
+      d := Date year: 2020 month: 6 day: 15.
+      (d year = 2020) and: [ (d month = 6) and: [ d day = 15 ] ] ].
+  DtRun check: 'Date printString' equals: '2020-06-15' is: [ (Date year: 2020 month: 6 day: 15) printString ].
+  DtRun check: 'Date today is a Date' that: [ Date today isKindOf: Date ].
+  DtRun check: 'Date dayOfWeek (2020-06-15 is Monday)' equals: 2 is: [ (Date year: 2020 month: 6 day: 15) dayOfWeek ].
+  DtRun check: 'Date weekdayName' equals: 'Monday' is: [ (Date year: 2020 month: 6 day: 15) weekdayName ].
+  DtRun check: 'Date monthName' equals: 'June' is: [ (Date year: 2020 month: 6 day: 15) monthName ].
+  DtRun check: 'Date isLeapYear' that: [ (Date year: 2020 month: 6 day: 15) isLeapYear ].
+  DtRun check: 'Date comparison <' that: [ (Date year: 2020 month: 1 day: 1) < (Date year: 2020 month: 1 day: 2) ].
+  DtRun check: 'Date value equality' that: [ (Date year: 2020 month: 6 day: 15) = (Date year: 2020 month: 6 day: 15) ].
+  DtRun check: 'Date addDays' that: [ | d |
+      d := (Date year: 2020 month: 6 day: 15) addDays: 20.
+      (d month = 7) and: [ d day = 5 ] ].
+  DtRun check: 'Date subtractDate is a day count' equals: 20 is: [
+      (Date year: 2020 month: 7 day: 5) subtractDate: (Date year: 2020 month: 6 day: 15) ].
+  DtRun check: 'Date asDateTime midnight' equals: 0 is: [ (Date year: 2020 month: 6 day: 15) asDateTime hour ].
+  DtRun check: 'DateTime asDate round-trips day' equals: 15 is: [
+      (DateTime new initializeMilliSeconds: 1592224245000) asDate day ].
+]
+
+[ "Time: a time of day with no calendar date"
+  DtRun check: 'Time components' that: [ | t |
+      t := Time hour: 12 minute: 30 second: 45.
+      (t hour = 12) and: [ (t minute = 30) and: [ t second = 45 ] ] ].
+  DtRun check: 'Time printString' equals: '12:30:45' is: [ (Time hour: 12 minute: 30 second: 45) printString ].
+  DtRun check: 'Time zero-pads' equals: '01:02:03' is: [ (Time hour: 1 minute: 2 second: 3) printString ].
+  DtRun check: 'Time comparison <' that: [ (Time hour: 1 minute: 0 second: 0) < (Time hour: 2 minute: 0 second: 0) ].
+  DtRun check: 'Time value equality' that: [ (Time hour: 12 minute: 0 second: 0) = (Time hour: 12 minute: 0 second: 0) ].
+  DtRun check: 'Time asDuration' equals: 45045000 is: [ (Time hour: 12 minute: 30 second: 45) asDuration asMilliseconds ].
+  DtRun check: 'Time now is a Time' that: [ Time now isKindOf: Time ].
+  DtRun check: 'Time now hour in 0..23' that: [ Time now hour between: 0 and: 23 ].
+  DtRun check: 'DateTime asTime round-trips' that: [ | t |
+      t := (DateTime new initializeMilliSeconds: 1592224245000) asTime.
+      (t hour = 12) and: [ (t minute = 30) and: [ t second = 45 ] ] ].
   ^DtRun report
 ]

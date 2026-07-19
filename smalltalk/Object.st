@@ -254,6 +254,19 @@ Object := nil [
 	]
 
 
+	assert: aBlockOrBoolean [
+		"Evaluate aBlockOrBoolean (a Block is sent #value; a Boolean is taken as
+		 is) and raise an AssertError unless the result is true. Answer self on
+		 success."
+		| ok |
+		ok := (aBlockOrBoolean isKindOf: Block)
+			ifTrue: [aBlockOrBoolean value]
+			ifFalse: [aBlockOrBoolean].
+		ok == true ifFalse: [^AssertError expected: true got: ok].
+		^self
+	]
+
+
 	mustBeBoolean [
 		"Sent by inlined conditionals (ifTrue:/and:/...) when the receiver is
 		 neither true nor false."
@@ -295,6 +308,29 @@ Object := nil [
 
 	print [
 		self printOn: Transcript.
+	]
+
+
+	"displaying"
+
+	displayString [
+		"A user-facing string form. Defaults to printString; String, Symbol and
+		 Character override it to drop the printOn: decoration (quotes, #, $)."
+		^self printString
+	]
+
+
+	displayOn: aStream [
+		self printOn: aStream.
+	]
+
+
+	displayNl [
+		"Print displayString followed by a newline on the Transcript; answer self.
+		 Mirrors printNl but uses the display (undecorated) form."
+		Transcript nextPutAll: self displayString.
+		Transcript lf.
+		^self
 	]
 
 

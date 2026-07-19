@@ -42,6 +42,21 @@ Dictionary := HashedCollection [
 	]
 
 
+	at: key ifAbsentPut: aBlock [
+		"Answer the value at key. If absent, evaluate aBlock exactly once,
+		 store its value at key and answer it."
+		^self at: key ifAbsent: [ | value | value := aBlock value. self at: key put: value. value]
+	]
+
+
+	at: key ifPresent: presentBlock ifAbsent: absentBlock [
+		| index |
+
+		index := self findIndex: key ifAbsent: [^absentBlock value].
+		^presentBlock value: (contents at: index) value
+	]
+
+
 	keyAtValue: anObject [
 		^self keyAtValue: anObject ifAbsent: [(NotFoundError value: anObject) signal]
 	]
@@ -146,6 +161,50 @@ Dictionary := HashedCollection [
 
 	keysAndValuesDo: aBlock [
 		self associationsDo: [ :assoc | aBlock value: assoc key value: assoc value].
+	]
+
+
+	valuesDo: aBlock [
+		self do: aBlock.
+	]
+
+
+	associations [
+		"An OrderedCollection of the receiver's Associations."
+		| result |
+
+		result := OrderedCollection new.
+		self associationsDo: [ :assoc | result add: assoc].
+		^result
+	]
+
+
+	keysSortedSafely [
+		"The keys as an Array in ascending sort order."
+		^self keys asArray sorted
+	]
+
+
+	associationsSelect: aBlock [
+		"Answer a Dictionary of the same species holding the key/value pairs
+		 whose Association satisfies aBlock."
+		| result |
+
+		result := self species new.
+		self associationsDo: [ :assoc |
+			(aBlock value: assoc) ifTrue: [result at: assoc key put: assoc value]].
+		^result
+	]
+
+
+	collectValues: aBlock [
+		"Answer a Dictionary of the same species with the same keys and the
+		 values transformed by aBlock."
+		| result |
+
+		result := self species new.
+		self keysAndValuesDo: [ :k :v | result at: k put: (aBlock value: v)].
+		^result
 	]
 
 

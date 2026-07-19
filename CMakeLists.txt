@@ -116,6 +116,7 @@ if(ST_OS STREQUAL "linux")
 		vm/os/linux/OsCpu.c
 		vm/os/linux/OsEvents.c
 		vm/os/linux/OsMemory.c
+		vm/os/linux/OsRandom.c
 		vm/os/linux/OsSignals.c
 		vm/os/linux/OsTime.c)
 else()
@@ -199,6 +200,7 @@ set(vmSources
 	vm/memory/Scavenger.c
 	vm/runtime/Collection.c
 	vm/runtime/Dictionary.c
+	vm/runtime/FileSystem.c
 	vm/runtime/Iterator.c
 	vm/runtime/Json.c
 	vm/runtime/Message.c

@@ -90,4 +90,33 @@ Stream := Iterator [
 		[self atEnd] whileFalse: [aBlock value: self next].
 	]
 
+
+	collect: aBlock [
+		"Consume the remaining stream, answering an OrderedCollection of the
+		 block values."
+		| result |
+
+		result := OrderedCollection new.
+		self do: [ :each | result add: (aBlock value: each)].
+		^result
+	]
+
+
+	select: aBlock [
+		| result |
+
+		result := OrderedCollection new.
+		self do: [ :each | (aBlock value: each) ifTrue: [result add: each]].
+		^result
+	]
+
+
+	reject: aBlock [
+		| result |
+
+		result := OrderedCollection new.
+		self do: [ :each | (aBlock value: each) ifFalse: [result add: each]].
+		^result
+	]
+
 ]

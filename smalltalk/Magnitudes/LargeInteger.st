@@ -297,7 +297,7 @@ LargeInteger := Integer [
 		"Truncating division. Answer {quotient. remainder}, remainder has sign of self."
 		| dm q r |
 
-		aLarge isZero ifTrue: [^self error: 'division by zero'].
+		aLarge isZero ifTrue: [^ZeroDivide new signal].
 		dm := LargeInteger divModMagnitude: digits and: aLarge digits.
 		q := self makeDigits: (dm at: 1) negative: self negative ~= aLarge negative.
 		r := self makeDigits: (dm at: 2) negative: self negative.

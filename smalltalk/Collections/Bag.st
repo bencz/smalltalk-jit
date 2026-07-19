@@ -75,4 +75,27 @@ Bag := Collection [
 		contents associationsDo: [ :assoc | assoc value timesRepeat: [aBlock value: assoc key]].
 	]
 
+
+	"counting"
+
+	valuesAndCounts [
+		"A Dictionary mapping each distinct element to its occurrence count."
+		| result |
+
+		result := Dictionary new.
+		contents keysAndValuesDo: [ :element :count | result at: element put: count].
+		^result
+	]
+
+
+	sortedCounts [
+		"An OrderedCollection of count -> element Associations, ordered by
+		 descending count."
+		| assocs |
+
+		assocs := OrderedCollection new.
+		contents keysAndValuesDo: [ :element :count | assocs add: count -> element].
+		^(assocs sorted: [ :a :b | a key >= b key]) asOrderedCollection
+	]
+
 ]

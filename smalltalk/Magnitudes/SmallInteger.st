@@ -50,7 +50,7 @@ SmallInteger := Integer [
 
 	/ aNumber [
 		(aNumber isKindOf: Integer) ifTrue: [
-			aNumber = 0 ifTrue: [^self error: 'division by zero'].
+			aNumber = 0 ifTrue: [^ZeroDivide new signal].
 			^Fraction numerator: self denominator: aNumber].
 		^self retry: #/ coercing: aNumber
 	]
@@ -59,7 +59,7 @@ SmallInteger := Integer [
 	\\ aNumber [
 		<primitive: IntModPrimitive>
 		(aNumber isKindOf: SmallInteger) ifTrue: [
-			aNumber = 0 ifTrue: [^self error: 'division by zero'].
+			aNumber = 0 ifTrue: [^ZeroDivide new signal].
 			^self asLargeInteger \\ aNumber asLargeInteger].
 		^self retry: #\\ coercing: aNumber
 	]
@@ -68,7 +68,7 @@ SmallInteger := Integer [
 	quo: aNumber [
 		<primitive: IntQuoPrimitive>
 		(aNumber isKindOf: SmallInteger) ifTrue: [
-			aNumber = 0 ifTrue: [^self error: 'division by zero'].
+			aNumber = 0 ifTrue: [^ZeroDivide new signal].
 			^self asLargeInteger quo: aNumber asLargeInteger].
 		^self retry: #quo: coercing: aNumber
 	]
@@ -77,7 +77,7 @@ SmallInteger := Integer [
 	rem: aNumber [
 		<primitive: IntRemPrimitive>
 		(aNumber isKindOf: SmallInteger) ifTrue: [
-			aNumber = 0 ifTrue: [^self error: 'division by zero'].
+			aNumber = 0 ifTrue: [^ZeroDivide new signal].
 			^self asLargeInteger rem: aNumber asLargeInteger].
 		^self retry: #rem: coercing: aNumber
 	]

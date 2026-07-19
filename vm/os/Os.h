@@ -17,6 +17,20 @@
 
 int64_t osCurrentMicroTime(void);
 
+// Nanoseconds on a monotonic clock: never jumps backwards on NTP/wall-clock
+// adjustments. Only differences are meaningful (Stopwatch, timeouts).
+int64_t osMonotonicNanos(void);
+
+// Seconds EAST of UTC of the process's local timezone at the given wall-clock
+// instant. Takes the instant because the answer is DST-dependent.
+int64_t osLocalUtcOffsetSeconds(int64_t epochSeconds);
+
+// ---- entropy ----------------------------------------------------------------
+
+// Fill buffer with `size` cryptographically strong random bytes (blocking
+// until the OS entropy pool is initialized). Returns 1 on success.
+_Bool osRandomBytes(void *buffer, size_t size);
+
 // ---- virtual memory ---------------------------------------------------------
 
 // System page size in bytes (cached after the first call).

@@ -42,4 +42,19 @@ Iterator := Object [
 		^false
 	]
 
+
+	"lazy pipelines"
+
+	asLazy [
+		"Start a LINQ-style deferred pipeline over the receiver. Because every
+		 Collection and every Stream is an Iterator, they all get this for free."
+		^LazySequence on: self
+	]
+
+
+	lazy [
+		"Alias of #asLazy."
+		^self asLazy
+	]
+
 ]

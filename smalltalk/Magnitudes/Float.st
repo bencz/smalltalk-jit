@@ -282,4 +282,28 @@ Float := Number [
 		aStream nextPutAll: self printString.
 	]
 
+
+	printShowingDecimalPlaces: places [
+		"Answer a fixed-point String with exactly `places` fractional digits, using
+		 half-up rounding and no scientific notation. Implemented over integers: the
+		 magnitude is scaled by 10^places, rounded from the next digit, then the
+		 decimal point is reinserted."
+		| neg pow scaledX10 lastDigit scaled intPart frac fracStr |
+		places < 0 ifTrue: [^self error: 'places must be non-negative'].
+		self isFinite ifFalse: [^self printString].
+		places = 0 ifTrue: [^self rounded printString].
+		neg := self < 0.0.
+		pow := 10 raisedToInteger: places.
+		scaledX10 := (self abs * pow * 10) truncated.
+		lastDigit := scaledX10 \\ 10.
+		scaled := scaledX10 // 10.
+		lastDigit >= 5 ifTrue: [scaled := scaled + 1].
+		scaled = 0 ifTrue: [neg := false].
+		intPart := scaled // pow.
+		frac := scaled \\ pow.
+		fracStr := frac printString.
+		[fracStr size < places] whileTrue: [fracStr := '0', fracStr].
+		^(neg ifTrue: ['-'] ifFalse: ['']), intPart printString, '.', fracStr
+	]
+
 ]

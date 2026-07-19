@@ -29,4 +29,9 @@ void registerPrimitives(void);
 void generatePrimitive(CodeGenerator *generator, uint16_t primitive);
 uint16_t primitiveCount(void);   // valid primitive numbers are 1..primitiveCount()
 
+// Post-option argv for CommandLinePrimitive; the pointers must outlive the VM
+// (main passes the real argv). Never copied: the primitive materializes
+// Strings on each call.
+void primitivesSetCommandLine(int count, char **arguments);
+
 #endif

@@ -294,6 +294,12 @@ Number := Magnitude [
 	]
 
 
+	clampBetween: aMinimum and: aMaximum [
+		"Answer the receiver limited to the closed range [aMinimum, aMaximum]."
+		^(self max: aMinimum) min: aMaximum
+	]
+
+
 	"truncation and round off"
 
 	ceiling [
@@ -321,6 +327,18 @@ Number := Magnitude [
 	]
 
 
+	integerPart [
+		"The receiver with its fractional part removed (truncated toward zero)."
+		^self truncated
+	]
+
+
+	fractionPart [
+		"The receiver minus its integerPart."
+		^self - self integerPart
+	]
+
+
 	roundTo: aNumber [
 		^(self / aNumber) rounded * aNumber
 	]
@@ -335,6 +353,11 @@ Number := Magnitude [
 
 	radiansToDegrees [
 		^self asFloat * 180.0 / Float pi
+	]
+
+
+	asString [
+		^self printString
 	]
 
 

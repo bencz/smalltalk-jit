@@ -39,22 +39,29 @@ int streamOpen(RawString *fileName, intptr_t mode)
 
 	closeHandleScope(&scope, NULL);
 
-	mode_t openMode = 0;
+	int openMode = 0;
 	switch (mode) {
 	case 1:
 		openMode = O_RDONLY;
 		break;
 	case 1 << 1:
-		openMode = O_WRONLY;
+		// write: opens for writing and CREATES/truncates the target, so writing
+		// to a brand-new file works like the standard "w" fopen mode.
+		openMode = O_WRONLY | O_CREAT | O_TRUNC;
 		break;
 	case 1 << 2:
-		openMode = O_RDWR;
+		// readOrWrite: opens read/write and CREATES the target if missing, but
+		// does NOT truncate, so existing contents can be read back and updated
+		// in place (standard "r+"/create semantics).
+		openMode = O_RDWR | O_CREAT;
 		break;
 	default:
 		return -1;
 	}
 
-	return TEMP_FAILURE_RETRY(open(buffer, openMode));
+	// The 0666 mode argument is honored only when O_CREAT is set (and is further
+	// filtered by the process umask); it is ignored for a pure O_RDONLY open.
+	return TEMP_FAILURE_RETRY(open(buffer, openMode, 0666));
 }
 
 

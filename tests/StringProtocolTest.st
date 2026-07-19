@@ -158,10 +158,11 @@ StrProtoSuite := Object [
     t check: 'non-empty notEmpty' that: [ 'a' notEmpty ].
     t check: 'non-empty is not isEmpty' that: [ 'a' isEmpty not ].
 
-    "String is not a Magnitude, so it has no ordering. Receiver bound to a temp
-     to avoid the literal-receiver does-not-understand segfault."
-    t expect: 'String has no <' raises: MessageNotUnderstood in: [ | s | s := 'abc'. s < 'abd' ].
-    t expect: 'String has no <=' raises: MessageNotUnderstood in: [ | s | s := 'abc'. s <= 'abd' ].
+    "Wave 3 gave String a lexicographic-by-byte ordering (it is still not a
+     Magnitude; the whole comparison protocol is defined directly on String).
+     These two cases used to assert the ordering was absent (a DNU)."
+    t check: 'lexicographic < true' that: [ | s | s := 'abc'. s < 'abd' ].
+    t check: 'lexicographic <= reflexive' that: [ | s | s := 'abc'. s <= 'abc' ].
 ]
 
 "--- final block: emit the report; its integer return is the process exit code ---"

@@ -7,6 +7,10 @@ ExternalStream := BufferedStream [
 
 	class initialize [
 		Transcript := self descriptor: 1.
+		"Standard error: the sibling of Transcript (descriptor 1) over fd 2,
+		 created here the same way so both globals exist right after bootstrap.
+		 System class stderr answers this same object."
+		StdErr := self descriptor: 2.
 	]
 
 

@@ -16,7 +16,9 @@ FileStream := ExternalStream [
 
 
 	class readOrWrite: aString [
-		^self new initializeFileName: aString mode: 3
+		"mode 4 selects the O_RDWR|O_CREAT branch of streamOpen (see Stream.c);
+		 the earlier value 3 matched no branch and always failed to open."
+		^self new initializeFileName: aString mode: 4
 	]
 
 

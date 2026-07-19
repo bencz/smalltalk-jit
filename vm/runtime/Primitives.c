@@ -20,6 +20,7 @@
 #include "concurrency/Scheduler.h"
 #include "runtime/Message.h"
 #include "runtime/Collection.h"
+#include "runtime/FileSystem.h"
 #include "core/Assert.h"
 #include <pthread.h>
 
@@ -135,6 +136,22 @@ static PrimitiveResult floatAsStringPrimitive(Value self);
 static PrimitiveResult intAsFloatPrimitive(Value self);
 static PrimitiveResult floatExponentPrimitive(Value self);
 static PrimitiveResult floatTimesTwoPowerPrimitive(Value self, Value arg);
+static PrimitiveResult monotonicNanoTimePrimitive(Value receiver);
+static PrimitiveResult localUtcOffsetPrimitive(Value receiver, Value epochSeconds);
+static PrimitiveResult randomBytesPrimitive(Value receiver, Value bytes);
+static PrimitiveResult getEnvPrimitive(Value receiver, Value name);
+static PrimitiveResult commandLinePrimitive(Value receiver);
+static PrimitiveResult exitWithCodePrimitive(Value receiver, Value code);
+static PrimitiveResult cpuCountPrimitive(Value receiver);
+static PrimitiveResult fileStatPrimitive(Value receiver, Value path);
+static PrimitiveResult fileMkdirPrimitive(Value receiver, Value path);
+static PrimitiveResult fileUnlinkPrimitive(Value receiver, Value path);
+static PrimitiveResult fileRmdirPrimitive(Value receiver, Value path);
+static PrimitiveResult fileRenamePrimitive(Value receiver, Value from, Value to);
+static PrimitiveResult fileListDirPrimitive(Value receiver, Value path);
+static PrimitiveResult fileGetCwdPrimitive(Value receiver);
+static PrimitiveResult fileChdirPrimitive(Value receiver, Value path);
+static PrimitiveResult fileRealpathPrimitive(Value receiver, Value path);
 
 // The GEN generators and the CCALL trampoline are provided by the CPU backend
 // selected at link time (CMake ST_ARCH -> vm/jit/<arch>/Primitives<Arch>.c);
@@ -376,6 +393,26 @@ Primitive Primitives[] = {
 	// process exit codes (see gUnhandledErrors in Scheduler.c).
 	{"UnhandledErrorNotePrimitive", CCALL, .cFunction = unhandledErrorNotePrimitive, 1},
 	{"UnhandledErrorTakePrimitive", CCALL, .cFunction = unhandledErrorTakePrimitive, 1},
+	// Appended (NEVER reorder this table): OS/system primitives for the stdlib
+	// core, monotonic clock, local timezone offset, entropy, environment,
+	// command line, exit code, CPU count, and the file-system calls
+	// (vm/runtime/FileSystem.c). All generic POSIX, no framework logic.
+	{"MonotonicNanoTimePrimitive", CCALL, .cFunction = monotonicNanoTimePrimitive, 1},
+	{"LocalUtcOffsetPrimitive", CCALL, .cFunction = localUtcOffsetPrimitive, 2},
+	{"RandomBytesPrimitive", CCALL, .cFunction = randomBytesPrimitive, 2},
+	{"GetEnvPrimitive", CCALL, .cFunction = getEnvPrimitive, 2},
+	{"CommandLinePrimitive", CCALL, .cFunction = commandLinePrimitive, 1},
+	{"ExitWithCodePrimitive", CCALL, .cFunction = exitWithCodePrimitive, 2},
+	{"CpuCountPrimitive", CCALL, .cFunction = cpuCountPrimitive, 1},
+	{"FileStatPrimitive", CCALL, .cFunction = fileStatPrimitive, 2},
+	{"FileMkdirPrimitive", CCALL, .cFunction = fileMkdirPrimitive, 2},
+	{"FileUnlinkPrimitive", CCALL, .cFunction = fileUnlinkPrimitive, 2},
+	{"FileRmdirPrimitive", CCALL, .cFunction = fileRmdirPrimitive, 2},
+	{"FileRenamePrimitive", CCALL, .cFunction = fileRenamePrimitive, 3},
+	{"FileListDirPrimitive", CCALL, .cFunction = fileListDirPrimitive, 2},
+	{"FileGetCwdPrimitive", CCALL, .cFunction = fileGetCwdPrimitive, 1},
+	{"FileChdirPrimitive", CCALL, .cFunction = fileChdirPrimitive, 2},
+	{"FileRealpathPrimitive", CCALL, .cFunction = fileRealpathPrimitive, 2},
 };
 
 
@@ -1954,6 +1991,251 @@ static PrimitiveResult lastGcStatsPrimitive(Value receiver)
 	stringDictAtPut(stats, asString("fiberSlots"), tagInt(schedulerFiberSlots()));
 	stringDictAtPut(stats, asString("armedWaiters"), tagInt(schedulerArmedWaiters()));
 	Value result = getTaggedPtr(stats);
+	closeHandleScope(&scope, NULL);
+	return primSuccess(result);
+}
+
+
+// ---- OS/system primitives (stdlib core) -----------------------------------
+
+static int commandLineCount = 0;
+static char **commandLineArguments = NULL;
+
+
+void primitivesSetCommandLine(int count, char **arguments)
+{
+	commandLineCount = count;
+	commandLineArguments = arguments;
+}
+
+
+// Marshal a String/Symbol argument into a NUL-terminated C path buffer.
+// Rejects non-byte objects and paths that do not fit (with the NUL).
+static _Bool pathFromValue(Value vPath, char *buffer, size_t capacity)
+{
+	if (!valueTypeOf(vPath, VALUE_POINTER)) {
+		return 0;
+	}
+	RawObject *raw = asObject(vPath);
+	if (!raw->class->instanceShape.isBytes) {
+		return 0;
+	}
+	size_t size = rawObjectSize(raw);
+	if (size >= capacity) {
+		return 0;
+	}
+	memcpy(buffer, getRawObjectIndexedVars(raw), size);
+	buffer[size] = '\0';
+	return 1;
+}
+
+
+static PrimitiveResult monotonicNanoTimePrimitive(Value receiver)
+{
+	return primSuccess(tagInt(osMonotonicNanos()));
+}
+
+
+static PrimitiveResult localUtcOffsetPrimitive(Value receiver, Value epochSeconds)
+{
+	if (!valueTypeOf(epochSeconds, VALUE_INT)) {
+		return primFailed();
+	}
+	return primSuccess(tagInt(osLocalUtcOffsetSeconds(asCInt(epochSeconds))));
+}
+
+
+// Fill the whole ByteArray with OS entropy, in place: no allocation, no GC
+// window. Answers the receiver's argument so .st can chain on it.
+static PrimitiveResult randomBytesPrimitive(Value receiver, Value bytes)
+{
+	if (!valueTypeOf(bytes, VALUE_POINTER)) {
+		return primFailed();
+	}
+	RawObject *raw = asObject(bytes);
+	if (!raw->class->instanceShape.isBytes) {
+		return primFailed();
+	}
+	if (!osRandomBytes(getRawObjectIndexedVars(raw), rawObjectSize(raw))) {
+		return primFailed();
+	}
+	return primSuccess(bytes);
+}
+
+
+static PrimitiveResult getEnvPrimitive(Value receiver, Value name)
+{
+	char nameBuffer[256];
+	if (!pathFromValue(name, nameBuffer, sizeof(nameBuffer))) {
+		return primFailed();
+	}
+	char *value = getenv(nameBuffer);
+	if (value == NULL) {
+		return primSuccess(getTaggedPtr(Handles.nil));
+	}
+	HandleScope scope;
+	openHandleScope(&scope);
+	Value result = getTaggedPtr(asString(value));
+	closeHandleScope(&scope, NULL);
+	return primSuccess(result);
+}
+
+
+static PrimitiveResult commandLinePrimitive(Value receiver)
+{
+	HandleScope scope;
+	openHandleScope(&scope);
+	OrderedCollection *result = newOrdColl(commandLineCount > 0 ? (size_t) commandLineCount : 1);
+	for (int i = 0; i < commandLineCount; i++) {
+		HandleScope entry;
+		openHandleScope(&entry);
+		ordCollAddObject(result, (Object *) asString(commandLineArguments[i]));
+		closeHandleScope(&entry, NULL);
+	}
+	Value r = getTaggedPtr(result);
+	closeHandleScope(&scope, NULL);
+	return primSuccess(r);
+}
+
+
+static PrimitiveResult exitWithCodePrimitive(Value receiver, Value code)
+{
+	exit(valueTypeOf(code, VALUE_INT) ? (int) asCInt(code) : EXIT_FAILURE);
+}
+
+
+static PrimitiveResult cpuCountPrimitive(Value receiver)
+{
+	return primSuccess(tagInt(osAvailableCoreCount()));
+}
+
+
+// Answers {type. size. mtimeMillis} (type 1 = file, 2 = directory, 3 = other)
+// or nil when the path cannot be stat'ed; `exists` in .st is stat notNil.
+static PrimitiveResult fileStatPrimitive(Value receiver, Value path)
+{
+	char pathBuffer[FS_PATH_MAX];
+	int64_t info[3];
+	if (!pathFromValue(path, pathBuffer, sizeof(pathBuffer))) {
+		return primFailed();
+	}
+	if (!fsStatPath(pathBuffer, info)) {
+		return primSuccess(getTaggedPtr(Handles.nil));
+	}
+	HandleScope scope;
+	openHandleScope(&scope);
+	Array *result = newArray(3);
+	result->raw->vars[0] = tagInt(info[0]);
+	result->raw->vars[1] = tagInt(info[1]);
+	result->raw->vars[2] = tagInt(info[2]);
+	Value r = getTaggedPtr(result);
+	closeHandleScope(&scope, NULL);
+	return primSuccess(r);
+}
+
+
+static PrimitiveResult fileMkdirPrimitive(Value receiver, Value path)
+{
+	char pathBuffer[FS_PATH_MAX];
+	if (!pathFromValue(path, pathBuffer, sizeof(pathBuffer))) {
+		return primFailed();
+	}
+	return primSuccess(getTaggedPtr(fsMkdir(pathBuffer) ? Handles.true : Handles.false));
+}
+
+
+static PrimitiveResult fileUnlinkPrimitive(Value receiver, Value path)
+{
+	char pathBuffer[FS_PATH_MAX];
+	if (!pathFromValue(path, pathBuffer, sizeof(pathBuffer))) {
+		return primFailed();
+	}
+	return primSuccess(getTaggedPtr(fsUnlink(pathBuffer) ? Handles.true : Handles.false));
+}
+
+
+static PrimitiveResult fileRmdirPrimitive(Value receiver, Value path)
+{
+	char pathBuffer[FS_PATH_MAX];
+	if (!pathFromValue(path, pathBuffer, sizeof(pathBuffer))) {
+		return primFailed();
+	}
+	return primSuccess(getTaggedPtr(fsRmdir(pathBuffer) ? Handles.true : Handles.false));
+}
+
+
+static PrimitiveResult fileRenamePrimitive(Value receiver, Value from, Value to)
+{
+	char fromBuffer[FS_PATH_MAX];
+	char toBuffer[FS_PATH_MAX];
+	if (!pathFromValue(from, fromBuffer, sizeof(fromBuffer))) {
+		return primFailed();
+	}
+	if (!pathFromValue(to, toBuffer, sizeof(toBuffer))) {
+		return primFailed();
+	}
+	return primSuccess(getTaggedPtr(fsRename(fromBuffer, toBuffer) ? Handles.true : Handles.false));
+}
+
+
+// Answers an OrderedCollection of entry names, or nil when the directory
+// cannot be read (missing, not a directory, no permission).
+static PrimitiveResult fileListDirPrimitive(Value receiver, Value path)
+{
+	char pathBuffer[FS_PATH_MAX];
+	if (!pathFromValue(path, pathBuffer, sizeof(pathBuffer))) {
+		return primFailed();
+	}
+	HandleScope scope;
+	openHandleScope(&scope);
+	OrderedCollection *result = fsListDir(pathBuffer);
+	if (result == NULL) {
+		closeHandleScope(&scope, NULL);
+		return primSuccess(getTaggedPtr(Handles.nil));
+	}
+	Value r = getTaggedPtr(result);
+	closeHandleScope(&scope, NULL);
+	return primSuccess(r);
+}
+
+
+static PrimitiveResult fileGetCwdPrimitive(Value receiver)
+{
+	char pathBuffer[FS_PATH_MAX];
+	if (!fsGetCwd(pathBuffer, sizeof(pathBuffer))) {
+		return primSuccess(getTaggedPtr(Handles.nil));
+	}
+	HandleScope scope;
+	openHandleScope(&scope);
+	Value result = getTaggedPtr(asString(pathBuffer));
+	closeHandleScope(&scope, NULL);
+	return primSuccess(result);
+}
+
+
+static PrimitiveResult fileChdirPrimitive(Value receiver, Value path)
+{
+	char pathBuffer[FS_PATH_MAX];
+	if (!pathFromValue(path, pathBuffer, sizeof(pathBuffer))) {
+		return primFailed();
+	}
+	return primSuccess(getTaggedPtr(fsChdir(pathBuffer) ? Handles.true : Handles.false));
+}
+
+
+static PrimitiveResult fileRealpathPrimitive(Value receiver, Value path)
+{
+	char pathBuffer[FS_PATH_MAX];
+	char resolved[FS_PATH_MAX];
+	if (!pathFromValue(path, pathBuffer, sizeof(pathBuffer))) {
+		return primFailed();
+	}
+	if (!fsRealpath(pathBuffer, resolved)) {
+		return primSuccess(getTaggedPtr(Handles.nil));
+	}
+	HandleScope scope;
+	openHandleScope(&scope);
+	Value result = getTaggedPtr(asString(resolved));
 	closeHandleScope(&scope, NULL);
 	return primSuccess(result);
 }

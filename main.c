@@ -12,6 +12,7 @@
 #include "vm/core/Exception.h"
 #include "vm/os/Os.h"
 #include "vm/tools/Cli.h"
+#include "vm/runtime/Primitives.h"
 #include "vm/jit/TargetCpu.h"
 #include "vm/jit/InlineCache.h"
 #include "vm/jit/Tier.h"
@@ -75,6 +76,10 @@ int main(int argc, char **args)
 	targetCpuDetect();
 
 	parseCliArgs(&cliArgs, argc, args);
+
+	// Script-visible command line (CommandLinePrimitive): everything left after
+	// the options, e.g. `st -f prog.st alpha beta` -> #('alpha' 'beta').
+	primitivesSetCommandLine(argc - optind, args + optind);
 
 	// The C-level self-test battery (ST_*_TEST env vars) lives in
 	// vm/tests/SelfTests.c; -1 means "no self-test requested".

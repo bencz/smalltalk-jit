@@ -2,10 +2,12 @@
  existing exception tests do not cover directly. Two facts drive most of it:
    * Error is resumable-false and is the parent of MessageNotUnderstood,
      OutOfRangeError, IoError, SubClassResponsibility and ShouldNotImplement.
-   * Warning and NotFoundError are direct Exception subclasses, NOT Errors, so
-     an `on: Error do:` handler must NOT catch them while `on: Exception do:`
-     must. Handler selection is verified by letting a non-matching inner handler
-     fall through to an outer `on: Exception` sentinel.
+   * Warning is a direct Exception subclass, NOT an Error, so an `on: Error do:`
+     handler must NOT catch it while `on: Exception do:` must. NotFoundError, in
+     contrast, is now an Error (a lookup miss is a genuine failure, not a
+     resumable notification), so `on: Error do:` DOES catch it. Handler
+     selection is verified by letting a non-matching inner handler fall through
+     to an outer `on: Exception` sentinel.
 
  A custom class tree (base -> mid -> leaf, plus a sibling and a direct Exception
  subclass) probes user-defined selection. Globals live in this test process
@@ -35,8 +37,8 @@ ErrHierProbe := Object [
             that: [ MessageNotUnderstood inheritsFrom: Error ].
         t check: 'NotFoundError inheritsFrom Exception'
             that: [ NotFoundError inheritsFrom: Exception ].
-        t check: 'NotFoundError does NOT inheritFrom Error'
-            that: [ (NotFoundError inheritsFrom: Error) not ].
+        t check: 'NotFoundError inheritsFrom Error'
+            that: [ NotFoundError inheritsFrom: Error ].
         t check: 'OutOfRangeError inheritsFrom Error'
             that: [ OutOfRangeError inheritsFrom: Error ].
         t check: 'IoError inheritsFrom Error'
@@ -51,8 +53,8 @@ ErrHierProbe := Object [
     class fillIsKindOf: t [
         t check: 'NotFoundError instance isKindOf Exception'
             that: [ NotFoundError new isKindOf: Exception ].
-        t check: 'NotFoundError instance is NOT a kind of Error'
-            that: [ (NotFoundError new isKindOf: Error) not ].
+        t check: 'NotFoundError instance isKindOf Error'
+            that: [ NotFoundError new isKindOf: Error ].
         t check: 'OutOfRangeError instance isKindOf Error'
             that: [ (OutOfRangeError value: 1 between: 2 and: 3) isKindOf: Error ].
         t check: 'MNU instance isKindOf Error and Exception'
@@ -72,8 +74,8 @@ ErrHierProbe := Object [
             equals: #byException
             is: [ [[Warning signal] on: Error do: [:e | #byError]]
                     on: Exception do: [:e | #byException] ].
-        t check: 'on: Error does NOT catch a NotFoundError'
-            equals: #byException
+        t check: 'on: Error now catches a NotFoundError'
+            equals: #byError
             is: [ [[NotFoundError signal] on: Error do: [:e | #byError]]
                     on: Exception do: [:e | #byException] ].
         t check: 'on: Exception catches an Error'
@@ -98,8 +100,8 @@ ErrHierProbe := Object [
             that: [ Exception handles: Warning new ].
         t check: 'Error handles: a MessageNotUnderstood instance'
             that: [ Error handles: MessageNotUnderstood new ].
-        t check: 'Error does NOT handle a NotFoundError instance'
-            that: [ (Error handles: NotFoundError new) not ].
+        t check: 'Error handles: a NotFoundError instance'
+            that: [ Error handles: NotFoundError new ].
         t check: 'NotFoundError handles: a NotFoundError instance'
             that: [ NotFoundError handles: NotFoundError new ].
     ]

@@ -83,7 +83,9 @@
     t check: 'asString answers a plain String' that: [ #foo asString class == String ].
     t check: 'asString content drops the #' equals: 'foo' is: [ #foo asString ].
     t check: 'asString is a fresh object, not the symbol' that: [ (#foo asString == #foo) not ].
-    t expect: 'Symbol has no < (not a Magnitude)' raises: MessageNotUnderstood in: [ | x | x := #a. x < #b ].
+    "Wave 3 gave String (and thus Symbol, its subclass) a lexicographic-by-byte
+     ordering; this case used to assert < was absent (a DNU)."
+    t check: 'Symbol inherits String lexicographic <' that: [ | x | x := #a. x < #b ].
 
     ^t report
 ]

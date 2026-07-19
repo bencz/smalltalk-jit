@@ -92,6 +92,12 @@ Character := Magnitude [
 	]
 
 
+	class value: anInteger [
+		"Alias for codePoint:: answer the Character with the given code point."
+		^self codePoint: anInteger
+	]
+
+
 	class digitValue: anInteger [
 		^'0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ' at: anInteger + 1
 	]
@@ -134,6 +140,18 @@ Character := Magnitude [
 	]
 
 
+	value [
+		"Alias for codePoint."
+		^self codePoint
+	]
+
+
+	asInteger [
+		"Alias for codePoint."
+		^self codePoint
+	]
+
+
 	"comparing"
 
 	hash [
@@ -149,6 +167,12 @@ Character := Magnitude [
 
 	< aCharacter [
 		^self codePoint < aCharacter codePoint
+	]
+
+
+	sameAs: aCharacter [
+		"Case-insensitive comparison (ASCII fold)."
+		^self asLowercase = aCharacter asLowercase
 	]
 
 
@@ -199,6 +223,16 @@ Character := Magnitude [
 	]
 
 
+	isPunctuation [
+		"True for ASCII punctuation: code points 33..47, 58..64, 91..96, 123..126
+		 (the C ispunct ranges)."
+		| c |
+		c := self codePoint.
+		^(c between: 33 and: 47) or: [(c between: 58 and: 64)
+			or: [(c between: 91 and: 96) or: [c between: 123 and: 126]]]
+	]
+
+
 	"converting"
 
 	asLowercase [
@@ -208,6 +242,35 @@ Character := Magnitude [
 
 	asUppercase [
 		^self class codePoint: (Table at: self codePoint + 769)
+	]
+
+
+	asCharacter [
+		^self
+	]
+
+
+	asString [
+		"A one-character String containing the receiver."
+		^String with: self
+	]
+
+
+	asSymbol [
+		^self asString asSymbol
+	]
+
+
+	to: aCharacter [
+		"Answer an Array of the consecutive Characters from the receiver to
+		 aCharacter inclusive (empty when aCharacter precedes the receiver)."
+		| start stop result |
+		start := self codePoint.
+		stop := aCharacter codePoint.
+		stop < start ifTrue: [^Array new: 0].
+		result := Array new: stop - start + 1.
+		start to: stop do: [ :c | result at: c - start + 1 put: (Character value: c)].
+		^result
 	]
 
 
@@ -230,6 +293,19 @@ Character := Magnitude [
 				aStream nextPut: $<.
 				self codePoint printOn: aStream.
 				aStream nextPut: $>].
+	]
+
+
+	"displaying"
+
+	displayString [
+		"The character itself, without the leading $ that printOn: adds."
+		^self asString
+	]
+
+
+	displayOn: aStream [
+		aStream nextPut: self.
 	]
 
 ]
