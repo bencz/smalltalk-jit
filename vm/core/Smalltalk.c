@@ -207,7 +207,7 @@ void objectBecome(Object *old, Object *new)
 	// safepoint handshake needed. become: allocates nothing, so holding gcLock is deadlock-free.
 	_Bool multi = (heap->mutators != NULL && heap->mutators->nextMutator != NULL);
 	heapGcEnterBlocked(heap, &CurrentThread);
-	pthread_mutex_lock(&heap->gcLock);
+	osMutexLock(&heap->gcLock);
 	heapGcLeaveBlocked(heap, &CurrentThread);
 	if (multi) {
 		heapGcBegin(heap, &CurrentThread);
@@ -227,7 +227,7 @@ void objectBecome(Object *old, Object *new)
 	if (multi) {
 		heapGcEnd(heap);
 	}
-	pthread_mutex_unlock(&heap->gcLock);
+	osMutexUnlock(&heap->gcLock);
 }
 
 

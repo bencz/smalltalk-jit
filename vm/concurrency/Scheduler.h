@@ -3,6 +3,7 @@
 
 #include "concurrency/Fiber.h"
 #include "core/Object.h"
+#include "os/Os.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -51,7 +52,7 @@ void schedulerSleep(int64_t micros);
 // Park the current fiber until `fd` is ready for reading (forWrite == 0) or
 // writing (forWrite != 0). This is how non-blocking socket I/O turns into
 // linear, blocking-looking code without stalling the whole VM.
-void schedulerWaitFd(int fd, int forWrite);
+void schedulerWaitFd(OsFd fd, int forWrite);
 
 // Terminate a fiber by id. If it is the current fiber this never returns.
 void schedulerTerminate(size_t id);

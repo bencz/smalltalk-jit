@@ -1,147 +1,72 @@
+// Fiber integration for TCP sockets: the OS work (create/connect/accept,
+// non-blocking flags, the syscalls themselves) lives behind vm/os/OsSocket.h;
+// this layer owns the RETRY POLICY — park the calling fiber on the scheduler's
+// event loop whenever the OS answers OS_IO_WOULD_BLOCK, retry on
+// OS_IO_INTERRUPTED — which is exactly the piece the OS seam must never know
+// about (it never calls the scheduler).
 #include "runtime/Socket.h"
+#include "os/OsSocket.h"
 #include "concurrency/Scheduler.h"
-#include "core/Assert.h"
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <netdb.h>
-#include <unistd.h>
-#include <string.h>
-#include <fcntl.h>
-#include <errno.h>
 
 
-// Put a descriptor into non-blocking mode so its I/O parks the fiber (via the
-// scheduler's epoll loop) instead of stalling the whole VM.
-void socketSetNonBlocking(int descriptor)
+OsFd socketConnect(uint32_t ip, uint16_t port)
 {
-	int flags = fcntl(descriptor, F_GETFL, 0);
-	if (flags >= 0) {
-		fcntl(descriptor, F_SETFL, flags | O_NONBLOCK);
+	OsFd fd;
+	OsIoStatus status = osSocketConnectBegin(ip, port, &fd);
+	if (status == OS_IO_ERROR) {
+		return OS_FD_INVALID;
 	}
-}
-
-
-// Disable Nagle's algorithm so small HTTP responses are sent immediately instead
-// of being coalesced. Applied automatically to every connected/accepted socket.
-void socketSetNoDelay(int descriptor)
-{
-	int one = 1;
-	setsockopt(descriptor, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-}
-
-
-int socketConnect(uint32_t ip, uint16_t port)
-{
-	int descriptor = socket(AF_INET, SOCK_STREAM, 0);
-	struct sockaddr_in address;
-
-	if (descriptor < 0) {
-		return -1;
-	}
-	socketSetNonBlocking(descriptor);
-	socketSetNoDelay(descriptor);
-
-	address.sin_family = AF_INET;
-	address.sin_port = htons(port);
-	memcpy(&address.sin_addr, &ip, sizeof(ip));
-
-	int result = connect(descriptor, (struct sockaddr *) &address, sizeof(address));
-	if (result != 0 && errno == EINPROGRESS) {
+	if (status == OS_IO_WOULD_BLOCK) {
 		// connection in progress: park until the socket is writable, then check
-		schedulerWaitFd(descriptor, 1);
-		int error = 0;
-		socklen_t len = sizeof(error);
-		if (getsockopt(descriptor, SOL_SOCKET, SO_ERROR, &error, &len) != 0 || error != 0) {
-			close(descriptor);
-			return -1;
+		schedulerWaitFd(fd, 1);
+		if (osSocketConnectFinish(fd) != OS_IO_OK) {
+			osSocketClose(fd);
+			return OS_FD_INVALID;
 		}
-		return descriptor;
 	}
-	if (result != 0) {
-		close(descriptor);
-		return -1;
-	}
-	return descriptor;
+	return fd;
 }
 
 
-int socketBind(uint32_t ip, uint16_t port, int backlog)
+OsFd socketBind(uint32_t ip, uint16_t port, int backlog)
 {
-	int descriptor = socket(AF_INET, SOCK_STREAM, 0);
-	struct sockaddr_in address;
-
-	if (descriptor < 0) {
-		return -1;
+	OsFd fd;
+	if (osSocketListen(ip, port, backlog, &fd) != OS_IO_OK) {
+		return OS_FD_INVALID;
 	}
-
-	address.sin_family = AF_INET;
-	address.sin_port = htons(port);
-	memcpy(&address.sin_addr, &ip, sizeof(ip));
-	//address.sin_addr.s_addr = INADDR_ANY;
-
-	int reuse = 1;
-	setsockopt(descriptor, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-
-	if (bind(descriptor, (struct sockaddr *) &address, sizeof(address)) != 0) {
-		close(descriptor);
-		return -1;
-	}
-	if (listen(descriptor, backlog) != 0) {
-		close(descriptor);
-		return -1;
-	}
-	socketSetNonBlocking(descriptor);
-	return descriptor;
+	return fd;
 }
 
 
 // Accept a connection, parking the fiber until one arrives. The returned
-// client descriptor is itself non-blocking.
-int socketAccept(int descriptor)
+// client descriptor is itself non-blocking (and nodelay).
+OsFd socketAccept(OsFd listener)
 {
 	for (;;) {
-		int client = accept(descriptor, NULL, 0);
-		if (client >= 0) {
-			socketSetNonBlocking(client);
-			socketSetNoDelay(client);
+		OsFd client;
+		switch (osSocketAccept(listener, &client)) {
+		case OS_IO_OK:
 			return client;
-		}
-		if (errno == EAGAIN || errno == EWOULDBLOCK) {
-			schedulerWaitFd(descriptor, 0);
+		case OS_IO_WOULD_BLOCK:
+			schedulerWaitFd(listener, 0);
 			continue;
-		}
-		if (errno == EINTR) {
+		case OS_IO_INTERRUPTED:
 			continue;
+		default:
+			return OS_FD_INVALID;
 		}
-		return -1;
 	}
 }
 
 
 uint32_t socketHostLookup(char *host, const char **error)
 {
-	struct addrinfo hints;
-	struct addrinfo *addr;
-
-	hints.ai_family = AF_INET;
-	hints.ai_socktype = SOCK_STREAM;
-	hints.ai_flags = 0;
-	hints.ai_protocol = 0;
-	hints.ai_canonname = NULL;
-	hints.ai_addr = NULL;
-	hints.ai_next = NULL;
-
-	int result = getaddrinfo(host, NULL, &hints, &addr);
-	if (result == 0) {
-		ASSERT(addr->ai_addr->sa_family == AF_INET);
-		uint32_t ip;
-		memcpy(&ip, &((struct sockaddr_in *) addr->ai_addr)->sin_addr, sizeof(ip));
-		*error = NULL;
-		freeaddrinfo(addr);
-		return ip;
-	} else {
-		*error = gai_strerror(result);
+	static _Thread_local char errorBuffer[256];
+	uint32_t ip;
+	if (!osSocketHostLookup(host, &ip, errorBuffer, sizeof(errorBuffer))) {
+		*error = errorBuffer;
 		return 0;
 	}
+	*error = NULL;
+	return ip;
 }

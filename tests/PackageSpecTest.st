@@ -23,7 +23,7 @@
 	t check: 'an entry point makes it an application' that: [ spec isApplication ].
 
 	spec := PackageSpec new.
-	spec requires: 'Std.Json'.
+	spec requires: 'Acme.Json'.
 	spec requires: 'Acme.Pg' path: '../pg'.
 	spec requires: 'Std.Http' version: '1.0'.
 	t check: 'requirements accumulate in order' equals: 3 is: [ spec requirements size ].

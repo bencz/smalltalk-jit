@@ -1,27 +1,16 @@
+// File-stream support over the OS seam (vm/os/OsFile.h): this layer only
+// converts between Smalltalk values (mode bits, String file names) and the
+// OsFile contract. Blocking semantics; EINTR is absorbed inside the OS layer.
 #include "runtime/Stream.h"
 #include "core/Thread.h"
 #include "core/Handle.h"
 #include "memory/Heap.h"
 #include "core/Assert.h"
-#include <sys/ioctl.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <errno.h>
+#include "os/OsFile.h"
 #include <string.h>
 
-#if !defined(TEMP_FAILURE_RETRY)
-    static inline int64_t temp_failure_retry(int64_t expression) {
-        int64_t __result;
-        do {
-            __result = expression;
-        } while (__result == -1L && errno == EINTR);
-        return __result;
-    }
-    #define TEMP_FAILURE_RETRY(expression) temp_failure_retry(expression)
-#endif
 
-
-int streamOpen(RawString *fileName, intptr_t mode)
+OsFd streamOpen(RawString *fileName, intptr_t mode)
 {
 	HandleScope scope;
 	openHandleScope(&scope);
@@ -39,82 +28,69 @@ int streamOpen(RawString *fileName, intptr_t mode)
 
 	closeHandleScope(&scope, NULL);
 
-	int openMode = 0;
+	OsFileMode fileMode;
 	switch (mode) {
 	case 1:
-		openMode = O_RDONLY;
+		fileMode = OS_FILE_READ;
 		break;
 	case 1 << 1:
 		// write: opens for writing and CREATES/truncates the target, so writing
 		// to a brand-new file works like the standard "w" fopen mode.
-		openMode = O_WRONLY | O_CREAT | O_TRUNC;
+		fileMode = OS_FILE_WRITE_TRUNC;
 		break;
 	case 1 << 2:
 		// readOrWrite: opens read/write and CREATES the target if missing, but
 		// does NOT truncate, so existing contents can be read back and updated
 		// in place (standard "r+"/create semantics).
-		openMode = O_RDWR | O_CREAT;
+		fileMode = OS_FILE_READ_WRITE_CREATE;
 		break;
 	default:
-		return -1;
+		return OS_FD_INVALID;
 	}
 
-	// The 0666 mode argument is honored only when O_CREAT is set (and is further
-	// filtered by the process umask); it is ignored for a pure O_RDONLY open.
-	return TEMP_FAILURE_RETRY(open(buffer, openMode, 0666));
+	return osFileOpen(buffer, fileMode);
 }
 
 
-_Bool streamClose(int descriptor)
+_Bool streamClose(OsFd descriptor)
 {
-	return close(descriptor) == 0;
+	return osFileClose(descriptor);
 }
 
 
-ptrdiff_t streamRead(int descriptor, void *buffer, size_t size)
+ptrdiff_t streamRead(OsFd descriptor, void *buffer, size_t size)
 {
-	return TEMP_FAILURE_RETRY(read(descriptor, buffer, size));
+	return (ptrdiff_t) osFileRead(descriptor, buffer, size);
 }
 
 
-ptrdiff_t streamWrite(int descriptor, void *buffer, size_t size)
+ptrdiff_t streamWrite(OsFd descriptor, void *buffer, size_t size)
 {
-	return TEMP_FAILURE_RETRY(write(descriptor, buffer, size));
+	return (ptrdiff_t) osFileWrite(descriptor, buffer, size);
 }
 
 
-_Bool streamFlush(int descriptor)
+_Bool streamFlush(OsFd descriptor)
 {
-	return TEMP_FAILURE_RETRY(fsync(descriptor)) == 0;
+	return osFileFlush(descriptor);
 }
 
 
-/*_Bool streamAtEnd(RawFileStream *stream)
+ptrdiff_t streamGetPosition(OsFd descriptor)
 {
-	return feof(stream->file);
-}*/
-
-
-ptrdiff_t streamGetPosition(int descriptor)
-{
-	return TEMP_FAILURE_RETRY(lseek(descriptor, 0, SEEK_CUR));
+	return (ptrdiff_t) osFileGetPosition(descriptor);
 }
 
 
-_Bool streamSetPosition(int descriptor, ptrdiff_t position)
+_Bool streamSetPosition(OsFd descriptor, ptrdiff_t position)
 {
-	return TEMP_FAILURE_RETRY(lseek(descriptor, position, SEEK_SET)) != -1;
+	return osFileSetPosition(descriptor, position);
 }
 
 
-intptr_t streamAvailable(int descriptor)
+intptr_t streamAvailable(OsFd descriptor)
 {
-	int available;
-	int result = TEMP_FAILURE_RETRY(ioctl(descriptor, FIONREAD, &available));
-	if (result < 0) {
-		return result;
-	}
-	return available;
+	return (intptr_t) osFileAvailable(descriptor);
 }
 
 
@@ -124,7 +100,7 @@ IoError *getLastIoError(void)
 	openHandleScope(&scope);
 
 	char msg[256] = "IoError: ";
-	strerror_r(errno, msg + 9, 256 - 9);
+	osErrorMessage(osLastError(), msg + 9, sizeof(msg) - 9);
 	IoError *error = newObject(Handles.IoError, 0);
 	objectStorePtr((Object *) error,  &error->raw->messageText, (Object *) asString(msg));
 

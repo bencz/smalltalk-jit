@@ -5,6 +5,9 @@
 // buffer is treated as "does not fit".
 #include "os/Os.h"
 #include <unistd.h>
+#include <string.h>
+#include <errno.h>
+#include <stdio.h>
 
 
 _Bool osExecutablePath(char *buffer, size_t size)
@@ -18,4 +21,32 @@ _Bool osExecutablePath(char *buffer, size_t size)
 	}
 	buffer[length] = '\0';
 	return 1;
+}
+
+
+int osLastError(void)
+{
+	return errno;
+}
+
+
+void osErrorMessage(int code, char *buffer, size_t size)
+{
+	// The XSI strerror_r fills the buffer; on the GNU variant the result may
+	// live in a static string instead, so route through the return value.
+#if defined(_GNU_SOURCE) || (defined(__GLIBC__) && !((_POSIX_C_SOURCE >= 200112L) && !defined(_GNU_SOURCE)))
+	char scratch[256];
+	char *message = strerror_r(code, scratch, sizeof(scratch));
+	snprintf(buffer, size, "%s", message);
+#else
+	if (strerror_r(code, buffer, size) != 0 && size > 0) {
+		snprintf(buffer, size, "error %d", code);
+	}
+#endif
+}
+
+
+_Bool osJitMapPath(char *buffer, size_t size)
+{
+	return snprintf(buffer, size, "/tmp/perf-%d.map", (int) getpid()) < (int) size;
 }

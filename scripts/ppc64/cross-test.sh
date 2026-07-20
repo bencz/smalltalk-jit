@@ -98,7 +98,7 @@ fi
 # and C self-tests above never exercise Smalltalk semantics on the target.
 echo "== bootstrap + numeric .st tests under qemu ($TARGET_ARCH):"
 IMG="/tmp/st-cross-$TARGET_ARCH.img"
-"$OUT/st" -s "$IMG" -b smalltalk </dev/null >/dev/null
+"$OUT/st" -s "$IMG" -b packages/Core </dev/null >/dev/null
 if [ "$MODE" = be ]; then
 	# Bootstrap compiles the WHOLE kernel: the largest codegen the VM ever
 	# does, and the case that shipped broken once. Under power7 the float
@@ -108,7 +108,7 @@ if [ "$MODE" = be ]; then
 	# of the gate, then prove the image it built actually works there.
 	echo "==   full bootstrap under QEMU_CPU=power7 (memory-path codegen):"
 	IMG7="/tmp/st-cross-$TARGET_ARCH-power7.img"
-	QEMU_CPU=power7 timeout 1800 "$OUT/st" -s "$IMG7" -b smalltalk </dev/null >/dev/null \
+	QEMU_CPU=power7 timeout 1800 "$OUT/st" -s "$IMG7" -b packages/Core </dev/null >/dev/null \
 		|| { echo "FAIL: bootstrap under power7"; exit 1; }
 	QEMU_CPU=power7 timeout 900 "$OUT/st" -s "$IMG7" -f tests/FloatTest.st </dev/null >/dev/null 2>&1 \
 		|| { echo "FAIL: FloatTest.st on the power7-built image"; exit 1; }

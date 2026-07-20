@@ -60,22 +60,23 @@ fi
 # stdin from /dev/null: bootstrapping falls through to the REPL, so feed it EOF
 # to make it exit immediately instead of waiting for input.
 echo "${B}bootstrapping image...${Z}"
-if ! "$BUILD/st" -s "$SNAP" -b smalltalk </dev/null >/dev/null 2>&1; then
+if ! "$BUILD/st" -s "$SNAP" -b packages/Core </dev/null >/dev/null 2>&1; then
 	echo "${R}BOOTSTRAP FAILED${Z}"; exit 1
 fi
 
-# The fat development image: core + every shipped Std.* package (devimage/).
-# Samples run against it, exactly like the pre-package era where everything
-# was in the kernel. Fresh core.img is always newer than the cached project
-# image, so this rebuilds every run (cheap, and the point of the gate).
+# The samples project image: core + the Std.* packages the samples use
+# (samples/package.st). Samples run against it through the harness (explicit
+# ST_IMAGE/-s is the debug/override surface st run uses implicitly). Fresh
+# core.img is always newer than the cached project image, so this rebuilds
+# every run (cheap, and the point of the gate).
 SNAP_ABS="$(cd "$(dirname "$SNAP")" && pwd)/$(basename "$SNAP")"
 ST_ABS="$(cd "$BUILD" && pwd)/st"
-DEVSNAP="$ROOT/devimage/.stbuild/program.img"
-echo "${B}building dev image (core + Std packages)...${Z}"
-if ! (cd devimage && ST_PACKAGE_PATH="$ROOT/packages" ST_IMAGE="$SNAP_ABS" \
+DEVSNAP="$ROOT/samples/.stbuild/program.img"
+echo "${B}building samples project image (core + Std packages)...${Z}"
+if ! (cd samples && ST_PACKAGE_PATH="$ROOT/packages" ST_IMAGE="$SNAP_ABS" \
 		"$ST_ABS" build >/dev/null 2>&1); then
-	echo "${R}DEV IMAGE BUILD FAILED${Z}"
-	(cd devimage && ST_PACKAGE_PATH="$ROOT/packages" ST_IMAGE="$SNAP_ABS" "$ST_ABS" build)
+	echo "${R}SAMPLES IMAGE BUILD FAILED${Z}"
+	(cd samples && ST_PACKAGE_PATH="$ROOT/packages" ST_IMAGE="$SNAP_ABS" "$ST_ABS" build)
 	exit 1
 fi
 
@@ -242,8 +243,8 @@ else
 fi
 
 # run_group <title> <image> <files...>: each file through the -f path against
-# the given image (core tests run on the core image; samples run on the fat
-# devimage so unqualified lib references resolve).
+# the given image (core tests run on the core image; samples run on the
+# samples project image so unqualified lib references resolve).
 run_group() {
 	local title="$1"; shift
 	local image="$1"; shift
@@ -253,6 +254,7 @@ run_group() {
 	for f in "$@"; do
 		[ -f "$f" ] || continue
 		base="$(basename "$f")"
+		[ "$base" = "package.st" ] && continue   # a project manifest, not a runnable script
 		[ "$base" = "CompilerTestFile.st" ] && continue   # included by CompilerTest, not standalone
 		[ "$base" = "IcHammerTest.st" ] && continue   # OS-thread stress: sandboxed group below
 		[ "$base" = "TierHammerTest.st" ] && continue   # OS-thread stress: sandboxed group below

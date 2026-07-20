@@ -9,7 +9,9 @@
 #include "compiler/Compiler.h"
 #include "runtime/Stream.h"
 #include "runtime/Socket.h"
+#include "os/OsSocket.h"
 #include "runtime/Json.h"
+#include "runtime/Base64.h"
 #include "compiler/Parser.h"
 #include "core/Lookup.h"
 #include "core/StackFrame.h"
@@ -23,7 +25,7 @@
 #include "runtime/Collection.h"
 #include "runtime/FileSystem.h"
 #include "core/Assert.h"
-#include <pthread.h>
+#include "os/OsThread.h"
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -160,6 +162,9 @@ static PrimitiveResult fileListDirPrimitive(Value receiver, Value path);
 static PrimitiveResult fileGetCwdPrimitive(Value receiver);
 static PrimitiveResult fileChdirPrimitive(Value receiver, Value path);
 static PrimitiveResult fileRealpathPrimitive(Value receiver, Value path);
+static PrimitiveResult base64EncodePrimitive(Value receiver, Value input);
+static PrimitiveResult base64DecodePrimitive(Value receiver, Value input);
+static PrimitiveResult base64DecodeBytesPrimitive(Value receiver, Value input);
 
 // The GEN generators and the CCALL trampoline are provided by the CPU backend
 // selected at link time (CMake ST_ARCH -> vm/jit/<arch>/Primitives<Arch>.c);
@@ -437,6 +442,12 @@ Primitive Primitives[] = {
 	// Appended (NEVER reorder this table): dev-reload surgery behind
 	// Behavior>>removeSelector:, invalidating like extend/redefine do.
 	{"ClassRemoveSelectorPrimitive", CCALL, .cFunction = classRemoveSelectorPrimitive, 2},
+	// Appended (NEVER reorder this table): base-64 fast paths for the core
+	// codec (vm/runtime/Base64.c); malformed decode input fails into the .st
+	// fallback, which raises the precise InvalidArgumentError.
+	{"Base64EncodePrimitive", CCALL, .cFunction = base64EncodePrimitive, 2},
+	{"Base64DecodePrimitive", CCALL, .cFunction = base64DecodePrimitive, 2},
+	{"Base64DecodeBytesPrimitive", CCALL, .cFunction = base64DecodeBytesPrimitive, 2},
 };
 
 
@@ -842,7 +853,7 @@ typedef struct {
 	Heap *heap;
 } ParWorkerArg;
 
-static void *parallelPrimWorker(void *arg)
+static void parallelPrimWorker(void *arg)
 {
 	ParWorkerArg *w = arg;
 	memset(&CurrentThread, 0, sizeof(Thread));
@@ -875,7 +886,6 @@ static void *parallelPrimWorker(void *arg)
 	closeHandleScope(&scope, NULL);
 
 	heapEndMutator(w->heap, &CurrentThread); // leave the mutator set before the thread dies
-	return NULL;
 }
 
 static PrimitiveResult workerParallelPrimitive(Value self, Value blocksArray)
@@ -892,7 +902,7 @@ static PrimitiveResult workerParallelPrimitive(Value self, Value blocksArray)
 	Heap *heap = CurrentThread.heap;
 
 	ParWorkerArg *works = malloc(n * sizeof(ParWorkerArg));
-	pthread_t *threads = malloc(n * sizeof(pthread_t));
+	OsThread *threads = malloc(n * sizeof(OsThread));
 	for (size_t i = 0; i < n; i++) {
 		works[i].arrayHandle = arrPH;
 		works[i].resultsHandle = resultsPH;
@@ -902,10 +912,10 @@ static PrimitiveResult workerParallelPrimitive(Value self, Value blocksArray)
 	}
 	heapGcEnterBlocked(heap, &CurrentThread); // caller is idle (blocked) during the join
 	for (size_t i = 0; i < n; i++) {
-		pthread_create(&threads[i], NULL, parallelPrimWorker, &works[i]);
+		osThreadSpawn(&threads[i], parallelPrimWorker, &works[i]);
 	}
 	for (size_t i = 0; i < n; i++) {
-		pthread_join(threads[i], NULL);
+		osThreadJoin(&threads[i]);
 	}
 	heapGcLeaveBlocked(heap, &CurrentThread);
 	free(works);
@@ -1040,8 +1050,8 @@ static PrimitiveResult socketConnectPrimitive(Value socket, Value vAddr, Value p
 		return primFailed();
 	}
 	RawInternetAddress *addr = (RawInternetAddress *) asObject(vAddr);
-	int descriptor = socketConnect(asCInt(addr->address), asCInt(port));
-	return descriptor < 0 ? primFailed() : primSuccess(tagInt(descriptor));
+	OsFd descriptor = socketConnect(asCInt(addr->address), asCInt(port));
+	return descriptor == OS_FD_INVALID ? primFailed() : primSuccess(tagInt(descriptor));
 }
 
 
@@ -1051,16 +1061,16 @@ static PrimitiveResult socketBindPrimitive(Value socket, Value vAddr, Value port
 		return primFailed();
 	}
 	RawInternetAddress *addr = (RawInternetAddress *) asObject(vAddr);
-	int descriptor = socketBind(asCInt(addr->address), asCInt(port), asCInt(queueSize));
-	return descriptor < 0 ? primFailed() : primSuccess(tagInt(descriptor));
+	OsFd descriptor = socketBind(asCInt(addr->address), asCInt(port), asCInt(queueSize));
+	return descriptor == OS_FD_INVALID ? primFailed() : primSuccess(tagInt(descriptor));
 }
 
 
 static PrimitiveResult socketAcceptPrimitive(Value socket)
 {
 	RawServerSocket *server = (RawServerSocket *) asObject(socket);
-	int descriptor = socketAccept(asCInt(server->descriptor));
-	return descriptor < 0 ? primFailed() : primSuccess(tagInt(descriptor));
+	OsFd descriptor = socketAccept((OsFd) asCInt(server->descriptor));
+	return descriptor == OS_FD_INVALID ? primFailed() : primSuccess(tagInt(descriptor));
 }
 
 
@@ -1068,7 +1078,7 @@ static PrimitiveResult socketAcceptPrimitive(Value socket)
 // get this automatically; this primitive is for explicit control from Smalltalk.
 static PrimitiveResult socketSetNoDelayPrimitive(Value self, Value vFd)
 {
-	socketSetNoDelay((int) asCInt(vFd));
+	osSocketSetNoDelay((OsFd) asCInt(vFd));
 	return primSuccess(self);
 }
 
@@ -1083,7 +1093,7 @@ static PrimitiveResult socketReadPrimitive(Value self, Value vFd, Value vBuffer,
 	openHandleScope(&scope);
 
 	String *buffer = scopeHandle(asObject(vBuffer));
-	int fd = (int) asCInt(vFd);
+	OsFd fd = (OsFd) asCInt(vFd);
 	intptr_t size = asCInt(vSize);
 	intptr_t start = asCInt(vStart) - 1;
 
@@ -1095,24 +1105,26 @@ static PrimitiveResult socketReadPrimitive(Value self, Value vFd, Value vBuffer,
 		size = buffer->raw->size - start;
 	}
 
-	ptrdiff_t n;
+	size_t bytesRead = 0;
+	_Bool failed = 0;
 	for (;;) {
-		n = read(fd, buffer->raw->contents + start, size);
-		if (n >= 0) {
+		OsIoStatus status = osSocketRead(fd, buffer->raw->contents + start, (size_t) size, &bytesRead);
+		if (status == OS_IO_OK) {
 			break;
 		}
-		if (errno == EAGAIN || errno == EWOULDBLOCK) {
+		if (status == OS_IO_WOULD_BLOCK) {
 			schedulerWaitFd(fd, 0);
 			continue;
 		}
-		if (errno == EINTR) {
+		if (status == OS_IO_INTERRUPTED) {
 			continue;
 		}
+		failed = 1;
 		break;
 	}
 
 	closeHandleScope(&scope, NULL);
-	return n < 0 ? primFailed() : primSuccess(tagInt(n));
+	return failed ? primFailed() : primSuccess(tagInt((intptr_t) bytesRead));
 }
 
 
@@ -1124,7 +1136,7 @@ static PrimitiveResult socketWritePrimitive(Value self, Value vFd, Value vBuffer
 	openHandleScope(&scope);
 
 	String *buffer = scopeHandle(asObject(vBuffer));
-	int fd = (int) asCInt(vFd);
+	OsFd fd = (OsFd) asCInt(vFd);
 	intptr_t size = asCInt(vSize);
 
 	if (size > buffer->raw->size) {
@@ -1133,16 +1145,18 @@ static PrimitiveResult socketWritePrimitive(Value self, Value vFd, Value vBuffer
 
 	intptr_t total = 0;
 	while (total < size) {
-		ptrdiff_t n = write(fd, buffer->raw->contents + total, size - total);
-		if (n >= 0) {
-			total += n;
+		size_t bytesWritten = 0;
+		OsIoStatus status = osSocketWrite(fd, buffer->raw->contents + total,
+			(size_t) (size - total), &bytesWritten);
+		if (status == OS_IO_OK) {
+			total += (intptr_t) bytesWritten;
 			continue;
 		}
-		if (errno == EAGAIN || errno == EWOULDBLOCK) {
+		if (status == OS_IO_WOULD_BLOCK) {
 			schedulerWaitFd(fd, 1);
 			continue;
 		}
-		if (errno == EINTR) {
+		if (status == OS_IO_INTERRUPTED) {
 			continue;
 		}
 		closeHandleScope(&scope, NULL);
@@ -1236,6 +1250,68 @@ static PrimitiveResult jsonParsePrimitive(Value receiver, Value vString)
 	}
 	closeHandleScope(&scope, NULL);
 	return primSuccess(result);
+}
+
+
+// Base64 class >> encode: — byte fast path (vm/runtime/Base64.c). Exact
+// String/ByteArray inputs only; anything else fails into the .st fallback,
+// which raises the precise InvalidArgumentError.
+static PrimitiveResult base64EncodePrimitive(Value receiver, Value vInput)
+{
+	if (!valueTypeOf(vInput, VALUE_POINTER)) {
+		return primFailed();
+	}
+	RawClass *class = asObject(vInput)->class;
+	if (class != Handles.String->raw && class != Handles.ByteArray->raw) {
+		return primFailed();
+	}
+	HandleScope scope;
+	openHandleScope(&scope);
+	Object *input = scopeHandle(asObject(vInput));
+	String *encoded;
+	if (!base64Encode(input, &encoded)) {
+		closeHandleScope(&scope, NULL);
+		return primFailed();
+	}
+	Value result = getTaggedPtr(encoded);
+	closeHandleScope(&scope, NULL);
+	return primSuccess(result);
+}
+
+
+// Base64 class >> decode: / decodeBytes: — strict decode; malformed input
+// fails BEFORE any allocation and the .st fallback re-scans for its error.
+static PrimitiveResult base64DecodeToClass(Value vInput, Class *outputClass)
+{
+	if (!valueTypeOf(vInput, VALUE_POINTER)) {
+		return primFailed();
+	}
+	if (asObject(vInput)->class != Handles.String->raw) {
+		return primFailed();
+	}
+	HandleScope scope;
+	openHandleScope(&scope);
+	String *input = (String *) scopeHandle(asObject(vInput));
+	Object *decoded;
+	if (!base64Decode(input, outputClass, &decoded)) {
+		closeHandleScope(&scope, NULL);
+		return primFailed();
+	}
+	Value result = getTaggedPtr(decoded);
+	closeHandleScope(&scope, NULL);
+	return primSuccess(result);
+}
+
+
+static PrimitiveResult base64DecodePrimitive(Value receiver, Value vInput)
+{
+	return base64DecodeToClass(vInput, Handles.String);
+}
+
+
+static PrimitiveResult base64DecodeBytesPrimitive(Value receiver, Value vInput)
+{
+	return base64DecodeToClass(vInput, Handles.ByteArray);
 }
 
 

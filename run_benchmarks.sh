@@ -56,7 +56,7 @@ fi
 # always bootstrap a fresh image so it matches the current kernel (cheap).
 # stdin from /dev/null: with a terminal on stdin the VM falls through to the
 # REPL and waits for input instead of exiting (same reason as run_tests.sh)
-if ! "$BUILD/st" -s "$SNAP" -b smalltalk </dev/null >/dev/null 2>&1; then
+if ! "$BUILD/st" -s "$SNAP" -b packages/Core </dev/null >/dev/null 2>&1; then
 	echo "${R}BOOTSTRAP FAILED${Z}"; exit 1
 fi
 

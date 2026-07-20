@@ -221,7 +221,7 @@ void icInvalidateAllSends(void (*mutate)(void *ctx), void *ctx)
 	Heap *heap = CurrentThread.heap;
 	_Bool multi = (heap->mutators != NULL && heap->mutators->nextMutator != NULL);
 	heapGcEnterBlocked(heap, &CurrentThread);
-	pthread_mutex_lock(&heap->gcLock);
+	osMutexLock(&heap->gcLock);
 	heapGcLeaveBlocked(heap, &CurrentThread);
 	if (multi) {
 		heapGcBegin(heap, &CurrentThread);
@@ -249,7 +249,7 @@ void icInvalidateAllSends(void (*mutate)(void *ctx), void *ctx)
 	if (multi) {
 		heapGcEnd(heap);
 	}
-	pthread_mutex_unlock(&heap->gcLock);
+	osMutexUnlock(&heap->gcLock);
 }
 
 

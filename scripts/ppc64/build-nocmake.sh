@@ -19,7 +19,9 @@ mkdir -p "$BUILD"
 CC="${CC:-cc}"
 TARGET_ARCH="${TARGET_ARCH:-$(uname -m)}"
 STATIC="${STATIC:-0}"
-CFLAGS="-std=gnu11 -O2 -fcommon -fno-omit-frame-pointer -I$ROOT/vm -I$ROOT"
+# -I vm/os/linux mirrors CMake's per-OS include dir (target_include_directories
+# with vm/os/${ST_OS}): that is how vm/os/OsThread.h finds OsThreadImpl.h.
+CFLAGS="-std=gnu11 -O2 -fcommon -fno-omit-frame-pointer -I$ROOT/vm -I$ROOT -I$ROOT/vm/os/linux"
 
 # ONE backend serves both byte orders (vm/jit/ppc64/); the targets differ in
 # the ABI bind (elfv1/elfv2), the CPU-floor bind (cpu/CpuBind*.c) and the

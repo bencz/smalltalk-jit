@@ -87,9 +87,12 @@ scheduler, channels, an actor layer, and non-blocking sockets.
 | `06_business_card_server.st`| The same API as a **standalone server** bound to `0.0.0.0:8080`, seeded with one card; hammer it with `curl`, `ab -k -n 50000 -c 200`, or `wrk` |
 | `07_mediator_cqrs.st`       | **Advanced Mediator (CQRS)** — commands/queries routed to one handler through a pipeline (`log → validate → time`); events published **fire-and-forget** to per-subscriber fibers; a saga reacts to a `StockLow` event by issuing a `Restock`; concurrent buyers fan out as fibers and fan in over a channel |
 
-The HTTP server, client and JSON codec used by 05/06 live in the kernel
-(`smalltalk/Http/*.st` and `smalltalk/Json.st`), so they are reusable
-building blocks, not just sample code:
+The HTTP server and client used by 05/06 live in `packages/Std.Http`, and
+the JSON codec is a core class (`packages/Core/src/Json.st`), so they are
+reusable building blocks, not just sample code. The samples themselves form
+a project (`samples/package.st` requires the Std packages they use), so
+`st run samples/concurrency/05_business_card_api.st` runs against the
+samples project image automatically:
 
 ```smalltalk
 server := HttpServer port: 8080.

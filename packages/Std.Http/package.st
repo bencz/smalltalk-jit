@@ -1,10 +1,9 @@
 "Std.Http package manifest. HTTP/1.1 server and client over the core
- non-blocking sockets; JSON request/response bodies through Std.Json."
+ non-blocking sockets; JSON request/response bodies through the core Json."
 PackageSpec new
 	name: 'Std.Http';
 	version: '0.1.0';
 	summary: 'HTTP/1.1 server and client over the core non-blocking sockets';
-	requires: 'Std.Json';
 	files: #(
 		'src/HttpRequest.st'
 		'src/HttpConnection.st'

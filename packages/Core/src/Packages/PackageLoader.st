@@ -105,24 +105,28 @@ PackageLoader := Object [
 		aStack addLast: aSpec name.
 		aSpec requirements do: [ :req |
 			| existing dir child |
-			existing := specs at: req name ifAbsent: [nil].
-			existing isNil
-				ifTrue: [
-					dir := self resolveRequirement: req from: aSpec.
-					child := self specFrom: dir.
-					child name = req name ifFalse: [
-						Error signal: dir, '/package.st declares name ', child name,
-							' but was required as ', req name].
-					self check: req against: child.
-					specs at: req name put: child.
-					self resolve: child stack: aStack]
-				ifFalse: [
-					req path notNil ifTrue: [
+			"Core is the image itself: requires: 'Core' is always satisfied and
+			 must never resolve to packages/Core on disk, which would reload
+			 the kernel into a second namespace."
+			req name = 'Core' ifFalse: [
+				existing := specs at: req name ifAbsent: [nil].
+				existing isNil
+					ifTrue: [
 						dir := self resolveRequirement: req from: aSpec.
-						dir = existing rootPath ifFalse: [
-							Error signal: 'conflicting sources for package ', req name, ': ',
-								existing rootPath, ' vs ', dir]].
-					self check: req against: existing]].
+						child := self specFrom: dir.
+						child name = req name ifFalse: [
+							Error signal: dir, '/package.st declares name ', child name,
+								' but was required as ', req name].
+						self check: req against: child.
+						specs at: req name put: child.
+						self resolve: child stack: aStack]
+					ifFalse: [
+						req path notNil ifTrue: [
+							dir := self resolveRequirement: req from: aSpec.
+							dir = existing rootPath ifFalse: [
+								Error signal: 'conflicting sources for package ', req name, ': ',
+									existing rootPath, ' vs ', dir]].
+						self check: req against: existing]]].
 		aStack removeLast.
 		loadOrder addLast: aSpec.
 	]
@@ -148,10 +152,17 @@ PackageLoader := Object [
 
 	loadPackage: aSpec [
 		| nsName ns imports classes compiler |
+		"Core is already in the image (the C bootstrap compiled it): register
+		 the spec so tooling sees it, but never create a namespace over the
+		 seeded #Core nor recompile anything."
+		aSpec name = 'Core' ifTrue: [
+			LoadedPackages at: 'Core' put: aSpec.
+			^self].
 		(LoadedPackages includesKey: aSpec name) ifTrue: [^self].
 		nsName := aSpec name asSymbol.
 		imports := OrderedCollection new.
-		aSpec requirements do: [ :req | imports add: (Namespaces at: req name asSymbol)].
+		aSpec requirements do: [ :req |
+			req name = 'Core' ifFalse: [imports add: (Namespaces at: req name asSymbol)]].
 		ns := Namespace named: nsName imports: imports asArray.
 		Namespaces at: nsName put: ns.
 		compiler := Compiler new.

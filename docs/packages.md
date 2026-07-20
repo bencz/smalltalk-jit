@@ -1,10 +1,15 @@
 # Packages and projects
 
-The kernel image (`smalltalk/`) is only the core: compiler, collections,
-streams, files, concurrency, exceptions, the package tooling itself. Every
-other library lives in a package under `packages/` (the shipped stdlib uses
-the `Std.` prefix: `Std.Http`, `Std.Json`, `Std.Actors`, `Std.Uuid`,
-`Std.Base64`), and applications are packages with an entry point.
+The core of the runtime is itself a package: `packages/Core` (compiler,
+collections, streams, files, concurrency, exceptions, the package tooling
+itself). Its `package.st` `files:` list is the single source of truth for
+the kernel file set and order; the C bootstrap (`st -b packages/Core`) reads
+that literal with a minimal scanner, compiles the core from nothing and
+writes the base image. `requires: 'Core'` is implicit and always satisfied:
+the loader never resolves Core from disk, because the core IS the image.
+Every other library lives in a package under `packages/` (the shipped stdlib
+uses the `Std.` prefix: `Std.Http`, `Std.Actors`, `Std.Uuid`), and
+applications are packages with an entry point.
 
 ## The manifest: package.st
 
@@ -18,7 +23,6 @@ PackageSpec new
 	name: 'Std.Http';
 	version: '0.1.0';
 	summary: 'HTTP/1.1 server and client';
-	requires: 'Std.Json';
 	files: #(
 		'src/HttpRequest.st'
 		'src/HttpServer.st');
@@ -108,4 +112,13 @@ block answers `^t report`). `st test` compiles them into a `<Name>Tests`
 namespace importing the package under test and its direct requirements, runs
 each file through the same path as `st -f`, and exits with the summed fail
 count. `run_tests.sh` drives `st test` for every shipped package and builds
-the fat `devimage/` project (all Std packages) that the samples run against.
+the `samples/` project image that the samples run against.
+
+## Running scripts and choosing an image
+
+`st run path/to/script.st` runs a script in its project's image: the project
+root is found walking up from the SCRIPT's directory, the image is rebuilt if
+stale, and the script then compiles into the project's namespace (a script
+outside any project runs on the base image). Passing an image explicitly
+(`-s` or `ST_IMAGE`) is a debug/override surface, useful for harnesses and
+for inspecting a specific snapshot; the normal flow never needs it.

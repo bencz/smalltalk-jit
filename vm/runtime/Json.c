@@ -1,4 +1,4 @@
-// C runtime for smalltalk/Json.st — a strict RFC 8259 parser and a core-type
+// C runtime for packages/Core/src/Json.st — a strict RFC 8259 parser and a core-type
 // encoder. The design contract with the GC (see Dictionary.c's growDictionary
 // for the house pattern):
 //

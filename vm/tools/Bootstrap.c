@@ -16,19 +16,32 @@
 #include "core/Namespace.h"
 #include "compiler/Scope.h"
 #include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 static void initSmalltalkStubs(void);
 static Class *newStubClass(Class *metaClass, InstanceShape shape, size_t instanceSize);
 static Class *newStubMetaClass(InstanceShape shape, size_t instanceSize);
 static Object *newStubObject(size_t size);
-static _Bool parseKernelFiles(char *kernelDir);
+static _Bool parseKernelFiles(char *coreDir);
 
 
-_Bool bootstrap(char *kernelDir)
+// Builds the initial image from nothing. The C side cannot be replaced by the
+// package system because the loader cannot load itself: PackageLoader and
+// Compiler evaluate: are kernel Smalltalk, and before the kernel is compiled
+// there is no Smalltalk to run them. What stays in C is exactly the
+// pre-Smalltalk minimum: the stub metaobjects the parser needs
+// (initSmalltalkStubs), the primitive table (registerPrimitives), the parse
+// loop over the core files (parseKernelFiles), the metaclass initialize sweep
+// and the layout ASSERTs. The FILE LIST is no longer C: the Core package
+// manifest (<coreDir>/package.st, normally packages/Core/package.st) is the
+// single source of truth for the kernel file set and its order.
+_Bool bootstrap(char *coreDir)
 {
 	initSmalltalkStubs();
 	registerPrimitives();
-	return parseKernelFiles(kernelDir);
+	return parseKernelFiles(coreDir);
 }
 
 
@@ -251,177 +264,249 @@ static Object *newStubObject(size_t size)
 }
 
 
-static _Bool parseKernelFiles(char *kernelDir)
+// ---- core manifest reader ---------------------------------------------------
+// The kernel file list and its load order live in <coreDir>/package.st: the
+// Core package manifest is the single source of truth, shared with the package
+// tooling. The bootstrap runs before any Smalltalk exists, so this is a
+// MINIMAL scanner for the two tokens the bootstrap needs, not a parser of the
+// DSL: it skips "..." comments (with "" escape), consumes '...' strings (with
+// '' escape), validates name: 'Core' and collects the files: #('...' ...)
+// literal. Anything fancier in the manifest (computed lists, concatenation)
+// is a bootstrap error by design; the manifest is ours, not adversarial input.
+
+// Skip whitespace and "..." comments.
+static void manifestSkipBlanks(const char **p, const char *end)
 {
-	char *kernelFiles[] = {
-		"Object.st",
-		"UndefinedObject.st",
-		"Behavior.st",
-		"ClassDescription.st",
-		"MetaClass.st",
-		"Class.st",
-		"Boolean.st",
-		"True.st",
-		"False.st",
-		"TypeFeedback.st",
-		"Magnitudes/Magnitude.st",
-		"Magnitudes/Number.st",
-		"Magnitudes/Integer.st",
-		"Magnitudes/SmallInteger.st",
-		"Magnitudes/LargeInteger.st",
-		"Magnitudes/LargePositiveInteger.st",
-		"Magnitudes/LargeNegativeInteger.st",
-		"Magnitudes/Fraction.st",
-		"Magnitudes/ScaledDecimal.st",
-		"Magnitudes/Float.st",
-		"Magnitudes/SmallFloat64.st",
-		"Magnitudes/BoxedFloat64.st",
-		"Magnitudes/Character.st",
-		"Magnitudes/DateTime.st",
-		"Magnitudes/Duration.st",
-		"Magnitudes/Date.st",
-		"Magnitudes/Time.st",
-		"Magnitudes/Stopwatch.st",
-		"Iterator.st",
-		"LazySequence.st",
-		"Collections/Association.st",
-		"Collections/Collection.st",
-		"Collections/SequenceableCollection.st",
-		"Collections/ArrayedCollection.st",
-		"Collections/Array.st",
-		"Collections/String.st",
-		"Collections/Symbol.st",
-		"Collections/HashedCollection.st",
-		"Collections/Dictionary.st",
-		"Collections/Set.st",
-		"Collections/ByteArray.st",
-		"Collections/Bag.st",
-		"Collections/OrderedCollection.st",
-		"Collections/SortedCollection.st",
-		"Collections/Interval.st",
-		"Collections/IdentitySet.st",
-		"Collections/IdentityDictionary.st",
-		"Collections/Stack.st",
-		"Collections/Queue.st",
-		"Collections/Heap.st",
-		"Random.st",
-		"Namespace.st",
-		"CompiledCode.st",
-		"CompiledBlock.st",
-		"CompiledMethod.st",
-		"Block.st",
-		"Context.st",
-		"ContextCopy.st",
-		"MethodContext.st",
-		"BlockContext.st",
-		"ExceptionHandler.st",
-		"UnwindHandler.st",
-		"Message.st",
-		"SourceCode.st",
-		"FileSourceCode.st",
-		"Streams/Stream.st",
-		"Streams/PositionableStream.st",
-		"Streams/StreamView.st",
-		"Streams/CollectionStream.st",
-		"Streams/BufferedStream.st",
-		"Streams/ExternalStream.st",
-		"Streams/FileStream.st",
-		"Streams/Socket.st",
-		"Streams/ServerSocket.st",
-		"Streams/InternetAddress.st",
+	while (*p < end) {
+		char c = **p;
+		if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+			(*p)++;
+		} else if (c == '"') {
+			(*p)++;
+			while (*p < end) {
+				if (**p == '"') {
+					(*p)++;
+					if (*p < end && **p == '"') {
+						(*p)++; // "" escape: keep scanning the comment
+						continue;
+					}
+					break;
+				}
+				(*p)++;
+			}
+		} else {
+			return;
+		}
+	}
+}
 
-		// The HTTP framework moved out of the kernel: packages/Std.Http/,
-		// loaded on demand by the package system (devimage/ for the dev image).
 
-		"GarbageCollector.st",
+// Read the '...' literal at *p (assumes **p == '\'') resolving the '' escape.
+// Answers a malloc'd copy and advances *p past the closing quote, or NULL on
+// an unterminated literal. Relies on the source buffer being NUL-terminated.
+static char *manifestReadString(const char **p, const char *end)
+{
+	const char *scan = *p + 1;
+	size_t size = 0;
+	while (scan < end) {
+		if (*scan == '\'') {
+			if (scan[1] == '\'') {
+				scan += 2;
+				size++;
+				continue;
+			}
+			break;
+		}
+		scan++;
+		size++;
+	}
+	if (scan >= end) {
+		return NULL;
+	}
+	char *result = malloc(size + 1);
+	char *out = result;
+	scan = *p + 1;
+	for (;;) {
+		if (*scan == '\'') {
+			if (scan[1] == '\'') {
+				*out++ = '\'';
+				scan += 2;
+				continue;
+			}
+			scan++;
+			break;
+		}
+		*out++ = *scan++;
+	}
+	*out = '\0';
+	*p = scan;
+	return result;
+}
 
-		// scheduling kernel
-		"Processes/ProcessorScheduler.st",
-		"Processes/Process.st",
-		"Processes/Delay.st",
 
-		// synchronisation primitives
-		"Concurrency/Atomic.st", // generic lock-free atomic cell (load/store/CAS/exchange)
-		"Concurrency/AtomicInteger.st", // Atomic subclass: lock-free fetch-add counters
-		"Concurrency/AtomicArray.st", // fixed array of atomic slots (per-index CAS/fetch-add)
-		"Concurrency/Semaphore.st",
-		"Concurrency/Channel.st",
-		"Concurrency/Worker.st",
-		"Concurrency/SharedDictionary.st", // thread-safe collection for shared state under the pool
-		"Concurrency/ConcurrentDictionary.st", // read-mostly, lock-free reads (actor registry / id->pid maps)
+static void manifestFreeFiles(char **files, size_t count)
+{
+	for (size_t i = 0; i < count; i++) {
+		free(files[i]);
+	}
+	free(files);
+}
 
-		// The actor framework moved out of the kernel: packages/Std.Actors/.
 
-		"Exception.st",
-		"HandlerEscape.st",
-		"Error.st",
-		// arithmetic error family: ArithmeticError < Error, ZeroDivide < ArithmeticError
-		"ArithmeticError.st",
-		"ZeroDivide.st",
-		// minimal system-error classes (kernel adoption is deferred to a later wave)
-		"InvalidArgumentError.st",
-		"NotYetImplementedError.st",
-		"EmptyCollectionError.st",
-		"Warning.st",
-		"MessageNotUnderstood.st",
-		"OutOfRangeError.st",
-		"NotFoundError.st",
-		"ShouldNotImplement.st",
-		"SubClassResponsibility.st",
-		"IoError.st",
+static _Bool manifestIsLetter(char c)
+{
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+}
 
-		// The JSON codec moved out of the kernel: packages/Std.Json (its C
-		// primitives stay registered in the VM and resolve by name).
 
-		"Parser/ParseError.st",
-		"Parser/Parser.st",
-		"Parser/LiteralNode.st",
-		"Parser/ClassNode.st",
-		"Parser/MethodNode.st",
-		"Parser/BlockNode.st",
-		"Parser/ExpressionNode.st",
-		"Parser/MessageExpressionNode.st",
-		"Parser/VariableNode.st",
-		"Parser/NilNode.st",
-		"Parser/TrueNode.st",
-		"Parser/FalseNode.st",
-		"Parser/IntegerNode.st",
-		"Parser/CharacterNode.st",
-		"Parser/StringNode.st",
-		"Parser/SymbolNode.st",
-		"Parser/ArrayNode.st",
-		"Parser/BlockScope.st",
+static _Bool manifestIsIdentifier(char c)
+{
+	return manifestIsLetter(c) || (c >= '0' && c <= '9');
+}
 
-		"Compiler/CompileError.st",
-		"Compiler/Compiler.st",
-		"Compiler/InvalidPragmaError.st",
-		"Compiler/UndefinedVariableError.st",
-		"Compiler/RedefinitionError.st",
-		"Compiler/ReadonlyVariableError.st",
 
-		"Debugger.st",
-		"Repl.st",
-		"Assert.st",
-		"AssertError.st",
-		"TestRun.st", // kernel unit-test runner (tests/*.st end with ^t report)
+// Extract the files: entries from <coreDir>/package.st. Answers a malloc'd
+// array of malloc'd strings (count in *countOut), or NULL after printing the
+// reason to stderr (bootstrap then fails noisily).
+static char **readCoreManifestFiles(const char *coreDir, size_t *countOut)
+{
+	char path[strlen(coreDir) + sizeof("/package.st") + 1];
+	sprintf(path, "%s/package.st", coreDir);
 
-		// System / file-system / Uuid / Base64 utilities: loaded last, after the
-		// Streams, DateTime and Random they build on. Class-side wrappers over the
-		// OS primitives appended in earlier waves.
-		"System.st",
-		"Files/Path.st",
-		"Files/File.st",
-		"Files/Directory.st",
-		// Uuid and Base64 moved out of the kernel: packages/Std.Uuid,
-		// packages/Std.Base64.
+	FILE *file = fopen(path, "r");
+	if (file == NULL) {
+		fprintf(stderr, "Bootstrap: cannot open core manifest %s: %s\n", path, strerror(errno));
+		return NULL;
+	}
+	fseek(file, 0, SEEK_END);
+	long fileSize = ftell(file);
+	fseek(file, 0, SEEK_SET);
+	if (fileSize < 0) {
+		fclose(file);
+		fprintf(stderr, "Bootstrap: cannot read core manifest %s\n", path);
+		return NULL;
+	}
+	char *source = malloc((size_t) fileSize + 1);
+	size_t sourceSize = fread(source, 1, (size_t) fileSize, file);
+	fclose(file);
+	source[sourceSize] = '\0';
 
-		// package system tooling (manifest, loader, CLI driver): core so that
-		// st build can run it on top of the base image
-		"Packages/PackageRequirement.st",
-		"Packages/PackageSpec.st",
-		"Packages/PackageLoader.st",
-		"Packages/ProjectTool.st",
-	};
+	const char *p = source;
+	const char *end = source + sourceSize;
+	char **files = NULL;
+	size_t count = 0;
+	size_t capacity = 0;
+	_Bool nameSeen = 0;
+	_Bool filesSeen = 0;
+	const char *error = NULL;
+	char errorBuffer[256];
+
+	while (p < end && error == NULL) {
+		manifestSkipBlanks(&p, end);
+		if (p >= end) {
+			break;
+		}
+		if (*p == '\'') {
+			// a string in cascade position (version:, summary:, ...): skip it
+			char *skipped = manifestReadString(&p, end);
+			if (skipped == NULL) {
+				error = "unterminated string";
+				break;
+			}
+			free(skipped);
+		} else if (manifestIsLetter(*p)) {
+			const char *start = p;
+			while (p < end && manifestIsIdentifier(*p)) {
+				p++;
+			}
+			_Bool keyword = p < end && *p == ':';
+			if (keyword) {
+				p++;
+			}
+			size_t tokenSize = (size_t) (p - start);
+			if (keyword && tokenSize == 5 && memcmp(start, "name:", 5) == 0) {
+				manifestSkipBlanks(&p, end);
+				if (p >= end || *p != '\'') {
+					error = "name: must be followed by a plain string";
+					break;
+				}
+				char *name = manifestReadString(&p, end);
+				if (name == NULL) {
+					error = "unterminated string after name:";
+					break;
+				}
+				if (strcmp(name, "Core") != 0) {
+					snprintf(errorBuffer, sizeof(errorBuffer),
+						"declares name: '%s', expected 'Core' - is -b pointing at the core package?", name);
+					error = errorBuffer;
+					free(name);
+					break;
+				}
+				free(name);
+				nameSeen = 1;
+			} else if (keyword && tokenSize == 6 && memcmp(start, "files:", 6) == 0) {
+				manifestSkipBlanks(&p, end);
+				if (p + 1 >= end || p[0] != '#' || p[1] != '(') {
+					error = "files: must be followed by a #('...' ...) literal";
+					break;
+				}
+				p += 2;
+				for (;;) {
+					manifestSkipBlanks(&p, end);
+					if (p >= end) {
+						error = "unterminated files: #( literal";
+						break;
+					}
+					if (*p == ')') {
+						p++;
+						filesSeen = 1;
+						break;
+					}
+					if (*p != '\'') {
+						error = "files: may only contain plain '...' strings";
+						break;
+					}
+					char *entry = manifestReadString(&p, end);
+					if (entry == NULL) {
+						error = "unterminated string in files:";
+						break;
+					}
+					if (count == capacity) {
+						capacity = capacity == 0 ? 160 : capacity * 2;
+						files = realloc(files, capacity * sizeof(char *));
+					}
+					files[count++] = entry;
+				}
+			}
+		} else {
+			p++; // any other char (#, (, ), ;, digits, ...) is not ours to check
+		}
+	}
+
+	free(source);
+	if (error == NULL && !nameSeen) {
+		error = "missing name: 'Core'";
+	}
+	if (error == NULL && (!filesSeen || count == 0)) {
+		error = "missing or empty files: list";
+	}
+	if (error != NULL) {
+		fprintf(stderr, "Bootstrap: bad core manifest %s: %s\n", path, error);
+		manifestFreeFiles(files, count);
+		return NULL;
+	}
+	*countOut = count;
+	return files;
+}
+
+
+static _Bool parseKernelFiles(char *coreDir)
+{
+	size_t kernelFileCount = 0;
+	char **kernelFiles = readCoreManifestFiles(coreDir, &kernelFileCount);
+	if (kernelFiles == NULL) {
+		return 0;
+	}
 
 	HandleScope scope;
 	openHandleScope(&scope);
@@ -439,18 +524,20 @@ static _Bool parseKernelFiles(char *kernelDir)
 	arrayAtPutObject(classInstanceVariables, 9, (Object *) asString("namespace"));
 	classSetInstanceVariables(Handles.Class, classInstanceVariables);
 
-	size_t kernelDirNameSize = strlen(kernelDir);
-	for (size_t i = 0; i < sizeof(kernelFiles) / sizeof(char *); i++) {
+	size_t coreDirNameSize = strlen(coreDir);
+	for (size_t i = 0; i < kernelFileCount; i++) {
 		size_t fileNameSize = strlen(kernelFiles[i]);
-		char fileName[kernelDirNameSize + fileNameSize + 1];
-		memcpy(fileName, kernelDir, kernelDirNameSize);
-		fileName[kernelDirNameSize] = '/';
-		memcpy(fileName + kernelDirNameSize + 1, kernelFiles[i], fileNameSize + 1);
+		char fileName[coreDirNameSize + fileNameSize + 2];
+		memcpy(fileName, coreDir, coreDirNameSize);
+		fileName[coreDirNameSize] = '/';
+		memcpy(fileName + coreDirNameSize + 1, kernelFiles[i], fileNameSize + 1);
 		if (!parseFile(fileName, NULL, NULL)) {
 			closeHandleScope(&scope, NULL);
+			manifestFreeFiles(kernelFiles, kernelFileCount);
 			return 0;
 		}
 	}
+	manifestFreeFiles(kernelFiles, kernelFileCount);
 
 	Iterator iterator;
 	initDictIterator(&iterator, Handles.Smalltalk);

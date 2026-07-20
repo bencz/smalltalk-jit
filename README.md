@@ -46,11 +46,11 @@ libm, everything else is POSIX. Linux only, for now.
 ```sh
 cmake -S . -B build
 cmake --build build -j
-LD_LIBRARY_PATH=build build/st -b smalltalk   # compiles the kernel, writes ./snapshot
+LD_LIBRARY_PATH=build build/st -b packages/Core   # compiles the core package, writes ./snapshot
 ```
 
 The image is a frozen snapshot, so bootstrap again after touching the C VM or
-anything under `smalltalk/`.
+anything under `packages/Core/`.
 
 Running
 -------
@@ -60,7 +60,8 @@ export LD_LIBRARY_PATH=build
 
 build/st                                  # REPL
 build/st -e '(1 to: 10) inject: 0 into: [ :a :b | a + b ]'
-build/st -f samples/17_mandelbrot.st
+build/st run samples/17_mandelbrot.st     # runs in the samples project image
+build/st -f samples/17_mandelbrot.st      # same script, explicit base image
 ```
 
 One quirk to know early: the value of the last top-level block becomes the

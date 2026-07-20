@@ -7,11 +7,34 @@
 // The operating-system seam. Bound at link time: CMake's ST_OS selection
 // compiles exactly one platform directory — vm/os/<os>/ (linux today; windows/
 // osx/aix are future peers), whose files implement this contract split by
-// domain (OsTime, OsMemory, OsEvents, OsSignals, OsCpu — future domains like
-// OsCrypto slot in as sibling files). The API is 1:1 with what the VM needs —
-// no speculative generality — but shaped so a runtime-selectable backend (an
-// ops struct, e.g. io_uring vs epoll) could slide in later without touching
-// the callers.
+// domain (OsTime, OsMemory, OsEvents, OsSignals, OsCpu — grown domains live in
+// sibling headers: OsThread.h, OsSocket.h, OsFile.h). The API is 1:1 with what
+// the VM needs — no speculative generality — but shaped so a runtime-
+// selectable backend (an ops struct, e.g. io_uring vs epoll) could slide in
+// later without touching the callers.
+
+// ---- I/O vocabulary (shared by OsEvents/OsSocket/OsFile) --------------------
+
+// Descriptor type wide enough for POSIX int fds AND WinSock's SOCKET
+// (UINT_PTR): raw platform descriptors never cross the seam as bare ints.
+typedef intptr_t OsFd;
+#define OS_FD_INVALID ((OsFd) -1)
+
+// I/O status across the seam. The OS layer NEVER blocks on readiness and
+// NEVER calls the scheduler: it reports WOULD_BLOCK and the caller (Socket.c /
+// Primitives.c) parks the fiber via schedulerWaitFd and retries.
+typedef enum {
+	OS_IO_OK = 0,
+	OS_IO_WOULD_BLOCK,  // retry after readiness (EAGAIN/EWOULDBLOCK/WSAEWOULDBLOCK)
+	OS_IO_INTERRUPTED,  // retry immediately (EINTR; never surfaces on Windows)
+	OS_IO_ERROR         // real failure; details via osLastError()
+} OsIoStatus;
+
+// Thread-local last OS error as an opaque code (errno / GetLastError /
+// WSAGetLastError), valid until the next OS-layer call on this thread, and
+// its human-readable rendering (thread-safe).
+int osLastError(void);
+void osErrorMessage(int code, char *buffer, size_t size);
 
 // ---- time -------------------------------------------------------------------
 
@@ -74,10 +97,10 @@ OsEventLoop *osEventLoopCreate(void);
 
 // Arm ONE-SHOT readiness (read or write) for fd, tagging the event with `tag`
 // (a fiber id). Re-arms an fd the loop already knows.
-void osEventLoopArm(OsEventLoop *loop, int fd, _Bool forWrite, uint64_t tag);
+void osEventLoopArm(OsEventLoop *loop, OsFd fd, _Bool forWrite, uint64_t tag);
 
 // Forget an armed fd (e.g. its waiting fiber was killed).
-void osEventLoopDisarm(OsEventLoop *loop, int fd);
+void osEventLoopDisarm(OsEventLoop *loop, OsFd fd);
 
 // Block until readiness or timeoutMs (-1 = forever; 0 = poll). Fills tags[]
 // with the tags of ready events and returns how many. Wakeups via
@@ -112,6 +135,11 @@ void osIgnoreBrokenPipe(void);
 // FreeBSD sysctl KERN_PROC_PATHNAME, Windows GetModuleFileName, AIX has no
 // reliable answer (return 0 and the callers fall back to CWD-relative paths).
 _Bool osExecutablePath(char *buffer, size_t size);
+
+// Path for the JIT symbol map consumed by the platform profiler, or 0 when
+// the platform has no such consumer (the feature then stays disabled).
+// Linux: /tmp/perf-<pid>.map for `perf`. PORT_ME(jit-map): others return 0.
+_Bool osJitMapPath(char *buffer, size_t size);
 
 // ---- scheduling ----------------------------------------------------------------
 

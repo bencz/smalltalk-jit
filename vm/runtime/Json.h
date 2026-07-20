@@ -4,7 +4,7 @@
 #include "core/Object.h"
 #include "runtime/String.h"
 
-// Fast JSON runtime backing smalltalk/Json.st (which is also the validating
+// Fast JSON runtime backing packages/Core/src/Json.st (which is also the validating
 // fallback and the reference implementation — keep semantics in sync).
 //
 // jsonParse: strict RFC 8259 parse of `input` into a Smalltalk object graph

@@ -2,6 +2,7 @@
 #include "concurrency/Scheduler.h"
 #include "core/Thread.h"
 #include "memory/Heap.h"
+#include "os/OsThread.h"
 #include "core/Handle.h"
 #include "core/Entry.h"
 #include "core/Smalltalk.h"
@@ -121,13 +122,13 @@ struct Scheduler {
 	size_t workerStackSize; // per-fiber stack reservation for schedulerSpawnBlock
 	size_t initialCommit;   // initial committed stack window (for helper fiberInitStackGrowth)
 	SmalltalkHandles handles; // well-known-symbol snapshot replicated into helper workers
-	pthread_cond_t work;   // signalled when a fiber becomes ready / on shutdown
+	OsCond work;           // signalled when a fiber becomes ready / on shutdown
 	// Guards ALL of the above so M worker OS threads can share this one scheduler.
 	// A LEAF lock: no code path allocates or hits a GC safepoint while holding it, so
 	// it never nests under heap->gcLock and cannot deadlock the STW handshake. Never
 	// held across a fiber context switch (the park handoff releases it before the
 	// switch and re-takes it in the run loop's commit).
-	pthread_mutex_t lock;
+	OsMutex lock;
 };
 
 // The current heap's shared scheduler. Only reached from scheduler code, which runs
@@ -153,8 +154,8 @@ static PER_ISOLATE int gWorkerIndex = 0;
 #define gFreeCap        (curSched()->freeCap)
 #define gDirtyHead      (curSched()->dirtyHead)
 
-static inline void schedLock(void)   { pthread_mutex_lock(&curSched()->lock); }
-static inline void schedUnlock(void) { pthread_mutex_unlock(&curSched()->lock); }
+static inline void schedLock(void)   { osMutexLock(&curSched()->lock); }
+static inline void schedUnlock(void) { osMutexUnlock(&curSched()->lock); }
 
 // Make a fiber runnable; caller holds sched->lock. Forward-declared because the timer
 // sweep (defined earlier) resumes through it.
@@ -576,8 +577,8 @@ void schedulerInit(void)
 		// same heap reuse it.
 		struct Scheduler *sched = calloc(1, sizeof(struct Scheduler));
 		sched->events = osEventLoopCreate();
-		pthread_mutex_init(&sched->lock, NULL);
-		pthread_cond_init(&sched->work, NULL);
+		osMutexInit(&sched->lock);
+		osCondInit(&sched->work);
 		// Worker-pool size: N OS threads share this scheduler, each running fibers pinned
 		// to it. DEFAULT = one worker per available core (respects taskset/cgroup
 		// affinity). The whole gate is green at N workers: shared-heap GC via STW
@@ -690,7 +691,7 @@ static void signalWork(void)
 	// idle peer whose own queue is empty → it re-sleeps and the home worker stays parked →
 	// lost wakeup / hang). All woken workers re-check their own queue; non-home ones re-wait.
 	struct Scheduler *s = curSched();
-	pthread_cond_broadcast(&s->work);
+	osCondBroadcast(&s->work);
 	wakePoller(s); // the target worker might be the one currently blocked in epoll_wait
 }
 
@@ -831,7 +832,7 @@ void schedulerSleep(int64_t micros)
 }
 
 
-void schedulerWaitFd(int fd, int forWrite)
+void schedulerWaitFd(OsFd fd, int forWrite)
 {
 	Fiber *self = gCurrent;
 	if (self == NULL || gEvents == NULL) {
@@ -956,7 +957,7 @@ static void waitForEvents(void)
 	}
 	wakeExpiredTimers(); // resumes via schedulerResumeLocked (lock held)
 	s->pollerActive = 0;
-	pthread_cond_broadcast(&s->work); // wake idle workers for the freshly-ready fibers
+	osCondBroadcast(&s->work); // wake idle workers for the freshly-ready fibers
 	schedUnlock();
 }
 
@@ -1035,7 +1036,7 @@ static void schedulerRunWorker(void)
 			// shut the whole pool down. (Must check all queues, not just ours — a fiber
 			// could be ready on a peer worker's queue while we and it are both idle.)
 			s->shutdown = 1;
-			pthread_cond_broadcast(&s->work);
+			osCondBroadcast(&s->work);
 			schedUnlock();
 			break;
 		}
@@ -1055,7 +1056,7 @@ static void schedulerRunWorker(void)
 		schedLock();
 		while (s->readyHead[gWorkerIndex] == NULL && !s->shutdown
 		       && !((gArmedWaiters > 0 || gTimerCount > 0) && !s->pollerActive)) {
-			pthread_cond_wait(&s->work, &s->lock);
+			osCondWait(&s->work, &s->lock);
 		}
 		s->idleWorkers--;
 		schedUnlock();
@@ -1070,7 +1071,7 @@ typedef struct { Heap *heap; int index; } HelperArg;
 
 // A spawned helper worker OS thread: set up its TLS to share the caller's heap and
 // scheduler (mirrors parallelPrimWorker), then run the shared run loop.
-static void *schedulerHelperMain(void *arg)
+static void schedulerHelperMain(void *arg)
 {
 	HelperArg *ha = (HelperArg *) arg;
 	Heap *heap = ha->heap;
@@ -1103,7 +1104,7 @@ static void *schedulerHelperMain(void *arg)
 	CurrentThread.schedFiberSlots = &gFiberSlots;
 	CurrentThread.schedCurrent = &gCurrent;
 	// Do NOT call fiberInitStackGrowth here: it writes process-global page-size/commit
-	// caches that the primary already set in schedulerInit BEFORE pthread_create (a
+	// caches that the primary already set in schedulerInit BEFORE the spawn (a
 	// happens-before edge), so helpers only READ them. Re-writing them races (TSan). We
 	// still need this worker's OWN sigaltstack for the growable-stack SIGSEGV handler.
 	osInstallSegvHandler(fiberSegvGrowCallback);
@@ -1111,7 +1112,6 @@ static void *schedulerHelperMain(void *arg)
 	schedulerRunWorker();
 
 	heapEndMutator(heap, &CurrentThread); // deregister so a later GC never scans this dead thread
-	return NULL;
 }
 
 
@@ -1123,14 +1123,14 @@ Value schedulerRun(void)
 
 	gWorkerIndex = 0; // the schedulerRun thread is worker 0 (pops readyHead[0])
 
-	pthread_t *tids = NULL;
+	OsThread *tids = NULL;
 	if (helpers > 0) {
-		tids = malloc((size_t) helpers * sizeof(pthread_t));
+		tids = malloc((size_t) helpers * sizeof(OsThread));
 		for (int i = 0; i < helpers; i++) {
 			HelperArg *ha = malloc(sizeof(HelperArg));
 			ha->heap = heap;
 			ha->index = i + 1; // workers 1..workerCount-1
-			pthread_create(&tids[i], NULL, schedulerHelperMain, ha);
+			osThreadSpawn(&tids[i], schedulerHelperMain, ha);
 		}
 	}
 
@@ -1141,7 +1141,7 @@ Value schedulerRun(void)
 		// safe while joining so a helper's final GC isn't blocked by us.
 		heapGcEnterBlocked(heap, &CurrentThread);
 		for (int i = 0; i < helpers; i++) {
-			pthread_join(tids[i], NULL);
+			osThreadJoin(&tids[i]);
 		}
 		heapGcLeaveBlocked(heap, &CurrentThread);
 		free(tids);

@@ -1,4 +1,5 @@
 #include "memory/Scavenger.h"
+#include <stdlib.h>
 #include "memory/Heap.h"
 #include "jit/TargetCodePatch.h"
 #include "jit/InlineCache.h"
@@ -80,9 +81,18 @@ uint8_t *scavengerTryAllocate(Scavenger *scavenger, size_t size)
 }
 
 
+void freeListValidate(FreeList *freeList, PageSpace *space, const char *where);
+extern int gFreeListDebug;
+
 void scavengerScavenge(Scavenger *scavenger)
 {
 	int64_t scavengeStart = osCurrentMicroTime();
+	if (gFreeListDebug < 0) {
+		gFreeListDebug = getenv("ST_DEBUG_FREELIST") != NULL;
+	}
+	if (gFreeListDebug > 0) {
+		freeListValidate(&scavenger->heap->oldSpace.freeList, &scavenger->heap->oldSpace, "scavenge-begin");
+	}
 	scavenger->hasPromotionFailure = 0;
 	scavenger->top = (uint8_t *) ((uintptr_t) scavenger->toSpace | NEW_SPACE_TAG);
 	scavenger->end = scavenger->toSpace + scavenger->size;
@@ -137,6 +147,9 @@ void scavengerScavenge(Scavenger *scavenger)
 	memset(scavenger->toSpace, 0x5A, scavenger->size); // poison: stale readers crash AT the culprit
 #endif
 
+	if (gFreeListDebug > 0) {
+		freeListValidate(&scavenger->heap->oldSpace.freeList, &scavenger->heap->oldSpace, "scavenge-end");
+	}
 	LastGCStats.scavengeCount++;
 	LastGCStats.scavengeTimeUs += osCurrentMicroTime() - scavengeStart;
 

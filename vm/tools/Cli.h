@@ -129,8 +129,9 @@ static void parseCliArgs(CliArgs *cliArgs, int argc, char **args)
 
 // Resolve which snapshot to load when -s was not given. Search order:
 //   1. the ST_IMAGE environment variable
-//   2. subcommand mode only: "snapshot" next to the st executable, when it
-//      exists (the installed/dev default image)
+//   2. subcommand mode only: "snapshot" next to the st executable, then in
+//      its parent directory (installed layout, then the dev tree where the
+//      executable is build/st and the base image sits at the repo root)
 //   3. "snapshot" in the current directory (the historical default)
 // Legacy mode skips step 2 so existing flag-based workflows keep their exact
 // behavior. Bootstrap runs (-b) always write to the explicit or historical
@@ -147,14 +148,22 @@ static void resolveSnapshotPath(CliArgs *cliArgs)
 	}
 	if (cliArgs->subcommand != NULL
 			&& osExecutablePath(cliArgs->snapshotPathBuffer, sizeof(cliArgs->snapshotPathBuffer))) {
-		char *slash = strrchr(cliArgs->snapshotPathBuffer, '/');
-		size_t dirLength = slash == NULL ? 0 : (size_t) (slash + 1 - cliArgs->snapshotPathBuffer);
-		if (slash != NULL && dirLength + sizeof("snapshot") <= sizeof(cliArgs->snapshotPathBuffer)) {
-			strcpy(slash + 1, "snapshot");
+		for (int hop = 0; hop < 2; hop++) {
+			char *slash = strrchr(cliArgs->snapshotPathBuffer, '/');
+			if (slash == NULL || slash == cliArgs->snapshotPathBuffer) {
+				break;
+			}
+			*slash = '\0'; // drop the last component (st, then its directory)
+			size_t dirLength = strlen(cliArgs->snapshotPathBuffer);
+			if (dirLength + sizeof("/snapshot") > sizeof(cliArgs->snapshotPathBuffer)) {
+				break;
+			}
+			strcpy(cliArgs->snapshotPathBuffer + dirLength, "/snapshot");
 			if (access(cliArgs->snapshotPathBuffer, R_OK) == 0) {
 				cliArgs->snapshotFileName = cliArgs->snapshotPathBuffer;
 				return;
 			}
+			cliArgs->snapshotPathBuffer[dirLength] = '\0'; // undo for the next hop
 		}
 	}
 }
@@ -163,11 +172,13 @@ static void resolveSnapshotPath(CliArgs *cliArgs)
 static void printCliHelp(void)
 {
 	printf(
-		"Usage:\t<executable> [<command>] [-e <code>] [-f <file>] [-s <snapshot file>] [-b <kernel dir>]\n"
+		"Usage:\t<executable> [<command>] [-e <code>] [-f <file>] [-s <snapshot file>] [-b <core package dir>]\n"
 		"Commands:\n"
 		"\tnew <name>  scaffold a new project\n"
 		"\tbuild       compile the project into .stbuild/program.img (--force rebuilds)\n"
-		"\trun         build if stale, then run the project entry point\n"
+		"\trun [<f>.st] build if stale, then run the project entry point; with a\n"
+		"\t            script operand, run the script in ITS project's image\n"
+		"\t            (found from the script's directory; base image outside one)\n"
 		"\ttest        build if stale, then run the project tests\n"
 		"\trepl        REPL; inside a project, in the project image and namespace\n"
 		"\thelp        print this help\n"
@@ -175,10 +186,11 @@ static void printCliHelp(void)
 		"\t-e evaluate code\n"
 		"\t-f compile classes and evaluate code within specified file\n"
 		"\t-s path to snapshot file\n"
-		"\t-b bootstrap from kernel directory\n"
+		"\t-b bootstrap from the core package directory (normally packages/Core)\n"
 		"\t-h prints this help\n"
 		"Snapshot search when -s is absent: ST_IMAGE env var, then (commands\n"
-		"only) the snapshot next to the executable, then ./snapshot\n"
+		"only) the snapshot next to the executable or in its parent dir, then\n"
+		"./snapshot\n"
 	);
 }
 

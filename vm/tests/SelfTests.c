@@ -23,7 +23,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <pthread.h>
+#include "os/OsThread.h"
 
 
 static void runMessageTest(void *arg)
@@ -310,7 +310,7 @@ static Heap *gWorkerHeap;
 static Object *gWorkerBlockH;
 static Value gWorkerResult;
 
-static void *workerRunBlock(void *arg)
+static void workerRunBlock(void *arg)
 {
 	(void) arg;
 	memset(&CurrentThread, 0, sizeof(Thread));
@@ -330,7 +330,6 @@ static void *workerRunBlock(void *arg)
 	gWorkerResult = sendMessage(getSymbol("value"), &args);
 	closeHandleScope(&scope, NULL);
 	heapEndMutator(gWorkerHeap, &CurrentThread); // leave heap->mutators before this thread dies
-	return NULL;
 }
 
 static int workerSelfTest(void)
@@ -343,10 +342,10 @@ static int workerSelfTest(void)
 	// the worker; returns 2*200000 = 400000.
 	gWorkerBlockH = handle(asObject(evalObject("[ | n | n := 0. 1 to: 200000 do: [:i | n := n + (Array new: 2) size]. n ]")));
 
-	pthread_t worker;
+	OsThread worker;
 	heapGcEnterBlocked(gWorkerHeap, &CurrentThread); // main is idle: safe for the worker's GC
-	pthread_create(&worker, NULL, workerRunBlock, NULL);
-	pthread_join(worker, NULL);
+	osThreadSpawn(&worker, workerRunBlock, NULL);
+	osThreadJoin(&worker);
 	heapGcLeaveBlocked(gWorkerHeap, &CurrentThread);
 
 	closeHandleScope(&scope, NULL);
@@ -365,7 +364,7 @@ static int workerSelfTest(void)
 #define PAR_WORKERS 8
 static Value gParResults[PAR_WORKERS];
 
-static void *parWorker(void *arg)
+static void parWorker(void *arg)
 {
 	long id = (long) arg;
 	memset(&CurrentThread, 0, sizeof(Thread));
@@ -387,7 +386,6 @@ static void *parWorker(void *arg)
 	gParResults[id] = sendMessage(getSymbol("value"), &args);
 	closeHandleScope(&scope, NULL);
 	heapEndMutator(gWorkerHeap, &CurrentThread); // leave heap->mutators before this thread dies
-	return NULL;
 }
 
 static Value runBlockOnce(Value block)
@@ -419,12 +417,12 @@ static int parallelSelfTest(void)
 
 	heapGcEnterBlocked(gWorkerHeap, &CurrentThread); // main idle while the workers run
 	int64_t p0 = osCurrentMicroTime();
-	pthread_t th[PAR_WORKERS];
+	OsThread th[PAR_WORKERS];
 	for (long w = 0; w < PAR_WORKERS; w++) {
-		pthread_create(&th[w], NULL, parWorker, (void *) w);
+		osThreadSpawn(&th[w], parWorker, (void *) w);
 	}
 	for (int w = 0; w < PAR_WORKERS; w++) {
-		pthread_join(th[w], NULL);
+		osThreadJoin(&th[w]);
 	}
 	int64_t parUs = osCurrentMicroTime() - p0;
 	heapGcLeaveBlocked(gWorkerHeap, &CurrentThread);
@@ -464,12 +462,12 @@ static int parallelGcSelfTest(void)
 
 	heapGcEnterBlocked(gWorkerHeap, &CurrentThread);
 	int64_t t0 = osCurrentMicroTime();
-	pthread_t th[PAR_WORKERS];
+	OsThread th[PAR_WORKERS];
 	for (long w = 0; w < PAR_WORKERS; w++) {
-		pthread_create(&th[w], NULL, parWorker, (void *) w);
+		osThreadSpawn(&th[w], parWorker, (void *) w);
 	}
 	for (int w = 0; w < PAR_WORKERS; w++) {
-		pthread_join(th[w], NULL);
+		osThreadJoin(&th[w]);
 	}
 	int64_t us = osCurrentMicroTime() - t0;
 	heapGcLeaveBlocked(gWorkerHeap, &CurrentThread);
@@ -523,12 +521,12 @@ static int parallelFullGcSelfTest(void)
 
 	heapGcEnterBlocked(gWorkerHeap, &CurrentThread); // main idle while the workers run
 	int64_t t0 = osCurrentMicroTime();
-	pthread_t th[PAR_WORKERS];
+	OsThread th[PAR_WORKERS];
 	for (long w = 0; w < PAR_WORKERS; w++) {
-		pthread_create(&th[w], NULL, parWorker, (void *) w);
+		osThreadSpawn(&th[w], parWorker, (void *) w);
 	}
 	for (int w = 0; w < PAR_WORKERS; w++) {
-		pthread_join(th[w], NULL);
+		osThreadJoin(&th[w]);
 	}
 	int64_t us = osCurrentMicroTime() - t0;
 	heapGcLeaveBlocked(gWorkerHeap, &CurrentThread);
@@ -569,7 +567,7 @@ static int gSchedReady = 0;
 static int gSchedDone = 0;
 static long gSchedExpected;
 
-static void *schedGcPeer(void *arg)
+static void schedGcPeer(void *arg)
 {
 	long id = (long) arg;
 	memset(&CurrentThread, 0, sizeof(Thread));
@@ -611,7 +609,6 @@ static void *schedGcPeer(void *arg)
 
 	closeHandleScope(&scope, NULL);
 	heapEndMutator(gWorkerHeap, &CurrentThread);
-	return NULL;
 }
 
 static void schedGcCollectorFiber(void *arg)
@@ -675,9 +672,9 @@ static int schedGcSelfTest(void)
 	__atomic_store_n(&gSchedDone, 0, __ATOMIC_RELEASE);
 
 	heapGcEnterBlocked(gWorkerHeap, &CurrentThread); // main safe while peers build+park
-	pthread_t th[SCHEDGC_PEERS];
+	OsThread th[SCHEDGC_PEERS];
 	for (long w = 0; w < SCHEDGC_PEERS; w++) {
-		pthread_create(&th[w], NULL, schedGcPeer, (void *) w);
+		osThreadSpawn(&th[w], schedGcPeer, (void *) w);
 	}
 	while (__atomic_load_n(&gSchedReady, __ATOMIC_ACQUIRE) < SCHEDGC_PEERS) {
 		usleep(200);
@@ -692,7 +689,7 @@ static int schedGcSelfTest(void)
 	__atomic_store_n(&gSchedDone, 1, __ATOMIC_RELEASE);
 	heapGcEnterBlocked(gWorkerHeap, &CurrentThread); // main safe while peers verify+exit
 	for (int w = 0; w < SCHEDGC_PEERS; w++) {
-		pthread_join(th[w], NULL);
+		osThreadJoin(&th[w]);
 	}
 	heapGcLeaveBlocked(gWorkerHeap, &CurrentThread);
 
@@ -724,7 +721,7 @@ static int gSpjitReady = 0;
 static int gSpjitResults[SPJIT_PEERS];
 static Value gSpjitExpected;
 
-static void *spjitPeer(void *arg)
+static void spjitPeer(void *arg)
 {
 	long id = (long) arg;
 	memset(&CurrentThread, 0, sizeof(Thread));
@@ -745,7 +742,6 @@ static void *spjitPeer(void *arg)
 	gSpjitResults[id] = (valueTypeOf(r, VALUE_INT) && asCInt(r) == asCInt(gSpjitExpected)) ? 1 : 0;
 	closeHandleScope(&scope, NULL);
 	heapEndMutator(gWorkerHeap, &CurrentThread);
-	return NULL;
 }
 
 static int safepointJitSelfTest(void)
@@ -762,9 +758,9 @@ static int safepointJitSelfTest(void)
 	runBlockOnce(getTaggedPtr(gWorkerBlockH)); // warm up JIT so peers only READ cached code
 
 	__atomic_store_n(&gSpjitReady, 0, __ATOMIC_RELEASE);
-	pthread_t th[SPJIT_PEERS];
+	OsThread th[SPJIT_PEERS];
 	for (long w = 0; w < SPJIT_PEERS; w++) {
-		pthread_create(&th[w], NULL, spjitPeer, (void *) w);
+		osThreadSpawn(&th[w], spjitPeer, (void *) w);
 	}
 	while (__atomic_load_n(&gSpjitReady, __ATOMIC_ACQUIRE) < SPJIT_PEERS) {
 		usleep(200);
@@ -786,7 +782,7 @@ static int safepointJitSelfTest(void)
 
 	heapGcEnterBlocked(gWorkerHeap, &CurrentThread); // main safe while peers finish + exit
 	for (int w = 0; w < SPJIT_PEERS; w++) {
-		pthread_join(th[w], NULL);
+		osThreadJoin(&th[w]);
 	}
 	heapGcLeaveBlocked(gWorkerHeap, &CurrentThread);
 
@@ -825,7 +821,7 @@ static Object *gRootsPeerBlockH;
 static Object *gRootsReadBlockH;
 static Object *gRootsSharedH;
 
-static void *rootsPeer(void *arg)
+static void rootsPeer(void *arg)
 {
 	long id = (long) arg;
 	memset(&CurrentThread, 0, sizeof(Thread));
@@ -846,7 +842,6 @@ static void *rootsPeer(void *arg)
 	sendMessage(getSymbol("value:value:"), &args);
 	closeHandleScope(&scope, NULL);
 	heapEndMutator(gWorkerHeap, &CurrentThread);
-	return NULL;
 }
 
 static int safepointRootsSelfTest(void)
@@ -885,9 +880,9 @@ static int safepointRootsSelfTest(void)
 
 	__atomic_store_n(&gRootsReady, 0, __ATOMIC_RELEASE);
 	heapGcEnterBlocked(gWorkerHeap, &CurrentThread); // main safe while peers build + start looping
-	pthread_t th[SPROOTS_PEERS];
+	OsThread th[SPROOTS_PEERS];
 	for (long w = 0; w < SPROOTS_PEERS; w++) {
-		pthread_create(&th[w], NULL, rootsPeer, (void *) w);
+		osThreadSpawn(&th[w], rootsPeer, (void *) w);
 	}
 	while (__atomic_load_n(&gRootsReady, __ATOMIC_ACQUIRE) < SPROOTS_PEERS) {
 		usleep(200);
@@ -900,16 +895,16 @@ static int safepointRootsSelfTest(void)
 	// peer's young box; the frame slot must move with it (the Q4 fix) or later
 	// writes are lost.
 	heapGcEnterBlocked(gWorkerHeap, &CurrentThread);
-	pthread_mutex_lock(&gWorkerHeap->gcLock);
+	osMutexLock(&gWorkerHeap->gcLock);
 	heapGcLeaveBlocked(gWorkerHeap, &CurrentThread);
 	heapGcBegin(gWorkerHeap, &CurrentThread);      // park every peer at its back-edge poll
 	scavengerScavenge(&gWorkerHeap->newSpace);     // move box; update shared[idx] + (with fix) frame slot
 	heapGcEnd(gWorkerHeap);
-	pthread_mutex_unlock(&gWorkerHeap->gcLock);
+	osMutexUnlock(&gWorkerHeap->gcLock);
 
 	heapGcEnterBlocked(gWorkerHeap, &CurrentThread); // main safe while peers run to BIG + exit
 	for (int w = 0; w < SPROOTS_PEERS; w++) {
-		pthread_join(th[w], NULL);
+		osThreadJoin(&th[w]);
 	}
 	heapGcLeaveBlocked(gWorkerHeap, &CurrentThread);
 
@@ -941,7 +936,7 @@ static int safepointRootsSelfTest(void)
 // (which is not thread-safe until B3). A watchdog turns a hang into a hard FAIL.
 
 static _Atomic int gWatchdogDone;
-static void *schedWatchdog(void *arg)
+static void schedWatchdog(void *arg)
 {
 	long ms = (long) arg;
 	long waited = 0;
@@ -953,7 +948,6 @@ static void *schedWatchdog(void *arg)
 		fprintf(stderr, "WATCHDOG: scheduler pool hung (lost wakeup / deadlock) -> FAIL\n");
 		_exit(99);
 	}
-	return NULL;
 }
 
 static int schedWorkerCount(void)
@@ -1029,11 +1023,11 @@ static int schedDoubleRunSelfTest(void)
 		schedulerSpawnC(sdrFiber, (void *) i, 0);
 	}
 	__atomic_store_n(&gWatchdogDone, 0, __ATOMIC_RELEASE);
-	pthread_t wd;
-	pthread_create(&wd, NULL, schedWatchdog, (void *) 120000L);
+	OsThread wd;
+	osThreadSpawn(&wd, schedWatchdog, (void *) 120000L);
 	schedulerRun();
 	__atomic_store_n(&gWatchdogDone, 1, __ATOMIC_RELEASE);
-	pthread_join(wd, NULL);
+	osThreadJoin(&wd);
 	long total = 0;
 	for (int i = 0; i < SDR_FIBERS; i++) {
 		total += __atomic_load_n(&gSdrRounds[i], __ATOMIC_RELAXED);
@@ -1070,11 +1064,11 @@ static int schedLostWakeSelfTest(void)
 		schedulerSpawnC(slwFiber, (void *) i, 0);
 	}
 	__atomic_store_n(&gWatchdogDone, 0, __ATOMIC_RELEASE);
-	pthread_t wd;
-	pthread_create(&wd, NULL, schedWatchdog, (void *) 120000L);
+	OsThread wd;
+	osThreadSpawn(&wd, schedWatchdog, (void *) 120000L);
 	schedulerRun();
 	__atomic_store_n(&gWatchdogDone, 1, __ATOMIC_RELEASE);
-	pthread_join(wd, NULL);
+	osThreadJoin(&wd);
 	long total = 0;
 	for (int i = 0; i < SLW_FIBERS; i++) {
 		total += __atomic_load_n(&gSlwRounds[i], __ATOMIC_RELAXED);
@@ -1126,11 +1120,11 @@ static int schedStwSelfTest(void)
 		schedulerSpawnC(sstwFiber, (void *) i, 0);
 	}
 	__atomic_store_n(&gWatchdogDone, 0, __ATOMIC_RELEASE);
-	pthread_t wd;
-	pthread_create(&wd, NULL, schedWatchdog, (void *) 180000L);
+	OsThread wd;
+	osThreadSpawn(&wd, schedWatchdog, (void *) 180000L);
 	schedulerRun();
 	__atomic_store_n(&gWatchdogDone, 1, __ATOMIC_RELEASE);
-	pthread_join(wd, NULL);
+	osThreadJoin(&wd);
 
 	unsigned long fullGcs = __atomic_load_n(&gFullGcRuns, __ATOMIC_RELAXED) - fullGcBefore;
 	// The point of this test is idle-worker GC-safety, which only exists at workers>1;
@@ -1195,11 +1189,11 @@ static int schedMigrateSelfTest(void)
 		schedulerSpawnC(smigFiber, (void *) i, 0);
 	}
 	__atomic_store_n(&gWatchdogDone, 0, __ATOMIC_RELEASE);
-	pthread_t wd;
-	pthread_create(&wd, NULL, schedWatchdog, (void *) 120000L);
+	OsThread wd;
+	osThreadSpawn(&wd, schedWatchdog, (void *) 120000L);
 	schedulerRun();
 	__atomic_store_n(&gWatchdogDone, 1, __ATOMIC_RELEASE);
-	pthread_join(wd, NULL);
+	osThreadJoin(&wd);
 
 	int ok = __atomic_load_n(&gSmigOk, __ATOMIC_RELAXED);
 	fprintf(stderr, "sched-migrate self-test: %d fibers yielded mid-Smalltalk across %d workers (context rebind) | all-correct=%d -> %s\n",
@@ -1261,11 +1255,11 @@ static int schedExcSelfTest(void)
 		schedulerSpawnC(sexcFiber, (void *) i, 0);
 	}
 	__atomic_store_n(&gWatchdogDone, 0, __ATOMIC_RELEASE);
-	pthread_t wd;
-	pthread_create(&wd, NULL, schedWatchdog, (void *) 120000L);
+	OsThread wd;
+	osThreadSpawn(&wd, schedWatchdog, (void *) 120000L);
 	schedulerRun();
 	__atomic_store_n(&gWatchdogDone, 1, __ATOMIC_RELEASE);
-	pthread_join(wd, NULL);
+	osThreadJoin(&wd);
 
 	int done = __atomic_load_n(&gSexcDone, __ATOMIC_RELAXED);
 	int ok = __atomic_load_n(&gSexcOk, __ATOMIC_RELAXED) && done == SEXC_FIBERS;

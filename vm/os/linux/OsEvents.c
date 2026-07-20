@@ -35,7 +35,7 @@ OsEventLoop *osEventLoopCreate(void)
 }
 
 
-void osEventLoopArm(OsEventLoop *loop, int fd, _Bool forWrite, uint64_t tag)
+void osEventLoopArm(OsEventLoop *loop, OsFd fd, _Bool forWrite, uint64_t tag)
 {
 	struct epoll_event ev;
 	ev.events = (forWrite ? EPOLLOUT : EPOLLIN) | EPOLLONESHOT;
@@ -47,7 +47,7 @@ void osEventLoopArm(OsEventLoop *loop, int fd, _Bool forWrite, uint64_t tag)
 }
 
 
-void osEventLoopDisarm(OsEventLoop *loop, int fd)
+void osEventLoopDisarm(OsEventLoop *loop, OsFd fd)
 {
 	epoll_ctl(loop->epollFd, EPOLL_CTL_DEL, fd, NULL);
 }

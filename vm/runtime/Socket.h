@@ -2,6 +2,7 @@
 #define SOCKET_H
 
 #include "core/Object.h"
+#include "os/Os.h"
 #include <stdint.h>
 
 typedef struct {
@@ -16,11 +17,11 @@ typedef struct {
 } RawInternetAddress;
 OBJECT_HANDLE(InternetAddress);
 
-void socketSetNonBlocking(int descriptor);
-void socketSetNoDelay(int descriptor);
-int socketConnect(uint32_t ip, uint16_t port);
-int socketBind(uint32_t ip, uint16_t port, int backlog);
-int socketAccept(int descriptor);
+// Fiber-parking socket operations (retry policy over vm/os/OsSocket.h).
+// All answer OS_FD_INVALID on failure.
+OsFd socketConnect(uint32_t ip, uint16_t port);
+OsFd socketBind(uint32_t ip, uint16_t port, int backlog);
+OsFd socketAccept(OsFd listener);
 uint32_t socketHostLookup(char *host, const char **error);
 
 #endif

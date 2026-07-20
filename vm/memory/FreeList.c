@@ -14,6 +14,67 @@ static FreeSpace *createInitialFreeSpace(struct HeapPage *page);
 static void freeSpacePrint(FreeSpace *freeSpace);
 
 
+// Freelist self-check tool (ST_DEBUG_FREELIST=1): validate chunks at every
+// add/pop against the owning space's mapped ranges (the FreeList is embedded
+// in its PageSpace, so offsetof recovers the owner) and abort WITH A BACKTRACE
+// at the guilty call. This caught the freeMapNext out-of-bounds read below by
+// flagging the fabricated bin's "chunk" the moment it was popped; costs one
+// predictable branch per add/pop when off, nothing on the TLAB fast path.
+#include <stdlib.h>
+#include <stddef.h>
+#include <execinfo.h>
+
+int gFreeListDebug = -1; // set from ST_DEBUG_FREELIST on first scavenge (Scavenger.c)
+
+static void freeListDebugCheck(FreeList *freeList, FreeSpace *freeSpace, const char *op)
+{
+	PageSpace *space = (PageSpace *) ((char *) freeList - offsetof(PageSpace, freeList));
+	if (pageSpaceIncludes(space, (uint8_t *) freeSpace)
+			&& freeSpace->size >= HEAP_OBJECT_ALIGN) {
+		return;
+	}
+	uintptr_t *w = (uintptr_t *) freeSpace;
+	fprintf(stderr, "FREELIST BAD %s: chunk=%p size=%zu inSpace=%d\n",
+		op, (void *) freeSpace, (size_t) freeSpace->size,
+		(int) pageSpaceIncludes(space, (uint8_t *) freeSpace));
+	fprintf(stderr, "  words: %016zx %016zx %016zx %016zx\n", w[0], w[1], w[2], w[3]);
+	void *frames[32];
+	int depth = backtrace(frames, 32);
+	backtrace_symbols_fd(frames, depth, 2);
+	abort();
+}
+
+void freeListValidate(FreeList *freeList, PageSpace *space, const char *where)
+{
+	for (size_t bin = 0; bin <= FREE_LIST_SIZE; bin++) {
+		FreeSpace *prev = NULL;
+		for (FreeSpace *fs = freeList->freeSpaces[bin]; fs != NULL; fs = fs->next) {
+			_Bool bad = !pageSpaceIncludes(space, (uint8_t *) fs)
+				|| (fs->tags & TAG_FREESPACE) == 0
+				|| fs->size < HEAP_OBJECT_ALIGN;
+			if (bad) {
+				uintptr_t *w = (uintptr_t *) fs;
+				fprintf(stderr, "FREELIST INVALID at %s: bin=%zu chunk=%p inSpace=%d tags=%x size=%zu\n",
+					where, bin, (void *) fs, (int) pageSpaceIncludes(space, (uint8_t *) fs),
+					(unsigned) fs->tags, (size_t) fs->size);
+				if (pageSpaceIncludes(space, (uint8_t *) fs)) {
+					fprintf(stderr, "  chunk words: %016zx %016zx %016zx %016zx\n", w[0], w[1], w[2], w[3]);
+				}
+				if (prev != NULL) {
+					uintptr_t *pw = (uintptr_t *) prev;
+					fprintf(stderr, "  PREDECESSOR %p words: %016zx %016zx %016zx %016zx %016zx %016zx\n",
+						(void *) prev, pw[0], pw[1], pw[2], pw[3], pw[4], pw[5]);
+				} else {
+					fprintf(stderr, "  chunk was the BIN HEAD (bins array clobbered or bad insert)\n");
+				}
+				abort();
+			}
+			prev = fs;
+		}
+	}
+}
+
+
 void initFreeList(FreeList *freeList, struct HeapPage *page)
 {
 	for (size_t i = 0; i < FREE_LIST_SIZE; i++) {
@@ -109,8 +170,9 @@ static ptrdiff_t indexForSize(size_t size)
 
 void freeListAddFreeSpace(FreeList *freeList, FreeSpace *freeSpace)
 {
-	//ASSERT(pageSpaceIncludes(&_Heap.oldSpace, (uint8_t *) freeSpace)
-	//	|| pageSpaceIncludes(&_Heap.execSpace, (uint8_t *) freeSpace));
+	if (gFreeListDebug > 0) {
+		freeListDebugCheck(freeList, freeSpace, "add");
+	}
 	ptrdiff_t index = indexForSize(freeSpace->size);
 	freeSpace->next = freeList->freeSpaces[index];
 	freeList->freeSpaces[index] = freeSpace;
@@ -129,6 +191,9 @@ void freeListAddFreeSpace(FreeList *freeList, FreeSpace *freeSpace)
 static FreeSpace *popFreeSpace(FreeList *freeList, ptrdiff_t index)
 {
 	FreeSpace *result = freeList->freeSpaces[index];
+	if (gFreeListDebug > 0) {
+		freeListDebugCheck(freeList, result, "pop");
+	}
 	FreeSpace *next = result->next;
 	if (next == NULL) {
 		freeList->freeMap[index / 8] &= ~(1 << (index % 8));
@@ -148,8 +213,6 @@ static FreeSpace *popAndSplitFreeSpace(FreeList *freeList, ptrdiff_t index, size
 static FreeSpace *splitFreeSpace(FreeList *freeList, FreeSpace *freeSpace, size_t size)
 {
 	ASSERT(freeSpace->size >= size);
-	//ASSERT(pageSpaceIncludes(&_Heap.oldSpace, (uint8_t *) freeSpace)
-	//	|| pageSpaceIncludes(&_Heap.execSpace, (uint8_t *) freeSpace));
 	size_t newSize = freeSpace->size - size;
 	// Exact fit: nothing left over to return to the free list.
 	if (newSize == 0) {
@@ -164,23 +227,32 @@ static FreeSpace *splitFreeSpace(FreeList *freeList, FreeSpace *freeSpace, size_
 static ptrdiff_t freeMapNext(uint8_t *freeMap, ptrdiff_t index)
 {
 	ASSERT(index < FREE_LIST_SIZE);
-	uint8_t element = index / 8;
-	uint8_t v = freeMap[element] & ~((1 << index) - 1);
-
+	ptrdiff_t element = index / 8;
+	// Mask below the start bit WITHIN this byte: the old `1 << index` shifted by
+	// the GLOBAL bin number, so for any index >= 8 the mask cleared the whole
+	// byte and same-byte candidates above the start bin were silently skipped
+	// (falling through to page growth - a waste, not a corruption).
+	uint8_t v = freeMap[element] & (uint8_t) ~((1u << (index % 8)) - 1);
 	if (v != 0) {
-		ASSERT((element * 8 + __builtin_ctz(v)) < FREE_LIST_SIZE);
-		return element * 8 + __builtin_ctz(v);
+		ptrdiff_t nextIndex = element * 8 + __builtin_ctz(v);
+		ASSERT(nextIndex < FREE_LIST_SIZE);
+		return nextIndex;
 	}
 
-	do {
-		element++;
+	// Scan the remaining bytes STRICTLY inside the map. The old do-while here
+	// incremented before its bounds check, reading freeMap[FREE_MAP_SIZE] - one
+	// byte of struct padding past the array. Whenever that byte happened to be
+	// non-zero (malloc-history dependent, so image/startup-path dependent), it
+	// fabricated a bin >= 136 and freeListTryAllocate then read freeSpaces[]
+	// OUT OF BOUNDS - the "chunk" was really a neighboring PageSpace field (an
+	// exec page pointer), corrupting the old-space freelist under load.
+	for (element++; element < FREE_MAP_SIZE; element++) {
 		v = freeMap[element];
 		if (v != 0) {
 			ptrdiff_t nextIndex = element * 8 + __builtin_ctz(v);
-			return nextIndex == FREE_LIST_SIZE ? -1 : nextIndex;
+			return nextIndex >= FREE_LIST_SIZE ? -1 : nextIndex;
 		}
-	} while (element < FREE_MAP_SIZE);
-
+	}
 	return -1;
 }
 

@@ -1,8 +1,13 @@
 "RFC 4648 base-64 codec using the standard alphabet (A-Za-z0-9+/) and '='
  padding. encode: accepts a String or a ByteArray and answers a padded base-64
  String; decode: accepts a base-64 String and answers the decoded bytes as a
- String, raising InvalidArgumentError on malformed input. The alphabet and the
- reverse lookup table are built once in class initialize."
+ String (decodeBytes: as a ByteArray), raising InvalidArgumentError on
+ malformed input. encodeUrlSafe:/decodeUrlSafe:/decodeBytesUrlSafe: are the
+ base64url variant (section 5: -_ alphabet, no padding). The hot paths run in
+ C (vm/runtime/Base64.c); the Smalltalk bodies below the pragmas are the
+ validating fallback and the reference implementation - keep semantics in
+ sync. The alphabet and the reverse lookup table are built once in class
+ initialize."
 
 Base64 := Object [
 
@@ -22,6 +27,7 @@ Base64 := Object [
 	"--- encoding ---"
 
 	class encode: aCollection [
+		<primitive: Base64EncodePrimitive>
 		| bytes n out oi bi b0 b1 b2 |
 
 		bytes := self bytesOf: aCollection.
@@ -57,6 +63,7 @@ Base64 := Object [
 	"--- decoding ---"
 
 	class decode: aString [
+		<primitive: Base64DecodePrimitive>
 		| n out oi accum bits pad v c |
 
 		n := aString size.
@@ -70,22 +77,81 @@ Base64 := Object [
 		oi := 1.
 		accum := 0.
 		bits := 0.
-		1 to: n do: [ :i |
+		"strict RFC 4648: '=' is only valid as final padding, so everything
+		 before the tail must be an alphabet character (valueOf: rejects '=')"
+		1 to: n - pad do: [ :i |
 			c := aString at: i.
-			c = $= ifFalse: [
-				v := self valueOf: c.
-				v < 0 ifTrue: [^self decodeError].
-				accum := (accum bitShift: 6) bitOr: v.
-				bits := bits + 6.
-				bits >= 8 ifTrue: [
-					bits := bits - 8.
-					out at: oi put: (Character codePoint: ((accum bitShift: bits negated) bitAnd: 255)).
-					oi := oi + 1]]].
+			v := self valueOf: c.
+			v < 0 ifTrue: [^self decodeError].
+			accum := (accum bitShift: 6) bitOr: v.
+			bits := bits + 6.
+			bits >= 8 ifTrue: [
+				bits := bits - 8.
+				out at: oi put: (Character codePoint: ((accum bitShift: bits negated) bitAnd: 255)).
+				oi := oi + 1]].
 		^out
 	]
 
 
+	class decodeBytes: aString [
+		"Like decode: but answers a ByteArray."
+		<primitive: Base64DecodeBytesPrimitive>
+		| s ba |
+
+		s := self decode: aString.
+		ba := ByteArray new: s size.
+		1 to: s size do: [ :i | ba at: i put: (s at: i) codePoint].
+		^ba
+	]
+
+
+	"--- URL-safe variant (RFC 4648 section 5): -_ alphabet, no padding ---"
+
+	class encodeUrlSafe: aCollection [
+		| s n out c |
+
+		s := self encode: aCollection.
+		n := s size.
+		[n > 0 and: [(s at: n) = $=]] whileTrue: [n := n - 1].
+		out := String new: n.
+		1 to: n do: [ :i |
+			c := s at: i.
+			c = $+ ifTrue: [c := $-].
+			c = $/ ifTrue: [c := $_].
+			out at: i put: c].
+		^out
+	]
+
+
+	class decodeUrlSafe: aString [
+		^self decode: (self urlSafeToStandard: aString)
+	]
+
+
+	class decodeBytesUrlSafe: aString [
+		^self decodeBytes: (self urlSafeToStandard: aString)
+	]
+
+
 	"--- private ---"
+
+	class urlSafeToStandard: aString [
+		"Translate base64url back to the standard alphabet and re-pad."
+		| n pad out c |
+
+		n := aString size.
+		pad := (4 - (n \\ 4)) \\ 4.
+		pad = 3 ifTrue: [^self decodeError].
+		out := String new: n + pad.
+		1 to: n do: [ :i |
+			c := aString at: i.
+			c = $- ifTrue: [c := $+].
+			c = $_ ifTrue: [c := $/].
+			out at: i put: c].
+		1 to: pad do: [ :i | out at: n + i put: $=].
+		^out
+	]
+
 
 	class bytesOf: aCollection [
 		"Answer aCollection's bytes as a ByteArray. A ByteArray is used as-is; a

@@ -311,7 +311,7 @@ mid-JIT (only at C calls) but cheap and tidy).
 4. Golden the 5 x64-mirror sequences (loadtls/ccall/storecheck/ccallprim/
    entry stub) + oracle.
 5. Cross-build BE, qemu-user: `st -e '3 + 4'` (first JIT execution!), then
-   bootstrap `-b smalltalk`, then tests. Debug loop: qemu -g + gdb.
+   bootstrap `-b packages/Core`, then tests. Debug loop: qemu -g + gdb.
 6. build.sh in a BE rootfs (debootstrap debian-ports under binfmt) — needs
    cmake in the rootfs.
 7. ppc64le mirror (LE emitters, ELFv2: no descriptors, TOC save 24(r1),

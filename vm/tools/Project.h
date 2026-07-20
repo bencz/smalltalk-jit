@@ -5,7 +5,7 @@
 // project root, decide staleness from .stbuild/build.deps, and shuttle eval
 // results across the C boundary. All project SEMANTICS (manifest evaluation,
 // dependency graph, entry point, scaffolding) live in-image in
-// smalltalk/Packages/; this file only walks directories, stats files and
+// packages/Core/src/Packages/; this file only walks directories, stats files and
 // copies strings, keeping the VM generic.
 
 #include "core/Entry.h"
@@ -35,11 +35,19 @@ typedef struct {
 } ProjectPlan;
 
 
-// Walk upward from the working directory to the first dir with a package.st.
-static _Bool projectFindRoot(char *buffer, size_t size)
+// Walk upward from startDir (or the working directory when NULL) to the
+// first dir with a package.st.
+static _Bool projectFindRootFrom(const char *startDir, char *buffer, size_t size)
 {
-	if (getcwd(buffer, size) == NULL) {
-		return 0;
+	if (startDir == NULL) {
+		if (getcwd(buffer, size) == NULL) {
+			return 0;
+		}
+	} else {
+		if (strlen(startDir) >= size) {
+			return 0;
+		}
+		strcpy(buffer, startDir);
 	}
 	for (;;) {
 		size_t length = strlen(buffer);
@@ -55,6 +63,12 @@ static _Bool projectFindRoot(char *buffer, size_t size)
 		}
 		*slash = '\0';
 	}
+}
+
+
+static _Bool projectFindRoot(char *buffer, size_t size)
+{
+	return projectFindRootFrom(NULL, buffer, size);
 }
 
 

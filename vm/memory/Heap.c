@@ -8,7 +8,7 @@
 #include "runtime/String.h"
 #include <string.h>
 #include <stdlib.h>
-#include <pthread.h>
+#include "os/OsThread.h"
 
 // From core/Lookup.c (not via Lookup.h: that header pulls CompiledCode/JIT
 // types this TU does not need). Flushes the calling thread's TLS LookupCache
@@ -48,11 +48,11 @@ void initHeap(Heap *heap, struct Thread *thread)
 	initPageSpace(&heap->oldSpace, 256 * KB, 0);
 	initPageSpace(&heap->execSpace, 256 * KB, 1);
 	heap->oldGcThreshold = OLD_GC_MIN_THRESHOLD;
-	pthread_mutex_init(&heap->youngLock, NULL);
-	pthread_mutex_init(&heap->oldLock, NULL);
-	pthread_mutex_init(&heap->execLock, NULL);
-	pthread_mutex_init(&heap->codegenLock, NULL);
-	pthread_mutex_init(&heap->monitorLock, NULL); // retained for ABI/offset stability; unused
+	osMutexInit(&heap->youngLock);
+	osMutexInit(&heap->oldLock);
+	osMutexInit(&heap->execLock);
+	osMutexInit(&heap->codegenLock);
+	osMutexInit(&heap->monitorLock); // retained for ABI/offset stability; unused
 	// Striped sync monitor: N = ST_MONITOR_STRIPES (default 64), clamped to a power of 2
 	// in [1, 4096]. N=1 => one lock (legacy behavior / escape hatch). Parsed ONCE here so
 	// every worker of this heap agrees; stripeForSyncObject mixes obj->hash into [0,N).
@@ -70,18 +70,18 @@ void initHeap(Heap *heap, struct Thread *thread)
 		while (n * 2 <= requested) { n *= 2; log2n++; }
 		heap->monitorStripeCount = n;
 		heap->monitorStripeShift = (n <= 1) ? 0 : (32 - log2n);
-		heap->monitorLocks = malloc(n * sizeof(pthread_mutex_t));
+		heap->monitorLocks = malloc(n * sizeof(OsMutex));
 		ASSERT(heap->monitorLocks != NULL);
 		for (size_t i = 0; i < n; i++) {
-			pthread_mutex_init(&heap->monitorLocks[i], NULL);
+			osMutexInit(&heap->monitorLocks[i]);
 		}
 	}
-	pthread_mutex_init(&heap->symbolLock, NULL);
+	osMutexInit(&heap->symbolLock);
 	heap->symbolCount = 0;
 	heap->symbolCountValid = 0; // force a recount on first intern (snapshot restores the table only)
-	pthread_mutex_init(&heap->gcLock, NULL);
-	pthread_mutex_init(&heap->safepointLock, NULL);
-	pthread_cond_init(&heap->safepointCond, NULL);
+	osMutexInit(&heap->gcLock);
+	osMutexInit(&heap->safepointLock);
+	osCondInit(&heap->safepointCond);
 	heap->safepointRequested = 0;
 	heap->gcEpoch = 0;
 	heap->mutators = NULL;
@@ -103,12 +103,12 @@ void initHeap(Heap *heap, struct Thread *thread)
 // free in practice; youngLock still guards the actual list write.
 void heapAddMutator(Heap *heap, struct Thread *thread)
 {
-	pthread_mutex_lock(&heap->gcLock);
-	pthread_mutex_lock(&heap->youngLock);
+	osMutexLock(&heap->gcLock);
+	osMutexLock(&heap->youngLock);
 	thread->nextMutator = heap->mutators;
 	heap->mutators = thread;
-	pthread_mutex_unlock(&heap->youngLock);
-	pthread_mutex_unlock(&heap->gcLock);
+	osMutexUnlock(&heap->youngLock);
+	osMutexUnlock(&heap->gcLock);
 }
 
 
@@ -118,9 +118,9 @@ void heapAddMutator(Heap *heap, struct Thread *thread)
 void heapEndMutator(Heap *heap, Thread *thread)
 {
 	heapGcEnterBlocked(heap, thread); // waiting on gcLock counts as safe
-	pthread_mutex_lock(&heap->gcLock);
+	osMutexLock(&heap->gcLock);
 	heapGcLeaveBlocked(heap, thread);
-	pthread_mutex_lock(&heap->youngLock);
+	osMutexLock(&heap->youngLock);
 	Thread **link = &heap->mutators;
 	while (*link != NULL && *link != thread) {
 		link = &(*link)->nextMutator;
@@ -128,7 +128,7 @@ void heapEndMutator(Heap *heap, Thread *thread)
 	if (*link == thread) {
 		*link = thread->nextMutator;
 	}
-	pthread_mutex_unlock(&heap->youngLock);
+	osMutexUnlock(&heap->youngLock);
 
 	// Splice this exiting worker's per-thread barrier delta (old->young edges recorded
 	// since the last GC) into the heap-level consolidated set, so they are NOT lost when
@@ -151,7 +151,7 @@ void heapEndMutator(Heap *heap, Thread *thread)
 		thread->rememberedSet.blocks = NULL; // ownership transferred; thread is dying
 	}
 
-	pthread_mutex_unlock(&heap->gcLock);
+	osMutexUnlock(&heap->gcLock);
 }
 
 
@@ -164,16 +164,16 @@ void heapGcPoll(Heap *heap, Thread *self)
 	if (!__atomic_load_n(&heap->safepointRequested, __ATOMIC_ACQUIRE)) {
 		return; // hot path: one acquire load
 	}
-	pthread_mutex_lock(&heap->safepointLock);
+	osMutexLock(&heap->safepointLock);
 	if (__atomic_load_n(&heap->safepointRequested, __ATOMIC_ACQUIRE)) {
 		self->spAtSafepoint = 1;
-		pthread_cond_broadcast(&heap->safepointCond); // wake a waiting collector
+		osCondBroadcast(&heap->safepointCond); // wake a waiting collector
 		while (__atomic_load_n(&heap->safepointRequested, __ATOMIC_ACQUIRE)) {
-			pthread_cond_wait(&heap->safepointCond, &heap->safepointLock);
+			osCondWait(&heap->safepointCond, &heap->safepointLock);
 		}
 		self->spAtSafepoint = 0;
 	}
-	pthread_mutex_unlock(&heap->safepointLock);
+	osMutexUnlock(&heap->safepointLock);
 	lookupCacheOnGcResume(self); // the collection may have moved cached classes/selectors
 }
 
@@ -192,38 +192,38 @@ static int heapAllSafe(Heap *heap, Thread *exclude)
 
 void heapGcBegin(Heap *heap, Thread *self)
 {
-	pthread_mutex_lock(&heap->safepointLock);
+	osMutexLock(&heap->safepointLock);
 	__atomic_store_n(&heap->safepointRequested, 1, __ATOMIC_RELEASE);
 	while (!heapAllSafe(heap, self)) {
-		pthread_cond_wait(&heap->safepointCond, &heap->safepointLock);
+		osCondWait(&heap->safepointCond, &heap->safepointLock);
 	}
-	pthread_mutex_unlock(&heap->safepointLock);
+	osMutexUnlock(&heap->safepointLock);
 }
 
 void heapGcEnd(Heap *heap)
 {
-	pthread_mutex_lock(&heap->safepointLock);
+	osMutexLock(&heap->safepointLock);
 	__atomic_store_n(&heap->safepointRequested, 0, __ATOMIC_RELEASE);
-	pthread_cond_broadcast(&heap->safepointCond);
-	pthread_mutex_unlock(&heap->safepointLock);
+	osCondBroadcast(&heap->safepointCond);
+	osMutexUnlock(&heap->safepointLock);
 }
 
 void heapGcEnterBlocked(Heap *heap, Thread *self)
 {
-	pthread_mutex_lock(&heap->safepointLock);
+	osMutexLock(&heap->safepointLock);
 	self->spBlocked = 1;
-	pthread_cond_broadcast(&heap->safepointCond);
-	pthread_mutex_unlock(&heap->safepointLock);
+	osCondBroadcast(&heap->safepointCond);
+	osMutexUnlock(&heap->safepointLock);
 }
 
 void heapGcLeaveBlocked(Heap *heap, Thread *self)
 {
-	pthread_mutex_lock(&heap->safepointLock);
+	osMutexLock(&heap->safepointLock);
 	while (__atomic_load_n(&heap->safepointRequested, __ATOMIC_ACQUIRE)) {
-		pthread_cond_wait(&heap->safepointCond, &heap->safepointLock);
+		osCondWait(&heap->safepointCond, &heap->safepointLock);
 	}
 	self->spBlocked = 0;
-	pthread_mutex_unlock(&heap->safepointLock);
+	osMutexUnlock(&heap->safepointLock);
 	lookupCacheOnGcResume(self); // a collection may have run while blocked
 }
 
@@ -240,7 +240,7 @@ void heapCodegenLockEnter(Heap *heap)
 {
 	if (gCodegenDepth++ == 0) {
 		heapGcEnterBlocked(heap, &CurrentThread); // waiting on codegenLock counts as safe
-		pthread_mutex_lock(&heap->codegenLock);
+		osMutexLock(&heap->codegenLock);
 		heapGcLeaveBlocked(heap, &CurrentThread);
 	}
 }
@@ -248,7 +248,7 @@ void heapCodegenLockEnter(Heap *heap)
 void heapCodegenLockLeave(Heap *heap)
 {
 	if (--gCodegenDepth == 0) {
-		pthread_mutex_unlock(&heap->codegenLock);
+		osMutexUnlock(&heap->codegenLock);
 	}
 }
 
@@ -262,13 +262,13 @@ void heapCodegenLockLeave(Heap *heap)
 void heapMonitorEnterStripe(Heap *heap, size_t stripe)
 {
 	heapGcEnterBlocked(heap, &CurrentThread); // waiting on a stripe counts as safe
-	pthread_mutex_lock(&heap->monitorLocks[stripe]);
+	osMutexLock(&heap->monitorLocks[stripe]);
 	heapGcLeaveBlocked(heap, &CurrentThread);
 }
 
 void heapMonitorExitStripe(Heap *heap, size_t stripe)
 {
-	pthread_mutex_unlock(&heap->monitorLocks[stripe]);
+	osMutexUnlock(&heap->monitorLocks[stripe]);
 }
 
 // Legacy no-arg monitor == stripe 0 (the arity-1 primitives / any global use).
@@ -295,7 +295,7 @@ void heapSymbolLockEnter(Heap *heap)
 {
 	if (gSymbolDepth++ == 0) {
 		heapGcEnterBlocked(heap, &CurrentThread); // waiting on symbolLock counts as safe
-		pthread_mutex_lock(&heap->symbolLock);
+		osMutexLock(&heap->symbolLock);
 		heapGcLeaveBlocked(heap, &CurrentThread);
 	}
 }
@@ -303,7 +303,7 @@ void heapSymbolLockEnter(Heap *heap)
 void heapSymbolLockLeave(Heap *heap)
 {
 	if (--gSymbolDepth == 0) {
-		pthread_mutex_unlock(&heap->symbolLock);
+		osMutexUnlock(&heap->symbolLock);
 	}
 }
 
@@ -316,7 +316,7 @@ void freeHeap(Heap *heap)
 	rememberedSetFreeBlocks(heap->rememberedSet.blocks); // free the whole chain (incl. head)
 	heap->rememberedSet.blocks = NULL;
 	for (size_t i = 0; i < heap->monitorStripeCount; i++) {
-		pthread_mutex_destroy(&heap->monitorLocks[i]);
+		osMutexDestroy(&heap->monitorLocks[i]);
 	}
 	free(heap->monitorLocks);
 	heap->monitorLocks = NULL;
@@ -400,9 +400,9 @@ NativeCode *allocateNativeCode(Heap *heap, size_t size, size_t pointersOffsetsSi
 	size_t realSize = align(sizeof(NativeCode)
 		+ nativeCodePayloadSize(size, pointersOffsetsSize, icCellsSize), HEAP_OBJECT_ALIGN);
 	// Serialize concurrent exec-space carving across worker threads (see execLock).
-	pthread_mutex_lock(&heap->execLock);
+	osMutexLock(&heap->execLock);
 	NativeCode *code = (NativeCode *) pageSpaceAllocate(&heap->execSpace, realSize);
-	pthread_mutex_unlock(&heap->execLock);
+	osMutexUnlock(&heap->execLock);
 	code->size = size;
 	code->pointersOffsetsSize = pointersOffsetsSize;
 	code->icCellsSize = icCellsSize;
@@ -475,11 +475,11 @@ void heapFillAllTlabTails(Heap *heap)
 // the nursery lacks room for `realSize` (caller scavenges + retries).
 static _Bool tlabRefill(Heap *heap, size_t realSize)
 {
-	pthread_mutex_lock(&heap->youngLock);
+	osMutexLock(&heap->youngLock);
 	Scavenger *s = &heap->newSpace;
 	size_t available = (size_t) (s->end - s->top);
 	if (available < realSize) {
-		pthread_mutex_unlock(&heap->youngLock);
+		osMutexUnlock(&heap->youngLock);
 		return 0;
 	}
 
@@ -499,7 +499,7 @@ static _Bool tlabRefill(Heap *heap, size_t realSize)
 	CurrentThread.tlab.top = s->top;
 	CurrentThread.tlab.end = s->top + chunk;
 	s->top += chunk;
-	pthread_mutex_unlock(&heap->youngLock);
+	osMutexUnlock(&heap->youngLock);
 	return 1;
 }
 
@@ -529,7 +529,7 @@ static void maybeFullGc(Heap *heap)
 static void heapCollectYoung(Heap *heap, size_t realSize)
 {
 	heapGcEnterBlocked(heap, &CurrentThread); // blocking on gcLock counts as safe
-	pthread_mutex_lock(&heap->gcLock);
+	osMutexLock(&heap->gcLock);
 	heapGcLeaveBlocked(heap, &CurrentThread);
 
 	if (heap->mutators == NULL || heap->mutators->nextMutator == NULL) {
@@ -542,9 +542,9 @@ static void heapCollectYoung(Heap *heap, size_t realSize)
 		// still needed. Read newSpace.top under youngLock — the lock that guards the
 		// bump cursor a peer's tlabRefill advances — so this re-check does not race
 		// the carve (a plain read here is a benign but real data race, per TSan).
-		pthread_mutex_lock(&heap->youngLock);
+		osMutexLock(&heap->youngLock);
 		_Bool needed = (size_t) (heap->newSpace.end - heap->newSpace.top) < realSize;
-		pthread_mutex_unlock(&heap->youngLock);
+		osMutexUnlock(&heap->youngLock);
 		if (needed) {
 			heapGcBegin(heap, &CurrentThread); // park every other mutator
 			scavengerScavenge(&heap->newSpace);
@@ -554,7 +554,7 @@ static void heapCollectYoung(Heap *heap, size_t realSize)
 			lookupCacheOnGcResume(&CurrentThread);
 		}
 	}
-	pthread_mutex_unlock(&heap->gcLock);
+	osMutexUnlock(&heap->gcLock);
 }
 
 
@@ -594,12 +594,12 @@ uint8_t *allocate(Heap *heap, size_t size)
 uint8_t *tryAllocateOld(Heap *heap, size_t size, _Bool grow)
 {
 	size_t realSize = align(size, HEAP_OBJECT_ALIGN);
-	pthread_mutex_lock(&heap->oldLock);
+	osMutexLock(&heap->oldLock);
 	uint8_t *p = pageSpaceTryAllocate(&heap->oldSpace, realSize);
 	if (p == NULL && grow) {
 		p = pageSpaceAllocate(&heap->oldSpace, realSize);
 	}
-	pthread_mutex_unlock(&heap->oldLock);
+	osMutexUnlock(&heap->oldLock);
 	ASSERT(p == NULL || isOldObject((RawObject *) p));
 	return p;
 }
@@ -807,7 +807,7 @@ typedef struct {
 	uint8_t **ptrs;
 } TlabTestArg;
 
-static void *tlabTestWorker(void *arg)
+static void tlabTestWorker(void *arg)
 {
 	TlabTestArg *ta = arg;
 	// A fresh thread-local mutator that SHARES the one test heap.
@@ -822,7 +822,7 @@ static void *tlabTestWorker(void *arg)
 		*(uint64_t *) p = ((uint64_t) ta->id << 32) | (uint64_t) i; // stamp
 		ta->ptrs[i] = p;
 	}
-	return NULL;
+
 }
 
 int tlabConcurrencySelfTest(void)
@@ -831,15 +831,15 @@ int tlabConcurrencySelfTest(void)
 	CurrentThread.heap = &gTlabTestHeap;
 	initHeap(&gTlabTestHeap, &CurrentThread);
 
-	pthread_t threads[TLAB_TEST_WORKERS];
+	OsThread threads[TLAB_TEST_WORKERS];
 	TlabTestArg args[TLAB_TEST_WORKERS];
 	for (long w = 0; w < TLAB_TEST_WORKERS; w++) {
 		args[w].id = w;
 		args[w].ptrs = malloc(TLAB_TEST_ALLOCS * sizeof(uint8_t *));
-		pthread_create(&threads[w], NULL, tlabTestWorker, &args[w]);
+		osThreadSpawn(&threads[w], tlabTestWorker, &args[w]);
 	}
 	for (int w = 0; w < TLAB_TEST_WORKERS; w++) {
-		pthread_join(threads[w], NULL);
+		osThreadJoin(&threads[w]);
 	}
 
 	long clobbered = 0;

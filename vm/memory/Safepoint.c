@@ -1,5 +1,5 @@
 #include "memory/Safepoint.h"
-#include <pthread.h>
+#include "os/OsThread.h"
 #include <stdio.h>
 #include <stdint.h>
 
@@ -14,8 +14,8 @@
 
 int gSafepointRequested = 0;
 
-static pthread_mutex_t gLock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t gCond = PTHREAD_COND_INITIALIZER;
+static OsMutex gLock = OS_MUTEX_STATIC_INIT;
+static OsCond gCond = OS_COND_STATIC_INIT;
 static SafepointThread *gThreads = NULL; // intrusive list, guarded by gLock
 
 
@@ -23,10 +23,10 @@ void safepointInit(void)
 {
 	// The statically-initialised mutex/cond are ready; reset dynamic state so a
 	// self-test (or a re-init) starts clean.
-	pthread_mutex_lock(&gLock);
+	osMutexLock(&gLock);
 	gThreads = NULL;
 	__atomic_store_n(&gSafepointRequested, 0, __ATOMIC_RELEASE);
-	pthread_mutex_unlock(&gLock);
+	osMutexUnlock(&gLock);
 }
 
 
@@ -35,9 +35,9 @@ void safepointInit(void)
 static void parkUntilReleased(SafepointThread *thread)
 {
 	thread->atSafepoint = 1;
-	pthread_cond_broadcast(&gCond); // a waiting coordinator may now be satisfied
+	osCondBroadcast(&gCond); // a waiting coordinator may now be satisfied
 	while (__atomic_load_n(&gSafepointRequested, __ATOMIC_ACQUIRE)) {
-		pthread_cond_wait(&gCond, &gLock);
+		osCondWait(&gCond, &gLock);
 	}
 	thread->atSafepoint = 0;
 }
@@ -45,7 +45,7 @@ static void parkUntilReleased(SafepointThread *thread)
 
 void safepointRegister(SafepointThread *thread)
 {
-	pthread_mutex_lock(&gLock);
+	osMutexLock(&gLock);
 	thread->state = SP_ACTIVE;
 	thread->atSafepoint = 0;
 	thread->next = gThreads;
@@ -55,13 +55,13 @@ void safepointRegister(SafepointThread *thread)
 	if (__atomic_load_n(&gSafepointRequested, __ATOMIC_ACQUIRE)) {
 		parkUntilReleased(thread);
 	}
-	pthread_mutex_unlock(&gLock);
+	osMutexUnlock(&gLock);
 }
 
 
 void safepointUnregister(SafepointThread *thread)
 {
-	pthread_mutex_lock(&gLock);
+	osMutexLock(&gLock);
 	SafepointThread **link = &gThreads;
 	while (*link != NULL && *link != thread) {
 		link = &(*link)->next;
@@ -70,40 +70,40 @@ void safepointUnregister(SafepointThread *thread)
 		*link = thread->next;
 	}
 	// A coordinator may have been waiting on this thread; it is gone now.
-	pthread_cond_broadcast(&gCond);
-	pthread_mutex_unlock(&gLock);
+	osCondBroadcast(&gCond);
+	osMutexUnlock(&gLock);
 }
 
 
 void safepointBlock(SafepointThread *thread)
 {
-	pthread_mutex_lock(&gLock);
+	osMutexLock(&gLock);
 	if (__atomic_load_n(&gSafepointRequested, __ATOMIC_ACQUIRE)) {
 		parkUntilReleased(thread);
 	}
-	pthread_mutex_unlock(&gLock);
+	osMutexUnlock(&gLock);
 }
 
 
 void safepointEnterBlocked(SafepointThread *thread)
 {
-	pthread_mutex_lock(&gLock);
+	osMutexLock(&gLock);
 	thread->state = SP_BLOCKED;
 	// Now counts as safe; a coordinator waiting on us can proceed.
-	pthread_cond_broadcast(&gCond);
-	pthread_mutex_unlock(&gLock);
+	osCondBroadcast(&gCond);
+	osMutexUnlock(&gLock);
 }
 
 
 void safepointLeaveBlocked(SafepointThread *thread)
 {
-	pthread_mutex_lock(&gLock);
+	osMutexLock(&gLock);
 	// Cannot resume mutating while the world is stopped.
 	while (__atomic_load_n(&gSafepointRequested, __ATOMIC_ACQUIRE)) {
-		pthread_cond_wait(&gCond, &gLock);
+		osCondWait(&gCond, &gLock);
 	}
 	thread->state = SP_ACTIVE;
-	pthread_mutex_unlock(&gLock);
+	osMutexUnlock(&gLock);
 }
 
 
@@ -125,24 +125,24 @@ static int allSafe(SafepointThread *exclude)
 
 void safepointBegin(SafepointThread *exclude)
 {
-	pthread_mutex_lock(&gLock);
+	osMutexLock(&gLock);
 	__atomic_store_n(&gSafepointRequested, 1, __ATOMIC_RELEASE);
 	while (!allSafe(exclude)) {
-		pthread_cond_wait(&gCond, &gLock);
+		osCondWait(&gCond, &gLock);
 	}
 	// World stopped. Release the lock: correctness now comes from every other
 	// mutator being parked, not from holding gLock, so the collection can run
 	// (and can itself take other locks) without contending here.
-	pthread_mutex_unlock(&gLock);
+	osMutexUnlock(&gLock);
 }
 
 
 void safepointEnd(void)
 {
-	pthread_mutex_lock(&gLock);
+	osMutexLock(&gLock);
 	__atomic_store_n(&gSafepointRequested, 0, __ATOMIC_RELEASE);
-	pthread_cond_broadcast(&gCond);
-	pthread_mutex_unlock(&gLock);
+	osCondBroadcast(&gCond);
+	osMutexUnlock(&gLock);
 }
 
 
@@ -160,7 +160,7 @@ static long gRaces = 0;               // worker saw itself active during STW
 static long gWorkDone = 0;            // total worker iterations (progress proof)
 static int gStopWorkers = 0;
 
-static void *safepointTestWorker(void *arg)
+static void safepointTestWorker(void *arg)
 {
 	SafepointThread me;
 	unsigned seed = (unsigned) (uintptr_t) arg * 2654435761u + 1u;
@@ -196,7 +196,6 @@ static void *safepointTestWorker(void *arg)
 
 	__atomic_fetch_add(&gWorkDone, work, __ATOMIC_RELAXED);
 	__atomic_fetch_add(&gRaces, races, __ATOMIC_RELAXED);
-	return NULL;
 }
 
 
@@ -208,9 +207,9 @@ int safepointSelfTest(void)
 	gWorkDone = 0;
 	__atomic_store_n(&gStopWorkers, 0, __ATOMIC_RELEASE);
 
-	pthread_t workers[SP_TEST_WORKERS];
+	OsThread workers[SP_TEST_WORKERS];
 	for (long i = 0; i < SP_TEST_WORKERS; i++) {
-		pthread_create(&workers[i], NULL, safepointTestWorker, (void *) i);
+		osThreadSpawn(&workers[i], safepointTestWorker, (void *) i);
 	}
 
 	for (int r = 0; r < SP_TEST_STOPS; r++) {
@@ -227,7 +226,7 @@ int safepointSelfTest(void)
 
 	__atomic_store_n(&gStopWorkers, 1, __ATOMIC_RELEASE);
 	for (int i = 0; i < SP_TEST_WORKERS; i++) {
-		pthread_join(workers[i], NULL);
+		osThreadJoin(&workers[i]);
 	}
 
 	fprintf(stderr, "safepoint self-test: stops=%d workers=%d workDone=%ld races=%ld -> %s\n",

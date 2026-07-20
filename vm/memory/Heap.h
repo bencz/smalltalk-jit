@@ -5,7 +5,7 @@
 #include "memory/HeapPage.h"
 #include "memory/Scavenger.h"
 #include "memory/RememberedSet.h"
-#include <pthread.h>
+#include "os/OsThread.h"
 
 struct Thread;
 struct NativeCode;
@@ -41,24 +41,24 @@ typedef struct Heap {
 	// Guards carving TLAB chunks out of the shared young space: the per-mutator
 	// bump inside a TLAB stays lock-free; only the (rare) refill takes this lock,
 	// so several worker OS threads can share one nursery.
-	pthread_mutex_t youngLock;
+	OsMutex youngLock;
 	// Guards the old space (free list + page growth). Promotion during a
 	// (stop-the-world) GC is uncontended; this covers concurrent mutators
 	// allocating large/old objects, and future concurrent promotion.
-	pthread_mutex_t oldLock;
+	OsMutex oldLock;
 	// Guards the executable space (JIT code). Several worker OS threads lazily
 	// generate methods into ONE shared exec space; without this lock their concurrent
 	// pageSpaceAllocate calls corrupt the exec freelist/page list/index. (Stubs are
 	// now generated once per heap — stubCode[] above — so only method compilation
 	// still contends here.) Exec allocation never triggers a young/old GC, so holding
 	// it cannot deadlock the safepoint handshake.
-	pthread_mutex_t execLock;
+	OsMutex execLock;
 	// Serializes JIT code generation across worker threads. Codegen allocates young
 	// heap objects (assembler scratch, stackmaps) and can trigger a scavenge, so a
 	// thread WAITING for this lock counts as safe (it enters the blocked state before
 	// locking) or a peer collector would wait for it forever. Recursive use (a stub
 	// generated while compiling a method) is handled by a per-thread depth counter.
-	pthread_mutex_t codegenLock;
+	OsMutex codegenLock;
 	// The ONE global synchronization monitor for the Smalltalk sync primitives
 	// (Semaphore/Channel/Future/Mailbox/ActorSystem). Under the multi-worker pool a
 	// fiber's "check a condition then park" is no longer atomic by virtue of cooperative
@@ -67,13 +67,13 @@ typedef struct Heap {
 	// enter-blocked discipline as codegenLock), and it is only ever taken monitor→
 	// sched->lock (never the reverse), so it cannot deadlock the STW handshake. Coarse
 	// by design (correctness first); sharding it per sync-object is a perf follow-up.
-	pthread_mutex_t monitorLock;
+	OsMutex monitorLock;
 	// Serializes symbol interning (asSymbol + growSymbolTable) across worker threads: the
 	// symbol table is ONE shared open-addressed hash per heap, so concurrent probe/insert/
 	// grow would corrupt it. Re-entrant (growSymbolTable re-enters asSymbol via setGlobal),
 	// GC-safe acquisition (interning allocates the new Symbol / bigger table → may scavenge).
 	// The occupancy counter is per-heap too (was per-thread TLS, wrong for a shared table).
-	pthread_mutex_t symbolLock;
+	OsMutex symbolLock;
 	size_t symbolCount;      // live entries in the symbol table (guarded by symbolLock)
 	_Bool symbolCountValid;  // recomputed lazily on first intern (snapshot restores the table only)
 	// Every OS thread that mutates THIS heap links itself here (via Thread.nextMutator)
@@ -97,9 +97,9 @@ typedef struct Heap {
 	// gcLock: at most one collector at a time. safepoint{Lock,Cond,Requested}: the
 	// handshake — a collector parks every other mutator (they poll at allocation
 	// slow paths) before touching the object graph. Unused while single-mutator.
-	pthread_mutex_t gcLock;
-	pthread_mutex_t safepointLock;
-	pthread_cond_t safepointCond;
+	OsMutex gcLock;
+	OsMutex safepointLock;
+	OsCond safepointCond;
 	int safepointRequested;
 	// Striped Smalltalk sync monitor: each sync object's logical monitor is backed by
 	// monitorLocks[stripe], stripe = mix(obj->hash) >> monitorStripeShift (see
@@ -108,7 +108,7 @@ typedef struct Heap {
 	// APPENDED here (not replacing monitorLock above) so the JIT-baked offset of
 	// safepointRequested stays fixed; monitorLock is now unused but retained for that ABI
 	// stability. monitorLocks[0] is the "stripe 0"/global lock used by the arity-1 prims.
-	pthread_mutex_t *monitorLocks;
+	OsMutex *monitorLocks;
 	size_t monitorStripeCount;    // N (power of 2)
 	unsigned monitorStripeShift;  // 32 - log2(N) for N>1; 0 for N==1 (stripe forced to 0)
 } Heap;

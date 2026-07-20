@@ -120,7 +120,7 @@ int snapshotCheckHeader(FILE *file, char *err, size_t errSize)
 		|| memcmp(header, SNAPSHOT_MAGIC, 4) != 0) {
 		snprintf(err, errSize,
 			"not a valid image (missing '%s' magic): legacy or corrupt snapshot - "
-			"regenerate it with `st -s <image> -b smalltalk`", SNAPSHOT_MAGIC);
+			"regenerate it with `st -s <image> -b packages/Core`", SNAPSHOT_MAGIC);
 		return -1;
 	}
 	if (header[4] != SNAPSHOT_FORMAT_VERSION) {

@@ -115,10 +115,13 @@ if(ST_OS STREQUAL "linux")
 	set(vmOsSources
 		vm/os/linux/OsCpu.c
 		vm/os/linux/OsEvents.c
+		vm/os/linux/OsFile.c
 		vm/os/linux/OsMemory.c
 		vm/os/linux/OsProcess.c
 		vm/os/linux/OsRandom.c
 		vm/os/linux/OsSignals.c
+		vm/os/linux/OsSocket.c
+		vm/os/linux/OsThread.c
 		vm/os/linux/OsTime.c)
 else()
 	message(FATAL_ERROR "Unknown ST_OS '${ST_OS}' (supported: linux)")
@@ -200,6 +203,7 @@ set(vmSources
 	vm/memory/HeapPage.c
 	vm/memory/Safepoint.c
 	vm/memory/Scavenger.c
+	vm/runtime/Base64.c
 	vm/runtime/Collection.c
 	vm/runtime/Dictionary.c
 	vm/runtime/FileSystem.c
@@ -243,6 +247,11 @@ target_link_libraries(TokenizerTest VM)
 # (#include "memory/Heap.h"); vendored third-party code lives under
 # vm/thirdparty/ and is included the same way ("thirdparty/cityhash/city.h").
 target_include_directories(VM PUBLIC ${CMAKE_SOURCE_DIR}/vm)
+# The per-OS include dir is how contract headers reach their impl headers
+# (vm/os/OsThread.h includes "OsThreadImpl.h" — the header analogue of the
+# ST_OS link-time source selection; OsThread.h #errors when it is missing).
+# PUBLIC so the st executable's own sources (SelfTests.c) see it too.
+target_include_directories(VM PUBLIC ${CMAKE_SOURCE_DIR}/vm/os/${ST_OS})
 
 target_link_libraries(VM ${CMAKE_THREAD_LIBS_INIT})
 target_link_libraries(VM m)

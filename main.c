@@ -23,7 +23,6 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <pthread.h>
 
 static void bootstrapSmalltalk(char *snapshotFileName, char *bootstrapDir);
 
@@ -37,7 +36,10 @@ typedef struct {
 // Pre-flight for the project subcommands, BEFORE any image I/O: build/run/
 // test require a project root (package.st found walking upward); repl runs
 // in the project when there is one and as the plain base REPL otherwise.
-static _Bool planProject(CliArgs *cliArgs, ProjectPlan *plan)
+// `st run <script.st>` passes the SCRIPT's directory as scriptDir: the
+// project is looked up from there (not the CWD), and a script outside any
+// project is not an error — it simply runs on the base image.
+static _Bool planProject(CliArgs *cliArgs, ProjectPlan *plan, const char *scriptDir)
 {
 	char *subcommand = cliArgs->subcommand;
 	_Bool wantsProject = strcmp(subcommand, "build") == 0 || strcmp(subcommand, "run") == 0
@@ -45,7 +47,11 @@ static _Bool planProject(CliArgs *cliArgs, ProjectPlan *plan)
 	if (!wantsProject) {
 		return 1;
 	}
-	if (!projectFindRoot(plan->root, sizeof(plan->root))) {
+	if (scriptDir != NULL) {
+		if (!projectFindRootFrom(scriptDir, plan->root, sizeof(plan->root))) {
+			return 1;
+		}
+	} else if (!projectFindRoot(plan->root, sizeof(plan->root))) {
 		if (strcmp(subcommand, "repl") == 0) {
 			return 1;
 		}
@@ -113,7 +119,7 @@ static void runProgram(void *arg)
 		printCliHelp();
 	} else if (cliArgs->subcommand != NULL && strcmp(cliArgs->subcommand, "repl") != 0) {
 		// Project subcommands: thin eval bridges into ProjectTool
-		// (smalltalk/Packages/ProjectTool.st); `st repl` falls through to the
+		// (packages/Core/src/Packages/ProjectTool.st); `st repl` falls through to the
 		// ordinary REPL below, already inside the project image when one is
 		// loaded. Uncaught errors still poison the exit code through the
 		// scheduler's unhandled-error accounting.
@@ -158,6 +164,30 @@ int main(int argc, char **args)
 	parseCliArgs(&cliArgs, argc, args);
 	resolveSnapshotPath(&cliArgs);
 
+	// `st run <script.st>`: the first leftover operand ending in .st selects
+	// script mode — the script's PROJECT image is used (found from the
+	// script's directory, built if stale) and the script itself then runs
+	// through the ordinary -f path. The script sees the arguments AFTER its
+	// own name.
+	char *runScript = NULL;
+	static char runScriptPath[PROJECT_PATH_MAX];
+	static char runScriptDir[PROJECT_PATH_MAX];
+	if (cliArgs.subcommand != NULL && cliArgs.error == NULL
+			&& strcmp(cliArgs.subcommand, "run") == 0
+			&& cliArgs.argcAdjusted - cliArgs.argShift - optind > 0) {
+		char *operand = args[cliArgs.argShift + optind];
+		size_t operandLength = strlen(operand);
+		if (operandLength > 3 && strcmp(operand + operandLength - 3, ".st") == 0) {
+			if (realpath(operand, runScriptPath) == NULL) {
+				printf("st run: cannot open script '%s'\n", operand);
+				return EXIT_FAILURE;
+			}
+			strcpy(runScriptDir, runScriptPath);
+			*strrchr(runScriptDir, '/') = '\0'; // realpath always yields a slash
+			runScript = operand;
+		}
+	}
+
 	// Subcommand early dispatch (vm/tools/Cli.h). `st help`, argument errors
 	// and the project pre-flight (root discovery + staleness) all answer
 	// before any image is loaded; `st build` on a fresh project never boots a
@@ -173,7 +203,7 @@ int main(int argc, char **args)
 			printCliHelp();
 			return EXIT_SUCCESS;
 		}
-		if (!planProject(&cliArgs, &plan)) {
+		if (!planProject(&cliArgs, &plan, runScript != NULL ? runScriptDir : NULL)) {
 			return EXIT_FAILURE;
 		}
 		if (strcmp(cliArgs.subcommand, "build") == 0 && !plan.stale) {
@@ -184,9 +214,13 @@ int main(int argc, char **args)
 
 	// Script-visible command line (CommandLinePrimitive): everything left after
 	// the subcommand word (if any) and the options, e.g. `st -f prog.st alpha
-	// beta` -> #('alpha' 'beta').
-	primitivesSetCommandLine(cliArgs.argcAdjusted - cliArgs.argShift - optind,
-		args + cliArgs.argShift + optind);
+	// beta` -> #('alpha' 'beta'). In script mode the script's own name is
+	// consumed too.
+	{
+		int argOffset = runScript != NULL ? 1 : 0;
+		primitivesSetCommandLine(cliArgs.argcAdjusted - cliArgs.argShift - optind - argOffset,
+			args + cliArgs.argShift + optind + argOffset);
+	}
 
 	// The C-level self-test battery (ST_*_TEST env vars) lives in
 	// vm/tests/SelfTests.c; -1 means "no self-test requested".
@@ -217,7 +251,19 @@ int main(int argc, char **args)
 	// continue in the same process on the freshly built in-memory image.
 	if (plan.hasProject && plan.stale) {
 		char out[PROJECT_PATH_MAX];
-		if (!projectEvalToCString("ProjectTool build", out, sizeof(out))) {
+		// ProjectTool discovers the root from the image's working directory;
+		// in script mode the process may be anywhere, so hop into the
+		// project for the build and back out for the script itself.
+		char savedCwd[PROJECT_PATH_MAX];
+		_Bool hopped = runScript != NULL
+			&& getcwd(savedCwd, sizeof(savedCwd)) != NULL
+			&& chdir(plan.root) == 0;
+		_Bool built = projectEvalToCString("ProjectTool build", out, sizeof(out));
+		if (hopped && chdir(savedCwd) != 0) {
+			printf("st run: cannot return to '%s'\n", savedCwd);
+			return EXIT_FAILURE;
+		}
+		if (!built) {
 			return EXIT_FAILURE; // the image already printed the build error
 		}
 		collectGarbage(&CurrentThread);
@@ -233,6 +279,14 @@ int main(int argc, char **args)
 		if (strcmp(cliArgs.subcommand, "build") == 0) {
 			return EXIT_SUCCESS;
 		}
+	}
+
+	// Script mode: from here on it is exactly the -f path, running against
+	// the project image selected or freshly built above (or the base image
+	// when the script lives outside any project).
+	if (runScript != NULL) {
+		cliArgs.subcommand = NULL;
+		cliArgs.fileName = runScriptPath;
 	}
 
 	// Image idempotence probe (scripts/check-image-idempotence.sh): re-save the

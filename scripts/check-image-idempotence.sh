@@ -12,7 +12,7 @@ export LD_LIBRARY_PATH="$BUILD"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-"$BUILD/st" -s "$TMP/img1" -b smalltalk </dev/null >/dev/null
+"$BUILD/st" -s "$TMP/img1" -b packages/Core </dev/null >/dev/null
 ST_RESAVE="$TMP/img2" "$BUILD/st" -s "$TMP/img1" </dev/null >/dev/null
 ST_RESAVE="$TMP/img3" "$BUILD/st" -s "$TMP/img2" </dev/null >/dev/null
 

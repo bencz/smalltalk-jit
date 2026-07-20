@@ -267,16 +267,49 @@ domain (mirror `vm/os/linux/`):
 | `OsEvents.c` | the opaque `OsEventLoop` (arm/disarm/wait/wake) | epoll + wake-eventfd (kqueue/IOCP would slot in) |
 | `OsSignals.c` | `osInstallSegvHandler` (only the fault ADDRESS is consumed — no mcontext poking), `osIgnoreBrokenPipe` | `sigaction` + per-thread `sigaltstack` |
 | `OsCpu.c` | `osAvailableCoreCount` (must respect affinity/cgroup limits) | `sched_getaffinity` |
+| `OsThreadImpl.h` | by-value `OsMutex`/`OsCond`/`OsThread` types, `OS_MUTEX_STATIC_INIT`/`OS_COND_STATIC_INIT`, the mutex/cond ops as `static inline` (contract: `vm/os/OsThread.h`) | thin pthread wrappers, layout-identical (`_Static_assert`ed) |
+| `OsThread.c` | `osThreadSpawn`/`osThreadJoin` (void-returning entry) | `pthread_create`/`pthread_join` behind a thunk |
+| `OsSocket.c` | TCP/IPv4 create/connect/listen/accept/read/write/close/lookup (contract: `vm/os/OsSocket.h`) | BSD sockets, non-blocking + `TCP_NODELAY` |
+| `OsFile.c` | blocking file open/close/read/write/flush/seek/available (contract: `vm/os/OsFile.h`) | POSIX fds, `EINTR` absorbed in the layer |
+| `OsProcess.c` | `osExecutablePath`, `osLastError`/`osErrorMessage`, `osJitMapPath` | `/proc/self/exe`, `errno`/`strerror_r`, `/tmp/perf-<pid>.map` |
+| `OsRandom.c` | `osRandomBytes` | `getrandom` |
+
+The thread/socket/file contracts live in sibling headers (`vm/os/OsThread.h`,
+`OsSocket.h`, `OsFile.h`); `OsThreadImpl.h` is selected by the per-OS include
+directory the `ST_OS` block adds (`target_include_directories(VM PUBLIC
+vm/os/${ST_OS})`) — the header analogue of the link-time source selection, so
+mutex lock/unlock stay `static inline` and cost exactly a native call
+(`struct Heap` embeds `OsMutex` by value; the monitor-stripe hot path compiles
+to the same code as raw pthreads, verified by objdump diff).
+
+I/O crosses the seam through `OsFd` (`intptr_t`, wide enough for WinSock's
+`SOCKET`) and the `OsIoStatus` enum; raw `errno` never crosses it
+(`osLastError`/`osErrorMessage`). THE INVERSION RULE: the OS layer never
+blocks on readiness and never calls the scheduler — it answers
+`OS_IO_WOULD_BLOCK` and the VM side (`vm/runtime/Socket.c`, the socket
+primitives) parks the fiber on `schedulerWaitFd` and retries. File I/O is
+blocking by contract and retries `EINTR` inside the layer.
+
+Win32 mapping the contracts were shaped against: `OsMutex`=SRWLOCK
+(`SRWLOCK_INIT`), `OsCond`=CONDITION_VARIABLE (`SleepConditionVariableSRW`)
+— both non-recursive, matching the contract (VM re-entrancy is by per-thread
+depth counters, never recursive mutexes); `OsThread`=`_beginthreadex`;
+sockets=WinSock2 (`WSAEWOULDBLOCK` maps to `OS_IO_WOULD_BLOCK`;
+`OS_IO_INTERRUPTED` simply never occurs). Known Windows-port leftovers:
+sockets today are CLOSED through `StreamClosePrimitive` (fine while both are
+POSIX fds) — a port must APPEND a `SocketClosePrimitive` at the END of the
+primitive table (append-only: snapshots bake indices) and route
+`Socket>>close` through it; `vm/runtime/FileSystem.c` (dirent),
+`vm/concurrency/Fiber.c` (unistd) and the vendored linenoise (termios) are
+POSIX surfaces still outside the seam; TLS (`PER_ISOLATE`, JIT-baked tpoff)
+is an ARCH/ABI axis concern (`vm/jit/<arch>/abi/`), not an OS one.
 
 Future OS-dependent domains (e.g. an `OsCrypto.c` for OS crypto facilities)
 join as sibling files in every platform directory, with their contract added
-to `vm/os/Os.h` (or a sibling `vm/os/OsCrypto.h` once a domain grows large).
+to `vm/os/Os.h` (or a sibling header once a domain grows large).
 
 Register the OS in the `ST_OS` block in `CMakeLists.txt` (same link-time model
-as `ST_ARCH`; unsupported platforms fail at configure time). pthreads and BSD
-sockets are used directly by the VM (POSIX-portable by design) — a Windows
-port would need equivalents for those too, which is a bigger surface than
-this directory.
+as `ST_ARCH`; unsupported platforms fail at configure time).
 
 ## ppc64 (big-endian ELFv1 first, then little-endian ELFv2)
 
