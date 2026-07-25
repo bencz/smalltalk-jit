@@ -324,6 +324,18 @@ SmallInteger := Integer [
 
 
 	printStringBase: base [
+		"Digits in the given base (2..36), 0-9 then uppercase A-Z.
+
+		 The primitive writes the digits straight into the String's bytes. The
+		 Smalltalk body below is the fallback for a base outside 2..36, and it
+		 is kept because it is the definition of what the primitive must agree
+		 with: it is what IntegerPrintStringTest compares against.
+
+		 The fallback is not slow by accident of shape (it sizes the String once
+		 and fills it backwards), it is slow because every digit costs four
+		 sends, and neither // nor \\ is a JIT intrinsic, so each is a full
+		 dynamic dispatch."
+		<primitive: IntAsStringBasePrimitive>
 		| int string i |
 
 		self < 0

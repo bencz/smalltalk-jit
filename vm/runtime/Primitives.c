@@ -158,6 +158,7 @@ static PrimitiveResult floatArcCosPrimitive(Value self);
 static PrimitiveResult floatArcTanPrimitive(Value self);
 static PrimitiveResult floatArcTan2Primitive(Value self, Value arg);
 static PrimitiveResult floatAsStringPrimitive(Value self);
+static PrimitiveResult intAsStringBasePrimitive(Value self, Value base);
 static PrimitiveResult intAsFloatPrimitive(Value self);
 static PrimitiveResult floatExponentPrimitive(Value self);
 static PrimitiveResult floatTimesTwoPowerPrimitive(Value self, Value arg);
@@ -340,6 +341,7 @@ Primitive Primitives[] = {
 	{"FloatArcTan2Primitive", CCALL, .cFunction = floatArcTan2Primitive, 2},
 	{"FloatAsStringPrimitive", CCALL, .cFunction = floatAsStringPrimitive, 1},
 	{"IntAsFloatPrimitive", CCALL, .cFunction = intAsFloatPrimitive, 1},
+	{"IntAsStringBasePrimitive", CCALL, .cFunction = intAsStringBasePrimitive, 2},
 
 	{"StreamOpenPrimitive", CCALL, .cFunction = streamOpenPrimitive, 3},
 	{"StreamClosePrimitive", CCALL, .cFunction = streamClosePrimitive, 2},
@@ -2269,6 +2271,63 @@ static PrimitiveResult floatAsStringPrimitive(Value self)
 	HandleScope scope;
 	openHandleScope(&scope);
 	Value result = getTaggedPtr(asString(buf));
+	closeHandleScope(&scope, NULL);
+	return primSuccess(result);
+}
+
+
+// Integer -> String in a given base, the counterpart of the Float one above.
+//
+// The Smalltalk version it replaces (SmallInteger>>printStringBase:) is already
+// the good shape -- it sizes the String once with floorLog: and fills it
+// backwards -- but every digit still costs four sends: \\, //, digitValue: and
+// at:put:. Neither // nor \\ is a JIT intrinsic (jit/SendClassify.h), so each is
+// a full dynamic dispatch. For a 10-digit number that is about 40 sends plus the
+// floorLog: loop, and it measured ~13% of the cycles in tests/JsonTest.st, the
+// same path the HTTP server spends its time in when encoding JSON numbers.
+//
+// Fails (falling back to the Smalltalk method) for anything that is not a
+// SmallInteger, which is how LargeInteger keeps its own path, and for a base
+// outside 2..36. Digits are 0-9 then UPPERCASE A-Z, matching
+// Character class>>digitValue:.
+static PrimitiveResult intAsStringBasePrimitive(Value self, Value base)
+{
+	// Tag checks BEFORE any asObject: a CCALL primitive receives immediates
+	// untouched, and treating one as a pointer aborts the VM.
+	if (!valueTypeOf(self, VALUE_INT) || !valueTypeOf(base, VALUE_INT)) {
+		return primFailed();
+	}
+	intptr_t radix = asCInt(base);
+	if (radix < 2 || radix > 36) {
+		return primFailed();
+	}
+
+	intptr_t value = asCInt(self);
+	// Build backwards into a scratch buffer. SmallInteger is 62-bit, so base 2
+	// needs at most 62 digits; 70 leaves room for the sign and slack.
+	char digits[70];
+	size_t n = 0;
+	// Negate into the NEGATIVE side rather than taking an absolute value: the
+	// most negative SmallInteger has no positive counterpart in its own range,
+	// and this way one loop serves both signs.
+	intptr_t rest = value > 0 ? -value : value;
+	do {
+		intptr_t digit = -(rest % radix);
+		digits[n++] = (char) (digit < 10 ? '0' + digit : 'A' + digit - 10);
+		rest /= radix;
+	} while (rest != 0);
+	if (value < 0) {
+		digits[n++] = '-';
+	}
+
+	HandleScope scope;
+	openHandleScope(&scope);
+	String *string = newString(n);
+	char *contents = string->raw->contents;
+	for (size_t i = 0; i < n; i++) {
+		contents[i] = digits[n - 1 - i];
+	}
+	Value result = getTaggedPtr(string);
 	closeHandleScope(&scope, NULL);
 	return primSuccess(result);
 }
