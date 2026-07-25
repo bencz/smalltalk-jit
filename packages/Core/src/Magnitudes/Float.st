@@ -117,6 +117,11 @@ Float := Number [
 
 	"testing"
 
+	isFloat [
+		^true
+	]
+
+
 	isZero [
 		^self = 0.0
 	]
@@ -209,6 +214,28 @@ Float := Number [
 		"self * 2^anInteger, exact (the mantissa is untouched)."
 		<primitive: FloatTimesTwoPowerPrimitive>
 		^self error: 'power must be a SmallInteger'
+	]
+
+
+	asExactFraction [
+		"The EXACT rational this double denotes, with no approximation: a finite
+		 double is mantissa * 2^exponent, so scale the mantissa out by its 52
+		 fraction bits and put the remaining power of two in the denominator (or
+		 the numerator when the exponent is positive). Answers an Integer when
+		 the value is integral, since Fraction demotes a unit denominator."
+		| e m shift |
+		self isFinite ifFalse: [^self error: 'Infinity and NaN are not rational'].
+		self = 0.0 ifTrue: [^0].
+		e := self exponent.
+		m := (self timesTwoPower: 52 - e) truncated.
+		shift := e - 52.
+		shift >= 0 ifTrue: [^m * (2 raisedToInteger: shift)].
+		^Fraction numerator: m denominator: (2 raisedToInteger: shift negated)
+	]
+
+
+	asFraction [
+		^self asExactFraction
 	]
 
 

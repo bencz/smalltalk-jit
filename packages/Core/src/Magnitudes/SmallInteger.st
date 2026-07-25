@@ -1,5 +1,27 @@
 SmallInteger := Integer [
 
+	"--- range ---"
+
+	class maxVal [
+		"Largest value that stays immediate. A Value carries a 2-bit tag, so the
+		 payload is a SIGNED 62-bit field: [-2^61, 2^61-1]. Anything past this
+		 promotes to LargePositiveInteger, and LargeInteger>>normalize demotes at
+		 exactly this boundary. WARNING: the range is asymmetric, so
+		 `SmallInteger maxVal negated` is NOT minVal."
+		^2305843009213693951
+	]
+
+
+	class minVal [
+		"Computed, not written as a literal: -2^61 is exactly one past the
+		 parser's SYMMETRIC demotion boundary (|v| < 2^61), so as a literal it
+		 would be built as a LargeNegativeInteger, and this file is loaded before
+		 LargeNegativeInteger.st even exists. maxVal negated is comfortably
+		 immediate and the subtraction lands exactly on the payload minimum."
+		^self maxVal negated - 1
+	]
+
+
 	"comparing"
 
 	hash [
@@ -110,8 +132,14 @@ SmallInteger := Integer [
 
 
 	bitShift: anInteger [
+		"The primitive handles every right shift (the count is clamped, and an
+		 arithmetic shift saturates to the exact answer) and every left shift
+		 that still fits 62 bits. It fails only on overflow, where the answer is
+		 a LargeInteger, so PROMOTE instead of raising: `1 bitShift: 100` used to
+		 answer 2^36 because x86 masks the shift count to 6 bits."
 		<primitive: IntShiftPrimitive>
-		^self primitiveFailedFor: anInteger.
+		(anInteger isKindOf: Integer) ifFalse: [^self primitiveFailedFor: anInteger].
+		^self asLargeInteger bitShift: anInteger
 	]
 
 

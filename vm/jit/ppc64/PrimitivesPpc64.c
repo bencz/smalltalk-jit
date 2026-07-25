@@ -873,32 +873,66 @@ void generateIntXorPrimitive(CodeGenerator *generator)
 }
 
 
+// See the x64 twin for the full rationale: the right shift must be ARITHMETIC
+// (srad, not srd) so a negative receiver keeps its sign and gets Smalltalk's
+// floor semantics, the left shift must detect overflow instead of truncating,
+// and the count must be clamped EXPLICITLY rather than relying on the CPU. That
+// last point is why the two backends used to disagree: POWER's sld/srd take a
+// 7-bit count and yield 0 at 64 and above, while x86 masks to 6 bits, so
+// `1 bitShift: 64` answered 0 here and 1 there.
 void generateIntShiftPrimitive(CodeGenerator *generator)
 {
 	AssemblerBuffer *buffer = &generator->buffer;
+	// One label per forward reference (asmPpcLabelBind asserts a single
+	// resolution), all bound together at the end.
 	AssemblerLabel notInt;
+	AssemblerLabel countTooBig;
+	AssemblerLabel overflowed;
 	AssemblerLabel rightShift;
+	AssemblerLabel clamped;
 	asmInitLabel(&notInt);
+	asmInitLabel(&countTooBig);
+	asmInitLabel(&overflowed);
 	asmInitLabel(&rightShift);
+	asmInitLabel(&clamped);
 
 	movArg(buffer, 1, R4);
 	testInt(generator, R4);
 	asmBne(buffer, &notInt);
 
 	movArg(buffer, 0, R3);
-	asmSradi(buffer, R4, R4, 2);
+	asmSradi(buffer, R4, R4, 2); // untag the count, keeping its sign
 	asmCmpdi(buffer, 0, R4, 0);
 	asmBlt(buffer, &rightShift);
-	asmSld(buffer, R3, R3, R4);        // amounts >= 64 yield 0 (POWER rule)
+
+	// LEFT: a 62-bit payload cannot survive a count at or past 62.
+	asmCmpdi(buffer, 0, R4, 62);
+	asmBge(buffer, &countTooBig);
+	asmSld(buffer, R3, R3, R4);
+	// Overflow check: shifting back must reproduce the original, reloaded from
+	// the stack so no scratch register has to hold it.
+	asmSrad(buffer, R5, R3, R4);
+	movArg(buffer, 0, R6);
+	asmCmpd(buffer, 0, R5, R6);
+	asmBne(buffer, &overflowed);
 	asmBlr(buffer);
 
 	asmPpcLabelBind(buffer, &rightShift, asmOffset(buffer));
+	// Negate the FULL count then clamp to 63: srad saturates to all-sign-bits,
+	// which is already the exact answer (0 for a non-negative receiver, -1 for
+	// a negative one).
 	asmNeg(buffer, R4, R4);
-	asmSrd(buffer, R3, R3, R4);
-	asmRldicr(buffer, R3, R3, 0, 61);  // clear the tag bits (& ~3)
+	asmCmpdi(buffer, 0, R4, 63);
+	asmBle(buffer, &clamped);
+	asmLi(buffer, R4, 63);
+	asmPpcLabelBind(buffer, &clamped, asmOffset(buffer));
+	asmSrad(buffer, R3, R3, R4);
+	asmRldicr(buffer, R3, R3, 0, 61); // re-tag: sign bits shifted into the tag
 	asmBlr(buffer);
 
 	asmPpcLabelBind(buffer, &notInt, asmOffset(buffer));
+	asmPpcLabelBind(buffer, &countTooBig, asmOffset(buffer));
+	asmPpcLabelBind(buffer, &overflowed, asmOffset(buffer));
 }
 
 

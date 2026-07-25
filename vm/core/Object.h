@@ -306,8 +306,14 @@ static inline RawObject *asObject(Value value)
 
 static inline Value tagInt(intptr_t i)
 {
-	int64_t max = (int64_t) (UINT64_MAX >> 2);
-	int64_t min = -max;
+	// The payload is a SIGNED 62-bit field, so the range is [-2^61, 2^61-1] and
+	// it is ASYMMETRIC. The old bound was UINT64_MAX>>2 = 2^62-1, one bit too
+	// permissive in both directions: tagInt(2^62-1) shifts to 0xFFFFFFFFFFFFFFFC
+	// and decodes back as -1, silently, in a debug build that was meant to catch
+	// exactly that. These constants agree with SmallInteger class maxVal/minVal
+	// and with the demotion threshold in LargeInteger>>normalize.
+	int64_t max = ((int64_t) 1 << 61) - 1;
+	int64_t min = -((int64_t) 1 << 61);
 	ASSERT(min <= i && i <= max);
 	return i << 2;
 }

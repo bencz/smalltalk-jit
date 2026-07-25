@@ -169,6 +169,46 @@ Object := nil [
 	]
 
 
+	"Class-membership predicates. These answer false here and true in exactly
+	 one place each, so a caller can branch on a value's kind without an
+	 isKindOf: (a class comparison plus a superclass walk) and without naming
+	 the class, which matters for the immediates whose class is a tag."
+
+	isNumber [
+		^false
+	]
+
+
+	isInteger [
+		^false
+	]
+
+
+	isFloat [
+		^false
+	]
+
+
+	isFraction [
+		^false
+	]
+
+
+	isCharacter [
+		^false
+	]
+
+
+	isString [
+		^false
+	]
+
+
+	isSymbol [
+		^false
+	]
+
+
 	"copying"
 
 	copy [

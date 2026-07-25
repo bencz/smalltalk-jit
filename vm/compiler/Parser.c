@@ -828,6 +828,13 @@ static Value buildIntegerLiteral(const char *str, int base, _Bool negative)
 		// the sign of a LargeInteger lives in its CLASS (Pharo style); the
 		// only instance variable is the limb Array
 		Class *cls = getClass(negative ? "LargeNegativeInteger" : "LargePositiveInteger");
+		// A literal too big for a SmallInteger, in a kernel file that loads
+		// BEFORE Large{Positive,Negative}Integer.st, used to build against an
+		// unresolved global and silently produce a nonsense object (a bare
+		// `^-2305843009213693952` in SmallInteger.st answered an
+		// OrderedCollection). Only a kernel-ordering mistake can reach this;
+		// user code always loads after the kernel.
+		ASSERT(cls != NULL && !isNil(cls));
 		Object *large = newObject(cls, 0);
 		Value *vars = getObjectVars(large);
 		objectStorePtr(large, &vars[0], (Object *) digits);

@@ -844,33 +844,86 @@ void generateIntXorPrimitive(CodeGenerator *generator)
 }
 
 
+// SmallInteger>>bitShift: negative count = right, positive = left. The receiver
+// arrives TAGGED (value << 2), and because the tag bits are zero a shift of the
+// tagged word is a shift of the value, so all the work happens in place.
+//
+// Three defects lived here and each produced a silent wrong answer:
+//  1. the right shift was LOGICAL (shr), so `-8 bitShift: -1` answered a huge
+//     positive number instead of -4. It must be ARITHMETIC (sar), which also
+//     gives Smalltalk's floor semantics for negative receivers.
+//  2. the left shift never checked overflow, so `1 bitShift: 100` silently
+//     truncated instead of promoting to LargeInteger.
+//  3. the count was neither clamped nor range-checked, and the two backends
+//     DISAGREED as a result: x86 masks a shift count to 6 bits (so
+//     `1 bitShift: 64` answered 1) while POWER uses 7 bits (answering 0). The
+//     count is now clamped explicitly on both, trusting neither CPU rule.
+//     The old code also took only the LOW BYTE of the count, so a shift by
+//     -256 degenerated into a shift by 0.
+//
+// Failing to `notInt` hands over to the Smalltalk fallback, which promotes
+// through asLargeInteger, so overflow becomes an exact answer rather than an
+// error.
 void generateIntShiftPrimitive(CodeGenerator *generator)
 {
 	AssemblerBuffer *buffer = &generator->buffer;
+	// One label per forward reference: an AssemblerLabel takes exactly ONE
+	// (asmEmitLabel32 asserts it), so the three ways out all get their own and
+	// are bound together at the end, like generateIntModPrimitive does.
 	AssemblerLabel notInt;
+	AssemblerLabel countTooBig;
+	AssemblerLabel overflowed;
 	AssemblerLabel rightShift;
+	AssemblerLabel clamped;
 	asmInitLabel(&notInt);
+	asmInitLabel(&countTooBig);
+	asmInitLabel(&overflowed);
 	asmInitLabel(&rightShift);
+	asmInitLabel(&clamped);
 
 	movArg(buffer, 1, RSI);
 	testInt(generator, SIL);
 	asmJ(buffer, COND_NOT_ZERO, &notInt);
 
 	movArg(buffer, 0, RAX);
-	asmSarqImm(buffer, RSI, 2);
-	asmMovb(buffer, SIL, CL);
+	asmSarqImm(buffer, RSI, 2); // untag the count, keeping its sign
 	asmTestq(buffer, RSI, RSI);
 	asmJ(buffer, COND_SIGN, &rightShift);
+
+	// LEFT. A payload is 62 bits, so a count at or past 62 cannot fit any
+	// nonzero receiver; hand those to the fallback rather than trying to
+	// shift by them (which is also where the CPUs' count masking differs).
+	asmCmpqImm(buffer, RSI, 62);
+	asmJ(buffer, COND_GREATER_EQUAL, &countTooBig);
+	asmMovb(buffer, SIL, CL);
 	asmShlq(buffer, RAX);
+	// Overflow check: shifting back must reproduce the original, which is
+	// still on the stack. Comparing against arg(0) avoids needing a scratch
+	// register to hold it.
+	asmMovq(buffer, RAX, RDX);
+	asmSarq(buffer, RDX);
+	asmCmpqMem(buffer, arg(0), RDX);
+	asmJ(buffer, COND_NOT_EQUAL, &overflowed);
 	asmRet(buffer);
 
 	asmLabelBind(buffer, &rightShift, asmOffset(buffer));
-	asmNegb(buffer, CL);
-	asmShrq(buffer, RAX);
-	asmAndqImm(buffer, RAX, ~3);
+	// Negate the FULL count, not its low byte, then clamp: sar saturates at 63
+	// to all-sign-bits, which is already the mathematically right answer (0 for
+	// a non-negative receiver, -1 for a negative one), so clamping is exact and
+	// not an approximation.
+	asmNegq(buffer, RSI);
+	asmCmpqImm(buffer, RSI, 63);
+	asmJ(buffer, COND_LESS_EQUAL, &clamped);
+	asmMovqImm(buffer, 63, RSI);
+	asmLabelBind(buffer, &clamped, asmOffset(buffer));
+	asmMovb(buffer, SIL, CL);
+	asmSarq(buffer, RAX);
+	asmAndqImm(buffer, RAX, ~3); // re-tag: the sign bits shifted into the tag
 	asmRet(buffer);
 
 	asmLabelBind(buffer, &notInt, asmOffset(buffer));
+	asmLabelBind(buffer, &countTooBig, asmOffset(buffer));
+	asmLabelBind(buffer, &overflowed, asmOffset(buffer));
 }
 
 

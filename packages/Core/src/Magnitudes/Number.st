@@ -226,6 +226,14 @@ Number := Magnitude [
 	]
 
 
+	ceilingLog: aNumber [
+		"Companion of floorLog:. Integer>>floorLog: has always CALLED this for a
+		 radix below 1 (rewriting log_r(x) as -log_1/r(x)), but it did not exist,
+		 so that branch was a live doesNotUnderstand."
+		^(self log: aNumber) ceiling
+	]
+
+
 	raisedTo: aNumber [
 		(aNumber isKindOf: Integer) ifTrue: [^self raisedToInteger: aNumber].
 		^(self ln * aNumber) exp
@@ -262,13 +270,28 @@ Number := Magnitude [
 
 	"testing"
 
-	even [
+	isNumber [
+		^true
+	]
 
+
+	even [
+		"Generic over the whole tower: a Fraction is never even, and a Float is
+		 even exactly when its remainder mod 2 vanishes. Integer subclasses
+		 override with a cheap bit test. This used to have an EMPTY body, so
+		 `3.0 even` silently answered 3.0."
+		^(self \\ 2) = 0
 	]
 
 
 	odd [
-
+		"Deliberately NOT `self even not`. Parity is defined only for integers,
+		 and `even not` would report every Fraction as odd, which is exactly the
+		 kind of confident wrong answer this file is being cleaned of. Asking
+		 the remainder directly makes a non-integer answer false to BOTH, so
+		 `x even or: [x odd]` correctly means `x is an integer value`. Integer
+		 subclasses override with a bit test, where the two are complementary."
+		^(self \\ 2) = 1
 	]
 
 
@@ -303,17 +326,32 @@ Number := Magnitude [
 	"truncation and round off"
 
 	ceiling [
-
+		"Smallest integer not less than the receiver, derived from truncated
+		 (which rounds toward zero): only a positive fractional part moves it up."
+		| truncation |
+		truncation := self truncated.
+		"Receiver on the LEFT so the comparison dispatches to the subclass's own
+		 <, not to Integer's, which would drag the whole generality/coerce:
+		 machinery in just to compare against an Integer."
+		^self > truncation ifTrue: [truncation + 1] ifFalse: [truncation]
 	]
 
 
 	floor [
-
+		"Largest integer not greater than the receiver, derived from truncated:
+		 only a negative fractional part moves it down."
+		| truncation |
+		truncation := self truncated.
+		^self < truncation ifTrue: [truncation - 1] ifFalse: [truncation]
 	]
 
 
 	truncated [
-
+		"The only genuinely representation-specific member of this group: every
+		 other rounding here derives from it. A subclass that defines nothing
+		 must fail LOUDLY, not answer the receiver, which is what the former
+		 empty body did."
+		^SubClassResponsibility signal
 	]
 
 
@@ -323,7 +361,11 @@ Number := Magnitude [
 
 
 	rounded [
-
+		"Nearest integer, ties away from zero, matching the C round() behind
+		 Float>>rounded so both paths agree on x.5."
+		^self negative
+			ifTrue: [(self - (1 / 2)) ceiling]
+			ifFalse: [(self + (1 / 2)) floor]
 	]
 
 

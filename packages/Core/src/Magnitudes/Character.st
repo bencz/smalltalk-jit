@@ -178,6 +178,11 @@ Character := Magnitude [
 
 	"testing"
 
+	isCharacter [
+		^true
+	]
+
+
 	isAlphaNumeric [
 		^(Table at: self codePoint + 257) > 252
 	]

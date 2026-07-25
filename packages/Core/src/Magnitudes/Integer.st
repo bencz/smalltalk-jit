@@ -88,6 +88,26 @@ Integer := Number [
 	]
 
 
+	asFraction [
+		"Every integer is the rational n/1. Fraction numerator:denominator:
+		 demotes a unit denominator back to an Integer, so this answers self;
+		 the point is that the CONVERSION protocol is total over the tower."
+		^Fraction numerator: self denominator: 1
+	]
+
+
+	numerator [
+		"An integer viewed as a rational: n/1. Makes numerator/denominator total
+		 over Integer and Fraction, so a caller need not special-case."
+		^self
+	]
+
+
+	denominator [
+		^1
+	]
+
+
 	asScaledDecimal [
 		^ScaledDecimal basicNumerator: self denominator: 1 scale: 0
 	]

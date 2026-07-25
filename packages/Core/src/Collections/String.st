@@ -164,6 +164,12 @@ String := ArrayedCollection [
 	]
 
 
+	isString [
+		"True for Symbol too: a Symbol IS a String here, exactly as in Pharo."
+		^true
+	]
+
+
 	asString [
 		"A String is already a string; answer self. Symbol overrides this to answer
 		 a fresh, mutable, plain String (dropping its interned/immutable identity)."

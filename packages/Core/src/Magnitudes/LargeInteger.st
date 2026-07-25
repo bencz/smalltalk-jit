@@ -335,6 +335,25 @@ LargeInteger := Integer [
 	]
 
 
+	"--- bit operations ---"
+
+	bitShift: anInteger [
+		"Arithmetic shift: negative shifts right, positive left. Expressed with
+		 * and // rather than by walking the limb Array, because // is FLOORED
+		 here, which is exactly the sign-extending semantics a right shift owes a
+		 negative receiver, and both operands are already well tested. The result
+		 normalizes back to a SmallInteger through the usual path.
+
+		 WARNING: this is deliberately the simple formulation, not the fast one.
+		 The limb-level version belongs with the rest of the C kernel, together
+		 with bitAnd:/bitOr:/bitXor:, which a LargeInteger still does not
+		 understand at all."
+		anInteger = 0 ifTrue: [^self normalize].
+		anInteger > 0 ifTrue: [^self * (2 raisedToInteger: anInteger)].
+		^self // (2 raisedToInteger: anInteger negated)
+	]
+
+
 	"--- comparing ---"
 
 	compareLarge: aLarge [

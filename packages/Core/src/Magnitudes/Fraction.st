@@ -166,10 +166,25 @@ Fraction := Number [
 	]
 
 
+	"--- testing ---"
+
+	isFraction [
+		^true
+	]
+
+
 	"--- truncation and rounding ---"
 
 	truncated [
 		^numerator quo: denominator
+	]
+
+
+	asInteger [
+		"Same as truncated, matching Integer>>asInteger answering self. Its
+		 absence made `(3/2) asInteger` a doesNotUnderstand even though
+		 `(3/2) truncated` worked."
+		^self truncated
 	]
 
 

@@ -1,5 +1,12 @@
 Symbol := String [
 
+	"testing"
+
+	isSymbol [
+		^true
+	]
+
+
 	"comparing"
 
 	hash [

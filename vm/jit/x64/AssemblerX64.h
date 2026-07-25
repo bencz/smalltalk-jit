@@ -207,6 +207,7 @@ static void asmOrbMemImm(AssemblerBuffer *buffer, MemoryOperand operand, int8_t 
 static void asmXorq(AssemblerBuffer *buffer, Register src, Register dst);
 static void asmXorqMem(AssemblerBuffer *buffer, MemoryOperand operand, Register dst);
 
+static void asmSarq(AssemblerBuffer *buffer, Register dst);
 static void asmSarqImm(AssemblerBuffer *buffer, Register dst, uint8_t imm);
 static void asmShlq(AssemblerBuffer *buffer, Register dst);
 static void asmShlqImm(AssemblerBuffer *buffer, Register dst, uint8_t imm);
@@ -788,6 +789,16 @@ static void asmXorqMem(AssemblerBuffer *buffer, MemoryOperand operand, Register 
 	asmEmitRexOperands(buffer, REX_W, &operands);
 	asmEmitUint8(buffer, 0x33);
 	asmEmitOperands(buffer, &operands);
+}
+
+
+// ARITHMETIC right shift by CL (opcode extension 7), as opposed to asmShrq's
+// LOGICAL shift (extension 5). Sign-preserving, which is what a Smalltalk
+// bitShift: with a negative receiver needs.
+static void asmSarq(AssemblerBuffer *buffer, Register dst)
+{
+	asmEnsureCapacity(buffer);
+	asmEmitShift(buffer, 7, dst);
 }
 
 
