@@ -164,6 +164,16 @@ String := ArrayedCollection [
 	]
 
 
+	largeIntegerBase: anInteger negative: aBoolean classes: classPair [
+		"Parse the receiver's DIGITS (no sign character) in the given radix.
+		 Lives on String because the primitive's receiver is the digit buffer;
+		 LargeInteger class>>fromString:base:negative: is the readable entry
+		 point and supplies the classes pair."
+		<primitive: LargeIntFromStringPrimitive>
+		^InvalidArgumentError signal: 'not a valid integer in base ', anInteger printString
+	]
+
+
 	isString [
 		"True for Symbol too: a Symbol IS a String here, exactly as in Pharo."
 		^true

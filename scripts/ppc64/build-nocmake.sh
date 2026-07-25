@@ -58,7 +58,7 @@ SOURCES="$SOURCES $ABI_SRCS $ROOT/vm/thirdparty/cityhash/city.c $ROOT/vm/thirdpa
 if [ "$STATIC" = "1" ]; then
 	echo "cross-static build ($TARGET_ARCH via $CC)..."
 	$CC $CFLAGS $CITYHASH_FLAGS -static -o "$BUILD/st" \
-		"$ROOT/main.c" "$ROOT/vm/tests/SelfTests.c" $TEST_SRCS \
+		"$ROOT/main.c" "$ROOT/vm/tests/SelfTests.c" "$ROOT/vm/tests/BigIntTest.c" $TEST_SRCS \
 		$SOURCES -lpthread -lm
 	$CC $CFLAGS $CITYHASH_FLAGS -static -o "$BUILD/TokenizerTest" \
 		"$ROOT/vm/tests/TokenizerTest.c" $SOURCES -lpthread -lm
@@ -66,6 +66,7 @@ else
 	echo "native shared build ($TARGET_ARCH)..."
 	$CC $CFLAGS $CITYHASH_FLAGS -fPIC -shared -o "$BUILD/libVM.so" $SOURCES -lpthread -lm
 	$CC $CFLAGS -o "$BUILD/st" "$ROOT/main.c" "$ROOT/vm/tests/SelfTests.c" \
+		"$ROOT/vm/tests/BigIntTest.c" \
 		$TEST_SRCS -L"$BUILD" -lVM -Wl,-rpath,'$ORIGIN'
 	$CC $CFLAGS -o "$BUILD/TokenizerTest" "$ROOT/vm/tests/TokenizerTest.c" \
 		-L"$BUILD" -lVM -Wl,-rpath,'$ORIGIN'

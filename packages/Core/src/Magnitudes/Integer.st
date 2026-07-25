@@ -81,6 +81,46 @@ Integer := Number [
 	]
 
 
+	"--- large-integer kernels (vm/runtime/BigInt.c) ---
+	 Defined here rather than on LargeInteger because the primitives accept a
+	 SmallInteger operand directly, so SmallInteger uses them for its OVERFLOW
+	 fallbacks without widening first. The classes pair is an argument rather
+	 than something C looks up: see the comment in Primitives.c."
+
+	largeOp: opcode with: aNumber [
+		^self primLargeWith: aNumber op: opcode classes: LargeInteger classes
+	]
+
+
+	primLargeWith: aNumber op: opcode classes: classPair [
+		<primitive: LargeIntBinaryPrimitive>
+		aNumber = 0 ifTrue: [^ZeroDivide new signal].
+		^self error: 'large integer arithmetic failed'
+	]
+
+
+	largeCompare: aNumber [
+		^self primLargeCompareWith: aNumber classes: LargeInteger classes
+	]
+
+
+	primLargeCompareWith: aNumber classes: classPair [
+		<primitive: LargeIntComparePrimitive>
+		^self error: 'large integer comparison failed'
+	]
+
+
+	largeShift: anInteger [
+		^self primLargeShift: anInteger classes: LargeInteger classes
+	]
+
+
+	primLargeShift: anInteger classes: classPair [
+		<primitive: LargeIntShiftPrimitive>
+		^self error: 'large integer shift failed'
+	]
+
+
 	"converting"
 
 	asInteger [

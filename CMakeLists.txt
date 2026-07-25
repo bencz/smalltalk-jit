@@ -204,6 +204,7 @@ set(vmSources
 	vm/memory/Safepoint.c
 	vm/memory/Scavenger.c
 	vm/runtime/Base64.c
+	vm/runtime/BigInt.c
 	vm/runtime/Collection.c
 	vm/runtime/Dictionary.c
 	vm/runtime/FileSystem.c
@@ -233,7 +234,7 @@ if(CMAKE_C_BYTE_ORDER STREQUAL "BIG_ENDIAN")
 		PROPERTIES COMPILE_DEFINITIONS WORDS_BIGENDIAN)
 endif()
 add_library(VM SHARED ${vmSources})
-add_executable(st main.c vm/tests/SelfTests.c ${vmArchTestSources})
+add_executable(st main.c vm/tests/SelfTests.c vm/tests/BigIntTest.c ${vmArchTestSources})
 target_include_directories(st PRIVATE ${CMAKE_SOURCE_DIR})
 
 # Standalone C unit test for the tokenizer (own main(), not part of `st`):

@@ -1,4 +1,5 @@
 #include "compiler/Parser.h"
+#include "runtime/BigInt.h"
 #include "core/Smalltalk.h"
 #include "memory/Heap.h"
 #include "runtime/Collection.h"
@@ -812,21 +813,43 @@ static Value buildIntegerLiteral(const char *str, int base, _Bool negative)
 		len--;
 	}
 
-	if (len < 4 || (len == 4 && limbs[3] < 8192)) {
-		int64_t value = 0;
-		for (ptrdiff_t j = (ptrdiff_t) len - 1; j >= 0; j--) {
-			value = value * 65536 + limbs[j];
+	// Repack the base-2^16 accumulation into the 32-bit limbs the runtime
+	// representation uses. The accumulation stays 16-bit because it multiplies
+	// by the radix in a uint32_t; only the storage width changes here.
+	size_t limbs32 = (len + 1) / 2;
+	uint32_t *wide = calloc(limbs32 + 1, sizeof(uint32_t));
+	if (wide == NULL) {
+		FAIL();
+	}
+	for (size_t j = 0; j < len; j++) {
+		wide[j / 2] |= (uint32_t) limbs[j] << (16 * (j % 2));
+	}
+	limbs32 = bigIntNormalize(wide, limbs32);
+
+	// Demotion MUST agree with largeIntResult in Primitives.c, with
+	// SmallInteger class maxVal/minVal, and with tagInt's assertion, or a
+	// literal and a computed value of the same magnitude get different classes.
+	// The range is ASYMMETRIC: [-2^61, 2^61-1].
+	uint64_t magnitude = 0;
+	_Bool fits = limbs32 <= 2;
+	if (fits) {
+		if (limbs32 >= 1) {
+			magnitude |= wide[0];
 		}
-		result = tagInt(negative ? -value : value);
+		if (limbs32 == 2) {
+			magnitude |= (uint64_t) wide[1] << 32;
+		}
+		uint64_t limit = (uint64_t) 1 << 61;
+		fits = negative ? magnitude <= limit : magnitude < limit;
+	}
+
+	if (fits) {
+		result = tagInt(negative ? -(intptr_t) magnitude : (intptr_t) magnitude);
 	} else {
 		HandleScope scope;
 		openHandleScope(&scope);
-		Array *digits = newArray(len);
-		for (size_t j = 0; j < len; j++) {
-			digits->raw->vars[j] = tagInt(limbs[j]);
-		}
-		// the sign of a LargeInteger lives in its CLASS (Pharo style); the
-		// only instance variable is the limb Array
+		// The sign of a LargeInteger lives in its CLASS (Pharo style); the
+		// magnitude IS the byte payload, so there are no instance variables.
 		Class *cls = getClass(negative ? "LargeNegativeInteger" : "LargePositiveInteger");
 		// A literal too big for a SmallInteger, in a kernel file that loads
 		// BEFORE Large{Positive,Negative}Integer.st, used to build against an
@@ -835,11 +858,11 @@ static Value buildIntegerLiteral(const char *str, int base, _Bool negative)
 		// OrderedCollection). Only a kernel-ordering mistake can reach this;
 		// user code always loads after the kernel.
 		ASSERT(cls != NULL && !isNil(cls));
-		Object *large = newObject(cls, 0);
-		Value *vars = getObjectVars(large);
-		objectStorePtr(large, &vars[0], (Object *) digits);
+		Object *large = newObject(cls, limbs32 * sizeof(uint32_t));
+		memcpy(getObjectIndexedVars(large), wide, limbs32 * sizeof(uint32_t));
 		result = getTaggedPtr(closeHandleScope(&scope, large));
 	}
+	free(wide);
 	free(limbs);
 	return result;
 }

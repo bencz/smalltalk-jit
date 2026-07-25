@@ -1,246 +1,81 @@
-"Abstract arbitrary precision integer, Pharo style: the SIGN is encoded in
-the concrete class (LargePositiveInteger or LargeNegativeInteger) and the
-instances carry only the magnitude.
+"Arbitrary-precision integer.
 
-The magnitude is stored in `digits`, an Array of base-2^16 limbs, least
-significant first, with no trailing zero limbs (size >= 1). Results that fit
-in a SmallInteger are demoted back to SmallInteger by #normalize, so a
-LargeInteger only ever holds values outside the SmallInteger range. Instances
-are produced automatically when SmallInteger arithmetic overflows (see
-SmallInteger) and by big literals (built directly by the C parser, which
-picks the concrete class by sign)."
+The MAGNITUDE lives directly in a byte payload as 32-bit limbs, least
+significant first, in native order; the SIGN is the concrete class
+(LargePositiveInteger / LargeNegativeInteger), Pharo style, so there is no sign
+field that could disagree with the value. The arithmetic itself is in C
+(vm/runtime/BigInt.c) and this class is the thin layer that decides signs,
+coerces mixed operands, and raises.
+
+That replaced an Array of TAGGED SmallInteger limbs in base 2^16, which cost 8
+bytes of GC-scanned heap per 16 bits of value and carried schoolbook multiply,
+BIT BY BIT long division (a fresh limb Array allocated per bit), Euclid gcd
+through \\, and O(n^2) printing. The C layer has Karatsuba, Knuth Algorithm D,
+binary GCD, and chunked radix conversion.
+
+Because the payload is byte-shaped, the snapshot and actor message passing
+round-trip it verbatim with no work here.
+
+NORMALIZATION happens in C on every result: a magnitude that fits the 62-bit
+signed payload comes back as a SmallInteger instead, so a LargeInteger instance
+is ALWAYS genuinely too big to be immediate. The threshold is asymmetric
+([-2^61, 2^61-1]) and is shared with SmallInteger class maxVal/minVal, tagInt's
+assertion, and the parser's literal builder.
+
+WARNING: bitAnd:, bitOr: and bitXor: are still not understood by a
+LargeInteger, exactly as before this rewrite. They need two's-complement
+semantics over a sign-magnitude representation, which is a separate piece of
+work; nothing here regressed."
 
 LargeInteger := Integer [
 
-	| digits |
+	<shape: BytesShape>
+
+	| Classes |
 
 
-	"--- instance creation ---"
+	"--- class side ---"
 
-	class digits: anArray negative: aBoolean [
-		"The single constructor: the sign picks the concrete class."
-		^(aBoolean ifTrue: [LargeNegativeInteger] ifFalse: [LargePositiveInteger]) new
-			setDigits: anArray
+	class initialize [
+		"The concrete classes are handed to every primitive as a pair rather
+		 than looked up in C: adding VM Handles entries is append-only and bumps
+		 the snapshot format, and a by-name global lookup per operation would be
+		 a hash probe on the hot path."
+		Classes := Array with: LargePositiveInteger with: LargeNegativeInteger
 	]
 
 
-	setDigits: anArray [
-		digits := anArray.
-		^self
+	class classes [
+		^Classes
 	]
 
 
-	"--- accessing ---"
-
-	digits [
-		^digits
+	class fromString: aString base: anInteger negative: aBoolean [
+		"Digits only, no sign character. The primitive's receiver has to BE the
+		 digit buffer, so the work is on String and this is the readable entry
+		 point that supplies the classes pair."
+		^aString largeIntegerBase: anInteger negative: aBoolean classes: Classes
 	]
 
 
-	negative [
-		"The concrete classes answer their sign."
-		SubClassResponsibility signal.
-	]
-
-
-	isZero [
-		^digits size = 1 and: [(digits at: 1) = 0]
-	]
-
-
-	"--- magnitude helpers (operate on normalized limb Arrays) ---"
-
-	class normalizeArray: anArray [
-		"Answer anArray without trailing zero limbs (keeping at least one limb)."
-		| n |
-
-		n := anArray size.
-		[n > 1 and: [(anArray at: n) = 0]] whileTrue: [n := n - 1].
-		n = anArray size ifTrue: [^anArray].
-		^self copyArray: anArray size: n
-	]
-
-
-	class copyArray: anArray size: n [
-		| r |
-
-		r := Array new: n.
-		1 to: n do: [ :i | r at: i put: (anArray at: i)].
-		^r
-	]
-
-
-	class compareMagnitude: a and: b [
-		"Answer -1, 0 or 1 comparing the two magnitudes."
-		| na nb |
-
-		na := a size.
-		nb := b size.
-		na < nb ifTrue: [^-1].
-		na > nb ifTrue: [^1].
-		na to: 1 by: -1 do: [ :i |
-			(a at: i) < (b at: i) ifTrue: [^-1].
-			(a at: i) > (b at: i) ifTrue: [^1]].
-		^0
-	]
-
-
-	class addMagnitude: a and: b [
-		| na nb n r carry sum |
-
-		na := a size.
-		nb := b size.
-		n := na max: nb.
-		r := Array new: n + 1.
-		carry := 0.
-		1 to: n do: [ :i |
-			sum := carry
-				+ (i <= na ifTrue: [a at: i] ifFalse: [0])
-				+ (i <= nb ifTrue: [b at: i] ifFalse: [0]).
-			r at: i put: (sum bitAnd: 65535).
-			carry := sum bitShift: -16].
-		r at: n + 1 put: carry.
-		^self normalizeArray: r
-	]
-
-
-	class subtractMagnitude: a and: b [
-		"Answer a - b, assuming a >= b."
-		| na nb r borrow diff |
-
-		na := a size.
-		nb := b size.
-		r := Array new: na.
-		borrow := 0.
-		1 to: na do: [ :i |
-			diff := (a at: i) - borrow - (i <= nb ifTrue: [b at: i] ifFalse: [0]).
-			diff < 0
-				ifTrue: [diff := diff + 65536. borrow := 1]
-				ifFalse: [borrow := 0].
-			r at: i put: diff].
-		^self normalizeArray: r
-	]
-
-
-	class multiplyMagnitude: a and: b [
-		| na nb r carry idx t |
-
-		na := a size.
-		nb := b size.
-		r := Array new: na + nb.
-		1 to: na + nb do: [ :i | r at: i put: 0].
-		1 to: na do: [ :i |
-			carry := 0.
-			1 to: nb do: [ :j |
-				idx := i + j - 1.
-				t := (r at: idx) + ((a at: i) * (b at: j)) + carry.
-				r at: idx put: (t bitAnd: 65535).
-				carry := t bitShift: -16].
-			r at: i + nb put: (r at: i + nb) + carry].
-		^self normalizeArray: r
-	]
-
-
-	class shiftLeft1Magnitude: a addBit: bit [
-		"Answer a * 2 + bit."
-		| n r carry v |
-
-		n := a size.
-		r := Array new: n + 1.
-		carry := bit.
-		1 to: n do: [ :i |
-			v := ((a at: i) bitShift: 1) + carry.
-			r at: i put: (v bitAnd: 65535).
-			carry := v bitShift: -16].
-		r at: n + 1 put: carry.
-		^self normalizeArray: r
-	]
-
-
-	class divModMagnitude: a bySmall: d [
-		"Divide magnitude a by the single limb d (1..65535).
-		Answer an Array {quotientArray. remainderSmallInteger}."
-		| n q rem cur |
-
-		n := a size.
-		q := Array new: n.
-		rem := 0.
-		n to: 1 by: -1 do: [ :i |
-			cur := (rem bitShift: 16) + (a at: i).
-			q at: i put: cur // d.
-			rem := cur \\ d].
-		^Array with: (self normalizeArray: q) with: rem
-	]
-
-
-	class divModMagnitude: a and: b [
-		"Divide magnitude a by magnitude b (b ~= 0). Answer an Array
-		{quotientArray. remainderArray} using binary long division."
-		| cmp q r dm |
-
-		cmp := self compareMagnitude: a and: b.
-		cmp < 0 ifTrue: [^Array with: (Array with: 0) with: a].
-		cmp = 0 ifTrue: [^Array with: (Array with: 1) with: (Array with: 0)].
-		b size = 1 ifTrue: [
-			dm := self divModMagnitude: a bySmall: (b at: 1).
-			^Array with: (dm at: 1) with: (Array with: (dm at: 2))].
-
-		q := Array new: a size.
-		1 to: a size do: [ :i | q at: i put: 0].
-		r := Array with: 0.
-		a size to: 1 by: -1 do: [ :limbIndex |
-			15 to: 0 by: -1 do: [ :bit |
-				r := self shiftLeft1Magnitude: r
-					addBit: (((a at: limbIndex) bitShift: bit negated) bitAnd: 1).
-				(self compareMagnitude: r and: b) >= 0 ifTrue: [
-					r := self subtractMagnitude: r and: b.
-					q at: limbIndex put: ((q at: limbIndex) bitOr: (1 bitShift: bit))]]].
-		^Array with: (self normalizeArray: q) with: (self normalizeArray: r)
-	]
-
-
-	"--- private construction ---"
-
-	makeDigits: mag negative: aBoolean [
-		"Wrap a magnitude Array + sign into a normalized number
-		(a SmallInteger when it fits)."
-		^(LargeInteger digits: mag negative: aBoolean) normalize
-	]
-
-
-	normalize [
-		"Answer an equal SmallInteger when the magnitude fits in one, else self."
-		| n value |
-
-		digits := LargeInteger normalizeArray: digits.
-		n := digits size.
-		(n > 4 or: [n = 4 and: [(digits at: 4) >= 8192]]) ifTrue: [^self].
-		value := 0.
-		n to: 1 by: -1 do: [ :i | value := value * 65536 + (digits at: i)].
-		^self negative ifTrue: [value negated] ifFalse: [value]
-	]
-
-
-	"--- arithmetic ---"
+	"--- arithmetic ---
+	 Opcodes match the enum in vm/runtime/Primitives.c; they are part of the
+	 primitive's contract and must not be renumbered."
 
 	+ aNumber [
-		(aNumber isKindOf: Integer) ifTrue: [^self addLarge: aNumber asLargeInteger].
+		(aNumber isKindOf: Integer) ifTrue: [^self largeOp: 1 with: aNumber].
 		^self retry: #+ coercing: aNumber
 	]
 
 
 	- aNumber [
-		(aNumber isKindOf: Integer) ifTrue: [^self addLarge: aNumber negated asLargeInteger].
+		(aNumber isKindOf: Integer) ifTrue: [^self largeOp: 2 with: aNumber].
 		^self retry: #- coercing: aNumber
 	]
 
 
 	* aNumber [
-		(aNumber isKindOf: Integer) ifTrue: [
-			| other |
-			other := aNumber asLargeInteger.
-			^self makeDigits: (LargeInteger multiplyMagnitude: digits and: other digits)
-				negative: self negative ~= other negative].
+		(aNumber isKindOf: Integer) ifTrue: [^self largeOp: 3 with: aNumber].
 		^self retry: #* coercing: aNumber
 	]
 
@@ -252,75 +87,47 @@ LargeInteger := Integer [
 
 
 	// aNumber [
-		(aNumber isKindOf: Integer) ifTrue: [^(self floorDivRem: aNumber asLargeInteger) at: 1].
+		(aNumber isKindOf: Integer) ifTrue: [
+			aNumber = 0 ifTrue: [^ZeroDivide new signal].
+			^self largeOp: 6 with: aNumber].
 		^self retry: #// coercing: aNumber
 	]
 
 
 	\\ aNumber [
-		(aNumber isKindOf: Integer) ifTrue: [^(self floorDivRem: aNumber asLargeInteger) at: 2].
+		(aNumber isKindOf: Integer) ifTrue: [
+			aNumber = 0 ifTrue: [^ZeroDivide new signal].
+			^self largeOp: 7 with: aNumber].
 		^self retry: #\\ coercing: aNumber
 	]
 
 
 	quo: aNumber [
-		(aNumber isKindOf: Integer) ifTrue: [^(self divRemLarge: aNumber asLargeInteger) at: 1].
+		(aNumber isKindOf: Integer) ifTrue: [
+			aNumber = 0 ifTrue: [^ZeroDivide new signal].
+			^self largeOp: 4 with: aNumber].
 		^self retry: #quo: coercing: aNumber
 	]
 
 
 	rem: aNumber [
-		(aNumber isKindOf: Integer) ifTrue: [^(self divRemLarge: aNumber asLargeInteger) at: 2].
+		(aNumber isKindOf: Integer) ifTrue: [
+			aNumber = 0 ifTrue: [^ZeroDivide new signal].
+			^self largeOp: 5 with: aNumber].
 		^self retry: #rem: coercing: aNumber
 	]
 
 
-	addLarge: aLarge [
-		"Signed addition of two LargeIntegers."
-		| mag cmp |
-
-		self negative = aLarge negative ifTrue: [
-			^self makeDigits: (LargeInteger addMagnitude: digits and: aLarge digits)
-				negative: self negative].
-
-		cmp := LargeInteger compareMagnitude: digits and: aLarge digits.
-		cmp = 0 ifTrue: [^0].
-		cmp > 0 ifTrue: [
-			^self makeDigits: (LargeInteger subtractMagnitude: digits and: aLarge digits)
-				negative: self negative].
-		^self makeDigits: (LargeInteger subtractMagnitude: aLarge digits and: digits)
-			negative: aLarge negative
-	]
-
-
-	divRemLarge: aLarge [
-		"Truncating division. Answer {quotient. remainder}, remainder has sign of self."
-		| dm q r |
-
-		aLarge isZero ifTrue: [^ZeroDivide new signal].
-		dm := LargeInteger divModMagnitude: digits and: aLarge digits.
-		q := self makeDigits: (dm at: 1) negative: self negative ~= aLarge negative.
-		r := self makeDigits: (dm at: 2) negative: self negative.
-		^Array with: q with: r
-	]
-
-
-	floorDivRem: aLarge [
-		"Floored division. Answer {quotient. remainder}, remainder has sign of divisor."
-		| dr q r |
-
-		dr := self divRemLarge: aLarge.
-		q := dr at: 1.
-		r := dr at: 2.
-		r = 0 ifTrue: [^dr].
-		(self negative ~= aLarge negative) ifTrue: [^Array with: q - 1 with: r + aLarge].
-		^dr
+	gcd: aNumber [
+		"Binary GCD in C. Integer>>gcd: is Euclid through \\, which paid a full
+		 division per step."
+		(aNumber isKindOf: Integer) ifTrue: [^self largeOp: 8 with: aNumber].
+		^super gcd: aNumber
 	]
 
 
 	negated [
-		self isZero ifTrue: [^0].
-		^LargeInteger digits: digits negative: self negative not
+		^0 - self
 	]
 
 
@@ -330,7 +137,6 @@ LargeInteger := Integer [
 
 
 	sign [
-		self isZero ifTrue: [^0].
 		^self negative ifTrue: [-1] ifFalse: [1]
 	]
 
@@ -338,64 +144,91 @@ LargeInteger := Integer [
 	"--- bit operations ---"
 
 	bitShift: anInteger [
-		"Arithmetic shift: negative shifts right, positive left. Expressed with
-		 * and // rather than by walking the limb Array, because // is FLOORED
-		 here, which is exactly the sign-extending semantics a right shift owes a
-		 negative receiver, and both operands are already well tested. The result
-		 normalizes back to a SmallInteger through the usual path.
-
-		 WARNING: this is deliberately the simple formulation, not the fast one.
-		 The limb-level version belongs with the rest of the C kernel, together
-		 with bitAnd:/bitOr:/bitXor:, which a LargeInteger still does not
-		 understand at all."
-		anInteger = 0 ifTrue: [^self normalize].
-		anInteger > 0 ifTrue: [^self * (2 raisedToInteger: anInteger)].
-		^self // (2 raisedToInteger: anInteger negated)
+		"Arithmetic shift: negative right, positive left. The C side floors a
+		 right shift of a negative receiver, which sign-magnitude does not do for
+		 free (shifting the magnitude truncates toward zero)."
+		(anInteger isKindOf: Integer) ifFalse: [
+			^InvalidArgumentError signal: 'shift count must be an Integer'].
+		^self largeShift: anInteger
 	]
 
 
 	"--- comparing ---"
 
-	compareLarge: aLarge [
-		| c |
-
-		self negative ~= aLarge negative ifTrue: [^self negative ifTrue: [-1] ifFalse: [1]].
-		c := LargeInteger compareMagnitude: digits and: aLarge digits.
-		^self negative ifTrue: [c negated] ifFalse: [c]
+	compareLarge: aNumber [
+		"-1, 0 or 1. Accepts a SmallInteger too, so no operand has to be widened
+		 before comparing."
+		^self largeCompare: aNumber
 	]
 
 
 	< aNumber [
-		(aNumber isKindOf: Integer) ifTrue: [^(self compareLarge: aNumber asLargeInteger) < 0].
+		(aNumber isKindOf: Integer) ifTrue: [^(self compareLarge: aNumber) < 0].
 		^self retryRelationalOp: #< coercing: aNumber
 	]
 
 
+	> aNumber [
+		(aNumber isKindOf: Integer) ifTrue: [^(self compareLarge: aNumber) > 0].
+		^self retryRelationalOp: #> coercing: aNumber
+	]
+
+
+	<= aNumber [
+		(aNumber isKindOf: Integer) ifTrue: [^(self compareLarge: aNumber) <= 0].
+		^self retryRelationalOp: #<= coercing: aNumber
+	]
+
+
+	>= aNumber [
+		(aNumber isKindOf: Integer) ifTrue: [^(self compareLarge: aNumber) >= 0].
+		^self retryRelationalOp: #>= coercing: aNumber
+	]
+
+
 	= aNumber [
-		(aNumber isKindOf: Integer) ifTrue: [^(self compareLarge: aNumber asLargeInteger) = 0].
+		(aNumber isKindOf: Integer) ifTrue: [^(self compareLarge: aNumber) = 0].
 		(aNumber isKindOf: Number) ifTrue: [^self retryRelationalOp: #= coercing: aNumber].
 		^false
 	]
 
 
 	hash [
+		"Must agree with SmallInteger>>hash wherever the values are equal, but a
+		 LargeInteger is never equal to a SmallInteger by construction (it would
+		 have normalized), so folding the limbs is enough."
 		| h |
-
 		h := 0.
-		digits do: [ :d | h := (h * 65536 + d) bitAnd: 16r3FFFFFFF].
+		1 to: self basicSize do: [:i | h := (h * 257 + (self basicAt: i)) bitAnd: 16r3FFFFFFF].
 		^h
 	]
 
 
 	"--- testing ---"
 
+	negative [
+		"The concrete classes answer their sign."
+		^SubClassResponsibility signal
+	]
+
+
 	even [
-		^((digits at: 1) bitAnd: 1) = 0
+		"Deliberately NOT a direct read of the payload's first byte. Limbs are
+		 stored in NATIVE order, so byte 1 is the low byte of limb 0 on a
+		 little-endian target and its HIGH byte on a big-endian one; reading it
+		 would answer correctly on x86 and wrongly on POWER. Ask the arithmetic."
+		^(self \\ 2) = 0
 	]
 
 
 	odd [
-		^((digits at: 1) bitAnd: 1) = 1
+		^(self \\ 2) = 1
+	]
+
+
+	isZero [
+		"A normalized LargeInteger is never zero: zero fits a SmallInteger."
+		^false
 	]
 
 
@@ -407,7 +240,17 @@ LargeInteger := Integer [
 
 
 	coerce: aNumber [
-		^aNumber asLargeInteger
+		"Answers the number unchanged. The only class of lower generality is
+		 SmallInteger, and every kernel here takes a SmallInteger operand
+		 directly, so there is nothing to widen.
+
+		 WARNING: this means coerce: does NOT raise generality, so it cannot be
+		 what makes retry:coercing: converge. Convergence comes from every
+		 arithmetic and relational method above short-circuiting an Integer
+		 argument BEFORE calling retry:. Breaking that short-circuit turns
+		 `1 * (2 raisedTo: 64)` into infinite recursion, which is exactly how
+		 this was found."
+		^aNumber
 	]
 
 
@@ -422,11 +265,16 @@ LargeInteger := Integer [
 
 
 	asFloat [
-		| r |
+		"Correctly rounded (round half to even) in C. The old version was a
+		 Horner loop in doubles, which accumulates error and silently produced
+		 Infinity above 2^1024 instead of answering it deliberately."
+		^self primAsFloatWithClasses: LargeInteger classes
+	]
 
-		r := 0.0.
-		digits size to: 1 by: -1 do: [ :i | r := (r * 65536.0) + (digits at: i) asFloat].
-		^self negative ifTrue: [r negated] ifFalse: [r]
+
+	primAsFloatWithClasses: classPair [
+		<primitive: LargeIntAsFloatPrimitive>
+		^self error: 'LargeInteger asFloat failed'
 	]
 
 
@@ -463,26 +311,28 @@ LargeInteger := Integer [
 	"--- printing ---"
 
 	printOn: aStream [
-		| groups mag first gs |
+		^self printOn: aStream base: 10
+	]
 
-		self isZero ifTrue: [^aStream nextPutAll: '0'].
+
+	printOn: aStream base: anInteger [
 		self negative ifTrue: [aStream nextPut: $-].
+		aStream nextPutAll: (self digitsStringBase: anInteger)
+	]
 
-		groups := OrderedCollection new.
-		mag := digits.
-		[mag size = 1 and: [(mag at: 1) = 0]] whileFalse: [
-			| dm |
-			dm := LargeInteger divModMagnitude: mag bySmall: 10000.
-			groups add: (dm at: 2).
-			mag := dm at: 1].
 
-		first := true.
-		[groups isEmpty] whileFalse: [
-			gs := groups removeLast printString.
-			first
-				ifTrue: [first := false]
-				ifFalse: [[gs size < 4] whileTrue: [gs := '0', gs]].
-			aStream nextPutAll: gs]
+	printStringBase: anInteger [
+		^self negative
+			ifTrue: ['-', (self digitsStringBase: anInteger)]
+			ifFalse: [self digitsStringBase: anInteger]
+	]
+
+
+	digitsStringBase: anInteger [
+		"Digits WITHOUT a sign. Chunked in C: one division yields many digits,
+		 where the image divided by 10000 at a time through a general division."
+		<primitive: LargeIntPrintStringPrimitive>
+		^self error: 'LargeInteger printing failed'
 	]
 
 ]

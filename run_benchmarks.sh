@@ -63,20 +63,37 @@ fi
 fail=0
 failed=""
 
+# WALL time per benchmark, alongside the figure the benchmark reports itself.
+# The two answer different questions: the self-reported number is the timed
+# region only, while the wall time includes building the workload and any
+# warm-up, so a benchmark that is cheap to run but expensive to SET UP shows up
+# here and nowhere else.
+if [ -n "${EPOCHREALTIME:-}" ]; then
+	now_ms() { local t="${EPOCHREALTIME/[.,]/}"; echo $(( 10#$t / 1000 )); }
+else
+	now_ms() { echo $(( $(date +%s%N) / 1000000 )); }
+fi
+SUITE_T0=$(now_ms)
+
 for f in benchmarks/*.st; do
 	name="$(basename "$f")"
-	printf "  %-16s " "$name"
+	printf "  %-22s " "$name"
+	t0=$(now_ms)
 	# stdbuf: the VM's assertion path aborts, which would discard a buffered
 	# message. timeout: a hung benchmark must fail the gate, not freeze it.
 	# stdin from /dev/null: a terminal on stdin would drop into the REPL.
 	out="$(timeout 300 stdbuf -o0 "$BUILD/st" -s "$SNAP" -f "$f" </dev/null 2>&1)"
-	if [ $? -ne 0 ] || [ -z "$out" ]; then
-		echo "${R}FAILED${Z}"
+	rc=$?
+	ms=$(( $(now_ms) - t0 ))
+	if [ "$rc" -ne 0 ] || [ -z "$out" ]; then
+		echo "${R}FAILED${Z}  ${D}(${ms} ms wall)${Z}"
 		[ -n "$out" ] && echo "$out" | sed 's/^/      /'
 		fail=$((fail + 1)); failed="$failed $name"
 		continue
 	fi
-	echo "${G}$out${Z}"
+	# A benchmark may print more than one line (a comparison against a
+	# baseline representation, say); keep them all, then the wall time.
+	printf "${G}%s${Z}  ${D}[%s ms wall]${Z}\n" "$(printf '%s' "$out" | tr '\n' '|' | sed 's/|$//; s/|/ | /g')" "$ms"
 
 	if [ "$COMPARE" -eq 1 ]; then
 		slow="$(ST_NO_INLINE_CF=1 timeout 300 stdbuf -o0 "$BUILD/st" -s "$SNAP" -f "$f" </dev/null 2>&1)"
@@ -86,6 +103,7 @@ done
 
 echo ""
 echo "${B}================================${Z}"
+printf "total %s ms\n" "$(( $(now_ms) - SUITE_T0 ))"
 if [ "$fail" -eq 0 ]; then
 	echo "${G}${B}ALL RAN${Z}"
 	exit 0

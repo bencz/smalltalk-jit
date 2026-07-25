@@ -12,6 +12,7 @@
 #include "os/OsSocket.h"
 #include "runtime/Json.h"
 #include "runtime/Base64.h"
+#include "runtime/BigInt.h"
 #include "compiler/Parser.h"
 #include "core/Lookup.h"
 #include "core/StackFrame.h"
@@ -70,6 +71,12 @@ static PrimitiveResult becomePrimitive(Value object, Value other);
 static PrimitiveResult workerParallelPrimitive(Value self, Value blocks);
 static PrimitiveResult contextPositionDescriptorPrimitive(Value vContext);
 static PrimitiveResult stringAsSymbolPrimitive(Value receiver);
+static PrimitiveResult largeIntBinaryPrimitive(Value vSelf, Value vOther, Value vOp, Value vClasses);
+static PrimitiveResult largeIntComparePrimitive(Value vSelf, Value vOther, Value vClasses);
+static PrimitiveResult largeIntShiftPrimitive(Value vSelf, Value vShift, Value vClasses);
+static PrimitiveResult largeIntAsFloatPrimitive(Value vSelf, Value vClasses);
+static PrimitiveResult largeIntPrintStringPrimitive(Value vSelf, Value vBase);
+static PrimitiveResult largeIntFromStringPrimitive(Value vDigits, Value vBase, Value vNegative, Value vClasses);
 static PrimitiveResult floatArrayAtPrimitive(Value vSelf, Value vIndex);
 static PrimitiveResult floatArrayAtPutPrimitive(Value vSelf, Value vIndex, Value vValue);
 static PrimitiveResult floatArrayReducePrimitive(Value vSelf, Value vOp);
@@ -467,6 +474,17 @@ Primitive Primitives[] = {
 	{"FloatArrayBinaryPrimitive", CCALL, .cFunction = floatArrayBinaryPrimitive, 4},
 	{"FloatArrayScalarPrimitive", CCALL, .cFunction = floatArrayScalarPrimitive, 4},
 	{"FloatArrayFillPrimitive", CCALL, .cFunction = floatArrayFillPrimitive, 2},
+	// Appended (NEVER reorder this table): LargeInteger over the magnitude
+	// kernels in vm/runtime/BigInt.c. One binary primitive with an opcode
+	// rather than eight near-identical slots, since the table is append-only
+	// forever. Each fails into a Smalltalk fallback that raises precisely
+	// (ZeroDivide for a zero divisor, coercion for a non-Integer operand).
+	{"LargeIntBinaryPrimitive", CCALL, .cFunction = largeIntBinaryPrimitive, 4},
+	{"LargeIntComparePrimitive", CCALL, .cFunction = largeIntComparePrimitive, 3},
+	{"LargeIntShiftPrimitive", CCALL, .cFunction = largeIntShiftPrimitive, 3},
+	{"LargeIntAsFloatPrimitive", CCALL, .cFunction = largeIntAsFloatPrimitive, 2},
+	{"LargeIntPrintStringPrimitive", CCALL, .cFunction = largeIntPrintStringPrimitive, 2},
+	{"LargeIntFromStringPrimitive", CCALL, .cFunction = largeIntFromStringPrimitive, 4},
 };
 
 
@@ -2432,6 +2450,447 @@ static PrimitiveResult floatArrayFillPrimitive(Value vSelf, Value vValue)
 		elements[i] = value;
 	}
 	return primSuccess(vSelf);
+}
+
+
+/*
+ * LargeInteger over the magnitude kernels (vm/runtime/BigInt.c).
+ *
+ * REPRESENTATION. A LargeInteger is a BytesShape object whose byte payload IS
+ * the magnitude: an array of 32-bit limbs, least significant first, in native
+ * order. The sign is the CONCRETE CLASS (LargePositiveInteger /
+ * LargeNegativeInteger), Pharo style, so there is no sign field to keep
+ * consistent. The image used an Array of TAGGED SmallInteger limbs in base
+ * 2^16, which cost 8 bytes of GC-scanned heap per 16 bits of value; as bytes it
+ * is 4 bytes per 32 bits and the collector never looks inside.
+ *
+ * Because it is byte-shaped, the snapshot and actor message passing already
+ * round-trip it verbatim, exactly as for FloatArray, with no work here.
+ *
+ * NORMALIZATION is done in C, on every result: a magnitude that fits the
+ * 62-bit signed payload comes back as a tagged SmallInteger instead. The
+ * threshold is ASYMMETRIC ([-2^61, 2^61-1]) and MUST agree with
+ * SmallInteger class maxVal/minVal, with tagInt's assertion, and with the
+ * parser's literal builder, or the same magnitude gets a different class
+ * depending on how it was produced.
+ *
+ * The two concrete classes arrive as a 2-element Array argument rather than
+ * through Handles: adding Handles entries is append-only and bumps the snapshot
+ * format, and looking the globals up by name per operation would be a hash
+ * probe on the hot path. LargeInteger holds the pair in a class variable.
+ */
+#define LARGE_LIMB_BITS 32
+
+// Read a SmallInteger or a LargeInteger as (limbs, count, negative). The
+// SmallInteger case materializes into the caller's 2-limb scratch, which is
+// what lets every operation accept a mixed pair without the image converting
+// first.
+static _Bool largeIntOperand(Value v, uint32_t *scratch, const uint32_t **limbs,
+	size_t *count, _Bool *negative)
+{
+	if (valueTypeOf(v, VALUE_INT)) {
+		intptr_t i = asCInt(v);
+		*negative = i < 0;
+		// Negate through uint64_t: the magnitude of the most negative value is
+		// one past the positive range, so negating in intptr_t would overflow.
+		uint64_t magnitude = *negative ? (uint64_t) (-(int64_t) i) : (uint64_t) i;
+		scratch[0] = (uint32_t) (magnitude & 0xFFFFFFFFu);
+		scratch[1] = (uint32_t) (magnitude >> LARGE_LIMB_BITS);
+		*limbs = scratch;
+		*count = bigIntNormalize(scratch, 2);
+		return 1;
+	}
+	if (!valueTypeOf(v, VALUE_POINTER)) {
+		return 0;
+	}
+	RawObject *object = asObject(v);
+	InstanceShape shape = object->class->instanceShape;
+	if (!shape.isIndexed || !shape.isBytes) {
+		return 0;
+	}
+	size_t bytes = rawObjectSize(object);
+	if (bytes % sizeof(uint32_t) != 0) {
+		return 0;
+	}
+	*limbs = (const uint32_t *) getRawObjectIndexedVars(object);
+	*count = bigIntNormalize(*limbs, bytes / sizeof(uint32_t));
+	// The sign is the class. Anything byte-shaped that is not one of the two
+	// concrete LargeInteger classes is rejected by the caller's class check.
+	*negative = 0;
+	return 1;
+}
+
+
+// True when the class of `v` is the negative concrete class. Kept separate
+// from largeIntOperand because it needs the classes the image passed in.
+static _Bool largeIntIsNegative(Value v, RawObject *negativeClass)
+{
+	if (valueTypeOf(v, VALUE_INT)) {
+		return asCInt(v) < 0;
+	}
+	return asObject(v)->class == (RawClass *) negativeClass;
+}
+
+
+// Does this magnitude fit the 62-bit signed payload? ASYMMETRIC on purpose.
+static _Bool largeIntFitsSmall(const uint32_t *limbs, size_t n, _Bool negative)
+{
+	if (n > 2) {
+		return 0;
+	}
+	uint64_t magnitude = 0;
+	if (n >= 1) {
+		magnitude |= limbs[0];
+	}
+	if (n == 2) {
+		magnitude |= (uint64_t) limbs[1] << LARGE_LIMB_BITS;
+	}
+	uint64_t limit = (uint64_t) 1 << 61;
+	return negative ? magnitude <= limit : magnitude < limit;
+}
+
+
+// Build the image-level result: a tagged SmallInteger when it fits, else a
+// fresh byte-shaped LargeInteger of the sign's concrete class.
+static Value largeIntResult(const uint32_t *limbs, size_t n, _Bool negative, Value vClasses)
+{
+	n = bigIntNormalize(limbs, n);
+	if (n == 0) {
+		return tagInt(0); // zero has no sign
+	}
+	if (largeIntFitsSmall(limbs, n, negative)) {
+		uint64_t magnitude = limbs[0];
+		if (n == 2) {
+			magnitude |= (uint64_t) limbs[1] << LARGE_LIMB_BITS;
+		}
+		return tagInt(negative ? -(intptr_t) magnitude : (intptr_t) magnitude);
+	}
+	HandleScope scope;
+	openHandleScope(&scope);
+	// Scope the class BEFORE allocating: newObject can collect, and `limbs`
+	// points into a malloc'd buffer so only the class needs protecting.
+	RawArray *classes = (RawArray *) asObject(vClasses);
+	Class *class = (Class *) scopeHandle(asObject(classes->vars[negative ? 1 : 0]));
+	Object *result = newObject(class, n * sizeof(uint32_t));
+	memcpy(getObjectIndexedVars(result), limbs, n * sizeof(uint32_t));
+	Value tagged = getTaggedPtr(result);
+	closeHandleScope(&scope, NULL);
+	return tagged;
+}
+
+
+enum {
+	LARGE_OP_ADD = 1,
+	LARGE_OP_SUB = 2,
+	LARGE_OP_MUL = 3,
+	LARGE_OP_QUO = 4,   // truncating quotient
+	LARGE_OP_REM = 5,   // remainder of QUO, sign of the dividend
+	LARGE_OP_DIV = 6,   // floored quotient
+	LARGE_OP_MOD = 7,   // remainder of DIV, sign of the divisor
+	LARGE_OP_GCD = 8,
+};
+
+
+static PrimitiveResult largeIntBinaryPrimitive(Value vSelf, Value vOther, Value vOp,
+	Value vClasses)
+{
+	if (!valueTypeOf(vOp, VALUE_INT) || !valueTypeOf(vClasses, VALUE_POINTER)) {
+		return primFailed();
+	}
+	uint32_t scratchA[2], scratchB[2];
+	const uint32_t *a, *b;
+	size_t na, nb;
+	_Bool ignoredA, ignoredB;
+	if (!largeIntOperand(vSelf, scratchA, &a, &na, &ignoredA)
+			|| !largeIntOperand(vOther, scratchB, &b, &nb, &ignoredB)) {
+		return primFailed();
+	}
+	RawArray *classes = (RawArray *) asObject(vClasses);
+	RawObject *negativeClass = asObject(classes->vars[1]);
+	_Bool negA = largeIntIsNegative(vSelf, negativeClass);
+	_Bool negB = largeIntIsNegative(vOther, negativeClass);
+	intptr_t op = asCInt(vOp);
+
+	// Worst case across every operation: a product needs na + nb limbs, a sum
+	// needs max + 1, a shifted intermediate a little more.
+	size_t cap = na + nb + 4;
+	uint32_t *out = calloc(cap, sizeof(uint32_t));
+	if (out == NULL) {
+		FAIL();
+	}
+	size_t nOut = 0;
+	_Bool negOut = 0;
+	_Bool ok = 1;
+
+	switch (op) {
+	case LARGE_OP_ADD:
+	case LARGE_OP_SUB: {
+		_Bool effB = op == LARGE_OP_SUB ? !negB : negB;
+		if (negA == effB) {
+			nOut = bigIntAdd(a, na, b, nb, out);
+			negOut = negA;
+		} else if (bigIntCompare(a, na, b, nb) >= 0) {
+			nOut = bigIntSub(a, na, b, nb, out);
+			negOut = negA;
+		} else {
+			nOut = bigIntSub(b, nb, a, na, out);
+			negOut = effB;
+		}
+		break;
+	}
+
+	case LARGE_OP_MUL:
+		nOut = bigIntMul(a, na, b, nb, out);
+		negOut = negA != negB;
+		break;
+
+	case LARGE_OP_QUO:
+	case LARGE_OP_REM:
+	case LARGE_OP_DIV:
+	case LARGE_OP_MOD: {
+		if (nb == 0) {
+			ok = 0; // division by zero: the image raises ZeroDivide
+			break;
+		}
+		uint32_t *q = calloc(na + 1, sizeof(uint32_t));
+		uint32_t *r = calloc(nb + 1, sizeof(uint32_t));
+		if (q == NULL || r == NULL) {
+			FAIL();
+		}
+		size_t nq = 0, nr = 0;
+		bigIntDivMod(a, na, b, nb, q, &nq, r, &nr);
+		_Bool negQ = negA != negB;
+		if (op == LARGE_OP_QUO) {
+			memcpy(out, q, nq * sizeof(uint32_t));
+			nOut = nq;
+			negOut = negQ;
+		} else if (op == LARGE_OP_REM) {
+			memcpy(out, r, nr * sizeof(uint32_t));
+			nOut = nr;
+			negOut = negA; // remainder takes the DIVIDEND's sign
+		} else {
+			// Floored forms: when the signs differ and the division was not
+			// exact, the quotient goes one further from zero and the remainder
+			// swings to the divisor's sign.
+			_Bool adjust = negQ && nr != 0;
+			if (op == LARGE_OP_DIV) {
+				if (adjust) {
+					uint32_t one = 1;
+					nOut = bigIntAdd(q, nq, &one, 1, out);
+				} else {
+					memcpy(out, q, nq * sizeof(uint32_t));
+					nOut = nq;
+				}
+				negOut = negQ;
+			} else {
+				if (adjust) {
+					nOut = bigIntSub(b, nb, r, nr, out);
+				} else {
+					memcpy(out, r, nr * sizeof(uint32_t));
+					nOut = nr;
+				}
+				negOut = negB; // modulo takes the DIVISOR's sign
+			}
+		}
+		free(q);
+		free(r);
+		break;
+	}
+
+	case LARGE_OP_GCD:
+		nOut = bigIntGcd(a, na, b, nb, out);
+		negOut = 0; // a gcd is non-negative
+		break;
+
+	default:
+		ok = 0;
+		break;
+	}
+
+	Value result = 0;
+	if (ok) {
+		result = largeIntResult(out, nOut, negOut, vClasses);
+	}
+	free(out);
+	return ok ? primSuccess(result) : primFailed();
+}
+
+
+static PrimitiveResult largeIntComparePrimitive(Value vSelf, Value vOther, Value vClasses)
+{
+	if (!valueTypeOf(vClasses, VALUE_POINTER)) {
+		return primFailed();
+	}
+	uint32_t scratchA[2], scratchB[2];
+	const uint32_t *a, *b;
+	size_t na, nb;
+	_Bool ignoredA, ignoredB;
+	if (!largeIntOperand(vSelf, scratchA, &a, &na, &ignoredA)
+			|| !largeIntOperand(vOther, scratchB, &b, &nb, &ignoredB)) {
+		return primFailed();
+	}
+	RawArray *classes = (RawArray *) asObject(vClasses);
+	RawObject *negativeClass = asObject(classes->vars[1]);
+	_Bool negA = largeIntIsNegative(vSelf, negativeClass);
+	_Bool negB = largeIntIsNegative(vOther, negativeClass);
+	if (na == 0) {
+		negA = 0;
+	}
+	if (nb == 0) {
+		negB = 0;
+	}
+	int result;
+	if (negA != negB) {
+		result = negA ? -1 : 1;
+	} else {
+		result = bigIntCompare(a, na, b, nb);
+		if (negA) {
+			result = -result;
+		}
+	}
+	return primSuccess(tagInt(result));
+}
+
+
+// Arithmetic shift. A negative count on a NEGATIVE receiver must floor, which
+// sign-magnitude does not do for free: shifting the magnitude truncates toward
+// zero, so one is subtracted when any bit was shifted out.
+static PrimitiveResult largeIntShiftPrimitive(Value vSelf, Value vShift, Value vClasses)
+{
+	if (!valueTypeOf(vShift, VALUE_INT) || !valueTypeOf(vClasses, VALUE_POINTER)) {
+		return primFailed();
+	}
+	uint32_t scratch[2];
+	const uint32_t *a;
+	size_t na;
+	_Bool ignored;
+	if (!largeIntOperand(vSelf, scratch, &a, &na, &ignored)) {
+		return primFailed();
+	}
+	RawArray *classes = (RawArray *) asObject(vClasses);
+	_Bool negative = largeIntIsNegative(vSelf, asObject(classes->vars[1]));
+	intptr_t shift = asCInt(vShift);
+
+	size_t cap = na + (shift > 0 ? (size_t) shift / LARGE_LIMB_BITS : 0) + 4;
+	uint32_t *out = calloc(cap, sizeof(uint32_t));
+	if (out == NULL) {
+		FAIL();
+	}
+	size_t nOut;
+	if (shift >= 0) {
+		nOut = bigIntShiftLeft(a, na, (size_t) shift, out);
+	} else {
+		size_t amount = (size_t) (-shift);
+		nOut = bigIntShiftRight(a, na, amount, out);
+		if (negative) {
+			// Did anything fall off the bottom? If so the truncated magnitude
+			// is one short of the floored result.
+			_Bool lost = 0;
+			for (size_t bit = 0; bit < amount && bit < na * LARGE_LIMB_BITS; bit++) {
+				if (bigIntBitAt(a, na, bit)) {
+					lost = 1;
+					break;
+				}
+			}
+			if (lost) {
+				uint32_t one = 1;
+				uint32_t *bumped = calloc(nOut + 2, sizeof(uint32_t));
+				if (bumped == NULL) {
+					FAIL();
+				}
+				size_t nBumped = bigIntAdd(out, nOut, &one, 1, bumped);
+				memcpy(out, bumped, nBumped * sizeof(uint32_t));
+				nOut = nBumped;
+				free(bumped);
+			}
+		}
+	}
+	Value result = largeIntResult(out, nOut, negative, vClasses);
+	free(out);
+	return primSuccess(result);
+}
+
+
+static PrimitiveResult largeIntAsFloatPrimitive(Value vSelf, Value vClasses)
+{
+	if (!valueTypeOf(vClasses, VALUE_POINTER)) {
+		return primFailed();
+	}
+	uint32_t scratch[2];
+	const uint32_t *a;
+	size_t na;
+	_Bool ignored;
+	if (!largeIntOperand(vSelf, scratch, &a, &na, &ignored)) {
+		return primFailed();
+	}
+	RawArray *classes = (RawArray *) asObject(vClasses);
+	_Bool negative = largeIntIsNegative(vSelf, asObject(classes->vars[1]));
+	double d = bigIntToDouble(a, na);
+	return primSuccess(fromDoubleResult(negative ? -d : d));
+}
+
+
+// Digits only, WITHOUT a sign: the image prepends '-' so the same primitive
+// serves printString and printString:.
+static PrimitiveResult largeIntPrintStringPrimitive(Value vSelf, Value vBase)
+{
+	if (!valueTypeOf(vBase, VALUE_INT)) {
+		return primFailed();
+	}
+	intptr_t base = asCInt(vBase);
+	if (base < 2 || base > 36) {
+		return primFailed();
+	}
+	uint32_t scratch[2];
+	const uint32_t *a;
+	size_t na;
+	_Bool ignored;
+	if (!largeIntOperand(vSelf, scratch, &a, &na, &ignored)) {
+		return primFailed();
+	}
+	size_t cap = bigIntStringSize(na, (int) base);
+	char *buffer = malloc(cap);
+	if (buffer == NULL) {
+		FAIL();
+	}
+	size_t len = bigIntToString(a, na, (int) base, buffer, cap);
+	HandleScope scope;
+	openHandleScope(&scope);
+	String *string = newString(len);
+	memcpy(string->raw->contents, buffer, len);
+	Value result = getTaggedPtr(string);
+	closeHandleScope(&scope, NULL);
+	free(buffer);
+	return primSuccess(result);
+}
+
+
+static PrimitiveResult largeIntFromStringPrimitive(Value vDigits, Value vBase,
+	Value vNegative, Value vClasses)
+{
+	if (!valueTypeOf(vDigits, VALUE_POINTER) || !valueTypeOf(vBase, VALUE_INT)
+			|| !valueTypeOf(vClasses, VALUE_POINTER)) {
+		return primFailed();
+	}
+	intptr_t base = asCInt(vBase);
+	if (base < 2 || base > 36) {
+		return primFailed();
+	}
+	RawObject *digits = asObject(vDigits);
+	if (!digits->class->instanceShape.isBytes) {
+		return primFailed();
+	}
+	size_t len = rawObjectSize(digits);
+	size_t cap = bigIntFromStringSize(len, (int) base);
+	uint32_t *out = calloc(cap, sizeof(uint32_t));
+	if (out == NULL) {
+		FAIL();
+	}
+	size_t n = bigIntFromString((const char *) getRawObjectIndexedVars(digits), len,
+		(int) base, out);
+	Value result = largeIntResult(out, n, vNegative == getTaggedPtr(Handles.true), vClasses);
+	free(out);
+	return primSuccess(result);
 }
 
 

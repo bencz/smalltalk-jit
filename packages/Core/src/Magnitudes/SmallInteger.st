@@ -36,6 +36,11 @@ SmallInteger := Integer [
 
 	= aNumber [
 		(aNumber isKindOf: SmallInteger) ifTrue: [^self == aNumber].
+		"An Integer argument is handled HERE, never through retry:coercing:.
+		 LargeInteger>>coerce: answers its argument unchanged (there is nothing
+		 to widen, the kernels take a SmallInteger directly), so a pair that
+		 reached retry: would be re-dispatched identically and recur forever."
+		(aNumber isKindOf: Integer) ifTrue: [^(self largeCompare: aNumber) = 0].
 		(aNumber isKindOf: Number) ifTrue: [^self retryRelationalOp: #= coercing: aNumber].
 		^false
 	]
@@ -43,6 +48,10 @@ SmallInteger := Integer [
 
 	< aNumber [
 		 <primitive: IntLessThanPrimitive>
+		"See = below for why an Integer argument must not reach retry:coercing:.
+		 Magnitude derives >, <= and >= from this one, so fixing < and = covers
+		 the whole relational protocol."
+		(aNumber isKindOf: Integer) ifTrue: [^(self largeCompare: aNumber) < 0].
 		^self retryRelationalOp: #< coercing: aNumber
 	]
 
@@ -51,21 +60,21 @@ SmallInteger := Integer [
 
 	+ aNumber [
 		<primitive: IntAddPrimitive>
-		(aNumber isKindOf: SmallInteger) ifTrue: [^self asLargeInteger + aNumber asLargeInteger].
+		(aNumber isKindOf: Integer) ifTrue: [^self largeOp: 1 with: aNumber].
 		^self retry: #+ coercing: aNumber
 	]
 
 
 	- aNumber [
 		<primitive: IntSubPrimitive>
-		(aNumber isKindOf: SmallInteger) ifTrue: [^self asLargeInteger - aNumber asLargeInteger].
+		(aNumber isKindOf: Integer) ifTrue: [^self largeOp: 2 with: aNumber].
 		^self retry: #- coercing: aNumber
 	]
 
 
 	* aNumber [
 		<primitive: IntMulPrimitive>
-		(aNumber isKindOf: SmallInteger) ifTrue: [^self asLargeInteger * aNumber asLargeInteger].
+		(aNumber isKindOf: Integer) ifTrue: [^self largeOp: 3 with: aNumber].
 		^self retry: #* coercing: aNumber
 	]
 
@@ -80,27 +89,27 @@ SmallInteger := Integer [
 
 	\\ aNumber [
 		<primitive: IntModPrimitive>
-		(aNumber isKindOf: SmallInteger) ifTrue: [
+		(aNumber isKindOf: Integer) ifTrue: [
 			aNumber = 0 ifTrue: [^ZeroDivide new signal].
-			^self asLargeInteger \\ aNumber asLargeInteger].
+			^self largeOp: 7 with: aNumber].
 		^self retry: #\\ coercing: aNumber
 	]
 
 
 	quo: aNumber [
 		<primitive: IntQuoPrimitive>
-		(aNumber isKindOf: SmallInteger) ifTrue: [
+		(aNumber isKindOf: Integer) ifTrue: [
 			aNumber = 0 ifTrue: [^ZeroDivide new signal].
-			^self asLargeInteger quo: aNumber asLargeInteger].
+			^self largeOp: 4 with: aNumber].
 		^self retry: #quo: coercing: aNumber
 	]
 
 
 	rem: aNumber [
 		<primitive: IntRemPrimitive>
-		(aNumber isKindOf: SmallInteger) ifTrue: [
+		(aNumber isKindOf: Integer) ifTrue: [
 			aNumber = 0 ifTrue: [^ZeroDivide new signal].
-			^self asLargeInteger rem: aNumber asLargeInteger].
+			^self largeOp: 5 with: aNumber].
 		^self retry: #rem: coercing: aNumber
 	]
 
@@ -139,7 +148,7 @@ SmallInteger := Integer [
 		 answer 2^36 because x86 masks the shift count to 6 bits."
 		<primitive: IntShiftPrimitive>
 		(anInteger isKindOf: Integer) ifFalse: [^self primitiveFailedFor: anInteger].
-		^self asLargeInteger bitShift: anInteger
+		^self largeShift: anInteger
 	]
 
 
@@ -233,22 +242,17 @@ SmallInteger := Integer [
 
 
 	asLargeInteger [
-		"Answer the LargeInteger with the same value. Uses truncating quo:/rem:
-		so it is safe for the most-negative SmallInteger too."
-		| count v limbs |
+		"Answers SELF, deliberately: the value already fits the immediate
+		 payload, and every large-integer kernel accepts a SmallInteger operand
+		 directly, so widening would allocate an object that normalization would
+		 immediately undo. This used to build a base-2^16 limb Array by repeated
+		 quo:/rem:, which was the slow half of every overflow.
 
-		self = 0 ifTrue: [^LargeInteger digits: (Array with: 0) negative: false].
-
-		count := 0.
-		v := self.
-		[v = 0] whileFalse: [count := count + 1. v := v quo: 65536].
-
-		limbs := Array new: count.
-		v := self.
-		1 to: count do: [ :i |
-			limbs at: i put: (v rem: 65536) abs.
-			v := v quo: 65536].
-		^LargeInteger digits: limbs negative: self < 0
+		 WARNING: because this does NOT raise the receiver's generality, it must
+		 never be the thing that makes retry:coercing: converge. Every Integer
+		 operation short-circuits an Integer argument before reaching retry:
+		 (see + above), which is what keeps that true."
+		^self
 	]
 
 

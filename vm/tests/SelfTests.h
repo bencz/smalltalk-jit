@@ -29,4 +29,10 @@ int ppc64EmitGoldenSelfTest(const char *mode);
 // Bind TUs.
 int ppc64leEmitGoldenSelfTest(const char *mode);
 
+// Arbitrary-precision magnitude kernels (vm/runtime/BigInt.c). Needs NO image
+// and no heap: the kernels operate on plain limb arrays, so this can prove them
+// before any Smalltalk representation depends on them, and runs unchanged under
+// qemu on both POWER byte orders.
+int bigIntSelfTest(void);
+
 #endif

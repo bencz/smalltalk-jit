@@ -1451,6 +1451,11 @@ int selfTestFromEnv(char *snapshotFileName, char *bootstrapDir,
 		return smallFloatSelfTest();
 	}
 
+	// Arbitrary-precision magnitude kernels (C-level, no image): ST_BIGINT_TEST=1 ./st
+	if (getenv("ST_BIGINT_TEST") != NULL) {
+		return bigIntSelfTest();
+	}
+
 	// ABI emission golden test (C-level, no image): ST_ABI_EMIT_TEST=1 ./st
 	// (=print regenerates the expected vectors)
 	if (getenv("ST_ABI_EMIT_TEST") != NULL) {

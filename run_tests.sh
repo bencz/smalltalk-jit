@@ -11,8 +11,13 @@
 #   BUILD=mybuild ./run_tests.sh   use a different build directory
 #
 # Each test is a script that raises on the first failed assertion, so a
-# non-zero exit means failure. The runner prints a per-file result, re-shows
-# the output of any failure, and exits non-zero if anything failed.
+# non-zero exit means failure. The runner prints a per-file result WITH ITS
+# WALL TIME, re-shows the output of any failure, and exits non-zero if anything
+# failed.
+#
+# Timing knobs:
+#   SLOW_MS=500    flag any item at or above this many ms (0 disables the flag)
+#   SLOWEST_N=8    how many entries the closing "slowest" list shows (0 hides it)
 
 set -u
 ROOT="$(cd "$(dirname "$0")" && pwd)"
@@ -37,10 +42,48 @@ done
 
 # colours only on a terminal
 if [ -t 1 ]; then
-	G=$'\e[32m'; R=$'\e[31m'; B=$'\e[1m'; Z=$'\e[0m'
+	G=$'\e[32m'; R=$'\e[31m'; B=$'\e[1m'; Y=$'\e[33m'; D=$'\e[2m'; Z=$'\e[0m'
 else
-	G=""; R=""; B=""; Z=""
+	G=""; R=""; B=""; Y=""; D=""; Z=""
 fi
+
+# ---- per-item timing -------------------------------------------------------
+# Every item is timed and its wall time printed. The point is not curiosity: a
+# suite of 150 items that each take 40 ms is dominated by any single one that
+# takes seconds, and in a flat list of passes that item is invisible. Anything
+# at or above SLOW_MS is flagged inline, and the slowest few are repeated at the
+# end so the outlier cannot be missed.
+SLOW_MS="${SLOW_MS:-500}"
+SLOWEST_N="${SLOWEST_N:-8}"
+TIMINGS=""
+
+# Milliseconds. EPOCHREALTIME (bash 5) avoids forking a `date` per measurement,
+# which across a suite this size would itself be a measurable share of the
+# total. The character class covers locales that render the separator as a
+# comma; 10# forces base 10 so a leading zero is not read as octal.
+if [ -n "${EPOCHREALTIME:-}" ]; then
+	now_ms() { local t="${EPOCHREALTIME/[.,]/}"; echo $(( 10#$t / 1000 )); }
+else
+	now_ms() { echo $(( $(date +%s%N) / 1000000 )); }
+fi
+
+# One result line: status, name, wall time, and a flag when it is slow enough
+# to distort the run. Callers print any failure output themselves.
+report_result() {
+	local rc="$1" name="$2" ms="$3" mark=""
+	[ "$ms" -ge "$SLOW_MS" ] && mark="  ${Y}slow${Z}"
+	TIMINGS="$TIMINGS$ms $name"$'\n'
+	if [ "$rc" -eq 0 ]; then
+		printf "  ${G}pass${Z}  %-44s ${D}%6s ms${Z}%s\n" "$name" "$ms" "$mark"
+		pass=$((pass + 1))
+	else
+		printf "  ${R}FAIL${Z}  %-44s ${D}%6s ms${Z}\n" "$name" "$ms"
+		fail=$((fail + 1))
+		failed="$failed $name"
+	fi
+}
+
+SUITE_T0=$(now_ms)
 
 if [ "$DO_BUILD" -eq 1 ]; then
 	echo "${B}building...${Z}"
@@ -87,60 +130,41 @@ failed=""
 # C-level self-tests that gate every run (no image needed, milliseconds)
 echo ""
 echo "${B}self-tests${Z}"
-for st in ST_SMALLFLOAT_TEST ST_ABI_EMIT_TEST; do
-	if env "$st=1" "$BUILD/st" >/dev/null 2>&1; then
-		printf "  ${G}pass${Z}  %s\n" "$st"
-		pass=$((pass + 1))
-	else
-		printf "  ${R}FAIL${Z}  %s\n" "$st"
-		fail=$((fail + 1))
-		failed="$failed $st"
-	fi
+for st in ST_SMALLFLOAT_TEST ST_BIGINT_TEST ST_ABI_EMIT_TEST; do
+	t0=$(now_ms)
+	env "$st=1" "$BUILD/st" >/dev/null 2>&1
+	rc=$?
+	report_result "$rc" "$st" $(( $(now_ms) - t0 ))
 done
 
 # The message-serializer self-test evals Smalltalk source, so unlike the loop
 # above it needs the freshly bootstrapped image (-s).
-if ST_MESSAGE_TEST=1 "$BUILD/st" -s "$SNAP" </dev/null >/dev/null 2>&1; then
-	printf "  ${G}pass${Z}  %s\n" "ST_MESSAGE_TEST"
-	pass=$((pass + 1))
-else
-	printf "  ${R}FAIL${Z}  %s\n" "ST_MESSAGE_TEST"
-	fail=$((fail + 1))
-	failed="$failed ST_MESSAGE_TEST"
-fi
+t0=$(now_ms)
+ST_MESSAGE_TEST=1 "$BUILD/st" -s "$SNAP" </dev/null >/dev/null 2>&1
+rc=$?
+report_result "$rc" "ST_MESSAGE_TEST" $(( $(now_ms) - t0 ))
 
 # Inline-cache stats self-test (needs the image): first run proves mono sites
 # hit ~100% and poly sites take the counted fallback; the ST_NO_IC run proves
 # the kill-switch zeroes the whole apparatus.
-if ST_IC_STATS_TEST=1 "$BUILD/st" -s "$SNAP" </dev/null >/dev/null 2>&1; then
-	printf "  ${G}pass${Z}  %s\n" "ST_IC_STATS_TEST"
-	pass=$((pass + 1))
-else
-	printf "  ${R}FAIL${Z}  %s\n" "ST_IC_STATS_TEST"
-	fail=$((fail + 1))
-	failed="$failed ST_IC_STATS_TEST"
-fi
-if ST_NO_IC=1 ST_IC_STATS_TEST=1 "$BUILD/st" -s "$SNAP" </dev/null >/dev/null 2>&1; then
-	printf "  ${G}pass${Z}  %s\n" "ST_IC_STATS_TEST(ST_NO_IC)"
-	pass=$((pass + 1))
-else
-	printf "  ${R}FAIL${Z}  %s\n" "ST_IC_STATS_TEST(ST_NO_IC)"
-	fail=$((fail + 1))
-	failed="$failed ST_IC_STATS_TEST(ST_NO_IC)"
-fi
+t0=$(now_ms)
+ST_IC_STATS_TEST=1 "$BUILD/st" -s "$SNAP" </dev/null >/dev/null 2>&1
+rc=$?
+report_result "$rc" "ST_IC_STATS_TEST" $(( $(now_ms) - t0 ))
+t0=$(now_ms)
+ST_NO_IC=1 ST_IC_STATS_TEST=1 "$BUILD/st" -s "$SNAP" </dev/null >/dev/null 2>&1
+rc=$?
+report_result "$rc" "ST_IC_STATS_TEST(ST_NO_IC)" $(( $(now_ms) - t0 ))
 
 # Gate-of-the-gate: an UNCAUGHT Smalltalk error must exit nonzero (the VM
 # counts fiber deaths in Exception>>defaultAction and main folds them into the
 # exit code). If this ever exits 0 again, every assertion-style test in the
 # suite can silently false-pass, so the suite itself must go red.
-if "$BUILD/st" -s "$SNAP" -e 'nil zork' </dev/null >/dev/null 2>&1; then
-	printf "  ${R}FAIL${Z}  %s\n" "UNCAUGHT_ERROR_EXITS_NONZERO"
-	fail=$((fail + 1))
-	failed="$failed UNCAUGHT_ERROR_EXITS_NONZERO"
-else
-	printf "  ${G}pass${Z}  %s\n" "UNCAUGHT_ERROR_EXITS_NONZERO"
-	pass=$((pass + 1))
-fi
+t0=$(now_ms)
+"$BUILD/st" -s "$SNAP" -e 'nil zork' </dev/null >/dev/null 2>&1
+# INVERTED: exiting 0 here is the failure.
+[ $? -ne 0 ]; rc=$?
+report_result "$rc" "UNCAUGHT_ERROR_EXITS_NONZERO" $(( $(now_ms) - t0 ))
 
 # Project tooling e2e gate: the whole st new/build/run/test flow against the
 # fresh image. Covers scaffold, build, the up-to-date fast path, staleness on
@@ -175,14 +199,10 @@ project_e2e() {
 		&& ST_PACKAGE_PATH="$dir/roots" ST_IMAGE="$SNAP" "$ST" test >/dev/null 2>&1; [ $? -eq 1 ] ) || return 1
 	return 0
 }
-if project_e2e "$SNAP"; then
-	printf "  ${G}pass${Z}  %s\n" "PROJECT_TOOLING_E2E"
-	pass=$((pass + 1))
-else
-	printf "  ${R}FAIL${Z}  %s\n" "PROJECT_TOOLING_E2E"
-	fail=$((fail + 1))
-	failed="$failed PROJECT_TOOLING_E2E"
-fi
+t0=$(now_ms)
+project_e2e "$SNAP"
+rc=$?
+report_result "$rc" "PROJECT_TOOLING_E2E" $(( $(now_ms) - t0 ))
 
 # FloatArray's byte payload must survive a SNAPSHOT unchanged. That cannot be
 # asserted from a test running in an already-loaded image, so it is done
@@ -234,14 +254,10 @@ FAEOF
 		&& ST_IMAGE="$SNAP" "$ST" run >/dev/null 2>&1; [ $? -eq 0 ] ) || return 1
 	return 0
 }
-if floatarray_snapshot_e2e "$SNAP"; then
-	printf "  ${G}pass${Z}  %s\n" "FLOATARRAY_SNAPSHOT"
-	pass=$((pass + 1))
-else
-	printf "  ${R}FAIL${Z}  %s\n" "FLOATARRAY_SNAPSHOT"
-	fail=$((fail + 1))
-	failed="$failed FLOATARRAY_SNAPSHOT"
-fi
+t0=$(now_ms)
+floatarray_snapshot_e2e "$SNAP"
+rc=$?
+report_result "$rc" "FLOATARRAY_SNAPSHOT" $(( $(now_ms) - t0 ))
 
 # The committed project samples must keep building and answering what
 # samples/projects/README.md promises: declared namespaces plus the
@@ -262,44 +278,28 @@ project_samples() {
 		&& ST_IMAGE="$SNAP_ABS" "$ST_ABS" test >/dev/null 2>&1 ) || return 1
 	return 0
 }
-if project_samples; then
-	printf "  ${G}pass${Z}  %s\n" "PROJECT_SAMPLES"
-	pass=$((pass + 1))
-else
-	printf "  ${R}FAIL${Z}  %s\n" "PROJECT_SAMPLES"
-	fail=$((fail + 1))
-	failed="$failed PROJECT_SAMPLES"
-fi
+t0=$(now_ms)
+project_samples
+rc=$?
+report_result "$rc" "PROJECT_SAMPLES" $(( $(now_ms) - t0 ))
 
 # Tier stats self-test (needs the image): first run proves the hot-method
 # recompile fires once and promoted guards carry the dispatches; the
 # ST_NO_TIER run proves the kill-switch zeroes the whole apparatus.
-if ST_TIER_STATS_TEST=1 "$BUILD/st" -s "$SNAP" </dev/null >/dev/null 2>&1; then
-	printf "  ${G}pass${Z}  %s\n" "ST_TIER_STATS_TEST"
-	pass=$((pass + 1))
-else
-	printf "  ${R}FAIL${Z}  %s\n" "ST_TIER_STATS_TEST"
-	fail=$((fail + 1))
-	failed="$failed ST_TIER_STATS_TEST"
-fi
-if ST_NO_TIER=1 ST_TIER_STATS_TEST=1 "$BUILD/st" -s "$SNAP" </dev/null >/dev/null 2>&1; then
-	printf "  ${G}pass${Z}  %s\n" "ST_TIER_STATS_TEST(ST_NO_TIER)"
-	pass=$((pass + 1))
-else
-	printf "  ${R}FAIL${Z}  %s\n" "ST_TIER_STATS_TEST(ST_NO_TIER)"
-	fail=$((fail + 1))
-	failed="$failed ST_TIER_STATS_TEST(ST_NO_TIER)"
-fi
+t0=$(now_ms)
+ST_TIER_STATS_TEST=1 "$BUILD/st" -s "$SNAP" </dev/null >/dev/null 2>&1
+rc=$?
+report_result "$rc" "ST_TIER_STATS_TEST" $(( $(now_ms) - t0 ))
+t0=$(now_ms)
+ST_NO_TIER=1 ST_TIER_STATS_TEST=1 "$BUILD/st" -s "$SNAP" </dev/null >/dev/null 2>&1
+rc=$?
+report_result "$rc" "ST_TIER_STATS_TEST(ST_NO_TIER)" $(( $(now_ms) - t0 ))
 # Inline-off isolation: the tier without the M2 inliner must still promote
 # (the M1 shape) and stay correct.
-if ST_TIER_INLINE_MAX=0 ST_TIER_STATS_TEST=1 "$BUILD/st" -s "$SNAP" </dev/null >/dev/null 2>&1; then
-	printf "  ${G}pass${Z}  %s\n" "ST_TIER_STATS_TEST(INLINE_MAX=0)"
-	pass=$((pass + 1))
-else
-	printf "  ${R}FAIL${Z}  %s\n" "ST_TIER_STATS_TEST(INLINE_MAX=0)"
-	fail=$((fail + 1))
-	failed="$failed ST_TIER_STATS_TEST(INLINE_MAX=0)"
-fi
+t0=$(now_ms)
+ST_TIER_INLINE_MAX=0 ST_TIER_STATS_TEST=1 "$BUILD/st" -s "$SNAP" </dev/null >/dev/null 2>&1
+rc=$?
+report_result "$rc" "ST_TIER_STATS_TEST(INLINE_MAX=0)" $(( $(now_ms) - t0 ))
 
 # run_group <title> <image> <files...>: each file through the -f path against
 # the given image (core tests run on the core image; samples run on the
@@ -320,16 +320,11 @@ run_group() {
 		[ "$base" = "AtomicStressTest.st" ] && continue   # OS-thread stress: sandboxed group below
 		[ "$base" = "ExtendHammerTest.st" ] && continue   # OS-thread stress: sandboxed group below
 		[ "$base" = "06_business_card_server.st" ] && continue   # standalone server, runs forever
+		t0=$(now_ms)
 		out="$(timeout 120 "$BUILD/st" -s "$image" -f "$f" </dev/null 2>&1)"
-		if [ $? -eq 0 ]; then
-			printf "  ${G}pass${Z}  %s\n" "$base"
-			pass=$((pass + 1))
-		else
-			printf "  ${R}FAIL${Z}  %s\n" "$base"
-			echo "$out" | sed 's/^/        /'
-			fail=$((fail + 1))
-			failed="$failed $base"
-		fi
+		rc=$?
+		report_result "$rc" "$base" $(( $(now_ms) - t0 ))
+		[ "$rc" -eq 0 ] || echo "$out" | sed 's/^/        /'
 	done
 }
 
@@ -343,17 +338,12 @@ run_package_tests() {
 	for p in packages/*/; do
 		[ -f "$p/package.st" ] || continue
 		name="$(basename "$p")"
+		t0=$(now_ms)
 		out="$( (cd "$p" && ST_PACKAGE_PATH="$ROOT/packages" ST_IMAGE="$SNAP_ABS" \
 			timeout 300 "$ST_ABS" test) </dev/null 2>&1 )"
-		if [ $? -eq 0 ]; then
-			printf "  ${G}pass${Z}  %s\n" "$name"
-			pass=$((pass + 1))
-		else
-			printf "  ${R}FAIL${Z}  %s\n" "$name"
-			echo "$out" | sed 's/^/        /'
-			fail=$((fail + 1))
-			failed="$failed $name"
-		fi
+		rc=$?
+		report_result "$rc" "$name" $(( $(now_ms) - t0 ))
+		[ "$rc" -eq 0 ] || echo "$out" | sed 's/^/        /'
 	done
 }
 
@@ -367,6 +357,7 @@ run_sandboxed_hammer() {
 	echo "${B}tests (sandboxed)${Z}"
 	for f in tests/IcHammerTest.st tests/TierHammerTest.st tests/AtomicStressTest.st tests/ExtendHammerTest.st; do
 		base="$(basename "$f")"
+		t0=$(now_ms)
 		if command -v systemd-run >/dev/null 2>&1; then
 			out="$(systemd-run --user --scope -q -p MemoryMax=6G -p TasksMax=300 \
 				-- taskset -c 0-3 env LD_LIBRARY_PATH="$BUILD" \
@@ -377,15 +368,9 @@ run_sandboxed_hammer() {
 		else
 			out="$(timeout 120 "$BUILD/st" -s "$SNAP" -f "$f" </dev/null 2>&1)"
 		fi
-		if [ $? -eq 0 ]; then
-			printf "  ${G}pass${Z}  %s\n" "$base"
-			pass=$((pass + 1))
-		else
-			printf "  ${R}FAIL${Z}  %s\n" "$base"
-			echo "$out" | sed 's/^/        /'
-			fail=$((fail + 1))
-			failed="$failed $base"
-		fi
+		rc=$?
+		report_result "$rc" "$base" $(( $(now_ms) - t0 ))
+		[ "$rc" -eq 0 ] || echo "$out" | sed 's/^/        /'
 	done
 }
 
@@ -403,16 +388,29 @@ fi
 if [ "$RUN_BENCH" -eq 1 ]; then
 	echo ""
 	echo "${B}benchmarks${Z}"
-	if BUILD="$BUILD" "$ROOT/run_benchmarks.sh" --no-build; then
-		pass=$((pass + 1))
-	else
-		fail=$((fail + 1))
-		failed="$failed benchmarks"
-	fi
+	t0=$(now_ms)
+	BUILD="$BUILD" "$ROOT/run_benchmarks.sh" --no-build
+	rc=$?
+	report_result "$rc" "benchmarks" $(( $(now_ms) - t0 ))
+fi
+
+# Slowest items. A single pathological entry can cost more than the other 150
+# combined and is invisible in a list of passes; this is the line that makes it
+# obvious. Set SLOWEST_N=0 to suppress.
+if [ "$SLOWEST_N" -gt 0 ]; then
+	echo ""
+	echo "${B}slowest $SLOWEST_N${Z}"
+	printf '%s' "$TIMINGS" | sort -rn | head -n "$SLOWEST_N" \
+		| while read -r ms name; do
+			mark=""
+			[ "$ms" -ge "$SLOW_MS" ] && mark="  ${Y}slow${Z}"
+			printf "  %-44s ${D}%6s ms${Z}%s\n" "$name" "$ms" "$mark"
+		done
 fi
 
 echo ""
 echo "${B}================================${Z}"
+printf "total %s ms\n" "$(( $(now_ms) - SUITE_T0 ))"
 if [ "$fail" -eq 0 ]; then
 	echo "${G}${B}ALL PASSED${Z}  ($pass ok)"
 	exit 0

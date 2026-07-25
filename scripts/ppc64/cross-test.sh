@@ -54,6 +54,11 @@ echo "== ST_TLAB_TEST:"; ST_TLAB_TEST=1 "$OUT/st" && echo OK
 echo "== ST_SNAPSHOT_FORMAT_TEST:"; ST_SNAPSHOT_FORMAT_TEST=1 "$OUT/st" && echo OK
 # SmallFloat64 rotation encoding, re-proven on a genuine big/little-endian target
 echo "== ST_SMALLFLOAT_TEST:"; ST_SMALLFLOAT_TEST=1 "$OUT/st" && echo OK
+# Arbitrary-precision magnitude kernels. A limb array is a sequence of uint32
+# VALUES rather than a byte image, so these are endian independent by
+# construction; running them on a genuine big-endian target is what turns that
+# claim into a checked one, and it costs nothing since no image is needed.
+echo "== ST_BIGINT_TEST:"; ST_BIGINT_TEST=1 "$OUT/st" && echo OK
 # The arch's own emission golden: the same pinned vectors the x86 host runs
 # natively, re-checked on a genuinely big/little-endian target under qemu. Each
 # backend's Bind TU aliases ST_ABI_EMIT_TEST to its own golden.
@@ -141,6 +146,7 @@ for cpu in $CPUS; do
 	         tests/SuperExtendStaleTest.st \
 	         tests/BitShiftTest.st tests/NumberProtocolTest.st \
 	         tests/MixedArithTest.st tests/FloatArrayTest.st \
+	         tests/LargeIntegerDifferentialTest.st \
 	         tests/InlineControlFlowTest.st; do
 		QEMU_CPU=$cpu timeout 900 "$OUT/st" -s "$IMG" -f "$t" </dev/null >/dev/null 2>&1 \
 			|| { echo "FAIL $t ($cpu)"; exit 1; }
