@@ -63,7 +63,7 @@ Details worth knowing:
   identity, so they are emitted from `getStubNativeCode` rather than the
   method/block funnel. Without this they landed in the profiler's unresolved
   bucket, which is the bucket you are reading when you ask "how much of this
-  run is allocation?" — the answer for Richards turned out to be 2.8% of
+  run is allocation?" and the answer for Richards turned out to be 2.8% of
   retired instructions, which is what ruled the allocation work down the
   priority list.
 
@@ -212,6 +212,7 @@ once at startup.
 | `ST_NO_INLINE_CF=1` | Do not inline control flow (`ifTrue:`, `whileTrue:`, and friends). Every one becomes a real block send. |
 | `ST_NO_INLINE_FLOAT=1` | Do not use the float call-site intrinsic. Float arithmetic goes through normal sends. |
 | `ST_JIT_REGS=<n>` | Shrink the allocatable register pool to `n`. Test-only, for exercising the spiller. |
+| `ST_JIT_LOOP_ALIGN=<n>` | Byte boundary that loop headers are NOP-padded to (power of two in [1, 256], default 64). x64 only. This is not a tuning dial so much as a CONTROL: layout is worth as much on this VM as the optimisations measured against it, so before believing a change moved cycles, check that the same move does not appear by sweeping this. The default moved from 32 to 64 on a measured Richards -5.1% cycles; of the other five only ArrayNumericBench reproduced a direction (+0.25%), and the rest changed sign between sweeps. Set it back to 32 to recover the old layout exactly. |
 | `ST_SCHED_WORKERS=<n>` | Number of OS-thread workers running the fiber scheduler. |
 
 A typical comparison is to run the same workload under the default, then under

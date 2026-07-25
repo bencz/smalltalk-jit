@@ -33,6 +33,7 @@
 #include "compiler/Compiler.h"
 #include "jit/CodeDescriptors.h"
 #include "jit/SendClassify.h"
+#include "jit/BooleanBranchFuse.h"
 #include "jit/PrologueSlots.h"
 #include "jit/Tier.h"
 #include "jit/PerfMap.h"
@@ -65,7 +66,8 @@ static void movOperand(CodeGenerator *generator, Operand operand, Register reg);
 static void movToOperand(CodeGenerator *generator, Register reg, Operand operand, _Bool valueMayBePointer);
 static _Bool operandMayBePointer(Operand operand);
 static void generateClassCheck(CodeGenerator *generator, Operand operand, RawClass *class,
-	AssemblerLabel *label, _Bool fuseBoolean);
+	AssemblerLabel *label, _Bool fuseBoolean, AssemblerLabel *notBoolLabel);
+static _Bool fuseBooleanEnabled(void);
 static void generateLoadBlock(CodeGenerator *generator, Operand operand);
 static void fillContext(CodeGenerator *generator, uint8_t level);
 static void fillAssoc(CodeGenerator *generator, uint8_t index);
@@ -388,10 +390,21 @@ static void generateBody(CodeGenerator *generator)
 	size_t bcSize = generator->code.bytecodesSize;
 	ptrdiff_t *machineOffsetAt = malloc(sizeof(ptrdiff_t) * (bcSize + 1));
 	_Bool *isBackwardTarget = calloc(bcSize + 1, sizeof(_Bool));
+	// Boolean-branch fusion bookkeeping, identical to x64: referrer count per
+	// offset (a check may only be subsumed when the jump that subsumes it is the
+	// only way in), bytecode boundaries with their numbers (so the fusion test
+	// decodes in place instead of re-walking), and the subsumed marks.
+	uint8_t *targetRefs = calloc(bcSize + 1, sizeof(uint8_t));
+	ptrdiff_t *numberAt = malloc(sizeof(ptrdiff_t) * (bcSize + 1));
+	_Bool *fusedAway = calloc(bcSize + 1, sizeof(_Bool));
 	{
+		for (size_t i = 0; i <= bcSize; i++) {
+			numberAt[i] = -1;
+		}
 		BytecodesIterator pre;
 		bytecodeInitIterator(&pre, generator->code.bytecodes, bcSize);
 		while (bytecodeHasNext(&pre)) {
+			numberAt[bytecodeOffset(&pre)] = bytecodeNumber(&pre) + 2;
 			Bytecode bc = bytecodeNext(&pre);
 			switch (bc) {
 			case BYTECODE_COPY:
@@ -418,8 +431,13 @@ static void generateBody(CodeGenerator *generator)
 			case BYTECODE_JUMP: {
 				int32_t d = bytecodeNextInt32(&pre);
 				ptrdiff_t t = bytecodeOffset(&pre) + d;
-				if (d < 0 && t >= 0 && t <= (ptrdiff_t) bcSize) {
-					isBackwardTarget[t] = 1;
+				if (t >= 0 && t <= (ptrdiff_t) bcSize) {
+					if (targetRefs[t] < 255) {
+						targetRefs[t]++;
+					}
+					if (d < 0) {
+						isBackwardTarget[t] = 1;
+					}
 				}
 				break;
 			}
@@ -428,8 +446,13 @@ static void generateBody(CodeGenerator *generator)
 				bytecodeNextOperand(&pre);
 				int32_t d = bytecodeNextInt32(&pre);
 				ptrdiff_t t = bytecodeOffset(&pre) + d;
-				if (d < 0 && t >= 0 && t <= (ptrdiff_t) bcSize) {
-					isBackwardTarget[t] = 1;
+				if (t >= 0 && t <= (ptrdiff_t) bcSize) {
+					if (targetRefs[t] < 255) {
+						targetRefs[t]++;
+					}
+					if (d < 0) {
+						isBackwardTarget[t] = 1;
+					}
 				}
 				break;
 			}
@@ -526,6 +549,13 @@ static void generateBody(CodeGenerator *generator)
 			int32_t disp = bytecodeNextInt32(&iterator);
 			ptrdiff_t target = bytecodeOffset(&iterator) + disp;
 
+			// Already answered by an earlier fused three-way branch: emit
+			// NOTHING, so the label bound at this offset lands on the false arm,
+			// which is where that branch sends a false receiver (mirrors x64).
+			if (fusedAway[offset]) {
+				break;
+			}
+
 			asmInitLabel(&currentLabel->label);
 			if (disp < 0) {
 				asmPpcLabelBind(&generator->buffer, &currentLabel->label, machineOffsetAt[target]);
@@ -539,8 +569,32 @@ static void generateBody(CodeGenerator *generator)
 			// boolean fast path. Decided before emitting, mirroring x64.
 			_Bool isSpecGuard = tierSiteIsSpecGuard(generator->tierSiteMap,
 				generator->tierSiteMapSize, generator->bytecodeNumber);
+			// Fuse with the complementary check at the target when it is
+			// reachable only from here and neither half is a speculation guard
+			// (jit/BooleanBranchFuse.h has the condition list). Mirrors x64.
+			ptrdiff_t notBoolTarget = 0, secondNumber = 0;
+			if (!isSpecGuard && fuseBooleanEnabled() && disp > 0
+					&& targetRefs[target] == 1 && !isBackwardTarget[target]
+					&& numberAt[target] > 0
+					&& boolFuseSecondCheckAt(&generator->code, target, 1, class,
+						receiver, &notBoolTarget, &secondNumber, numberAt[target] - 1)
+					&& !tierSiteIsSpecGuard(generator->tierSiteMap,
+						generator->tierSiteMapSize, secondNumber)) {
+				// Two labels: one AssemblerLabel takes one reference and the
+				// fused branch has two outgoing edges.
+				currentLabel->offset = target;
+				BytecodeLabel *notBool = currentLabel + 1;
+				asmInitLabel(&notBool->label);
+				notBool->offset = notBoolTarget;
+				generateClassCheck(generator, receiver, (RawClass *) class,
+					&currentLabel->label, 1, &notBool->label);
+				fusedAway[target] = 1;
+				currentLabel += 2;
+				break;
+			}
+
 			generateClassCheck(generator, receiver, (RawClass *) class,
-				&currentLabel->label, !isSpecGuard);
+				&currentLabel->label, !isSpecGuard, NULL);
 			// SPEC_GUARD registration, mirroring x64: see the comment there and
 			// jit/SpecSite.h. Every dynamic arm of generateClassCheck ends with
 			// exactly one `bc` word, so the branch starts one word back;
@@ -583,6 +637,9 @@ static void generateBody(CodeGenerator *generator)
 
 	free(machineOffsetAt);
 	free(isBackwardTarget);
+	free(targetRefs);
+	free(numberAt);
+	free(fusedAway);
 	free(labels);
 }
 
@@ -1927,9 +1984,15 @@ static void movToOperand(CodeGenerator *generator, Register reg, Operand operand
 //    into an unconditional branch. The boolean arm jumps forward over its own
 //    tail and so cannot be poisoned; the caller refuses it for speculations.
 static void generateClassCheckOnReg(CodeGenerator *generator, Register reg,
-	RawClass *class, AssemblerLabel *label, _Bool fuseBoolean)
+	RawClass *class, AssemblerLabel *label, _Bool fuseBoolean, AssemblerLabel *notBoolLabel)
 {
 	AssemblerBuffer *buffer = &generator->buffer;
+
+	// A fused three-way branch is only meaningful for the boolean pair, and only
+	// on the singleton fast path below (mirrors x64).
+	ASSERT(notBoolLabel == NULL
+		|| ((class == Handles.True->raw || class == Handles.False->raw)
+			&& fuseBoolean && fuseBooleanEnabled()));
 
 	if (class == Handles.SmallInteger->raw) {
 		asmAndiDot(buffer, R0, reg, 3);
@@ -1966,10 +2029,11 @@ static void generateClassCheckOnReg(CodeGenerator *generator, Register reg,
 			? Handles.true->raw : Handles.false->raw;
 		RawObject *other = class == Handles.True->raw
 			? Handles.false->raw : Handles.true->raw;
-		AssemblerLabel isWanted, isOther, genericMatch;
+		AssemblerLabel isWanted, isOther, genericMatch, genericOther;
 		asmInitLabel(&isWanted);
 		asmInitLabel(&isOther);
 		asmInitLabel(&genericMatch);
+		asmInitLabel(&genericOther);
 
 		generateLoadObject(buffer, wanted, R3, 1);
 		asmCmpd(buffer, 0, reg, R3);
@@ -1984,13 +2048,32 @@ static void generateClassCheckOnReg(CodeGenerator *generator, Register reg,
 		asmCmpd(buffer, 0, R3, TMP);
 		asmBeq(buffer, &genericMatch);
 
+		// FUSED three-way form, mirroring x64: the compiler emits an inlined
+		// conditional as a PAIR of these checks over the same operand, the
+		// second sitting AT the first one's jump target, and generateBody has
+		// established it is reachable only from here (jit/BooleanBranchFuse.h).
+		// Deciding the complementary class here, off the class already in R3,
+		// deletes the second check entirely. It COMPOSES the two rather than
+		// replacing them, so `True new` is classified exactly as before.
+		if (notBoolLabel != NULL) {
+			generateLoadObject(buffer, class == Handles.True->raw
+				? (RawObject *) Handles.False->raw : (RawObject *) Handles.True->raw, TMP, 1);
+			asmCmpd(buffer, 0, R3, TMP);
+			asmBeq(buffer, &genericOther);
+			asmB(buffer, notBoolLabel);
+		}
+
 		// asmPpcLabelBind, NOT the generic asmLabelBind: a PowerPC branch
 		// displacement is patched into the instruction WORD and its width
 		// depends on the form (I-form b, B-form bc), which the generic byte
 		// version knows nothing about. Getting this wrong produces a corrupt
 		// word, and the failure mode is an illegal-instruction trap during
 		// bootstrap rather than anything that points at this code.
-		asmPpcLabelBind(buffer, &isOther, asmOffset(buffer));
+		ptrdiff_t toOther = asmOffset(buffer);
+		asmPpcLabelBind(buffer, &isOther, toOther);
+		if (notBoolLabel != NULL) {
+			asmPpcLabelBind(buffer, &genericOther, toOther);
+		}
 		asmB(buffer, label);
 
 		ptrdiff_t matched = asmOffset(buffer);
@@ -2009,7 +2092,7 @@ static void generateClassCheckOnReg(CodeGenerator *generator, Register reg,
 
 
 static void generateClassCheck(CodeGenerator *generator, Operand operand, RawClass *class,
-	AssemblerLabel *label, _Bool fuseBoolean)
+	AssemblerLabel *label, _Bool fuseBoolean, AssemblerLabel *notBoolLabel)
 {
 	AssemblerBuffer *buffer = &generator->buffer;
 
@@ -2050,7 +2133,7 @@ static void generateClassCheck(CodeGenerator *generator, Operand operand, RawCla
 	case OPERAND_ARG_VAR: {
 		Variable *var = variableAt(generator, operand.index);
 		fillVar(generator, var);
-		generateClassCheckOnReg(generator, varReg(var), class, label, fuseBoolean);
+		generateClassCheckOnReg(generator, varReg(var), class, label, fuseBoolean, notBoolLabel);
 		break;
 	}
 
@@ -2065,7 +2148,7 @@ static void generateClassCheck(CodeGenerator *generator, Operand operand, RawCla
 		ptrdiff_t offset = varOffset(RawContext, vars) + operand.index * sizeof(Value);
 		fillContext(generator, operand.level);
 		asmLdT(buffer, TMP, offset, varReg(context));
-		generateClassCheckOnReg(generator, TMP, class, label, fuseBoolean);
+		generateClassCheckOnReg(generator, TMP, class, label, fuseBoolean, notBoolLabel);
 		break;
 	}
 
@@ -2076,7 +2159,7 @@ static void generateClassCheck(CodeGenerator *generator, Operand operand, RawCla
 		fillVar(generator, self);
 
 		asmLdT(buffer, TMP, offset, varReg(self));
-		generateClassCheckOnReg(generator, TMP, class, label, fuseBoolean);
+		generateClassCheckOnReg(generator, TMP, class, label, fuseBoolean, notBoolLabel);
 		break;
 	}
 
@@ -2095,7 +2178,7 @@ static void generateClassCheck(CodeGenerator *generator, Operand operand, RawCla
 		fillVar(generator, instance);
 
 		asmLdT(buffer, TMP, offset, varReg(instance));
-		generateClassCheckOnReg(generator, TMP, class, label, fuseBoolean);
+		generateClassCheckOnReg(generator, TMP, class, label, fuseBoolean, notBoolLabel);
 		break;
 	}
 
@@ -2111,7 +2194,7 @@ static void generateClassCheck(CodeGenerator *generator, Operand operand, RawCla
 		// Load the association's RUNTIME value and check ITS class (see x64).
 		generateLoadObject(buffer, compiledCodeLiteralAt(&generator->code, operand.index), TMP, 1);
 		asmLdT(buffer, TMP, varOffset(RawAssociation, value), TMP);
-		generateClassCheckOnReg(generator, TMP, class, label, fuseBoolean);
+		generateClassCheckOnReg(generator, TMP, class, label, fuseBoolean, notBoolLabel);
 		break;
 	}
 
