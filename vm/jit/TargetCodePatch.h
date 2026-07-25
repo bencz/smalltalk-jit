@@ -17,4 +17,19 @@
 uint64_t targetReadCodePointer(const uint8_t *site);
 void targetWriteCodePointer(uint8_t *site, uint64_t value);
 
+// Poison a speculation guard (see jit/SpecSite.h): rewrite the CONDITIONAL
+// branch at `site` as an UNCONDITIONAL branch to the same target, so the
+// guard's fallback edge is taken from now on. Both backends emit a fixed-width
+// conditional branch for this purpose (x64 the 6-byte 0F 8x rel32, ppc64 the
+// 4-byte bc), so the rewrite is always in-place and never needs to move code.
+// The caller owns the world-stopped bracket and the icache flush.
+void targetPoisonGuardBranch(uint8_t *site);
+
+// Poison a compile-time devirtualized send (SPEC_STATIC in jit/SpecSite.h):
+// `site` is the UNCONDITIONAL branch that skips the send's inline re-resolve
+// thunk, and this zeroes its displacement so control falls into the thunk
+// instead. Idempotent, like targetPoisonGuardBranch. Same world-stopped and
+// icache-flush contract.
+void targetPoisonStaticSkip(uint8_t *site);
+
 #endif

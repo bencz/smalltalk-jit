@@ -135,7 +135,8 @@ void initHeap(Heap *heap, struct Thread *thread);
 void freeHeap(Heap *heap);
 RawObject *allocateObject(Heap *heap, RawClass *class, size_t size);
 void freeObject(PageSpace *space, RawObject *object);
-struct NativeCode *allocateNativeCode(Heap *heap, size_t size, size_t pointersOffsetsSize, size_t icCellsSize);
+struct NativeCode *allocateNativeCode(Heap *heap, size_t size, size_t pointersOffsetsSize, size_t icCellsSize,
+	size_t specSitesSize);
 uint8_t *allocate(Heap *heap, size_t size);
 uint8_t *tryAllocateOld(Heap *heap, size_t size, _Bool grow);
 void collectGarbage(struct Thread *thread);

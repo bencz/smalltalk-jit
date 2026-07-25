@@ -14,6 +14,11 @@
 
 TierStats gTierStats = { 0 };
 
+// Address-only sentinel for tierSiteMap slots holding a speculative inline
+// guard rather than a send's feedback cell (see tierSiteIsSpecGuard). Never
+// dereferenced, never published into emitted code.
+IcCell gTierSpecGuard = { NULL };
+
 
 size_t *tierAllocCounter(void)
 {

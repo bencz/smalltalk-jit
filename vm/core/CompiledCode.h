@@ -9,6 +9,7 @@
 #include "runtime/String.h"
 #include "compiler/Parser.h"
 #include "jit/InlineCache.h"
+#include "jit/SpecSite.h"
 
 typedef Value (*NativeCodeEntry)();
 
@@ -18,6 +19,7 @@ typedef struct NativeCode {
 	uint8_t tags;
 	size_t pointersOffsetsSize;
 	size_t icCellsSize;
+	size_t specSitesSize;
 	size_t argsSize;
 	RawArray *stackmaps;
 	RawArray *descriptors;
@@ -26,6 +28,7 @@ typedef struct NativeCode {
 	uint8_t insts[];
 	// uint32_t pointersOffsets[]; 4-byte aligned, see nativeCodePointersOffsets
 	// IcCell icCells[];           8-byte aligned, see nativeCodeIcCells
+	// SpecSite specSites[];       4-byte aligned, see nativeCodeSpecSites
 } NativeCode;
 
 // The baked-pointer patch offsets sit inline after the code bytes. insts+size
@@ -54,14 +57,34 @@ static inline IcCell *nativeCodeIcCells(NativeCode *code)
 	return (IcCell *) (code->insts + nativeCodeIcCellsOffset((size_t) code->size, code->pointersOffsetsSize));
 }
 
-// Single source of truth for everything after the NativeCode header: the code
-// bytes, the patch-offset array and the IC cells. allocateNativeCode (sizing),
-// computeNativeCodeSize (the exec-space walkers' stride) and nativeCodeIcCells
-// (the base) MUST agree; a one-term divergence desynchronizes every exec-space
-// walk (pageSpaceIteratorNext strides by computeNativeCodeSize).
-static inline size_t nativeCodePayloadSize(size_t instsSize, size_t pointersOffsetsSize, size_t icCellsSize)
+// The speculation sites sit LAST, after the IC cells. A cell is 8 bytes and
+// its base is 8-aligned, so the array after it is already 4-aligned for
+// SpecSite's uint32 fields with no extra rounding, and neither the cell base
+// nor the patch-offset base moves. Growing the tail is therefore the only
+// change to the sizing chain.
+static inline size_t nativeCodeSpecSitesOffset(size_t instsSize, size_t pointersOffsetsSize,
+	size_t icCellsSize)
 {
 	return nativeCodeIcCellsOffset(instsSize, pointersOffsetsSize) + icCellsSize * sizeof(IcCell);
+}
+
+static inline SpecSite *nativeCodeSpecSites(NativeCode *code)
+{
+	return (SpecSite *) (code->insts
+		+ nativeCodeSpecSitesOffset((size_t) code->size, code->pointersOffsetsSize, code->icCellsSize));
+}
+
+// Single source of truth for everything after the NativeCode header: the code
+// bytes, the patch-offset array, the IC cells and the speculation sites.
+// allocateNativeCode (sizing), computeNativeCodeSize (the exec-space walkers'
+// stride), nativeCodeIcCells and nativeCodeSpecSites (the bases) MUST agree; a
+// one-term divergence desynchronizes every exec-space walk
+// (pageSpaceIteratorNext strides by computeNativeCodeSize).
+static inline size_t nativeCodePayloadSize(size_t instsSize, size_t pointersOffsetsSize,
+	size_t icCellsSize, size_t specSitesSize)
+{
+	return nativeCodeSpecSitesOffset(instsSize, pointersOffsetsSize, icCellsSize)
+		+ specSitesSize * sizeof(SpecSite);
 }
 
 // The header is stored INSIDE the scanned vars area of CompiledMethod/Block
@@ -389,7 +412,8 @@ static RawClass *compiledCodeResolveOperandClass(CompiledCode *code, Operand ope
 static size_t computeNativeCodeSize(NativeCode *code)
 {
 	return sizeof(NativeCode)
-		+ nativeCodePayloadSize((size_t) code->size, code->pointersOffsetsSize, code->icCellsSize);
+		+ nativeCodePayloadSize((size_t) code->size, code->pointersOffsetsSize, code->icCellsSize,
+			code->specSitesSize);
 }
 
 #endif

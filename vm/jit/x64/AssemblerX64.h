@@ -1059,12 +1059,19 @@ static void asmJmpLabel(AssemblerBuffer *buffer, AssemblerLabel *label)
 }
 
 
+// Fixed width of what asmJ emits: 0F, 80+cc, rel32. asmJ NEVER emits the
+// 2-byte short form, which is what lets a caller locate the branch it just
+// emitted by subtracting this (see the SPEC_GUARD registration in
+// generateBody) and lets targetPoisonGuardBranch rewrite it in place.
+#define ASM_COND_BRANCH_SIZE 6
+
 static void asmJ(AssemblerBuffer *buffer, uint8_t condition, AssemblerLabel *label)
 {
 	asmEnsureCapacity(buffer);
 	asmEmitUint8(buffer, 0x0F);
 	asmEmitUint8(buffer, 0x80 + condition);
 	asmEmitLabel32(buffer, label);
+	ASSERT(1 + 1 + sizeof(int32_t) == ASM_COND_BRANCH_SIZE);
 }
 
 

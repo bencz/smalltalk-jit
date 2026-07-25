@@ -33,6 +33,44 @@ void targetWriteCodePointer(uint8_t *site, uint64_t value)
 }
 
 
+// Speculation-guard poison (jit/SpecSite.h). asmJ always emits the FIXED
+// 6-byte near form `0F 8x rel32` (never the 2-byte short form), so the site is
+// known to be exactly:
+//     site+0: 0F  site+1: 80+cc  site+2..5: rel32   ; target = site+6+rel32
+// The unconditional near jump `E9 rel32'` is 5 bytes and measures its
+// displacement from site+5, so the same target needs rel32' = rel32 + 1, and
+// the freed trailing byte becomes a NOP. Rewriting the branch (rather than
+// spoiling a baked class immediate) is what makes one poison work for every
+// receiver shape: an immediate-class guard is a bare tag test that bakes no
+// class at all.
+void targetPoisonGuardBranch(uint8_t *site)
+{
+	// IDEMPOTENT: invalidation is per redefinition, not per site, so a site
+	// already poisoned by an earlier redefinition is simply left alone. Its
+	// guard can never come back: the fallback is the full send and only a
+	// fresh compilation restores speculation.
+	if (site[0] == 0xE9) {
+		return;
+	}
+	ASSERT(site[0] == 0x0F && (site[1] & 0xF0) == 0x80);
+	int32_t rel = (int32_t) loadU32(site + 2);
+	site[0] = 0xE9;
+	storeU32(site + 1, (uint32_t) (rel + 1));
+	site[5] = 0x90;
+}
+
+
+// SPEC_STATIC poison: the site is the 5-byte `E9 rel32` that skips the send's
+// inline re-resolve thunk. Zeroing the displacement makes it jump to the very
+// next instruction, which is the thunk. Idempotent by construction: writing
+// zero twice is writing zero.
+void targetPoisonStaticSkip(uint8_t *site)
+{
+	ASSERT(site[0] == 0xE9);
+	storeU32(site + 1, 0);
+}
+
+
 // C -> JIT entry: on x64 the stub's code address IS a callable C function
 // pointer. See jit/TargetEntry.h (ppc64 ELFv1 needs a descriptor instead).
 Value targetCallSmalltalkEntry(void *entryStubInsts, void *arg0, void *arg1,

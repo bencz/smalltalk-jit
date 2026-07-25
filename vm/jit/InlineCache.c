@@ -6,6 +6,8 @@
 #include "core/Thread.h"
 #include "memory/Heap.h"
 #include "memory/HeapPage.h"
+#include "jit/TargetCodePatch.h"
+#include "os/Os.h"
 #include <stdio.h>
 
 IcState gIcUnlinked = { 0, NULL, IC_KIND_UNLINKED, 0, NULL };
@@ -191,6 +193,46 @@ void icResetNativeCodeCells(struct NativeCode *code)
 }
 
 
+// Poison every speculation site in `code` (jit/SpecSite.h). STW only, from the
+// icInvalidateAllSends bracket: each poison is a bounded, non-atomic rewrite of
+// live instructions, so no mutator may be executing them.
+//
+// Resetting IC cells is NOT enough for a speculation. A promoted send's hit
+// path reads no cell at all, and an inlined body IS the callee's bytecodes
+// copied into the caller. Both are gated by an exact-class guard, and
+// redefineMutate copies the new raw class OVER the old object, so the class
+// identity survives and the guard keeps matching. Poisoning forces the guard's
+// fallback edge, which is the untouched original send, so the site degrades to
+// exactly today's dispatch rather than to anything new.
+//
+// Poisoning is unconditional rather than dependency-filtered: a SpecSite
+// deliberately records no class or selector, and the alternative (a per-code
+// dependency list) would still need this same patch to act on. The cost is
+// that an unrelated redefinition also demotes hot sites, which the next tier
+// recompile undoes.
+static void codeInvalidateSpeculations(NativeCode *code)
+{
+	SpecSite *sites = nativeCodeSpecSites(code);
+	for (size_t i = 0; i < code->specSitesSize; i++) {
+		switch (sites[i].kind) {
+		case SPEC_GUARD:
+			targetPoisonGuardBranch(code->insts + sites[i].patchOffset);
+			break;
+		case SPEC_STATIC:
+			targetPoisonStaticSkip(code->insts + sites[i].patchOffset);
+			break;
+		default:
+			FAIL();
+		}
+	}
+	if (code->specSitesSize > 0) {
+		// Publish the rewritten instructions to instruction fetch before any
+		// mutator resumes (no-op on x86, REQUIRED on POWER).
+		osFlushICache(code->insts, (size_t) code->size);
+	}
+}
+
+
 // NON-STW retirement of every cell that dispatches into `oldCode`, called by
 // the tier-1 recompiler (jit/Tier.c) right after it republishes a method, so
 // callers rebind to the fresh code without waiting for the next scavenge.
@@ -238,6 +280,9 @@ void icInvalidateAllSends(void (*mutate)(void *ctx), void *ctx)
 	while (code != NULL) {
 		if ((code->tags & TAG_FREESPACE) == 0) {
 			icResetNativeCodeCells((struct NativeCode *) code);
+			// Cells alone do not cover speculation: a promoted send's hit path
+			// reads no cell, and an inlined body is a copy of the callee.
+			codeInvalidateSpeculations(code);
 		}
 		code = (NativeCode *) pageSpaceIteratorNext(&iterator);
 	}

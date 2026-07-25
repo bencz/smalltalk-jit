@@ -537,6 +537,25 @@ static void generateBody(CodeGenerator *generator)
 				currentLabel->offset = target;
 			}
 			generateClassCheck(generator, receiver, (RawClass *) class, &currentLabel->label);
+			// If this guard is the optimizer's SPECULATIVE inline guard (and not
+			// the compiler's boolean control flow, which emits the same
+			// bytecode), record its branch so class redefinition can force the
+			// fallback edge. See jit/SpecSite.h and tierSiteIsSpecGuard.
+			//
+			// Every DYNAMIC arm of generateClassCheck ends with exactly one
+			// fixed-width asmJ (0F 8x rel32, 6 bytes), so the branch starts that
+			// far back. The constant-folded arms cannot occur here: a
+			// speculation's receiver is restricted to the dynamic operand kinds
+			// by tryInlineSite. targetPoisonGuardBranch asserts the opcode, so a
+			// wrong offset fails loudly instead of corrupting code.
+			if (tierSiteIsSpecGuard(generator->tierSiteMap, generator->tierSiteMapSize,
+					generator->bytecodeNumber)) {
+				ASSERT(receiver.type == OPERAND_TEMP_VAR || receiver.type == OPERAND_ARG_VAR
+					|| receiver.type == OPERAND_CONTEXT_VAR || receiver.type == OPERAND_INST_VAR
+					|| receiver.type == OPERAND_ASSOC);
+				asmAddSpecSite(&generator->buffer, SPEC_GUARD,
+					asmOffset(&generator->buffer) - ASM_COND_BRANCH_SIZE, 0);
+			}
 			currentLabel++;
 			break;
 		}
@@ -980,14 +999,20 @@ static void generateIcSendPromoted(CodeGenerator *generator, uint16_t selectorIn
 
 	generateLoadObject(buffer, asObject(state->class), RAX, 1);
 	asmCmpq(buffer, RDI, RAX);
+	// SPEC_GUARD: the hit path below reads NO IC cell, so resetting cells
+	// cannot reach it, and a class redefinition preserves the class OBJECT
+	// identity (redefineMutate memcpys in place) so the compare still matches.
+	// Record the branch so redefinition can force the fallback edge instead.
+	asmAddSpecSite(buffer, SPEC_GUARD, asmOffset(buffer), 0);
 	asmJ(buffer, COND_NOT_EQUAL, &fallback);
 	if (tierStatsEnabled()) {
 		asmMovqImm(buffer, (int64_t) &gTierStats.directCalls, RDX);
 		asmIncqMem(buffer, asmMem(RDX, NO_REGISTER, SS_1, 0));
 	}
-	// The baked entry is immortal (exec space never moves nor frees); it may
-	// go stale if the callee itself recompiles, which is the documented
-	// staleness of every baked entry, not a correctness hazard.
+	// The baked entry is immortal (exec space never moves nor frees). It goes
+	// stale when the callee RECOMPILES, which is harmless (the old entry is
+	// semantically equivalent), and when the callee's class is REDEFINED,
+	// which is not: that case is handled by the SPEC_GUARD poison above.
 	asmMovqImm(buffer, (int64_t) state->target, R11);
 	asmJmpLabel(buffer, &done);
 
@@ -1179,7 +1204,43 @@ static void generateSend(CodeGenerator *generator, BytecodesIterator *iterator)
 			closeHandleScope(&probe, NULL);
 		}
 		if (devirtualize) {
-			asmMovqImm(buffer, (int64_t) lookupNativeCode(class, (RawString *) selector), R11);
+			// SPEC_STATIC (jit/SpecSite.h). This send bakes its callee entry with
+			// NO class guard and NO IC cell, so neither the cell reset nor the
+			// SPEC_GUARD poison can reach it, and redefining the resolved class
+			// leaves it calling the replaced method forever. (Reproduced by
+			// tests/SuperExtendStaleTest.st, which fails under ST_NO_TIER too:
+			// this hazard predates the tier and lives in tier-0 code.)
+			//
+			// The fix is a re-resolve thunk placed INLINE, jumped over. Inline
+			// rather than after the epilogue because generateMethodLookup can
+			// call LookupStub, which allocates: it must run inside the caller's
+			// frame, at the same point in the frame-size accounting as the
+			// normal dispatch path, so generateStackmap describes it correctly.
+			// Out of line the thunk would execute with the callee's return
+			// address already pushed and RBP still the caller's, and the stack
+			// walk would be off by one word.
+			//
+			// Poisoning sets the skip jump's displacement to zero so control
+			// falls into the thunk. Steady-state cost is one predicted
+			// unconditional jump.
+			AssemblerLabel thunkSkip, thunkDone;
+			asmInitLabel(&thunkSkip);
+			asmInitLabel(&thunkDone);
+			ptrdiff_t patchOffset = asmOffset(buffer);
+			asmJmpLabel(buffer, &thunkSkip);
+			// Handles: generateMethodLookup below may allocate (stub emission),
+			// which can move the class and the selector before they are used.
+			Class *classHandle = scopeHandle(class);
+			Object *selectorHandle = scopeHandle(selector);
+			generateLoadObject(buffer, (RawObject *) classHandle->raw, RDI, 1);
+			generateLoadObject(buffer, selectorHandle->raw, RSI, 0);
+			generateMethodLookup(generator);
+			asmJmpLabel(buffer, &thunkDone);
+			asmLabelBind(buffer, &thunkSkip, asmOffset(buffer));
+			asmMovqImm(buffer, (int64_t) lookupNativeCode(classHandle->raw,
+				(RawString *) selectorHandle->raw), R11);
+			asmLabelBind(buffer, &thunkDone, asmOffset(buffer));
+			asmAddSpecSite(buffer, SPEC_STATIC, patchOffset, 0);
 		} else {
 			// Always recompute the receiver's class from TMP. The old VAR_CLASS spill
 			// cache (keyed by the receiver variable) is UNSAFE once inlined control flow
@@ -2406,7 +2467,7 @@ NativeCode *buildNativeCodeFromAssembler(AssemblerBuffer *buffer)
 {
 	size_t size = asmOffset(buffer);
 	NativeCode *code = allocateNativeCode(CurrentThread.heap, size,
-		buffer->pointersOffsetsSize, buffer->icSitesSize);
+		buffer->pointersOffsetsSize, buffer->icSitesSize, buffer->specSitesSize);
 	code->compiledCode = NULL;
 	code->argsSize = 0;
 	code->descriptors = NULL;
@@ -2426,6 +2487,10 @@ NativeCode *buildNativeCodeFromAssembler(AssemblerBuffer *buffer)
 	gIcStats.sites += buffer->icSitesSize;
 	asmCopyBuffer(buffer, code->insts, size);
 	asmCopyPointersOffsets(buffer, nativeCodePointersOffsets(code));
+	// Speculation sites travel verbatim: the offsets are buffer-relative and
+	// the code bytes were just memcpy'd unchanged, so they are code offsets.
+	memcpy(nativeCodeSpecSites(code), buffer->specSites,
+		buffer->specSitesSize * sizeof(SpecSite));
 	// Single funnel for ALL code creation (methods, blocks, stubs): make the
 	// fresh instructions visible to instruction fetch before anyone can jump
 	// here (no-op on x86; required on ARM/RISC-V/PPC).

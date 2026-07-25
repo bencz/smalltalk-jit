@@ -5,6 +5,7 @@
 #include "core/Endian.h"
 #include "core/Thread.h"
 #include "jit/TargetCodePatch.h"
+#include "jit/SpecSite.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -68,6 +69,14 @@ typedef struct {
 	uint32_t *icSites;
 	size_t icSitesSize;
 	size_t icSitesCapacity;
+	// Speculation sites: places whose emitted code assumes a lookup result that
+	// a later class redefinition can falsify (see SpecSite in CompiledCode.h).
+	// Copied verbatim into the NativeCode tail at publication; class
+	// redefinition then poisons them with the world stopped. Like icSites these
+	// are NOT heap pointers, so the GC never walks them.
+	SpecSite *specSites;
+	size_t specSitesSize;
+	size_t specSitesCapacity;
 	CodegenSites sitesNode; // GC visibility of the baked pointers (see Thread.h)
 } AssemblerBuffer;
 
@@ -82,6 +91,7 @@ static AssemblerFixup *asmEmitFixup(AssemblerBuffer *buffer, AssemblerFixupType 
 static void asmBindFixups(AssemblerBuffer *buffer, uint8_t *p);
 static void asmAddPointerOffset(AssemblerBuffer *buffer, ptrdiff_t offset);
 static void asmCopyPointersOffsets(AssemblerBuffer *buffer, uint32_t *dest);
+static void asmAddSpecSite(AssemblerBuffer *buffer, uint32_t kind, ptrdiff_t patchOffset, ptrdiff_t auxOffset);
 static void asmEmitInt8(AssemblerBuffer *buffer, int8_t v);
 static void asmEmitUint8(AssemblerBuffer *buffer, uint8_t v);
 static void asmEmitUint16(AssemblerBuffer *buffer, uint16_t v);
@@ -94,6 +104,7 @@ static void asmBindFixup(AssemblerBuffer *buffer, AssemblerFixup *fixup, int64_t
 
 #define ASM_POINTERS_OFFSETS_INITIAL 64
 #define ASM_IC_SITES_INITIAL 32
+#define ASM_SPEC_SITES_INITIAL 16
 
 static void asmInitBuffer(AssemblerBuffer *buffer, size_t size)
 {
@@ -108,7 +119,11 @@ static void asmInitBuffer(AssemblerBuffer *buffer, size_t size)
 	buffer->icSites = malloc(ASM_IC_SITES_INITIAL * sizeof(uint32_t));
 	buffer->icSitesSize = 0;
 	buffer->icSitesCapacity = ASM_IC_SITES_INITIAL;
-	if (buffer->buffer == NULL || buffer->pointersOffsets == NULL || buffer->icSites == NULL) {
+	buffer->specSites = malloc(ASM_SPEC_SITES_INITIAL * sizeof(SpecSite));
+	buffer->specSitesSize = 0;
+	buffer->specSitesCapacity = ASM_SPEC_SITES_INITIAL;
+	if (buffer->buffer == NULL || buffer->pointersOffsets == NULL || buffer->icSites == NULL
+		|| buffer->specSites == NULL) {
 		FAIL();
 	}
 	// Codegen runs GC-active and allocates (stackmaps, descriptors), so a
@@ -136,6 +151,7 @@ static void asmFreeBuffer(AssemblerBuffer *buffer)
 	free(buffer->buffer);
 	free(buffer->pointersOffsets);
 	free(buffer->icSites);
+	free(buffer->specSites);
 }
 
 
@@ -296,6 +312,29 @@ static void asmAddIcSite(AssemblerBuffer *buffer, ptrdiff_t offset)
 		buffer->icSites = grown;
 	}
 	buffer->icSites[buffer->icSitesSize++] = (uint32_t) offset;
+}
+
+
+// Record a place class redefinition must be able to poison (see SpecSite.h).
+// Offsets are buffer-relative and stay valid across the copy into exec space:
+// the code bytes are memcpy'd verbatim, so a buffer offset is a code offset.
+static void asmAddSpecSite(AssemblerBuffer *buffer, uint32_t kind, ptrdiff_t patchOffset,
+	ptrdiff_t auxOffset)
+{
+	ASSERT(0 <= patchOffset && patchOffset <= UINT32_MAX);
+	ASSERT(0 <= auxOffset && auxOffset <= UINT32_MAX);
+	if (buffer->specSitesSize == buffer->specSitesCapacity) {
+		buffer->specSitesCapacity *= 2;
+		SpecSite *grown = realloc(buffer->specSites, buffer->specSitesCapacity * sizeof(SpecSite));
+		if (grown == NULL) {
+			FAIL();
+		}
+		buffer->specSites = grown;
+	}
+	buffer->specSites[buffer->specSitesSize].kind = kind;
+	buffer->specSites[buffer->specSitesSize].patchOffset = (uint32_t) patchOffset;
+	buffer->specSites[buffer->specSitesSize].auxOffset = (uint32_t) auxOffset;
+	buffer->specSitesSize++;
 }
 
 

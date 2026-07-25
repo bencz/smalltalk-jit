@@ -123,4 +123,23 @@ static size_t tierInlineMax(void)
 }
 
 
+// Marks a tierSiteMap slot whose instruction is the SPECULATIVE INLINE GUARD
+// the optimizer emitted, not a send. Both the compiler (inlined boolean
+// control flow, guarding True/False) and the optimizer emit
+// BYTECODE_JUMP_NOT_MEMBER_OF, and the backends cannot tell them apart from
+// the bytecode alone: only the optimizer's is a speculation that a class
+// redefinition must be able to poison (jit/SpecSite.h).
+//
+// The map is indexed by instruction number and mapSet only ever writes real
+// cells for SENDS, so a jump's slot is otherwise unused and free to carry this
+// sentinel. Its ADDRESS is the marker; the object is never dereferenced.
+extern IcCell gTierSpecGuard;
+
+static inline _Bool tierSiteIsSpecGuard(IcCell **siteMap, size_t siteMapSize, ptrdiff_t instruction)
+{
+	return siteMap != NULL && instruction >= 0 && (size_t) instruction < siteMapSize
+		&& siteMap[instruction] == &gTierSpecGuard;
+}
+
+
 #endif

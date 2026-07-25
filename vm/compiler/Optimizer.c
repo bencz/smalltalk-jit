@@ -421,6 +421,14 @@ static _Bool tryInlineSite(Optimizer *opt, IcCell *cell, uint16_t selectorIndex,
 
 	// Exact-class guard on the ORIGINAL receiver operand; any other class
 	// takes the untouched original send below.
+	//
+	// Mark the guard's instruction number so the backends can register it as a
+	// SPEC_GUARD (jit/SpecSite.h): the inlined body below is a COPY of the
+	// callee's bytecodes, and redefining the callee's class leaves that copy
+	// stale while the guard still matches (redefineMutate preserves the class
+	// object identity). The compiler emits the same bytecode for inlined
+	// boolean control flow, which is NOT speculative, hence the marker.
+	mapSet(opt, opt->buffer.instOffset, &gTierSpecGuard);
 	bytecodeJumpNotMemberOf(&opt->buffer, &receiver, (uint16_t) classLiteral, &fallback);
 	noteInstructions(opt);
 

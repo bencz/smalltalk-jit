@@ -393,12 +393,14 @@ void freeObject(PageSpace *space, RawObject *object)
 }
 
 
-NativeCode *allocateNativeCode(Heap *heap, size_t size, size_t pointersOffsetsSize, size_t icCellsSize)
+NativeCode *allocateNativeCode(Heap *heap, size_t size, size_t pointersOffsetsSize, size_t icCellsSize,
+	size_t specSitesSize)
 {
 	// Sizing MUST agree with computeNativeCodeSize (the exec-space walkers'
 	// stride): both go through nativeCodePayloadSize.
 	size_t realSize = align(sizeof(NativeCode)
-		+ nativeCodePayloadSize(size, pointersOffsetsSize, icCellsSize), HEAP_OBJECT_ALIGN);
+		+ nativeCodePayloadSize(size, pointersOffsetsSize, icCellsSize, specSitesSize),
+		HEAP_OBJECT_ALIGN);
 	// Serialize concurrent exec-space carving across worker threads (see execLock).
 	osMutexLock(&heap->execLock);
 	NativeCode *code = (NativeCode *) pageSpaceAllocate(&heap->execSpace, realSize);
@@ -406,6 +408,7 @@ NativeCode *allocateNativeCode(Heap *heap, size_t size, size_t pointersOffsetsSi
 	code->size = size;
 	code->pointersOffsetsSize = pointersOffsetsSize;
 	code->icCellsSize = icCellsSize;
+	code->specSitesSize = specSitesSize;
 	code->tags = 0;
 	return code;
 }

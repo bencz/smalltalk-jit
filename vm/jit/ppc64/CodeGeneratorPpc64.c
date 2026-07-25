@@ -521,6 +521,18 @@ static void generateBody(CodeGenerator *generator)
 				currentLabel->offset = target;
 			}
 			generateClassCheck(generator, receiver, (RawClass *) class, &currentLabel->label);
+			// SPEC_GUARD registration, mirroring x64: see the comment there and
+			// jit/SpecSite.h. Every dynamic arm of generateClassCheck ends with
+			// exactly one `bc` word, so the branch starts one word back;
+			// targetPoisonGuardBranch asserts the primary opcode.
+			if (tierSiteIsSpecGuard(generator->tierSiteMap, generator->tierSiteMapSize,
+					generator->bytecodeNumber)) {
+				ASSERT(receiver.type == OPERAND_TEMP_VAR || receiver.type == OPERAND_ARG_VAR
+					|| receiver.type == OPERAND_CONTEXT_VAR || receiver.type == OPERAND_INST_VAR
+					|| receiver.type == OPERAND_ASSOC);
+				asmAddSpecSite(&generator->buffer, SPEC_GUARD,
+					asmOffset(&generator->buffer) - ASM_COND_BRANCH_SIZE, 0);
+			}
 			currentLabel++;
 			break;
 		}
@@ -967,6 +979,11 @@ static void generateIcSendPromoted(CodeGenerator *generator, uint16_t selectorIn
 
 	generateLoadObject(buffer, asObject(state->class), R4, 1);
 	asmCmpd(buffer, 0, R3, R4);
+	// SPEC_GUARD: the hit path below reads NO IC cell, so resetting cells
+	// cannot reach it, and a class redefinition preserves the class OBJECT
+	// identity (redefineMutate memcpys in place) so the compare still matches.
+	// Record the branch so redefinition can force the fallback edge instead.
+	asmAddSpecSite(buffer, SPEC_GUARD, asmOffset(buffer), 0);
 	asmBne(buffer, &fallback);
 	if (tierStatsEnabled()) {
 		asmLi64(buffer, R6, (uint64_t) (uintptr_t) &gTierStats.directCalls);
@@ -974,8 +991,9 @@ static void generateIcSendPromoted(CodeGenerator *generator, uint16_t selectorIn
 		asmAddi(buffer, R5, R5, 1);
 		asmStd(buffer, R5, 0, R6);
 	}
-	// Immortal entry (exec space never moves nor frees); may go stale if the
-	// callee recompiles, the documented staleness of every baked entry.
+	// Immortal entry (exec space never moves nor frees). Stale on callee
+	// RECOMPILE is harmless (the old entry is semantically equivalent); stale
+	// on class REDEFINITION is not, and the SPEC_GUARD poison above covers it.
 	asmLi64(buffer, TGT, (uint64_t) (uintptr_t) state->target);
 	asmB(buffer, &done);
 
@@ -1146,7 +1164,28 @@ static void generateSend(CodeGenerator *generator, BytecodesIterator *iterator)
 			closeHandleScope(&probe, NULL);
 		}
 		if (devirtualize) {
-			asmLi64(buffer, TGT, (uint64_t) (uintptr_t) lookupNativeCode(class, (RawString *) selector));
+			// SPEC_STATIC: inline re-resolve thunk jumped over, mirroring x64.
+			// See the long comment there for why the thunk is inline (it can
+			// allocate, so it must sit inside the caller's frame where the call
+			// site's stackmap is valid) and how the poison works.
+			AssemblerLabel thunkSkip, thunkDone;
+			asmInitLabel(&thunkSkip);
+			asmInitLabel(&thunkDone);
+			ptrdiff_t patchOffset = asmOffset(buffer);
+			asmB(buffer, &thunkSkip);
+			// Handles: generateMethodLookup may allocate (stub emission), which
+			// can move the class and the selector before they are used.
+			Class *classHandle = scopeHandle(class);
+			Object *selectorHandle = scopeHandle(selector);
+			generateLoadObject(buffer, (RawObject *) classHandle->raw, R3, 1);
+			generateLoadObject(buffer, selectorHandle->raw, R4, 0);
+			generateMethodLookup(generator);
+			asmB(buffer, &thunkDone);
+			asmPpcLabelBind(buffer, &thunkSkip, asmOffset(buffer));
+			asmLi64(buffer, TGT, (uint64_t) (uintptr_t) lookupNativeCode(classHandle->raw,
+				(RawString *) selectorHandle->raw));
+			asmPpcLabelBind(buffer, &thunkDone, asmOffset(buffer));
+			asmAddSpecSite(buffer, SPEC_STATIC, patchOffset, 0);
 		} else {
 			// Always recompute the receiver's class from TMP (see x64).
 			generateLoadClass(buffer, TMP, R3);
@@ -2259,7 +2298,7 @@ NativeCode *buildNativeCodeFromAssembler(AssemblerBuffer *buffer)
 {
 	size_t size = asmOffset(buffer);
 	NativeCode *code = allocateNativeCode(CurrentThread.heap, size,
-		buffer->pointersOffsetsSize, buffer->icSitesSize);
+		buffer->pointersOffsetsSize, buffer->icSitesSize, buffer->specSitesSize);
 	code->compiledCode = NULL;
 	code->argsSize = 0;
 	code->descriptors = NULL;
@@ -2280,6 +2319,10 @@ NativeCode *buildNativeCodeFromAssembler(AssemblerBuffer *buffer)
 	gIcStats.sites += buffer->icSitesSize;
 	asmCopyBuffer(buffer, code->insts, size);
 	asmCopyPointersOffsets(buffer, nativeCodePointersOffsets(code));
+	// Speculation sites travel verbatim: the offsets are buffer-relative and
+	// the code bytes were just memcpy'd unchanged, so they are code offsets.
+	memcpy(nativeCodeSpecSites(code), buffer->specSites,
+		buffer->specSitesSize * sizeof(SpecSite));
 	// Single funnel for ALL code creation: publish to instruction fetch
 	// (dcbst/sync/icbi/isync via __builtin___clear_cache, REQUIRED on POWER).
 	osFlushICache(code->insts, size);
@@ -2299,6 +2342,41 @@ uint64_t targetReadCodePointer(const uint8_t *site)
 void targetWriteCodePointer(uint8_t *site, uint64_t value)
 {
 	asmLi64Patch(site, value);
+}
+
+
+// Speculation-guard poison (jit/SpecSite.h). asmBc emits the B-form `bc`
+// (primary opcode 16) with AA=LK=0 and a 14-bit BD in bits 2..15; asmB emits
+// the I-form `b` (primary opcode 18) with a 24-bit LI in bits 2..25. Both are
+// ONE word at the SAME address and both measure their displacement from the
+// branch instruction itself, so the poison keeps the displacement and only
+// widens the field: no code moves and no target is recomputed. A guard target
+// always fits 14 bits (it already had to, to be emitted as a bc), so widening
+// to 24 cannot overflow.
+void targetPoisonGuardBranch(uint8_t *site)
+{
+	uint32_t word = ppcLoadWord(site);
+	// IDEMPOTENT: see the x64 twin. A site already poisoned by an earlier
+	// redefinition is already an unconditional `b` and is left alone.
+	if ((word >> 26) == 18) {
+		return;
+	}
+	ASSERT((word >> 26) == 16);
+	int32_t disp = (int16_t) (word & 0xFFFC);
+	ppcStoreWord(site, (18u << 26) | ((uint32_t) disp & 0x03FFFFFC));
+}
+
+
+// SPEC_STATIC poison: the site is the I-form `b` that skips the send's inline
+// re-resolve thunk. Zeroing LI makes it branch to itself... which would hang,
+// so it must instead branch to the NEXT word: on POWER a branch displacement
+// is measured from the branch itself, so the thunk (one word later) is LI = 4.
+// Idempotent: writing the same word twice is a no-op.
+void targetPoisonStaticSkip(uint8_t *site)
+{
+	uint32_t word = ppcLoadWord(site);
+	ASSERT((word >> 26) == 18);
+	ppcStoreWord(site, (18u << 26) | (4u & 0x03FFFFFC));
 }
 
 

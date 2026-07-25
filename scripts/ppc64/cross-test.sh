@@ -122,6 +122,11 @@ for cpu in $CPUS; do
 	# tests gate here too, not only on x64. Same for the per-site inline caches
 	# (generateIcSend is per-backend emission; the Ic* tests cover bind, DNU,
 	# GC reset and the multi-worker hammer on the POWER code paths).
+	#
+	# The *Redefine*/*Stale* tests gate the speculation-invalidation poisons
+	# (jit/SpecSite.h), which rewrite live instructions and are per-backend by
+	# construction: the POWER poisons rewrite a `bc` into a `b` and retarget a
+	# `b`, encodings x64 testing cannot exercise at all.
 	for t in tests/AtomicTest.st tests/FloatTest.st tests/FloatEdgeTest.st tests/FloatCrossRepTest.st \
 	         tests/SmallFloat64BoundaryTest.st tests/FloatHashTest.st \
 	         tests/ScaledDecimalTest.st tests/LargeIntegerTest.st \
@@ -131,7 +136,9 @@ for cpu in $CPUS; do
 	         tests/IcGcPressureTest.st tests/IcHammerTest.st \
 	         tests/TierCorrectnessTest.st tests/TierGuardFailTest.st \
 	         tests/TierGcPressureTest.st tests/TierUnwindTest.st \
-	         tests/TierInlineTest.st tests/TierHammerTest.st; do
+	         tests/TierInlineTest.st tests/TierHammerTest.st \
+	         tests/TierRedefineTest.st tests/TierInlineRedefineTest.st \
+	         tests/SuperExtendStaleTest.st; do
 		QEMU_CPU=$cpu timeout 900 "$OUT/st" -s "$IMG" -f "$t" </dev/null >/dev/null 2>&1 \
 			|| { echo "FAIL $t ($cpu)"; exit 1; }
 		echo "     pass $(basename "$t")"

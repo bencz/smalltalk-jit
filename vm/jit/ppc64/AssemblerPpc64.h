@@ -391,6 +391,11 @@ static inline void asmB(AssemblerBuffer *buffer, AssemblerLabel *label)
 	}
 }
 
+// Fixed width of what asmBc emits: one B-form word. Lets a caller locate the
+// branch it just emitted by subtracting this (see the SPEC_GUARD registration
+// in generateBody) and lets targetPoisonGuardBranch rewrite it in place.
+#define ASM_COND_BRANCH_SIZE 4
+
 static inline void asmBc(AssemblerBuffer *buffer, int bo, int bi, AssemblerLabel *label)
 {
 	uint32_t word = (16u << 26) | ((uint32_t) (bo & 31) << 21) | ((uint32_t) (bi & 31) << 16);
