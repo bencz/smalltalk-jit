@@ -773,6 +773,18 @@ static inline void asmFmul(AssemblerBuffer *buffer, int frt, int fra, int frc)
 	asmPpcEmitWord(buffer, ppcAForm(frt, fra, 0, frc, 25));
 }
 
+// fcfid frt, frb (X-form, opcode 63, XO 846): convert the SIGNED 64-bit
+// integer held in FRB's bit pattern to a double in FRT. Note that POWER
+// converts FPR-to-FPR, so the integer must be moved into an FPR first
+// (generateBitsToFpr), unlike x64's cvtsi2sd which reads a GPR directly.
+// Used by the inline Float intrinsic for a SmallInteger operand; matches
+// Float>>coerce: through asFloat, precision loss above 2^53 included.
+static inline void asmFcfid(AssemblerBuffer *buffer, int frt, int frb)
+{
+	asmPpcEmitWord(buffer, (63u << 26) | ((uint32_t) (frt & 31) << 21)
+		| ((uint32_t) (frb & 31) << 11) | (846u << 1));
+}
+
 // fcmpu crf, fra, frb, the unordered (NaN) outcome lands in the crf's SO
 // bit (BI = crf*4 + CR_SO): a DEDICATED bit, unlike x64's parity-flag dance.
 static inline void asmFcmpu(AssemblerBuffer *buffer, int crf, int fra, int frb)

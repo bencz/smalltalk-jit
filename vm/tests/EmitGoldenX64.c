@@ -98,6 +98,27 @@ static void emitSmallFloatOpsCase(CodeGenerator *generator)
 	asmMovqFromXmm(buffer, XMM1, R10);
 }
 
+
+// cvtsi2sd (the SmallInteger operand of the mixed int/float intrinsic) and the
+// CL-count arithmetic right shift (bitShift: with a negative receiver). Both
+// are easy to encode ALMOST right: cvtsi2sd differs from the movq GPR->XMM
+// above only in prefix and opcode, and sar differs from shr only in the opcode
+// EXTENSION field, so an eyeball review would not catch a swap. Registers
+// spanning the REX boundary on purpose.
+static void emitIntToFloatOpsCase(CodeGenerator *generator)
+{
+	AssemblerBuffer *buffer = &generator->buffer;
+	asmCvtsi2sdq(buffer, RAX, XMM0);
+	asmCvtsi2sdq(buffer, RSI, XMM1);
+	asmCvtsi2sdq(buffer, R10, XMM0);
+	asmCvtsi2sdq(buffer, RDI, XMM1);
+	asmSarq(buffer, RAX);
+	asmSarq(buffer, RSI);
+	asmSarq(buffer, R10);
+	asmSarqImm(buffer, RAX, 2);
+	asmShrq(buffer, RAX);
+}
+
 // ---- expected vectors -------------------------------------------------------
 // Captured with ST_ABI_EMIT_TEST=print from the pre-ABI-seam build (SysV).
 // Regenerate with print mode whenever an emitter legitimately changes.
@@ -119,6 +140,8 @@ static const GoldenCase Cases[] = {
 	  ExpectedSmallFloatOps, sizeof(ExpectedSmallFloatOps) },
 	{ "generateIcGuard(miss)", emitIcGuardCase,
 	  ExpectedIcGuard, sizeof(ExpectedIcGuard) },
+	{ "cvtsi2sd + sar CL", emitIntToFloatOpsCase,
+	  ExpectedIntToFloatOps, sizeof(ExpectedIntToFloatOps) },
 };
 
 static void hexdumpAsCArray(const char *name, const uint8_t *bytes, size_t size)
@@ -136,7 +159,7 @@ static void hexdumpAsCArray(const char *name, const uint8_t *bytes, size_t size)
 static const char *CaseArrayNames[] = {
 	"ExpectedLoadTls", "ExpectedCCall", "ExpectedStoreCheck",
 	"ExpectedCCallPrimitive", "ExpectedEntryStub", "ExpectedSmallFloatOps",
-	"ExpectedIcGuard",
+	"ExpectedIcGuard", "ExpectedIntToFloatOps",
 };
 
 // Some sequences bake REAL C-function addresses (e.g. generateStoreCheck's

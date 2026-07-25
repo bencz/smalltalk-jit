@@ -72,3 +72,43 @@ number. Fixed in `vm/jit/x64/CodeGeneratorX64.c` (`fillVarToReg`), with
 `tests/NestedInlinedConditionalTest.st` as the regression. Inlined conditionals
 make Richards about 2.7x faster, so the workaround of disabling them
 (`ST_NO_INLINE_CF=1`) was never an option.
+
+## Comparing two configurations: `scripts/ab.sh`
+
+`./run_benchmarks.sh` prints one figure per benchmark, which is enough to see
+that a benchmark still passes its self-check but not enough to decide whether a
+change made anything faster. For that, use the interleaved runner:
+
+```
+scripts/ab.sh 'base=' 'notier=ST_NO_TIER=1' 8 > /tmp/run.jsonl
+awk -f scripts/report.awk /tmp/run.jsonl
+```
+
+Each spec is `LABEL=ENV,ENV`; one spec records a baseline, two compare them.
+Set `ST_AB_ROOT_<label>` to compare two BUILDS instead of two configurations,
+and `ST_AB_BENCHES` to pick benchmarks.
+
+Three things it does that matter, and why:
+
+* **It interleaves ABBA rather than running all of A then all of B.** Code
+  layout in this VM is a lottery: moving a cold block has produced a
+  reproducible 2 percent swing with identical executed instructions, and
+  changing loop-header alignment from 16 to 32 bytes moved a benchmark 4
+  percent. The machine also warms up over a session. Pairing symmetrically
+  inside each round cancels monotonic drift instead of handing it to whichever
+  side ran first.
+
+* **It records retired instructions, not just wall clock.** On this workload
+  instruction counts repeat to a few parts in 10^8, so they answer "did this
+  change add work" immediately, while the clock may need many runs to say
+  anything. Prefer them, and treat wall clock as confirmation.
+
+* **It refuses to declare a winner it cannot see.** `report.awk` calls wall
+  clock INCONCLUSIVE whenever the median difference is smaller than the spread
+  within either label. Note that `Richards` and `DeltaBlue` divide their total
+  by 100 with integer division, so their wall-clock resolution is 1 ms per 100
+  iterations and is close to useless for A/B work; their instruction counts are
+  not. `MixedArithBench` reports a single untruncated total for this reason.
+
+`benchmarks/results/BASELINE.jsonl` is the committed record. Append to it, do
+not rewrite it: the point is to be able to see when a number moved and why.

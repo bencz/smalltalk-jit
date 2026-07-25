@@ -197,6 +197,19 @@ static void emitFloatXerCase(AssemblerBuffer *buffer)
 }
 
 
+// fcfid, the signed-int-to-double conversion the mixed int/float intrinsic
+// uses for a SmallInteger operand. Separate case so the existing vectors stay
+// byte-identical. The instruction WORD is the same as big-endian; what this
+// file proves is that it is STORED in the other byte order.
+static void emitFcfidCase(AssemblerBuffer *buffer)
+{
+	asmFcfid(buffer, 0, 0);
+	asmFcfid(buffer, 1, 1);
+	asmFcfid(buffer, 0, 1);
+	asmFcfid(buffer, 31, 30);
+}
+
+
 // The SmallFloat64 decode/encode building blocks: pure 64-bit rotates plus
 // the ISA 2.07 GPR<->VSR moves (emitted only behind the isPower8 gate).
 static void emitSmallFloatOpsCase(AssemblerBuffer *buffer)
@@ -265,6 +278,8 @@ static const GoldenCase Cases[] = {
 	  ExpectedPpcLeFloatXer, sizeof(ExpectedPpcLeFloatXer) },
 	{ "smallfloat rotldi/rotrdi/mtvsrd/mfvsrd", emitSmallFloatOpsCase,
 	  ExpectedPpcLeSmallFloatOps, sizeof(ExpectedPpcLeSmallFloatOps) },
+	{ "fcfid", emitFcfidCase,
+	  ExpectedPpcLeFcfid, sizeof(ExpectedPpcLeFcfid) },
 	{ "ic guard (li64 cell/ld/ld/cmpd/bne/ld)", emitIcGuardCase,
 	  ExpectedPpcLeIcGuard, sizeof(ExpectedPpcLeIcGuard) },
 };
@@ -278,7 +293,7 @@ static const char *CaseArrayNames[] = {
 	"ExpectedPpcLeLoadTlsNeg", "ExpectedPpcLeCallCFunction",
 	"ExpectedPpcLeEntrySave", "ExpectedPpcLeEntryRestore",
 	"ExpectedPpcLeSubWord", "ExpectedPpcLeXoArith", "ExpectedPpcLeShiftCmp",
-	"ExpectedPpcLeFloatXer", "ExpectedPpcLeSmallFloatOps",
+	"ExpectedPpcLeFloatXer", "ExpectedPpcLeSmallFloatOps", "ExpectedPpcLeFcfid",
 	"ExpectedPpcLeIcGuard",
 };
 

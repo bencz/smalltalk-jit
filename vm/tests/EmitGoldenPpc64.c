@@ -188,6 +188,19 @@ static void emitFloatXerCase(AssemblerBuffer *buffer)
 }
 
 
+// fcfid, the signed-int-to-double conversion the mixed int/float intrinsic
+// uses for a SmallInteger operand. A separate case rather than an addition to
+// the one above, so the existing vectors stay byte-identical and a diff here
+// can only mean this emitter changed.
+static void emitFcfidCase(AssemblerBuffer *buffer)
+{
+	asmFcfid(buffer, 0, 0);
+	asmFcfid(buffer, 1, 1);
+	asmFcfid(buffer, 0, 1);
+	asmFcfid(buffer, 31, 30);
+}
+
+
 // The SmallFloat64 decode/encode building blocks: pure 64-bit rotates plus
 // the ISA 2.07 GPR<->VSR moves (emitted only behind the isPower8 gate).
 static void emitSmallFloatOpsCase(AssemblerBuffer *buffer)
@@ -256,6 +269,8 @@ static const GoldenCase Cases[] = {
 	  ExpectedPpcFloatXer, sizeof(ExpectedPpcFloatXer) },
 	{ "smallfloat rotldi/rotrdi/mtvsrd/mfvsrd", emitSmallFloatOpsCase,
 	  ExpectedPpcSmallFloatOps, sizeof(ExpectedPpcSmallFloatOps) },
+	{ "fcfid", emitFcfidCase,
+	  ExpectedPpcFcfid, sizeof(ExpectedPpcFcfid) },
 	{ "ic guard (li64 cell/ld/ld/cmpd/bne/ld)", emitIcGuardCase,
 	  ExpectedPpcIcGuard, sizeof(ExpectedPpcIcGuard) },
 };
@@ -266,7 +281,8 @@ static const char *CaseArrayNames[] = {
 	"ExpectedPpcLoadTlsNeg", "ExpectedPpcCallCFunction",
 	"ExpectedPpcEntrySave", "ExpectedPpcEntryRestore",
 	"ExpectedPpcSubWord", "ExpectedPpcXoArith", "ExpectedPpcShiftCmp",
-	"ExpectedPpcFloatXer", "ExpectedPpcSmallFloatOps", "ExpectedPpcIcGuard",
+	"ExpectedPpcFloatXer", "ExpectedPpcSmallFloatOps", "ExpectedPpcFcfid",
+	"ExpectedPpcIcGuard",
 };
 
 static void hexdumpAsCArray(const char *name, const uint8_t *bytes, size_t size)

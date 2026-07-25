@@ -145,6 +145,11 @@ writeSharedTail() {
 	mfvsrd 5,0
 	mfvsrd 10,31
 	.machine pop
+# case: fcfid
+	fcfid 0,0
+	fcfid 1,1
+	fcfid 0,1
+	fcfid 31,30
 # case: ic guard (li64 cell placeholder + state/class loads + guard + target)
 	lis 10,0
 	ori 10,10,0

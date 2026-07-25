@@ -613,6 +613,17 @@ static _Bool floatInlineEnabled(void)
 }
 
 
+// MIXED int/float operands inside the float intrinsic (see the x64 twin).
+static _Bool mixedInlineEnabled(void)
+{
+	static int enabled = -1;
+	if (enabled < 0) {
+		enabled = getenv("ST_NO_INLINE_MIXED") == NULL;
+	}
+	return enabled;
+}
+
+
 // Map an ordered-compare arith kind to the branch-if-taken (BO, BI) pair for
 // a cr0 cmpd/fcmpu result. NaN handling for floats is a SEPARATE dedicated
 // branch on cr0.SO (fcmpu's unordered bit), cleaner than x64's parity flag.
@@ -658,17 +669,25 @@ static void generateFprToBits(AssemblerBuffer *buffer, int fpr, Register dst, Re
 }
 
 
-// Load one already-guarded Float operand (SmallFloat64 immediate OR
-// BoxedFloat64 pointer) into an FPR; cannot miss after the guard phase.
+// Load one already-guarded numeric operand into an FPR; cannot miss after the
+// guard phase, which leaves exactly three possibilities (see the x64 twin):
+//   0b11 SmallFloat64 immediate, 0b01 BoxedFloat64 pointer, 0b00 SmallInteger.
+// Character (0b10) is rejected by the guard and never arrives here.
 // offsetReg holds SMALLFLOAT_OFFSET and is preserved; R0 is the scratch;
 // reg itself stays intact.
 static void generateFloatOperandLoad(AssemblerBuffer *buffer, Register reg, int fpr,
 	Register offsetReg, Register tls)
 {
-	AssemblerLabel boxed, skipAdd, done;
+	AssemblerLabel boxed, skipAdd, done, intCase, doneBoxed;
 	asmInitLabel(&boxed);
 	asmInitLabel(&skipAdd);
 	asmInitLabel(&done);
+	asmInitLabel(&intCase);
+	asmInitLabel(&doneBoxed);
+
+	// bit 0 clear can only be 0b00 here (0b10 was rejected by the guard)
+	asmAndiDot(buffer, R0, reg, 1);
+	asmBeq(buffer, &intCase);
 
 	asmAndiDot(buffer, R0, reg, 2);          // bit 1 set here means immediate (0b11)
 	asmBeq(buffer, &boxed);
@@ -686,8 +705,19 @@ static void generateFloatOperandLoad(AssemblerBuffer *buffer, Register reg, int 
 
 	asmPpcLabelBind(buffer, &boxed, asmOffset(buffer));
 	asmLfd(buffer, fpr, varOffset(RawFloat, value), reg);
+	asmB(buffer, &doneBoxed);
 
+	// SmallInteger: arithmetic-shift off the 2 tag bits, move the integer into
+	// the FPR (mtvsrd, or the TLS scratch slot on pre-ISA-2.07 parts), then
+	// convert in place. POWER cannot convert straight from a GPR.
+	asmPpcLabelBind(buffer, &intCase, asmOffset(buffer));
+	asmSradi(buffer, R0, reg, 2);
+	generateBitsToFpr(buffer, R0, fpr, tls);
+	asmFcfid(buffer, fpr, fpr);
+
+	// Two labels for one point: a label takes a single forward reference.
 	asmPpcLabelBind(buffer, &done, asmOffset(buffer));
+	asmPpcLabelBind(buffer, &doneBoxed, asmOffset(buffer));
 }
 
 
@@ -714,12 +744,25 @@ static void generateFloatFastPath(CodeGenerator *generator, int arithKind,
 {
 	AssemblerBuffer *buffer = &generator->buffer;
 	AssemblerLabel tagMissR, tagMissA, immOkR, immOkA, classMissR, classMissA;
+	AssemblerLabel intOkR, intOkA, okR, okA, okBothA, okIntArg;
+	AssemblerLabel intMissA, classMissA2;
 	asmInitLabel(&tagMissR);
 	asmInitLabel(&tagMissA);
 	asmInitLabel(&immOkR);
 	asmInitLabel(&immOkA);
 	asmInitLabel(&classMissR);
 	asmInitLabel(&classMissA);
+	asmInitLabel(&intOkR);
+	asmInitLabel(&intOkA);
+	asmInitLabel(&okR);
+	asmInitLabel(&okA);
+	asmInitLabel(&okBothA);
+	asmInitLabel(&okIntArg);
+	asmInitLabel(&intMissA);
+	asmInitLabel(&classMissA2);
+	// A literal operand is a known SmallFloat64, so a literal on either side
+	// makes the both-integer case impossible and its check unnecessary.
+	_Bool mixedInts = litRcvBits == NULL && litArgBits == NULL && mixedInlineEnabled();
 
 	if (litRcvBits == NULL) {
 		asmLd(buffer, R3, 0, R1);                // receiver
@@ -733,25 +776,96 @@ static void generateFloatFastPath(CodeGenerator *generator, int arithKind,
 	if (litRcvBits == NULL || litArgBits == NULL) {
 		generateLoadObject(buffer, (RawObject *) Handles.BoxedFloat64->raw, R6, 0); // BoxedFloat64 class (raw)
 	}
-	if (litRcvBits == NULL) {
+	if (!mixedInts) {
+		// Floats only, exactly as before mixed operands existed.
+		if (litRcvBits == NULL) {
+			asmAndiDot(buffer, R0, R3, 1);
+			asmBeq(buffer, &tagMissR);           // 0b00/0b10: not a Float
+			asmAndiDot(buffer, R0, R3, 2);
+			asmBne(buffer, &immOkR);             // 0b11: immediate
+			asmLdT(buffer, R0, varOffset(RawObject, class), R3);
+			asmCmpd(buffer, 0, R0, R6);
+			asmBne(buffer, &classMissR);
+			asmPpcLabelBind(buffer, &immOkR, asmOffset(buffer));
+		}
+		if (litArgBits == NULL) {
+			asmAndiDot(buffer, R0, R4, 1);
+			asmBeq(buffer, &tagMissA);
+			asmAndiDot(buffer, R0, R4, 2);
+			asmBne(buffer, &immOkA);
+			asmLdT(buffer, R0, varOffset(RawObject, class), R4);
+			asmCmpd(buffer, 0, R0, R6);
+			asmBne(buffer, &classMissA);
+			asmPpcLabelBind(buffer, &immOkA, asmOffset(buffer));
+		}
+	} else if (litRcvBits != NULL || litArgBits != NULL) {
+		// One operand is a known SmallFloat64 literal: the pair can never be
+		// both-integer, so the other operand may be an int with no extra check.
+		Register reg = litRcvBits != NULL ? R4 : R3;
+		AssemblerLabel *tagMiss = litRcvBits != NULL ? &tagMissA : &tagMissR;
+		AssemblerLabel *classMiss = litRcvBits != NULL ? &classMissA : &classMissR;
+		AssemblerLabel *immOk = litRcvBits != NULL ? &immOkA : &immOkR;
+		AssemblerLabel *intOk = litRcvBits != NULL ? &intOkA : &intOkR;
+		AssemblerLabel *ok = litRcvBits != NULL ? &okA : &okR;
+		asmAndiDot(buffer, R0, reg, 1);
+		asmBeq(buffer, intOk);
+		asmAndiDot(buffer, R0, reg, 2);
+		asmBne(buffer, immOk);
+		asmLdT(buffer, R0, varOffset(RawObject, class), reg);
+		asmCmpd(buffer, 0, R0, R6);
+		asmBne(buffer, classMiss);
+		asmPpcLabelBind(buffer, immOk, asmOffset(buffer));
+		asmB(buffer, ok);
+		asmPpcLabelBind(buffer, intOk, asmOffset(buffer));
+		asmAndiDot(buffer, R0, reg, 2);
+		asmBne(buffer, tagMiss);                 // 0b10 Character
+		asmPpcLabelBind(buffer, ok, asmOffset(buffer));
+	} else {
+		// Neither operand is a literal, see the x64 twin for the full argument.
+		// The both-integer pair is rejected by SHAPE rather than by a separate
+		// test, so the float/float path keeps exactly the instruction sequence
+		// it had before mixed operands existed: a standalone check measured
+		// +7.4% wall on FloatBench, which is pure same-type float work.
 		asmAndiDot(buffer, R0, R3, 1);
-		asmBeq(buffer, &tagMissR);           // 0b00/0b10: not a Float
+		asmBeq(buffer, &intOkR);                 // receiver 0b00/0b10
 		asmAndiDot(buffer, R0, R3, 2);
-		asmBne(buffer, &immOkR);             // 0b11: immediate
+		asmBne(buffer, &immOkR);                 // receiver 0b11
 		asmLdT(buffer, R0, varOffset(RawObject, class), R3);
 		asmCmpd(buffer, 0, R0, R6);
 		asmBne(buffer, &classMissR);
 		asmPpcLabelBind(buffer, &immOkR, asmOffset(buffer));
-	}
-	if (litArgBits == NULL) {
+
+		// Receiver is a Float: the argument may be a Float OR an int.
 		asmAndiDot(buffer, R0, R4, 1);
-		asmBeq(buffer, &tagMissA);
+		asmBeq(buffer, &intOkA);
 		asmAndiDot(buffer, R0, R4, 2);
-		asmBne(buffer, &immOkA);
+		asmBne(buffer, &okR);                    // 0b11: committed
 		asmLdT(buffer, R0, varOffset(RawObject, class), R4);
 		asmCmpd(buffer, 0, R0, R6);
 		asmBne(buffer, &classMissA);
-		asmPpcLabelBind(buffer, &immOkA, asmOffset(buffer));
+		asmB(buffer, &okA);
+		asmPpcLabelBind(buffer, &intOkA, asmOffset(buffer));
+		asmAndiDot(buffer, R0, R4, 2);
+		asmBne(buffer, &tagMissA);               // 0b10 Character
+		asmB(buffer, &okIntArg);                 // int arg + float receiver: committed
+
+		// Receiver is an int (or a Character): the argument MUST be a Float,
+		// which is exactly where the both-integer pair is rejected.
+		asmPpcLabelBind(buffer, &intOkR, asmOffset(buffer));
+		asmAndiDot(buffer, R0, R3, 2);
+		asmBne(buffer, &tagMissR);               // 0b10 Character
+		asmAndiDot(buffer, R0, R4, 1);
+		asmBeq(buffer, &intMissA);               // arg int or Character: BOTH-INT, dispatch
+		asmAndiDot(buffer, R0, R4, 2);
+		asmBne(buffer, &okBothA);                // 0b11
+		asmLdT(buffer, R0, varOffset(RawObject, class), R4);
+		asmCmpd(buffer, 0, R0, R6);
+		asmBne(buffer, &classMissA2);
+
+		asmPpcLabelBind(buffer, &okR, asmOffset(buffer));
+		asmPpcLabelBind(buffer, &okA, asmOffset(buffer));
+		asmPpcLabelBind(buffer, &okBothA, asmOffset(buffer));
+		asmPpcLabelBind(buffer, &okIntArg, asmOffset(buffer));
 	}
 
 	// Committed: decode both operands into f0/f1. R5 = SMALLFLOAT_OFFSET
@@ -886,6 +1000,8 @@ static void generateFloatFastPath(CodeGenerator *generator, int arithKind,
 	asmPpcLabelBind(buffer, &tagMissA, asmOffset(buffer));
 	asmPpcLabelBind(buffer, &classMissR, asmOffset(buffer));
 	asmPpcLabelBind(buffer, &classMissA, asmOffset(buffer));
+	asmPpcLabelBind(buffer, &classMissA2, asmOffset(buffer));
+	asmPpcLabelBind(buffer, &intMissA, asmOffset(buffer));
 }
 
 

@@ -1224,6 +1224,23 @@ static void asmMovqToXmm(AssemblerBuffer *buffer, Register src, XmmRegister dst)
 	asmEmitOperands(buffer, &operands);
 }
 
+// cvtsi2sd xmm(dst), r64(src)   (F2 REX.W 0F 2A /r) : signed 64-bit integer to
+// double. NOT a bit move like asmMovqToXmm: this is the numeric conversion the
+// inline Float intrinsic uses for a SmallInteger operand, and it is exactly
+// what Float>>coerce: does through asFloat, including losing precision above
+// 2^53. Only the low 53 bits are exact, which is the same contract the
+// dispatched retry:coercing: path has always had.
+static void asmCvtsi2sdq(AssemblerBuffer *buffer, Register src, XmmRegister dst)
+{
+	Operands operands = {.mod = MOD_REG, .reg = dst, .rm = src};
+	asmEnsureCapacity(buffer);
+	asmEmitUint8(buffer, 0xF2);
+	asmEmitRexOperands(buffer, REX_W, &operands);
+	asmEmitUint8(buffer, 0x0F);
+	asmEmitUint8(buffer, 0x2A);
+	asmEmitOperands(buffer, &operands);
+}
+
 // movq r64(dst), xmm(src)   (66 REX.W 0F 7E /r) : raw bit move XMM -> GPR,
 // used by the SmallFloat64 immediate encode in the inline Float intrinsic
 static void asmMovqFromXmm(AssemblerBuffer *buffer, XmmRegister src, Register dst)
