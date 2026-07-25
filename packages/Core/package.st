@@ -53,6 +53,7 @@ PackageSpec new
 		'src/Collections/Dictionary.st'
 		'src/Collections/Set.st'
 		'src/Collections/ByteArray.st'
+		'src/Collections/FloatArray.st'
 		'src/Collections/Bag.st'
 		'src/Collections/OrderedCollection.st'
 		'src/Collections/SortedCollection.st'

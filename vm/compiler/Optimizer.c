@@ -48,6 +48,10 @@
 // caller + inline-area count must stay under 256 (the register allocator itself
 // is sized per method now). Conservative head-room kept from the old limit.
 #define OPT_MAX_TEMPS 120
+// Independent ceiling on a callee's bytecode size, bounding the fixed-size
+// instruction-start and jump-target maps in inlineEligible. ST_TIER_INLINE_MAX
+// is settable at runtime, so this must not assume anything about it.
+#define OPT_MAX_CALLEE_BYTES 512
 
 typedef struct {
 	AssemblerBuffer buffer;
@@ -507,10 +511,27 @@ static _Bool inlineEligible(CompiledCode *callee, InstanceShape shape)
 	if (callee->bytecodesSize == 0 || callee->bytecodesSize > tierInlineMax()) {
 		return 0;
 	}
+	// Bound for the fixed-size maps below. tierInlineMax is settable, so this
+	// is a second, independent ceiling rather than an assumption about it.
+	if (callee->bytecodesSize > OPT_MAX_CALLEE_BYTES) {
+		return 0;
+	}
+
+	// Every byte offset that starts an instruction, plus every jump target, so
+	// a target can be PROVED to land on a real instruction boundary inside this
+	// callee. Nothing else validates that: a target that split an instruction
+	// would have the body emit a jump into the middle of one, and the resulting
+	// bytecode would decode as garbage rather than fail.
+	_Bool isStart[OPT_MAX_CALLEE_BYTES + 1];
+	ptrdiff_t targets[OPT_MAX_CALLEE_BYTES + 1];
+	size_t targetCount = 0;
+	memset(isStart, 0, callee->bytecodesSize + 1);
+	isStart[callee->bytecodesSize] = 1; // one past the end: falls off the body
 
 	BytecodesIterator iterator;
 	bytecodeInitIterator(&iterator, callee->bytecodes, callee->bytecodesSize);
 	while (bytecodeHasNext(&iterator)) {
+		isStart[bytecodeOffset(&iterator)] = 1;
 		Bytecode bytecode = bytecodeNext(&iterator);
 		switch (bytecode) {
 		case BYTECODE_COPY: {
@@ -543,18 +564,110 @@ static _Bool inlineEligible(CompiledCode *callee, InstanceShape shape)
 			break;
 		}
 		case BYTECODE_RETURN:
+			// Any position, not just the tail: emitInlinedBody gives each
+			// return its own exit jump to the body's merge point.
 			if (!operandEligible(bytecodeNextOperand(&iterator), shape)) {
 				return 0;
 			}
-			if (bytecodeHasNext(&iterator)) { // tail position only
+			break;
+
+		case BYTECODE_JUMP: {
+			int32_t disp = bytecodeNextInt32(&iterator);
+			targets[targetCount++] = bytecodeOffset(&iterator) + disp;
+			break;
+		}
+
+		case BYTECODE_JUMP_NOT_MEMBER_OF: {
+			bytecodeNextUint16(&iterator); // class literal, re-interned on emit
+			Operand guarded = bytecodeNextOperand(&iterator);
+			if (!operandEligible(guarded, shape)) {
 				return 0;
 			}
+			// WARNING: a guarded INST_VAR is remapped by adjustOperand into
+			// OPERAND_INST_VAR_OF, and generateClassCheck has no arm for that
+			// form on either backend: it would take the default and FAIL().
+			// Every other eligible operand maps to a type it does handle. So a
+			// callee that branches on one of its own instance variables is
+			// rejected here until the backends learn the form. Found by the
+			// ST_TIER_INLINE_MAX sweep, which crashed Richards at 128.
+			if (guarded.type == OPERAND_INST_VAR) {
+				return 0;
+			}
+			int32_t disp = bytecodeNextInt32(&iterator);
+			targets[targetCount++] = bytecodeOffset(&iterator) + disp;
 			break;
-		default: // OUTER_RETURN, JUMP, JUMP_NOT_MEMBER_OF, or corrupt
+		}
+
+		default: // OUTER_RETURN (needs a real context) or corrupt
+			return 0;
+		}
+	}
+
+	for (size_t i = 0; i < targetCount; i++) {
+		if (targets[i] < 0 || targets[i] > (ptrdiff_t) callee->bytecodesSize
+				|| !isStart[targets[i]]) {
 			return 0;
 		}
 	}
 	return 1;
+}
+
+
+// Can control reach the END of the callee body, either by falling out of the
+// last instruction or by a jump aimed one past it? Used to decide whether the
+// "a method answers self" copy is emitted at all, and therefore whether a
+// tail RETURN needs a jump to skip it. Keeping this exact is what makes a
+// straight-line callee emit byte-identical bytecode to before control flow
+// was allowed, so the existing inlining does not regress.
+static _Bool calleeCanFallThrough(CompiledCode *callee)
+{
+	BytecodesIterator iterator;
+	Bytecode last = BYTECODE_COPY;
+	bytecodeInitIterator(&iterator, callee->bytecodes, callee->bytecodesSize);
+	while (bytecodeHasNext(&iterator)) {
+		Bytecode bytecode = bytecodeNext(&iterator);
+		last = bytecode;
+		switch (bytecode) {
+		case BYTECODE_JUMP: {
+			int32_t disp = bytecodeNextInt32(&iterator);
+			if (bytecodeOffset(&iterator) + disp == (ptrdiff_t) callee->bytecodesSize) {
+				return 1;
+			}
+			break;
+		}
+		case BYTECODE_JUMP_NOT_MEMBER_OF: {
+			bytecodeNextUint16(&iterator);
+			bytecodeNextOperand(&iterator);
+			int32_t disp = bytecodeNextInt32(&iterator);
+			if (bytecodeOffset(&iterator) + disp == (ptrdiff_t) callee->bytecodesSize) {
+				return 1;
+			}
+			break;
+		}
+		case BYTECODE_COPY:
+			bytecodeNextOperand(&iterator);
+			bytecodeNextOperand(&iterator);
+			break;
+		case BYTECODE_SEND:
+		case BYTECODE_SEND_WITH_STORE: {
+			bytecodeNextUint16(&iterator);
+			uint8_t argsSize = bytecodeNextByte(&iterator);
+			for (uint8_t i = 0; i < argsSize + 1; i++) {
+				bytecodeNextOperand(&iterator);
+			}
+			if (bytecode == BYTECODE_SEND_WITH_STORE) {
+				bytecodeNextOperand(&iterator);
+			}
+			break;
+		}
+		default: // RETURN
+			bytecodeNextOperand(&iterator);
+			break;
+		}
+	}
+	// An unconditional JUMP already answered above if it aimed at the end; any
+	// other trailing instruction except a RETURN falls out of the body.
+	return last != BYTECODE_RETURN && last != BYTECODE_JUMP;
 }
 
 
@@ -579,13 +692,56 @@ static _Bool operandEligible(Operand operand, InstanceShape shape)
 }
 
 
+// Emit the callee's body into the caller's stream, remapping every operand and
+// RELOCATING every jump.
+//
+// The callee's jumps get their OWN relocation table and their own
+// newOffsetAt map, never the caller's. Both index spaces are plain byte
+// offsets and would collide numerically: a callee offset looked up in the
+// caller's map silently yields some unrelated caller instruction, which is a
+// wrong jump rather than a crash.
+//
+// Control leaves the body at two distinct points:
+//   fallEnd  reached by falling out of the last instruction, or by a jump
+//            aimed one past it. This is where "a method answers self" is
+//            emitted, because reaching the end without returning IS that case.
+//   bodyEnd  reached by an explicit RETURN, which must therefore SKIP the
+//            self copy rather than let it clobber the returned value.
+// When the self copy is not emitted at all the two coincide.
 static void emitInlinedBody(InlineContext *ctx, CompiledCode *callee, Operand result)
 {
 	Optimizer *opt = ctx->opt;
 	BytecodesIterator iterator;
-	_Bool returned = 0;
-	bytecodeInitIterator(&iterator, callee->bytecodes, callee->bytecodesSize);
+	size_t bcSize = callee->bytecodesSize;
+
+	ptrdiff_t *newOffsetAt = malloc((bcSize + 1) * sizeof(ptrdiff_t));
+	JumpReloc *relocs = malloc((bcSize + 1) * sizeof(JumpReloc));
+	// One exit label per RETURN; a RETURN is at least 2 bytes, so bcSize bounds
+	// them. Each label takes exactly ONE forward reference (asmEmitLabel32
+	// asserts it), which is why they cannot share a single `bodyEnd` label.
+	AssemblerLabel *returnExits = malloc((bcSize + 1) * sizeof(AssemblerLabel));
+	size_t relocCount = 0;
+	size_t returnExitCount = 0;
+	if (newOffsetAt == NULL || relocs == NULL || returnExits == NULL) {
+		FAIL();
+	}
+
+	// Emitting the self copy is what forces a tail RETURN to jump over it.
+	// Deciding it up front keeps a straight-line callee byte-identical to what
+	// the pre-control-flow inliner produced.
+	_Bool selfCopy = result.isValid && calleeCanFallThrough(callee);
+
+	bytecodeInitIterator(&iterator, callee->bytecodes, bcSize);
 	while (bytecodeHasNext(&iterator)) {
+		ptrdiff_t origOffset = bytecodeOffset(&iterator);
+		newOffsetAt[origOffset] = asmOffset(&opt->buffer);
+		for (size_t r = 0; r < relocCount; r++) {
+			if (!relocs[r].bound && relocs[r].origTarget == origOffset) {
+				asmLabelBind(&opt->buffer, &relocs[r].label, asmOffset(&opt->buffer));
+				relocs[r].bound = 1;
+			}
+		}
+
 		Bytecode bytecode = bytecodeNext(&iterator);
 		switch (bytecode) {
 		case BYTECODE_COPY: {
@@ -631,16 +787,65 @@ static void emitInlinedBody(InlineContext *ctx, CompiledCode *callee, Operand re
 		}
 
 		case BYTECODE_RETURN: {
-			// Tail position (eligibility): the callee's answer flows into the
-			// original send's result operand; a statement-position send
-			// discards it, and the return OPERAND is an effect-free read.
+			// Any position now. The callee's answer flows into the original
+			// send's result operand; a statement-position send discards it,
+			// and the return OPERAND is an effect-free read.
 			Operand value = bytecodeNextOperand(&iterator);
-			returned = 1;
 			if (result.isValid) {
 				adjustOperand(ctx, &value);
 				bytecodeCopy(&opt->buffer, &value, &result);
 				noteInstructions(opt);
 			}
+			// Skip the rest of the body. Not needed when this is the last
+			// instruction AND nothing follows it to skip, which is exactly the
+			// straight-line shape the old inliner handled.
+			if (bytecodeHasNext(&iterator) || selfCopy) {
+				AssemblerLabel *exit = &returnExits[returnExitCount++];
+				asmInitLabel(exit);
+				bytecodeJump(&opt->buffer, exit);
+				noteInstructions(opt);
+			}
+			break;
+		}
+
+		case BYTECODE_JUMP: {
+			int32_t disp = bytecodeNextInt32(&iterator);
+			ptrdiff_t target = bytecodeOffset(&iterator) + disp;
+			JumpReloc *reloc = &relocs[relocCount++];
+			reloc->origTarget = target;
+			reloc->bound = 0;
+			asmInitLabel(&reloc->label);
+			if (disp < 0) {
+				asmLabelBind(&opt->buffer, &reloc->label, newOffsetAt[target]);
+				reloc->bound = 1;
+			}
+			bytecodeJump(&opt->buffer, &reloc->label);
+			noteInstructions(opt);
+			break;
+		}
+
+		case BYTECODE_JUMP_NOT_MEMBER_OF: {
+			uint16_t classIndex = bytecodeNextUint16(&iterator);
+			Operand operand = bytecodeNextOperand(&iterator);
+			adjustOperand(ctx, &operand);
+			int32_t disp = bytecodeNextInt32(&iterator);
+			ptrdiff_t target = bytecodeOffset(&iterator) + disp;
+			// The guarded class is a CALLEE literal and must be re-interned
+			// into the merged frame like every other literal the body uses.
+			ptrdiff_t classLiteral = ordCollAddObjectIfNotExists(opt->literals,
+				arrayObjectAt(ctx->calleeLiterals, classIndex));
+			ASSERT(classLiteral <= 255);
+			JumpReloc *reloc = &relocs[relocCount++];
+			reloc->origTarget = target;
+			reloc->bound = 0;
+			asmInitLabel(&reloc->label);
+			if (disp < 0) {
+				asmLabelBind(&opt->buffer, &reloc->label, newOffsetAt[target]);
+				reloc->bound = 1;
+			}
+			bytecodeJumpNotMemberOf(&opt->buffer, &operand, (uint16_t) classLiteral,
+				&reloc->label);
+			noteInstructions(opt);
 			break;
 		}
 
@@ -649,13 +854,33 @@ static void emitInlinedBody(InlineContext *ctx, CompiledCode *callee, Operand re
 		}
 	}
 
-	if (!returned && result.isValid) {
+	// fallEnd: jumps aimed one past the last instruction land with the
+	// fall-through, because both mean "reached the end without returning".
+	for (size_t r = 0; r < relocCount; r++) {
+		if (!relocs[r].bound && relocs[r].origTarget == (ptrdiff_t) bcSize) {
+			asmLabelBind(&opt->buffer, &relocs[r].label, asmOffset(&opt->buffer));
+			relocs[r].bound = 1;
+		}
+		ASSERT(relocs[r].bound);
+	}
+
+	if (selfCopy) {
 		// Fell off the end: a method answers self.
 		Operand selfTemp = { .isValid = 1, .type = OPERAND_TEMP_VAR,
 			.index = (uint16_t) ctx->base };
 		bytecodeCopy(&opt->buffer, &selfTemp, &result);
 		noteInstructions(opt);
 	}
+
+	// bodyEnd: every explicit RETURN, which has already written the result and
+	// must not be clobbered by the self copy above.
+	for (size_t i = 0; i < returnExitCount; i++) {
+		asmLabelBind(&opt->buffer, &returnExits[i], asmOffset(&opt->buffer));
+	}
+
+	free(newOffsetAt);
+	free(relocs);
+	free(returnExits);
 }
 
 

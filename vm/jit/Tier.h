@@ -109,12 +109,31 @@ static size_t tierThreshold(void)
 // Byte-size ceiling for a callee's bytecode stream to qualify for speculative
 // inlining (compiler/Optimizer.c). ST_TIER_INLINE_MAX=0 disables inlining
 // while keeping the rest of the tier (the isolation knob for A/B).
+//
+// The default was 24 while callees had to be straight-line. Once the inliner
+// learned control flow, 24 turned out to admit NOTHING new: an ifTrue:ifFalse:
+// alone is a guard plus two jumps plus both arms, comfortably past it. Measured
+// inlinedSites at each ceiling, straight-line-only versus with control flow:
+//
+//   ceiling   Richards        DeltaBlue
+//   24        17 -> 17        73 -> 73     control flow admits nothing
+//   48        17 -> 17        89 -> 89     still nothing; the growth is the cap
+//   96        17 -> 19        92 -> 103
+//   256       17 -> 24        93 -> 108
+//
+// So the size ceiling, not the straight-line rule, was the real gate. At 96 the
+// executed-instruction counts fall 0.79% on Richards and 1.40% on DeltaBlue,
+// while MixedArithBench, FloatBench and ArrayNumericBench move by 0.000%, so
+// the wider ceiling costs nothing measurable where it does not apply. 256 buys
+// Richards a little more and DeltaBlue nothing, which is not worth the code
+// growth on a lottery this VM has lost before (see the tier slow-path
+// out-of-lining note below).
 static size_t tierInlineMax(void)
 {
 	static long limit = -1;
 	if (limit < 0) {
 		char *env = getenv("ST_TIER_INLINE_MAX");
-		limit = env != NULL ? atol(env) : 24;
+		limit = env != NULL ? atol(env) : 96;
 		if (limit < 0) {
 			limit = 0;
 		}

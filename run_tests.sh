@@ -184,6 +184,65 @@ else
 	failed="$failed PROJECT_TOOLING_E2E"
 fi
 
+# FloatArray's byte payload must survive a SNAPSHOT unchanged. That cannot be
+# asserted from a test running in an already-loaded image, so it is done
+# through the project tooling: the array is built in a class-side initialize,
+# which runs during `st build` and is therefore serialized, and `st run` loads
+# that image and reads it back. Covers the values that make the encoding
+# interesting: one that must box on read, an infinity, and one whose decimal
+# spelling is not its exact value.
+floatarray_snapshot_e2e() {
+	local dir SNAP ST
+	SNAP="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+	ST="$(cd "$BUILD" && pwd)/st"
+	dir="$(cd "$BUILD" && pwd)/e2e-floatarray"
+	rm -rf "$dir"
+	mkdir -p "$dir"
+	( cd "$dir" && ST_IMAGE="$SNAP" "$ST" new fa >/dev/null 2>&1 ) || return 1
+	cat > "$dir/fa/src/Main.st" <<'FAEOF'
+FaHolder := Object [
+	| Samples |
+	class initialize [
+		Samples := FloatArray new: 4.
+		Samples at: 1 put: 1.5.
+		Samples at: 2 put: 1.0e300.
+		Samples at: 3 put: 0.1.
+		Samples at: 4 put: Float infinity.
+	]
+	class samples [ ^Samples ]
+]
+
+Main := Object [
+	class main: args [
+		| a bad |
+		a := FaHolder samples.
+		bad := 0.
+		a size = 4 ifFalse: [bad := bad + 1].
+		(a at: 1) = 1.5 ifFalse: [bad := bad + 1].
+		(a at: 2) = 1.0e300 ifFalse: [bad := bad + 1].
+		(a at: 2) class = BoxedFloat64 ifFalse: [bad := bad + 1].
+		(a at: 3) = 0.1 ifFalse: [bad := bad + 1].
+		((a at: 3) asExactFraction = (1/10)) ifTrue: [bad := bad + 1].
+		(a at: 4) isInfinite ifFalse: [bad := bad + 1].
+		a sum isInfinite ifFalse: [bad := bad + 1].
+		^bad
+	]
+]
+FAEOF
+	( cd "$dir/fa" \
+		&& ST_IMAGE="$SNAP" "$ST" build 2>&1 | grep -q "^built " \
+		&& ST_IMAGE="$SNAP" "$ST" run >/dev/null 2>&1; [ $? -eq 0 ] ) || return 1
+	return 0
+}
+if floatarray_snapshot_e2e "$SNAP"; then
+	printf "  ${G}pass${Z}  %s\n" "FLOATARRAY_SNAPSHOT"
+	pass=$((pass + 1))
+else
+	printf "  ${R}FAIL${Z}  %s\n" "FLOATARRAY_SNAPSHOT"
+	fail=$((fail + 1))
+	failed="$failed FLOATARRAY_SNAPSHOT"
+fi
+
 # The committed project samples must keep building and answering what
 # samples/projects/README.md promises: declared namespaces plus the
 # reflective listing (namespaces/), package modules with imports and

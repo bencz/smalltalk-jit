@@ -361,6 +361,14 @@ int messageSelfTest(void)
 		"| d | d := Dictionary new. d at: #one put: 1. d at: #two put: #(2 3 4). d at: 'name' put: 'bob'. d",
 		"(1 to: 50) asArray",
 		"1.0e300",
+		// FloatArray: a BYTE-shaped payload that is really doubles. It exists
+		// here because structEqual compares byte-shaped contents with memcmp,
+		// so a bit-exact round trip is asserted, including the value that has
+		// to box on read (1.0e300) and the one whose decimal spelling is not
+		// its exact value (0.1). The wire format is native-endian, the same
+		// stance as the snapshot, so this also gates both POWER byte orders.
+		"| a | a := FloatArray new: 4. a at: 1 put: 1.5. a at: 2 put: -0.25."
+		" a at: 3 put: 1.0e300. a at: 4 put: 0.1. a",
 	};
 	int failures = 0;
 	for (size_t k = 0; k < sizeof(cases) / sizeof(cases[0]); k++) {

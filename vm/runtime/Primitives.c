@@ -70,6 +70,13 @@ static PrimitiveResult becomePrimitive(Value object, Value other);
 static PrimitiveResult workerParallelPrimitive(Value self, Value blocks);
 static PrimitiveResult contextPositionDescriptorPrimitive(Value vContext);
 static PrimitiveResult stringAsSymbolPrimitive(Value receiver);
+static PrimitiveResult floatArrayAtPrimitive(Value vSelf, Value vIndex);
+static PrimitiveResult floatArrayAtPutPrimitive(Value vSelf, Value vIndex, Value vValue);
+static PrimitiveResult floatArrayReducePrimitive(Value vSelf, Value vOp);
+static PrimitiveResult floatArrayDotPrimitive(Value vSelf, Value vOther);
+static PrimitiveResult floatArrayBinaryPrimitive(Value vSelf, Value vOther, Value vDest, Value vOp);
+static PrimitiveResult floatArrayScalarPrimitive(Value vSelf, Value vScalar, Value vDest, Value vOp);
+static PrimitiveResult floatArrayFillPrimitive(Value vSelf, Value vValue);
 static PrimitiveResult streamOpenPrimitive(Value fileStream, Value fileName, Value mode);
 static PrimitiveResult streamClosePrimitive(Value fileStream, Value descriptor);
 static PrimitiveResult streamReadPrimitive(Value vStream, Value descriptor, Value vSize, Value vBuffer, Value vStart);
@@ -448,6 +455,18 @@ Primitive Primitives[] = {
 	{"Base64EncodePrimitive", CCALL, .cFunction = base64EncodePrimitive, 2},
 	{"Base64DecodePrimitive", CCALL, .cFunction = base64DecodePrimitive, 2},
 	{"Base64DecodeBytesPrimitive", CCALL, .cFunction = base64DecodeBytesPrimitive, 2},
+	// Appended (NEVER reorder this table): FloatArray, unboxed IEEE-754 doubles
+	// in a BytesShape payload. The accessors matter for correctness; the bulk
+	// kernels are the point, since they remove the per-element send, tag decode
+	// and boxing that an Array of Floats pays. Every one of them fails into a
+	// Smalltalk fallback that raises the precise error.
+	{"FloatArrayAtPrimitive", CCALL, .cFunction = floatArrayAtPrimitive, 2},
+	{"FloatArrayAtPutPrimitive", CCALL, .cFunction = floatArrayAtPutPrimitive, 3},
+	{"FloatArrayReducePrimitive", CCALL, .cFunction = floatArrayReducePrimitive, 2},
+	{"FloatArrayDotPrimitive", CCALL, .cFunction = floatArrayDotPrimitive, 2},
+	{"FloatArrayBinaryPrimitive", CCALL, .cFunction = floatArrayBinaryPrimitive, 4},
+	{"FloatArrayScalarPrimitive", CCALL, .cFunction = floatArrayScalarPrimitive, 4},
+	{"FloatArrayFillPrimitive", CCALL, .cFunction = floatArrayFillPrimitive, 2},
 };
 
 
@@ -2180,6 +2199,239 @@ static PrimitiveResult floatAsStringPrimitive(Value self)
 	Value result = getTaggedPtr(asString(buf));
 	closeHandleScope(&scope, NULL);
 	return primSuccess(result);
+}
+
+
+/*
+ * FloatArray: a BytesShape collection whose bytes ARE native-endian IEEE-754
+ * doubles, with no per-element tag and nothing for the GC to scan.
+ *
+ * Why BytesShape and not a new InstanceShape field: computeInstanceSize knows
+ * exactly two element widths (1 byte when isBytes, else 8 for pointer slots),
+ * and widening it would break the three places that pun an InstanceShape into a
+ * Value plus the hardcoded bit math in Behavior.st. It also would not help:
+ * the generic AtPrimitive rebuilds a Value as `(byte << 2) + shape.valueType`,
+ * and there is no encoding in that scheme for "make a double out of 8 bytes",
+ * so dedicated accessors are needed either way. As bytes, the GC, the snapshot
+ * and actor message passing all work with no change at all: they already
+ * memcpy byte-shaped indexed contents verbatim, and isFloatShape (which would
+ * confuse a BoxedFloat64 with this) requires !isIndexed.
+ *
+ * The receiver is validated by SHAPE, not by class identity, exactly like
+ * replaceBytesPrimitive: these are installed only on FloatArray, and a
+ * primitive pointed at the wrong class is a kernel bug like any other. The
+ * byte count must be a whole number of doubles, which a String never satisfies
+ * by accident for a non-multiple-of-8 length and which costs one test.
+ *
+ * Alignment: an indexed byte payload starts at offset 24 from a 16-aligned
+ * object base, so it is 8-aligned and a double load is never misaligned.
+ */
+static _Bool floatArrayElements(Value vSelf, double **elements, size_t *count)
+{
+	if (!valueTypeOf(vSelf, VALUE_POINTER)) {
+		return 0;
+	}
+	RawObject *self = asObject(vSelf);
+	InstanceShape shape = self->class->instanceShape;
+	if (!shape.isIndexed || !shape.isBytes) {
+		return 0;
+	}
+	size_t bytes = rawObjectSize(self);
+	if (bytes % sizeof(double) != 0) {
+		return 0;
+	}
+	*elements = (double *) getRawObjectIndexedVars(self);
+	*count = bytes / sizeof(double);
+	return 1;
+}
+
+
+// Accepts any Number the tower can represent exactly as a double operand: a
+// Float (immediate or boxed) or a SmallInteger, matching what the mixed
+// arithmetic path coerces. Anything else fails into the Smalltalk fallback,
+// which raises the precise error.
+static _Bool floatArrayValue(Value v, double *out)
+{
+	if (isFloatValue(v)) {
+		*out = toDouble(v);
+		return 1;
+	}
+	if (valueTypeOf(v, VALUE_INT)) {
+		*out = (double) asCInt(v);
+		return 1;
+	}
+	return 0;
+}
+
+
+static PrimitiveResult floatArrayAtPrimitive(Value vSelf, Value vIndex)
+{
+	double *elements;
+	size_t count;
+	if (!floatArrayElements(vSelf, &elements, &count) || !valueTypeOf(vIndex, VALUE_INT)) {
+		return primFailed();
+	}
+	intptr_t index = asCInt(vIndex);
+	if (index < 1 || (size_t) index > count) {
+		return primFailed();
+	}
+	return primSuccess(fromDoubleResult(elements[index - 1]));
+}
+
+
+static PrimitiveResult floatArrayAtPutPrimitive(Value vSelf, Value vIndex, Value vValue)
+{
+	double *elements;
+	size_t count;
+	double value;
+	if (!floatArrayElements(vSelf, &elements, &count) || !valueTypeOf(vIndex, VALUE_INT)
+			|| !floatArrayValue(vValue, &value)) {
+		return primFailed();
+	}
+	intptr_t index = asCInt(vIndex);
+	if (index < 1 || (size_t) index > count) {
+		return primFailed();
+	}
+	elements[index - 1] = value;
+	// No write barrier: the payload holds raw doubles, never object pointers,
+	// which is the whole point of the shape.
+	return primSuccess(vValue);
+}
+
+
+// Reductions. These are where the win is: no per-element send, no tag decode,
+// no boxing of intermediates, and nothing for the collector to scan.
+enum {
+	FLOAT_ARRAY_SUM = 1,
+	FLOAT_ARRAY_MAX = 2,
+	FLOAT_ARRAY_MIN = 3,
+};
+
+static PrimitiveResult floatArrayReducePrimitive(Value vSelf, Value vOp)
+{
+	double *elements;
+	size_t count;
+	if (!floatArrayElements(vSelf, &elements, &count) || !valueTypeOf(vOp, VALUE_INT)) {
+		return primFailed();
+	}
+	intptr_t op = asCInt(vOp);
+	if (op == FLOAT_ARRAY_SUM) {
+		double sum = 0.0;
+		for (size_t i = 0; i < count; i++) {
+			sum += elements[i];
+		}
+		return primSuccess(fromDoubleResult(sum));
+	}
+	// max and min have no identity element, so an empty array must fail into
+	// the Smalltalk fallback, which raises EmptyCollectionError.
+	if (count == 0) {
+		return primFailed();
+	}
+	double best = elements[0];
+	for (size_t i = 1; i < count; i++) {
+		// NaN-propagating comparison would answer whichever end it started
+		// from; keep it simple and match Collection>>max, which uses <.
+		if (op == FLOAT_ARRAY_MAX ? elements[i] > best : elements[i] < best) {
+			best = elements[i];
+		}
+	}
+	return primSuccess(fromDoubleResult(best));
+}
+
+
+static PrimitiveResult floatArrayDotPrimitive(Value vSelf, Value vOther)
+{
+	double *a, *b;
+	size_t countA, countB;
+	if (!floatArrayElements(vSelf, &a, &countA) || !floatArrayElements(vOther, &b, &countB)
+			|| countA != countB) {
+		return primFailed();
+	}
+	double sum = 0.0;
+	for (size_t i = 0; i < countA; i++) {
+		sum += a[i] * b[i];
+	}
+	return primSuccess(fromDoubleResult(sum));
+}
+
+
+// Elementwise and scalar arithmetic. The DESTINATION is allocated in Smalltalk
+// and passed in, so these stay pure C loops over three buffers with no
+// allocation and therefore no GC interaction at all. One primitive with an
+// opcode rather than four: the table is append-only forever, so a family of
+// near-identical kernels is exactly the case for spending one slot.
+enum {
+	FLOAT_ARRAY_ADD = 1,
+	FLOAT_ARRAY_SUB = 2,
+	FLOAT_ARRAY_MUL = 3,
+	FLOAT_ARRAY_DIV = 4,
+};
+
+static double floatArrayApply(intptr_t op, double x, double y)
+{
+	switch (op) {
+	case FLOAT_ARRAY_ADD: return x + y;
+	case FLOAT_ARRAY_SUB: return x - y;
+	case FLOAT_ARRAY_MUL: return x * y;
+	default:              return x / y;  // FLOAT_ARRAY_DIV, IEEE: /0 is Inf/NaN
+	}
+}
+
+
+static PrimitiveResult floatArrayBinaryPrimitive(Value vSelf, Value vOther, Value vDest, Value vOp)
+{
+	double *a, *b, *dest;
+	size_t countA, countB, countDest;
+	if (!floatArrayElements(vSelf, &a, &countA) || !floatArrayElements(vOther, &b, &countB)
+			|| !floatArrayElements(vDest, &dest, &countDest)
+			|| !valueTypeOf(vOp, VALUE_INT)
+			|| countA != countB || countA != countDest) {
+		return primFailed();
+	}
+	intptr_t op = asCInt(vOp);
+	if (op < FLOAT_ARRAY_ADD || op > FLOAT_ARRAY_DIV) {
+		return primFailed();
+	}
+	for (size_t i = 0; i < countA; i++) {
+		dest[i] = floatArrayApply(op, a[i], b[i]);
+	}
+	return primSuccess(vDest);
+}
+
+
+static PrimitiveResult floatArrayScalarPrimitive(Value vSelf, Value vScalar, Value vDest, Value vOp)
+{
+	double *a, *dest;
+	size_t countA, countDest;
+	double scalar;
+	if (!floatArrayElements(vSelf, &a, &countA) || !floatArrayElements(vDest, &dest, &countDest)
+			|| !floatArrayValue(vScalar, &scalar) || !valueTypeOf(vOp, VALUE_INT)
+			|| countA != countDest) {
+		return primFailed();
+	}
+	intptr_t op = asCInt(vOp);
+	if (op < FLOAT_ARRAY_ADD || op > FLOAT_ARRAY_DIV) {
+		return primFailed();
+	}
+	for (size_t i = 0; i < countA; i++) {
+		dest[i] = floatArrayApply(op, a[i], scalar);
+	}
+	return primSuccess(vDest);
+}
+
+
+static PrimitiveResult floatArrayFillPrimitive(Value vSelf, Value vValue)
+{
+	double *elements;
+	size_t count;
+	double value;
+	if (!floatArrayElements(vSelf, &elements, &count) || !floatArrayValue(vValue, &value)) {
+		return primFailed();
+	}
+	for (size_t i = 0; i < count; i++) {
+		elements[i] = value;
+	}
+	return primSuccess(vSelf);
 }
 
 
