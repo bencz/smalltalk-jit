@@ -51,6 +51,15 @@ static void sysvEmitLoadTls(AssemblerBuffer *buffer, Register dst, ptrdiff_t tpo
 	asmLeaq(buffer, asmMem(dst, NO_REGISTER, SS_1, tpoff), dst); // dst += tpoff
 }
 
+// Load one WORD out of the running worker's TLS block: dst = *(tp + offset).
+// The %fs-prefixed load already carries a disp32, so the self-ref load, the
+// lea and the caller's dereference all collapse into this one instruction.
+static void sysvEmitLoadTlsField(AssemblerBuffer *buffer, Register dst, ptrdiff_t offset)
+{
+	ASSERT(INT32_MIN <= offset && offset <= INT32_MAX);
+	sysvMovqFsAbs(buffer, (int32_t) offset, dst);
+}
+
 // Load the CCALL primitive's Smalltalk-stack arguments (receiver+args pushed
 // by the send: slot i at [RSP + (i+1)*8]) into the SysV argument registers.
 static void sysvEmitCCallPrimArgs(AssemblerBuffer *buffer, size_t argsSize)
@@ -104,6 +113,7 @@ const X64Abi AbiX64SysV = {
 	.emitEntrySaveRegs = sysvEmitEntrySaveRegs,
 	.emitEntryRestoreRegs = sysvEmitEntryRestoreRegs,
 	.emitLoadTls = sysvEmitLoadTls,
+	.emitLoadTlsField = sysvEmitLoadTlsField,
 	.emitCCallPrimArgs = sysvEmitCCallPrimArgs,
 	.emitPrimResultCheck = sysvEmitPrimResultCheck,
 	.fiberSwitch = fiberSwitchSysV,

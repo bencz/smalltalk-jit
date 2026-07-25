@@ -33,6 +33,7 @@
 #include "compiler/Compiler.h"
 #include "jit/CodeDescriptors.h"
 #include "jit/SendClassify.h"
+#include "jit/PrologueSlots.h"
 #include "jit/Tier.h"
 #include "jit/PerfMap.h"
 #include "core/Thread.h"
@@ -219,11 +220,18 @@ static void generatePrologue(CodeGenerator *generator, size_t frameSize)
 	asmPush(buffer, FP);              // saved FP     (x64: push rbp)
 	asmMr(buffer, FP, R1);            // FP = StackFrame*
 	asmAddi(buffer, R1, R1, -(ptrdiff_t) (frameSize * sizeof(intptr_t)));
-	// Nil-initialise the local frame slots (same GC rationale as x64).
-	if (frameSize > 0) {
+	// Nil-initialise the local frame slots (same GC rationale as x64), skipping
+	// the ones generateContextDefinition overwrites immediately (jit/PrologueSlots.h).
+	if (frameSize > 0 && prologueNilSlotCount(generator, frameSize) > 0) {
+		ptrdiff_t deadIc = prologueDeadIcSlotOffset();
+		ptrdiff_t deadContext = prologueDeadContextSlotOffset(generator);
 		generateLoadObject(buffer, Handles.nil->raw, TMP, 1);
 		for (size_t i = 0; i < frameSize; i++) {
-			asmStd(buffer, TMP, -(ptrdiff_t) (i + 1) * sizeof(intptr_t), FP);
+			ptrdiff_t offset = -(ptrdiff_t) (i + 1) * sizeof(intptr_t);
+			if (offset == deadIc || offset == deadContext) {
+				continue;
+			}
+			asmStd(buffer, TMP, offset, FP);
 		}
 	}
 }
@@ -248,27 +256,30 @@ static void generateContextDefinition(CodeGenerator *generator)
 
 	// spill native code entry (TGT still holds it at method entry)
 	asmStd(buffer, TGT, -(ptrdiff_t) sizeof(intptr_t), FP);
+	prologueNoteContextDefStore(generator, -(ptrdiff_t) sizeof(intptr_t));
 
 	if (generator->code.isBlock) {
 		// setup frame pointer inside the context
 		asmStdT(buffer, FP, varOffset(RawContext, frame), varReg(context));
 		spillVar(generator, context);
+		prologueNoteContextDefStore(generator, context->frameOffset * sizeof(intptr_t));
 
 	} else {
 		if (generator->code.header.hasContext) {
 			generateMethodContextAllocation(generator, generator->code.header.contextSize);
 		} else {
-			// load the RUNNING worker's thread from TLS, then its dummy context
-			asmLoadTls(buffer, TMP, gCurrentThreadTpoff);
-			asmLd(buffer, TMP, offsetof(Thread, context), TMP);
+			// load the RUNNING worker's dummy (root) context straight out of TLS
+			asmLoadTlsField(buffer, TMP, gCurrentThreadTpoff + offsetof(Thread, context));
 			// spill dummy context
 			asmStd(buffer, TMP, context->frameOffset * sizeof(intptr_t), FP);
+			prologueNoteContextDefStore(generator, context->frameOffset * sizeof(intptr_t));
 		}
 		context->flags |= VAR_ON_STACK;
 	}
 
 	ASSERT(context->flags & VAR_IN_REG);
 	ASSERT(context->flags & VAR_ON_STACK);
+	prologueAssertDeadSlotsWritten(generator);
 }
 
 
@@ -291,9 +302,10 @@ static void generateSafepointPoll(CodeGenerator *generator, _Bool atBackEdge)
 	AssemblerLabel noGc;
 	asmInitLabel(&noGc);
 
-	// TMP = CTX->thread->heap
-	asmLdT(buffer, TMP, varOffset(RawContext, thread), CTX);
-	asmLd(buffer, TMP, offsetof(Thread, heap), TMP);
+	// TMP = the RUNNING worker's heap, straight out of TLS (see the x64 original:
+	// fewer dependent loads, and it drops the CTX->thread staleness the slow path
+	// below already refuses).
+	asmLoadTlsField(buffer, TMP, gCurrentThreadTpoff + offsetof(Thread, heap));
 	asmLwz(buffer, R0, offsetof(Heap, safepointRequested), TMP);
 	asmCmpldi(buffer, 0, R0, 0);
 	asmBeq(buffer, &noGc);
@@ -1396,8 +1408,7 @@ void generateStoreCheck(CodeGenerator *generator, Register object, Register valu
 	asmStb(buffer, R0, tagsOffset, object);
 
 	// TMP = the RUNNING worker's remembered-set head block (TLS)
-	asmLoadTls(buffer, TMP, gCurrentThreadTpoff);
-	asmLd(buffer, TMP, blocksOffset, TMP);
+	asmLoadTlsField(buffer, TMP, gCurrentThreadTpoff + blocksOffset);
 
 	// Grow BEFORE the store when the block is full (see x64). r0 = end,
 	// TMP2 = current, no push/pop dance needed (both are free scratch).
@@ -1412,8 +1423,7 @@ void generateStoreCheck(CodeGenerator *generator, Register object, Register valu
 	asmAddi(buffer, R3, TMP, rememberedSetOffset);
 	generateCCall(generator, (intptr_t) rememberedSetGrow, 1, 0);
 	abiEmitCallerSavedPop(gPpc64Abi, buffer);
-	asmLoadTls(buffer, TMP, gCurrentThreadTpoff);
-	asmLd(buffer, TMP, blocksOffset, TMP);
+	asmLoadTlsField(buffer, TMP, gCurrentThreadTpoff + blocksOffset);
 
 	asmPpcLabelBind(buffer, &notFull, asmOffset(buffer));
 	// store: advance block->current, then write object at the old slot
@@ -1578,8 +1588,7 @@ static void generateOuterReturn(CodeGenerator *generator, BytecodesIterator *ite
 	asmBne(buffer, &deathContext);
 
 	// pending ensure:/ifCurtailed: cleanups? (R6 is dead: the return leaves)
-	asmLoadTls(buffer, R6, gCurrentThreadTpoff);
-	asmLd(buffer, R6, offsetof(Thread, unwindHandler), R6);
+	asmLoadTlsField(buffer, R6, gCurrentThreadTpoff + offsetof(Thread, unwindHandler));
 	asmCmpdi(buffer, 0, R6, 0);
 	asmBeq(buffer, &cut);
 
@@ -2335,8 +2344,7 @@ void generateCCall(CodeGenerator *generator, intptr_t cFunction, size_t argsSize
 	asmStdu(buffer, R1, -(ptrdiff_t) gPpc64Abi->cCallFrameSize, R1);
 
 	// exit frame for the C call, the RUNNING worker's thread (TLS)
-	asmLoadTls(buffer, TMP, gCurrentThreadTpoff);
-	asmLd(buffer, TMP, offsetof(Thread, stackFramesTail), TMP);
+	asmLoadTlsField(buffer, TMP, gCurrentThreadTpoff + offsetof(Thread, stackFramesTail));
 	asmStd(buffer, FP, offsetof(EntryStackFrame, exit), TMP);
 
 	gPpc64Abi->emitCallCFunction(buffer, cFunction);
@@ -2425,9 +2433,11 @@ void generateBlockContextAllocation(CodeGenerator *generator)
 void generatePushDummyContext(AssemblerBuffer *buffer)
 {
 	// load the RUNNING worker's thread from TLS, then push its dummy context
-	asmLoadTls(buffer, TMP, gCurrentThreadTpoff);
-	asmLd(buffer, R0, offsetof(Thread, context), TMP);
-	asmPush(buffer, R0);
+	// TMP, not R0: the out-of-range fallback inside emitLoadTlsField ends in an
+	// addi whose RA would then read as literal zero (the r0-as-zero rule), which
+	// is silent and only shows up at a tpoff this host never produces.
+	asmLoadTlsField(buffer, TMP, gCurrentThreadTpoff + offsetof(Thread, context));
+	asmPush(buffer, TMP);
 }
 
 

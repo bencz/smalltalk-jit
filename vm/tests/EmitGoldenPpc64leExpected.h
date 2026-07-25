@@ -45,6 +45,15 @@ static const uint8_t ExpectedPpcLeBranch[] = {
 };
 
 // elfv2 emitLoadTls(r11, 0x1234) (8 bytes)
+// elfv2 emitLoadTlsField(r11, 0x1234) (4 bytes)
+static const uint8_t ExpectedPpcLeLoadTlsField[] = {
+	0x34, 0x12, 0x6D, 0xE9,
+};
+// elfv2 emitLoadTlsField(r11, -0x12344) (12 bytes)
+static const uint8_t ExpectedPpcLeLoadTlsFieldFar[] = {
+	0xFF, 0xFF, 0x6D, 0x3D, 0xBC, 0xDC, 0x6B, 0x39, 0x00, 0x00, 0x6B, 0xE9,
+};
+
 static const uint8_t ExpectedPpcLeLoadTls[] = {
 	0x00, 0x00, 0x6D, 0x3D, 0x34, 0x12, 0x6B, 0x39,
 };

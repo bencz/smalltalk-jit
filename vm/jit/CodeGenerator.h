@@ -40,6 +40,13 @@ typedef struct CodeGenerator {
 	// original bytecodes = positional pairing.
 	IcCell **tierSiteMap;
 	size_t tierSiteMapSize;
+	// Frame-slot byte offsets that generateContextDefinition wrote this compile,
+	// recorded for one purpose: asserting that every slot generatePrologue chose
+	// NOT to nil really does get overwritten (jit/PrologueSlots.h). A violation
+	// is undetectable at runtime -- the scavenger repairs an implausible stack
+	// slot to nil by design (Scavenger.c) -- so it has to be caught here.
+	ptrdiff_t contextDefWrote[2];
+	uint8_t contextDefWroteCount;
 } CodeGenerator;
 
 // Neutral initializer (jit/StubCode.c) — fresh buffer + zeroed frame state.

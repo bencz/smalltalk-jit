@@ -10,6 +10,18 @@
 #include "core/CompiledCode.h"
 #include "memory/Heap.h"
 #include "runtime/Collection.h"
+#include "jit/PerfMap.h"
+
+
+// Profiler labels for the shared stubs. Indexed by StubId, so this array must
+// stay in the same order as the enum in StubCode.h.
+static const char *StubNames[STUB_COUNT] = {
+	"<stub:smalltalk-entry>",
+	"<stub:allocate>",
+	"<stub:lookup>",
+	"<stub:dnu>",
+	"<stub:pic-probe>",
+};
 
 
 void initCodeGenerator(CodeGenerator *generator)
@@ -32,6 +44,7 @@ void initCodeGenerator(CodeGenerator *generator)
 	// NULL = "no bytecode descriptors" (stubs); method/block compilation
 	// allocates its own collection right after init.
 	generator->descriptors = NULL;
+	generator->contextDefWroteCount = 0;
 }
 
 
@@ -56,6 +69,9 @@ NativeCode *getStubNativeCode(StubCode *stub)
 			compiledMethodSetNativeCode((CompiledMethod *) generator.code.methodOrBlock, code);
 		}
 		asmFreeBuffer(&generator.buffer);
+		// buildNativeCode's own perfMapEmit skipped this: a stub has no
+		// compiledCode back-pointer to name it from.
+		perfMapEmitNamed(code, StubNames[stub->id]);
 		__atomic_store_n(&heap->stubCode[stub->id], code, __ATOMIC_RELEASE); // publish last
 
 		closeHandleScope(&scope, NULL);

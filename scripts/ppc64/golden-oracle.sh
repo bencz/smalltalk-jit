@@ -198,6 +198,12 @@ EOF
 # case: elfv1 emitLoadTls(r11, -0x12344)  [ha/lo rounding: -1<<16 - 9028]
 	addis 11,13,-1
 	addi 11,11,-9028
+# case: elfv1 emitLoadTlsField(r11, 0x1234)  [folds into one DS-form ld off r13]
+	ld 11,0x1234(13)
+# case: elfv1 emitLoadTlsField(r11, -0x12344)  [out of DS-form range: build, then load]
+	addis 11,13,-1
+	addi 11,11,-9028
+	ld 11,0(11)
 # case: elfv1 emitCallCFunction (descriptor at 0x1122334455667788)
 	lis 11,0x1122
 	ori 11,11,0x3344
@@ -273,6 +279,12 @@ EOF
 # case: elfv2 emitLoadTls(r11, -0x12344)  [ha/lo rounding: -1<<16 - 9028]
 	addis 11,13,-1
 	addi 11,11,-9028
+# case: elfv2 emitLoadTlsField(r11, 0x1234)  [folds into one DS-form ld off r13]
+	ld 11,0x1234(13)
+# case: elfv2 emitLoadTlsField(r11, -0x12344)  [out of DS-form range: build, then load]
+	addis 11,13,-1
+	addi 11,11,-9028
+	ld 11,0(11)
 # case: elfv2 emitCallCFunction (target 0x1122334455667788 in r12, no descriptor)
 	lis 12,0x1122
 	ori 12,12,0x3344

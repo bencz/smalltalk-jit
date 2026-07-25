@@ -58,12 +58,29 @@ Details worth knowing:
 - Writes are a single `write()` per line under `O_APPEND`, which is atomic
   against the file offset, so concurrent worker threads compiling at the same
   time never interleave a line.
-- Stubs (the shared IC probe, the allocation stub, and so on) are not named:
-  they are not built through the method/block funnel. They show up as a small
-  number of anonymous `[JIT]` addresses, which is expected.
+- Stubs are named too, as `<stub:allocate>`, `<stub:lookup>`, `<stub:dnu>`,
+  `<stub:pic-probe>` and `<stub:smalltalk-entry>`. They carry no method
+  identity, so they are emitted from `getStubNativeCode` rather than the
+  method/block funnel. Without this they landed in the profiler's unresolved
+  bucket, which is the bucket you are reading when you ask "how much of this
+  run is allocation?" — the answer for Richards turned out to be 2.8% of
+  retired instructions, which is what ruled the allocation work down the
+  priority list.
 
 The emitter lives in `vm/jit/PerfMap.c` and is called from `buildNativeCode`,
-the single place both methods and blocks finish compilation.
+the single place both methods and blocks finish compilation, plus
+`perfMapEmitNamed` from `getStubNativeCode` for the stubs.
+
+Once methods have names, the map also gives you their address ranges, and that
+turns `perf script -F ip` into an attribution tool the symbol view cannot
+match: bucket each sampled instruction pointer by its OFFSET inside the method
+that contains it, and you can measure what a shape of emitted code costs
+rather than what a method costs. Bucketing everything below the end of the
+prologue is how the method preamble (frame setup, nil-fill, context store,
+safepoint poll) was measured at 12.5% of Richards' retired instructions.
+Watch out for methods small enough to fit entirely inside the window, which
+would otherwise count as all-preamble: the frameless accessors are 10-11
+bytes.
 
 
 Profiling under load

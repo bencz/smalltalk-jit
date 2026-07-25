@@ -125,6 +125,16 @@ static void emitLoadTlsNegCase(AssemblerBuffer *buffer)
 	AbiPpc64ElfV2.emitLoadTls(buffer, R11_PPC, FAKE_TPOFF_NEG);
 }
 
+static void emitLoadTlsFieldCase(AssemblerBuffer *buffer)
+{
+	AbiPpc64ElfV2.emitLoadTlsField(buffer, R11_PPC, FAKE_TPOFF); // folds to a single ld
+}
+
+static void emitLoadTlsFieldFarCase(AssemblerBuffer *buffer)
+{
+	AbiPpc64ElfV2.emitLoadTlsField(buffer, R11_PPC, FAKE_TPOFF_NEG); // out of DS-form range
+}
+
 static void emitCallCFunctionCase(AssemblerBuffer *buffer)
 {
 	AbiPpc64ElfV2.emitCallCFunction(buffer, FAKE_C_FUNCTION);
@@ -262,6 +272,10 @@ static const GoldenCase Cases[] = {
 	  ExpectedPpcLeLoadTls, sizeof(ExpectedPpcLeLoadTls) },
 	{ "elfv2 emitLoadTls(r11, -0x12344)", emitLoadTlsNegCase,
 	  ExpectedPpcLeLoadTlsNeg, sizeof(ExpectedPpcLeLoadTlsNeg) },
+	{ "elfv2 emitLoadTlsField(r11, 0x1234)", emitLoadTlsFieldCase,
+	  ExpectedPpcLeLoadTlsField, sizeof(ExpectedPpcLeLoadTlsField) },
+	{ "elfv2 emitLoadTlsField(r11, -0x12344)", emitLoadTlsFieldFarCase,
+	  ExpectedPpcLeLoadTlsFieldFar, sizeof(ExpectedPpcLeLoadTlsFieldFar) },
 	{ "elfv2 emitCallCFunction (r12, no descriptor)", emitCallCFunctionCase,
 	  ExpectedPpcLeCallCFunction, sizeof(ExpectedPpcLeCallCFunction) },
 	{ "elfv2 entry save regs", emitEntrySaveCase,
@@ -290,7 +304,8 @@ static const GoldenCase Cases[] = {
 static const char *CaseArrayNames[] = {
 	"ExpectedPpcLeLi64", "ExpectedPpcLeLoadStore", "ExpectedPpcLeArith",
 	"ExpectedPpcLeSpr", "ExpectedPpcLeBranch", "ExpectedPpcLeLoadTls",
-	"ExpectedPpcLeLoadTlsNeg", "ExpectedPpcLeCallCFunction",
+	"ExpectedPpcLeLoadTlsNeg", "ExpectedPpcLeLoadTlsField",
+	"ExpectedPpcLeLoadTlsFieldFar", "ExpectedPpcLeCallCFunction",
 	"ExpectedPpcLeEntrySave", "ExpectedPpcLeEntryRestore",
 	"ExpectedPpcLeSubWord", "ExpectedPpcLeXoArith", "ExpectedPpcLeShiftCmp",
 	"ExpectedPpcLeFloatXer", "ExpectedPpcLeSmallFloatOps", "ExpectedPpcLeFcfid",

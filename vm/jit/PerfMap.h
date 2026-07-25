@@ -11,4 +11,11 @@ struct NativeCode;
 // call with code->compiledCode == NULL (it just returns). See PerfMap.c.
 void perfMapEmit(struct NativeCode *code);
 
+// Same, for code that carries no method identity and therefore cannot be named
+// by perfMapEmit: the shared stubs (allocate, lookup, DNU, PIC probe, entry).
+// Without this every stub sample lands in the profiler's unresolved-address
+// bucket, which is exactly the bucket you are trying to explain when you ask
+// "how much of this run is allocation?". `name` is copied into the line as-is.
+void perfMapEmitNamed(struct NativeCode *code, const char *name);
+
 #endif

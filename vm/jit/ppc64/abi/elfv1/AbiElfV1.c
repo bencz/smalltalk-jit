@@ -74,6 +74,26 @@ static void elfv1EmitLoadTls(AssemblerBuffer *buffer, Register dst, ptrdiff_t tp
 	asmAddi(buffer, dst, dst, elfv1Lo16(tpoff));
 }
 
+// Load one WORD out of the running worker's TLS block: dst = *(r13 + offset).
+// DS-form reaches a 4-aligned displacement in [-32768, 32764] off r13, which
+// covers a Thread field at the tpoffs this VM actually gets, and then the whole
+// sequence is a single `ld`. Outside that window the address still has to be
+// built first, which is exactly the pre-existing three instructions -- never
+// worse, and correct for any offset.
+static void elfv1EmitLoadTlsField(AssemblerBuffer *buffer, Register dst, ptrdiff_t offset)
+{
+	// r0 is not a legal dst: the fallback below ends in an addi whose RA would
+	// read as literal zero instead of the register, silently answering garbage
+	// for any tpoff outside the DS-form window.
+	ASSERT(dst != R0);
+	if ((offset & 3) == 0 && -32768 <= offset && offset <= 32764) {
+		asmLd(buffer, dst, offset, R13_PPC);
+		return;
+	}
+	elfv1EmitLoadTls(buffer, dst, offset);
+	asmLd(buffer, dst, 0, dst);
+}
+
 // Call an absolute C function through its ELFv1 .opd function DESCRIPTOR
 // {entry, TOC, environ}: save the caller's r2 in its ABI slot, load the real
 // entry and the callee TOC (and the environment, as compilers do for
@@ -205,6 +225,7 @@ const Ppc64Abi AbiPpc64ElfV1 = {
 	.emitEntrySaveRegs = elfv1EmitEntrySaveRegs,
 	.emitEntryRestoreRegs = elfv1EmitEntryRestoreRegs,
 	.emitLoadTls = elfv1EmitLoadTls,
+	.emitLoadTlsField = elfv1EmitLoadTlsField,
 	.emitCallCFunction = elfv1EmitCallCFunction,
 	.emitCCallPrimitive = elfv1EmitCCallPrimitive,
 	.fiberSwitch = fiberSwitchElfV1,

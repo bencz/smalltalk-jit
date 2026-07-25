@@ -85,6 +85,24 @@ static void elfv2EmitLoadTls(AssemblerBuffer *buffer, Register dst, ptrdiff_t tp
 	asmAddi(buffer, dst, dst, elfv2Lo16(tpoff));
 }
 
+// Load one WORD out of the running worker's TLS block, byte-for-byte the ELFv1
+// hook (TLS on ppc64 is r13-based under both ABIs): a single `ld` when the
+// total offset fits DS-form off r13, otherwise build the address first, which
+// is the pre-existing three instructions.
+static void elfv2EmitLoadTlsField(AssemblerBuffer *buffer, Register dst, ptrdiff_t offset)
+{
+	// r0 is not a legal dst: the fallback below ends in an addi whose RA would
+	// read as literal zero instead of the register, silently answering garbage
+	// for any tpoff outside the DS-form window.
+	ASSERT(dst != R0);
+	if ((offset & 3) == 0 && -32768 <= offset && offset <= 32764) {
+		asmLd(buffer, dst, offset, R13_PPC);
+		return;
+	}
+	elfv2EmitLoadTls(buffer, dst, offset);
+	asmLd(buffer, dst, 0, dst);
+}
+
 // Call an absolute C function. ELFv2 has NO function descriptors: the target
 // address itself goes in r12, which the ABI mandates so the callee's
 // global-entry prologue (`addis 2,12,.TOC.-.LCF@ha; addi 2,2,...@l`) can derive
@@ -203,6 +221,7 @@ const Ppc64Abi AbiPpc64ElfV2 = {
 	.emitEntrySaveRegs = elfv2EmitEntrySaveRegs,
 	.emitEntryRestoreRegs = elfv2EmitEntryRestoreRegs,
 	.emitLoadTls = elfv2EmitLoadTls,
+	.emitLoadTlsField = elfv2EmitLoadTlsField,
 	.emitCallCFunction = elfv2EmitCallCFunction,
 	.emitCCallPrimitive = elfv2EmitCCallPrimitive,
 	.fiberSwitch = fiberSwitchElfV2,

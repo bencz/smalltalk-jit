@@ -883,5 +883,6 @@ static inline void asmJumpReg(AssemblerBuffer *buffer, Register target)
 // directly, in a foreign-arch binary this name resolves to the HOST
 // backend's TLS emitter.
 void asmLoadTls(AssemblerBuffer *buffer, Register dst, ptrdiff_t tpoff);
+void asmLoadTlsField(AssemblerBuffer *buffer, Register dst, ptrdiff_t offset);
 
 #endif

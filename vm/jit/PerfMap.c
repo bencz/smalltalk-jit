@@ -69,6 +69,39 @@ static _Bool perfMapEnabled(void)
 }
 
 
+// Shared tail: one line, one write. perf reads the remainder of the line after
+// the size as the symbol name, so ">>", spaces and "[]" are all fine. A single
+// short write in append mode is atomic against concurrent writers (other
+// workers compiling in other heaps) and against the file offset, so no separate
+// lock is needed. Truncation only shortens a label.
+static void perfMapWrite(struct NativeCode *code, const char *line, int len)
+{
+	(void) code;
+	if (len <= 0) {
+		return;
+	}
+	int64_t written = osFileWrite(gPerfMapFd, line, (size_t) len);
+	(void) written; // best-effort tracing: a short write garbles at most one line
+}
+
+
+void perfMapEmitNamed(struct NativeCode *code, const char *name)
+{
+	if (!perfMapEnabled()) {
+		return;
+	}
+	char line[256];
+	int len = snprintf(line, sizeof(line), "%lx %lx %s\n",
+		(unsigned long) (uintptr_t) code->insts,
+		(unsigned long) code->size,
+		name);
+	if (len > 0 && (size_t) len > sizeof(line)) {
+		len = (int) sizeof(line); // snprintf return is the untruncated length
+	}
+	perfMapWrite(code, line, len);
+}
+
+
 void perfMapEmit(struct NativeCode *code)
 {
 	if (!perfMapEnabled()) {
@@ -99,11 +132,6 @@ void perfMapEmit(struct NativeCode *code)
 	RawString *className = (RawString *) asObject(class->name);
 	RawString *selector = (RawString *) asObject(method->selector);
 
-	// One line, one write. perf reads the remainder of the line after the size
-	// as the symbol name, so ">>", spaces and "[]" are all fine. A single short
-	// write in append mode is atomic against concurrent writers (other workers
-	// compiling in other heaps) and against the file offset, so no separate lock
-	// is needed. Truncation (name longer than the buffer) only shortens a label.
 	char line[512];
 	int len = snprintf(line, sizeof(line),
 		"%lx %lx %.*s%s>>%.*s%s\n",
@@ -111,12 +139,8 @@ void perfMapEmit(struct NativeCode *code)
 		(unsigned long) code->size,
 		(int) className->size, className->contents, classSuffix,
 		(int) selector->size, selector->contents, blockSuffix);
-	if (len <= 0) {
-		return;
-	}
-	if ((size_t) len > sizeof(line)) {
+	if (len > 0 && (size_t) len > sizeof(line)) {
 		len = (int) sizeof(line); // snprintf return is the untruncated length
 	}
-	int64_t written = osFileWrite(gPerfMapFd, line, (size_t) len);
-	(void) written; // best-effort tracing: a short write garbles at most one line
+	perfMapWrite(code, line, len);
 }

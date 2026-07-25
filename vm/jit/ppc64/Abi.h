@@ -66,6 +66,15 @@ typedef struct Ppc64Abi {
 	// sum, one fixed 2-instruction shape for any 32-bit tpoff.
 	void (*emitLoadTls)(AssemblerBuffer *buffer, Register dst, ptrdiff_t tpoff);
 
+	// Emit "dst = *(void **)(thread-pointer + offset)" — the VALUE of one word
+	// inside the running worker's TLS block, not the block's address. When the
+	// total offset lands in the DS-form displacement this is a single
+	// `ld dst, offset(r13)`, replacing addis/addi plus the caller's own load;
+	// otherwise it falls back to exactly the old three. `offset` is tpoff plus
+	// the field's offsetof, so whether it folds depends on the RUNTIME tpoff:
+	// both shapes are golden-pinned.
+	void (*emitLoadTlsField)(AssemblerBuffer *buffer, Register dst, ptrdiff_t offset);
+
 	// Emit a call to an absolute C function. ELFv1: `cFunction` points at an
 	// .opd function DESCRIPTOR {entry, TOC, environ}, the emitted code
 	// saves the caller's r2 to its ABI slot, loads the real entry and the

@@ -48,6 +48,11 @@ void asmLoadTls(AssemblerBuffer *buffer, Register dst, ptrdiff_t tpoff)
 	gPpc64Abi->emitLoadTls(buffer, dst, tpoff);
 }
 
+void asmLoadTlsField(AssemblerBuffer *buffer, Register dst, ptrdiff_t offset)
+{
+	gPpc64Abi->emitLoadTlsField(buffer, dst, offset);
+}
+
 // The jit/TargetFiber.h contract names, statically bound to the ELFv1 pair:
 // at -O2 these compile to direct tail-calls, no vtable dereference on the
 // context-switch path.

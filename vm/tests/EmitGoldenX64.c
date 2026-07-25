@@ -47,6 +47,11 @@ static void emitLoadTlsCase(CodeGenerator *generator)
 	asmLoadTls(&generator->buffer, TMP, FAKE_TPOFF_PLAIN);
 }
 
+static void emitLoadTlsFieldCase(CodeGenerator *generator)
+{
+	asmLoadTlsField(&generator->buffer, TMP, FAKE_TPOFF_PLAIN);
+}
+
 static void emitCCallCase(CodeGenerator *generator)
 {
 	generateCCall(generator, FAKE_C_FUNCTION, 2, 0 /*storeIp*/);
@@ -128,6 +133,8 @@ static void emitIntToFloatOpsCase(CodeGenerator *generator)
 static const GoldenCase Cases[] = {
 	{ "asmLoadTls(TMP, 0x1234)", emitLoadTlsCase,
 	  ExpectedLoadTls, sizeof(ExpectedLoadTls) },
+	{ "asmLoadTlsField(TMP, 0x1234)", emitLoadTlsFieldCase,
+	  ExpectedLoadTlsField, sizeof(ExpectedLoadTlsField) },
 	{ "generateCCall(fake, 2, storeIp=0)", emitCCallCase,
 	  ExpectedCCall, sizeof(ExpectedCCall) },
 	{ "generateStoreCheck(RDI, RAX)", emitStoreCheckCase,
@@ -157,7 +164,7 @@ static void hexdumpAsCArray(const char *name, const uint8_t *bytes, size_t size)
 }
 
 static const char *CaseArrayNames[] = {
-	"ExpectedLoadTls", "ExpectedCCall", "ExpectedStoreCheck",
+	"ExpectedLoadTls", "ExpectedLoadTlsField", "ExpectedCCall", "ExpectedStoreCheck",
 	"ExpectedCCallPrimitive", "ExpectedEntryStub", "ExpectedSmallFloatOps",
 	"ExpectedIcGuard", "ExpectedIntToFloatOps",
 };

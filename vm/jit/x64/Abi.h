@@ -61,6 +61,16 @@ typedef struct X64Abi {
 	// a different mechanism entirely, see PORTING.md.
 	void (*emitLoadTls)(AssemblerBuffer *buffer, Register dst, ptrdiff_t tpoff);
 
+	// Emit "dst = *(void **)(thread-pointer + offset)" — the VALUE of one word
+	// inside the running worker's TLS block, not the block's address. Callers
+	// that want a single field (the overwhelming majority: Thread.context,
+	// Thread.heap, Thread.stackFramesTail) would otherwise pay emitLoadTls plus
+	// their own dereference. sysv folds all of it into the %fs-prefixed load's
+	// disp32, one instruction; an ABI whose TLS needs real address arithmetic
+	// (win64's %gs TEB chain) implements this as emitLoadTls + a load and loses
+	// nothing. `offset` is tpoff + the field's offsetof.
+	void (*emitLoadTlsField)(AssemblerBuffer *buffer, Register dst, ptrdiff_t offset);
+
 	// CCALL-primitive marshalling: load argsSize Smalltalk-stack arguments
 	// (slot i at [RSP + (i+1)*8] — VM frame layout) into this ABI's C argument
 	// positions. Win64 additionally materializes the hidden PrimitiveResult

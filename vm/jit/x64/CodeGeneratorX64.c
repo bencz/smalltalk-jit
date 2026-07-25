@@ -22,6 +22,7 @@
 #include "compiler/Compiler.h"
 #include "jit/CodeDescriptors.h"
 #include "jit/SendClassify.h"
+#include "jit/PrologueSlots.h"
 #include "jit/Tier.h"
 #include "jit/PerfMap.h"
 #include "core/Thread.h"
@@ -188,11 +189,18 @@ static void generatePrologue(CodeGenerator *generator, size_t frameSize)
 	// read as stack garbage — wrong for Smalltalk semantics, and worse, the GC
 	// stackmap can mark such a slot as a live root and the scavenger then chases the
 	// garbage. The context/return-IC slots are overwritten right after this by
-	// generateContextDefinition.
-	if (frameSize > 0) {
+	// generateContextDefinition, so they are skipped: see jit/PrologueSlots.h for
+	// which ones and why that is safe (one case genuinely is not).
+	if (frameSize > 0 && prologueNilSlotCount(generator, frameSize) > 0) {
+		ptrdiff_t deadIc = prologueDeadIcSlotOffset();
+		ptrdiff_t deadContext = prologueDeadContextSlotOffset(generator);
 		generateLoadObject(&generator->buffer, Handles.nil->raw, TMP, 1);
 		for (size_t i = 0; i < frameSize; i++) {
-			asmMovqToMem(&generator->buffer, TMP, asmMem(RBP, NO_REGISTER, SS_1, -(ptrdiff_t)(i + 1) * sizeof(intptr_t)));
+			ptrdiff_t offset = -(ptrdiff_t)(i + 1) * sizeof(intptr_t);
+			if (offset == deadIc || offset == deadContext) {
+				continue;
+			}
+			asmMovqToMem(&generator->buffer, TMP, asmMem(RBP, NO_REGISTER, SS_1, offset));
 		}
 	}
 }
@@ -214,21 +222,23 @@ static void generateContextDefinition(CodeGenerator *generator)
 
 	// spill native code entry
 	asmMovqToMem(buffer, R11, asmMem(RBP, NO_REGISTER, SS_1, -sizeof(intptr_t)));
+	prologueNoteContextDefStore(generator, -sizeof(intptr_t));
 
 	if (generator->code.isBlock) {
 		// setup RBP
 		asmMovqToMem(buffer, RBP, asmMem(context->reg, NO_REGISTER, SS_1, varOffset(RawContext, frame)));
 		spillVar(generator, context);
+		prologueNoteContextDefStore(generator, context->frameOffset * sizeof(intptr_t));
 
 	} else {
 		if (generator->code.header.hasContext) {
 			generateMethodContextAllocation(generator, generator->code.header.contextSize);
 		} else {
-			// load the RUNNING worker's thread from TLS, then its dummy (root) context
-			asmLoadTls(buffer, TMP, gCurrentThreadTpoff);
-			asmMovqMem(buffer, asmMem(TMP, NO_REGISTER, SS_1, offsetof(Thread, context)), TMP);
+			// load the RUNNING worker's dummy (root) context straight out of TLS
+			asmLoadTlsField(buffer, TMP, gCurrentThreadTpoff + offsetof(Thread, context));
 			// spill dummy context
 			asmMovqToMem(buffer, TMP, asmMem(RBP, NO_REGISTER, SS_1, context->frameOffset * sizeof(intptr_t)));
+			prologueNoteContextDefStore(generator, context->frameOffset * sizeof(intptr_t));
 
 		}
 		context->flags |= VAR_ON_STACK;
@@ -236,6 +246,7 @@ static void generateContextDefinition(CodeGenerator *generator)
 
 	ASSERT(context->flags & VAR_IN_REG);
 	ASSERT(context->flags & VAR_ON_STACK);
+	prologueAssertDeadSlotsWritten(generator);
 }
 
 
@@ -275,9 +286,12 @@ static void generateSafepointPoll(CodeGenerator *generator, _Bool atBackEdge)
 	AssemblerLabel noGc;
 	asmInitLabel(&noGc);
 
-	// TMP = CTX->thread->heap
-	asmMovqMem(buffer, asmMem(CTX, NO_REGISTER, SS_1, varOffset(RawContext, thread)), TMP);
-	asmMovqMem(buffer, asmMem(TMP, NO_REGISTER, SS_1, offsetof(Thread, heap)), TMP);
+	// TMP = the RUNNING worker's heap, straight out of TLS. Not CTX->thread->heap:
+	// that is three dependent loads instead of one, and it is the SAME staleness
+	// the slow path below already refuses to accept — after a migration CTX->thread
+	// names another worker, so the old fast path could poll the wrong heap's flag
+	// and miss the stop-the-world it was there to answer.
+	asmLoadTlsField(buffer, TMP, gCurrentThreadTpoff + offsetof(Thread, heap));
 	// Fast path: one byte test of the 0/1 flag (little-endian low byte of the int,
 	// re-loaded every iteration so the mutator observes a set flag within ~1 pass).
 	asmCmpbMemImm(buffer, asmMem(TMP, NO_REGISTER, SS_1, offsetof(Heap, safepointRequested)), 0);
@@ -1488,8 +1502,7 @@ void generateStoreCheck(CodeGenerator *generator, Register object, Register valu
 	asmOrbMemImm(buffer, tags, TAG_REMEMBERED);
 
 	// TMP = remembered set head block — the RUNNING worker's set (per-mutator), read from TLS
-	asmLoadTls(buffer, TMP, gCurrentThreadTpoff);
-	asmMovqMem(buffer, asmMem(TMP, NO_REGISTER, SS_1, blocksOffset), TMP);
+	asmLoadTlsField(buffer, TMP, gCurrentThreadTpoff + blocksOffset);
 
 	// Grow BEFORE the store when the block is full (current >= end), so the store
 	// is always in bounds. `cmp end, [current]` leaves end > current (room) as
@@ -1509,8 +1522,7 @@ void generateStoreCheck(CodeGenerator *generator, Register object, Register valu
 	asmLeaq(buffer, asmMem(TMP, NO_REGISTER, SS_1, rememberedSetOffset), RDI);
 	generateCCall(generator, (intptr_t) rememberedSetGrow, 1, 0);
 	abiEmitCallerSavedPop(gX64Abi, buffer);
-	asmLoadTls(buffer, TMP, gCurrentThreadTpoff);
-	asmMovqMem(buffer, asmMem(TMP, NO_REGISTER, SS_1, blocksOffset), TMP);
+	asmLoadTlsField(buffer, TMP, gCurrentThreadTpoff + blocksOffset);
 
 	asmLabelBind(buffer, &notFull, asmOffset(buffer));
 	// store: advance block->current in memory, then write object at the old slot.
@@ -1680,8 +1692,7 @@ static void generateOuterReturn(CodeGenerator *generator, BytecodesIterator *ite
 	asmJ(buffer, COND_NOT_EQUAL, &deathContext);
 
 	// pending ensure:/ifCurtailed: cleanups? (RDI is dead: the return leaves)
-	asmLoadTls(buffer, RDI, gCurrentThreadTpoff);
-	asmMovqMem(buffer, asmMem(RDI, NO_REGISTER, SS_1, offsetof(Thread, unwindHandler)), RDI);
+	asmLoadTlsField(buffer, RDI, gCurrentThreadTpoff + offsetof(Thread, unwindHandler));
 	asmTestq(buffer, RDI, RDI);
 	asmJ(buffer, COND_ZERO, &cut);
 
@@ -2531,9 +2542,7 @@ void generateCCall(CodeGenerator *generator, intptr_t cFunction, size_t argsSize
 
 	// load the RUNNING worker's thread from TLS (per-mutator stackFramesTail), then set the
 	// exit frame for the C call — CTX->thread may be stale after a migration
-	asmLoadTls(buffer, TMP, gCurrentThreadTpoff);
-	// load last entry frame
-	asmMovqMem(buffer, asmMem(TMP, NO_REGISTER, SS_1, offsetof(Thread, stackFramesTail)), TMP);
+	asmLoadTlsField(buffer, TMP, gCurrentThreadTpoff + offsetof(Thread, stackFramesTail));
 	// set exit frame
 	asmMovqToMem(buffer, RBP, asmMem(TMP, NO_REGISTER, SS_1, offsetof(EntryStackFrame, exit)));
 
@@ -2629,9 +2638,9 @@ void generateBlockContextAllocation(CodeGenerator *generator)
 void generatePushDummyContext(AssemblerBuffer *buffer)
 {
 	// load the RUNNING worker's thread from TLS, then push its dummy (root) context
-	asmLoadTls(buffer, TMP, gCurrentThreadTpoff);
+	asmLoadTlsField(buffer, TMP, gCurrentThreadTpoff + offsetof(Thread, context));
 	// push dummy context
-	asmPushqMem(buffer, asmMem(TMP, NO_REGISTER, SS_1, offsetof(Thread, context)));
+	asmPushq(buffer, TMP);
 }
 
 

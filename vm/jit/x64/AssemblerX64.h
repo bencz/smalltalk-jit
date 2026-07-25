@@ -161,6 +161,7 @@ static void asmMovqMemImm(AssemblerBuffer *buffer, int64_t imm, MemoryOperand op
 // the implementation in abi/<abi>/. Unlike the static encoders around it,
 // this is one real function per process (Abi.c).
 void asmLoadTls(AssemblerBuffer *buffer, Register dst, ptrdiff_t tpoff);
+void asmLoadTlsField(AssemblerBuffer *buffer, Register dst, ptrdiff_t offset);
 static void asmMovb(AssemblerBuffer *buffer, ByteRegister src, ByteRegister dst);
 static void asmMovbToMem(AssemblerBuffer *buffer, ByteRegister src, MemoryOperand operand);
 static void asmMovbMem(AssemblerBuffer *buffer, MemoryOperand operand, ByteRegister dst);

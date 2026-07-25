@@ -19,6 +19,12 @@ void asmLoadTls(AssemblerBuffer *buffer, Register dst, ptrdiff_t tpoff)
 }
 
 
+void asmLoadTlsField(AssemblerBuffer *buffer, Register dst, ptrdiff_t offset)
+{
+	gX64Abi->emitLoadTlsField(buffer, dst, offset);
+}
+
+
 // Baked pointers live as the contiguous imm64 of a movabs on x64 — plain
 // (alignment-safe) 8-byte accesses. See jit/TargetCodePatch.h.
 uint64_t targetReadCodePointer(const uint8_t *site)
