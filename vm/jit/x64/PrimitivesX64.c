@@ -685,8 +685,10 @@ void generateIntQuoPrimitive(CodeGenerator *generator)
 	AssemblerBuffer *buffer = &generator->buffer;
 	AssemblerLabel notInt;
 	AssemblerLabel divZero;
+	AssemblerLabel overflow;
 	asmInitLabel(&notInt);
 	asmInitLabel(&divZero);
+	asmInitLabel(&overflow);
 
 	movArg(buffer, 1, RSI);
 	testInt(generator, SIL);
@@ -697,11 +699,96 @@ void generateIntQuoPrimitive(CodeGenerator *generator)
 	movArg(buffer, 0, RAX);
 	asmCqo(buffer);
 	asmIdivq(buffer, RSI);
+	// `minVal quo: -1` is +2^61, one past SmallInteger's range, and the tagging
+	// shift used to wrap it silently back to minVal. Re-derive the untagged
+	// value from the tagged one and refuse the pair that does not survive, so
+	// the Smalltalk fallback promotes to a LargeInteger instead.
+	asmMovq(buffer, RAX, RDX);
+	asmShlqImm(buffer, RAX, 2);
+	asmSarqImm(buffer, RAX, 2);
+	asmCmpq(buffer, RAX, RDX);
+	asmJ(buffer, COND_NOT_EQUAL, &overflow);
 	asmShlqImm(buffer, RAX, 2);
 	asmRet(buffer);
 
 	asmLabelBind(buffer, &notInt, asmOffset(buffer));
 	asmLabelBind(buffer, &divZero, asmOffset(buffer));
+	asmLabelBind(buffer, &overflow, asmOffset(buffer));
+}
+
+
+// Floored integer division, the `//` of the language. Until now SmallInteger had
+// no `//` at all: it inherited Integer>>//, which computes `quo:` and then
+// corrects with a multiply, a subtract, an equality and two comparisons, all as
+// sends. That made one `//` cost two dispatches plus six operations, and it
+// showed as 2.15% of Richards.
+//
+// Same tagged-operand trick as quo/mod: dividing two tagged SmallIntegers
+// cancels the tag in the quotient (so it is re-tagged with a shift) and leaves
+// the remainder already tagged.
+//
+// The floor correction is the mirror of generateIntModPrimitive's: the truncated
+// quotient is one too high exactly when the remainder is non-zero AND its sign
+// differs from the divisor's. The non-zero guard is the same one that bug bit
+// there -- without it `x // -1` with an exact division would answer one less.
+void generateIntFloorDivPrimitive(CodeGenerator *generator)
+{
+	AssemblerBuffer *buffer = &generator->buffer;
+	AssemblerLabel notInt;
+	AssemblerLabel divZero;
+	AssemblerLabel overflow;
+	AssemblerLabel floored;      // reached when the remainder is zero
+	AssemblerLabel sameSign;     // reached when the signs already agree
+	asmInitLabel(&notInt);
+	asmInitLabel(&divZero);
+	asmInitLabel(&overflow);
+	asmInitLabel(&floored);
+	asmInitLabel(&sameSign);
+
+	movArg(buffer, 1, RDI);
+	testInt(generator, DIL);
+	asmJ(buffer, COND_NOT_ZERO, &notInt);
+	asmTestq(buffer, RDI, RDI);                 // divide-by-zero would SIGFPE: fail the
+	asmJ(buffer, COND_ZERO, &divZero);          // primitive so the Smalltalk fallback raises
+
+	movArg(buffer, 0, RAX);
+	asmCqo(buffer);
+	asmIdivq(buffer, RDI);                      // RAX = truncated quotient, RDX = remainder
+
+	// Floor: the truncated quotient is one too high exactly when the division
+	// was inexact AND the operand signs differ, which is the same thing as the
+	// remainder's sign differing from the divisor's (the remainder carries the
+	// dividend's sign). The non-zero guard is the one whose absence was a bug in
+	// the sibling mod primitive: without it an exact `x // -1` would answer one
+	// less. TWO labels for the two ways of skipping the decrement, bound to the
+	// same offset, because an AssemblerLabel takes a single reference.
+	asmTestq(buffer, RDX, RDX);
+	asmJ(buffer, COND_ZERO, &floored);
+	asmXorq(buffer, RDI, RDX);                  // sign(divisor) != sign(remainder)?
+	asmCmpqImm(buffer, RDX, 0);
+	asmJ(buffer, COND_GREATER_EQUAL, &sameSign);
+	asmDecq(buffer, RAX);
+
+	ptrdiff_t tail = asmOffset(buffer);
+	asmLabelBind(buffer, &floored, tail);
+	asmLabelBind(buffer, &sameSign, tail);
+
+	// Re-tag, and REFUSE the one quotient that does not fit. `minVal // -1` is
+	// +2^61, one past SmallInteger's range, and the shift would wrap it silently
+	// back to minVal. Checked by re-deriving rather than by matching the operand
+	// pattern, so it cannot rot. (The sibling IntQuoPrimitive had exactly this
+	// bug for `minVal quo: -1`, answering minVal; fixed there too.)
+	asmMovq(buffer, RAX, RSI);                  // RSI = untagged quotient
+	asmShlqImm(buffer, RAX, 2);
+	asmSarqImm(buffer, RAX, 2);
+	asmCmpq(buffer, RAX, RSI);
+	asmJ(buffer, COND_NOT_EQUAL, &overflow);    // did not survive the round trip
+	asmShlqImm(buffer, RAX, 2);
+	asmRet(buffer);
+
+	asmLabelBind(buffer, &notInt, asmOffset(buffer));
+	asmLabelBind(buffer, &divZero, asmOffset(buffer));
+	asmLabelBind(buffer, &overflow, asmOffset(buffer));
 }
 
 

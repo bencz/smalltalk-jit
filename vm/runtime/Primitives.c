@@ -312,6 +312,7 @@ Primitive Primitives[] = {
 	{"IntQuoPrimitive", GEN, generateIntQuoPrimitive},
 	{"IntModPrimitive", GEN, generateIntModPrimitive},
 	{"IntRemPrimitive", GEN, generateIntRemPrimitive},
+	{"IntFloorDivPrimitive", GEN, generateIntFloorDivPrimitive},
 	{"IntNegPrimitive", GEN, generateIntNegPrimitive},
 	{"IntAndPrimitive", GEN, generateIntAndPrimitive},
 	{"IntOrPrimitive", GEN, generateIntOrPrimitive},

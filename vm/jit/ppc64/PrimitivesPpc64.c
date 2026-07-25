@@ -715,8 +715,10 @@ void generateIntQuoPrimitive(CodeGenerator *generator)
 	AssemblerBuffer *buffer = &generator->buffer;
 	AssemblerLabel notInt;
 	AssemblerLabel divZero;
+	AssemblerLabel overflow;
 	asmInitLabel(&notInt);
 	asmInitLabel(&divZero);
+	asmInitLabel(&overflow);
 
 	movArg(buffer, 1, R4);
 	testInt(generator, R4);
@@ -725,12 +727,74 @@ void generateIntQuoPrimitive(CodeGenerator *generator)
 	asmBeq(buffer, &divZero);          // fail so the Smalltalk fallback raises
 
 	movArg(buffer, 0, R3);
-	asmDivd(buffer, R3, R3, R4);       // tagged/tagged = untagged quotient
-	asmSldi(buffer, R3, R3, 2);
+	asmDivd(buffer, R5, R3, R4);       // tagged/tagged = untagged quotient
+	// `minVal quo: -1` is +2^61, one past SmallInteger's range, and the tagging
+	// shift used to wrap it silently back to minVal. Refuse the pair that does
+	// not survive the round trip so the Smalltalk fallback promotes instead.
+	asmSldi(buffer, R3, R5, 2);
+	asmSradi(buffer, R0, R3, 2);
+	asmCmpd(buffer, 0, R0, R5);
+	asmBne(buffer, &overflow);
 	asmBlr(buffer);
 
 	asmPpcLabelBind(buffer, &notInt, asmOffset(buffer));
 	asmPpcLabelBind(buffer, &divZero, asmOffset(buffer));
+	asmPpcLabelBind(buffer, &overflow, asmOffset(buffer));
+}
+
+
+// Floored integer division, the `//` of the language. See the x64 original for
+// why this exists at all: SmallInteger had no `//`, it inherited the Smalltalk
+// Integer>>// that computes quo: and corrects with five more sends.
+void generateIntFloorDivPrimitive(CodeGenerator *generator)
+{
+	AssemblerBuffer *buffer = &generator->buffer;
+	AssemblerLabel notInt;
+	AssemblerLabel divZero;
+	AssemblerLabel overflow;
+	AssemblerLabel floored;      // remainder was zero
+	AssemblerLabel sameSign;     // signs already agreed
+	asmInitLabel(&notInt);
+	asmInitLabel(&divZero);
+	asmInitLabel(&overflow);
+	asmInitLabel(&floored);
+	asmInitLabel(&sameSign);
+
+	movArg(buffer, 1, R4);
+	testInt(generator, R4);
+	asmBne(buffer, &notInt);
+	asmCmpdi(buffer, 0, R4, 0);        // POWER divd does not trap on /0,
+	asmBeq(buffer, &divZero);          // fail so the Smalltalk fallback raises
+
+	movArg(buffer, 0, R3);
+	asmDivd(buffer, R5, R3, R4);       // R5 = truncated quotient (the tag cancels)
+	asmMulld(buffer, R6, R5, R4);      // q * b
+	asmSubf(buffer, R6, R6, R3);       // R6 = remainder, still tagged
+
+	// Floor correction, see the x64 original. Two labels for the two ways of
+	// skipping the decrement, bound to the same offset: an AssemblerLabel takes
+	// a single reference.
+	asmCmpdi(buffer, 0, R6, 0);
+	asmBeq(buffer, &floored);
+	asmXor(buffer, R0, R6, R4);        // rem ^ divisor < 0 -> signs differ
+	asmCmpdi(buffer, 0, R0, 0);
+	asmBge(buffer, &sameSign);
+	asmAddi(buffer, R5, R5, -1);
+
+	ptrdiff_t tail = asmOffset(buffer);
+	asmPpcLabelBind(buffer, &floored, tail);
+	asmPpcLabelBind(buffer, &sameSign, tail);
+
+	// Re-tag and refuse the quotient that does not fit (`minVal // -1`).
+	asmSldi(buffer, R3, R5, 2);
+	asmSradi(buffer, R0, R3, 2);
+	asmCmpd(buffer, 0, R0, R5);
+	asmBne(buffer, &overflow);
+	asmBlr(buffer);
+
+	asmPpcLabelBind(buffer, &notInt, asmOffset(buffer));
+	asmPpcLabelBind(buffer, &divZero, asmOffset(buffer));
+	asmPpcLabelBind(buffer, &overflow, asmOffset(buffer));
 }
 
 
