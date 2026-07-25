@@ -128,6 +128,9 @@ CompiledMethod *optimizeMethod(CompiledMethod *method, NativeCode *oldCode,
 	IcCell *oldCells = nativeCodeIcCells(oldCode);
 	size_t oldCellCount = oldCode->icCellsSize;
 	size_t oldSiteIndex = 0;
+	if (typeStatsEnabled()) {
+		gTypeStats.hotMethods++;
+	}
 
 	BytecodesIterator iterator;
 	bytecodeInitIterator(&iterator, opt.code.bytecodes, bcSize);
@@ -172,8 +175,9 @@ CompiledMethod *optimizeMethod(CompiledMethod *method, NativeCode *oldCode,
 
 			// The backends' site classification, verbatim (SendClassify.h).
 			RawObject *selector = compiledCodeLiteralAt(&opt.code, selectorIndex);
-			_Bool dynamic = compiledCodeResolveOperandClass(&opt.code, receiver) == NULL
-				&& classifyIdentity(selector, argsSize) == IDENT_NONE;
+			_Bool identity = classifyIdentity(selector, argsSize) != IDENT_NONE;
+			_Bool resolved = compiledCodeResolveOperandClass(&opt.code, receiver) != NULL;
+			_Bool dynamic = !resolved && !identity;
 			IcCell *cell = NULL;
 			if (dynamic && oldSiteIndex < oldCellCount) {
 				cell = &oldCells[oldSiteIndex];
@@ -181,6 +185,11 @@ CompiledMethod *optimizeMethod(CompiledMethod *method, NativeCode *oldCode,
 			if (dynamic) {
 				oldSiteIndex++;
 			}
+			// ST_TYPE_STATS, hot scope: this method reached tier 1, and the cell
+			// is the site's accumulated feedback. Counted BEFORE tryInlineSite
+			// so an inlined site still appears, with the mono verdict that is
+			// exactly why it got inlined.
+			typeStatsNoteSend(1, receiver, identity, resolved, cell);
 
 			if (cell != NULL && argsFit && tryInlineSite(&opt, cell, selectorIndex,
 					argsSize, receiver, streamArgs, result,
@@ -583,16 +592,13 @@ static _Bool inlineEligible(CompiledCode *callee, InstanceShape shape)
 			if (!operandEligible(guarded, shape)) {
 				return 0;
 			}
-			// WARNING: a guarded INST_VAR is remapped by adjustOperand into
-			// OPERAND_INST_VAR_OF, and generateClassCheck has no arm for that
-			// form on either backend: it would take the default and FAIL().
-			// Every other eligible operand maps to a type it does handle. So a
-			// callee that branches on one of its own instance variables is
-			// rejected here until the backends learn the form. Found by the
-			// ST_TIER_INLINE_MAX sweep, which crashed Richards at 128.
-			if (guarded.type == OPERAND_INST_VAR) {
-				return 0;
-			}
+			// A guarded INST_VAR is remapped by adjustOperand into
+			// OPERAND_INST_VAR_OF. That form used to have no arm in
+			// generateClassCheck on either backend, so a callee branching on one
+			// of its own instance variables had to be rejected here (found by the
+			// ST_TIER_INLINE_MAX sweep, which crashed Richards at 128). Both
+			// backends now handle it, so every eligible operand maps to a form
+			// generateClassCheck knows. tests/InlineControlFlowTest.st pins it.
 			int32_t disp = bytecodeNextInt32(&iterator);
 			targets[targetCount++] = bytecodeOffset(&iterator) + disp;
 			break;

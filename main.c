@@ -321,6 +321,11 @@ int main(int argc, char **args)
 	if (tierStatsEnabled()) {
 		tierPrintStats();
 	}
+	// Send-classification census (jit/Tier.h) under ST_TYPE_STATS=1: the
+	// measurement gate for optional type annotations.
+	if (typeStatsEnabled()) {
+		typePrintStats();
+	}
 
 	freeHandles();
 	freeThread(&CurrentThread);

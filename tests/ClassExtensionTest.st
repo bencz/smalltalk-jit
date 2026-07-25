@@ -83,6 +83,13 @@ ExtChild := ExtParent [
 		raises: NotFoundError in: [ Object removeSelector: #extNsProbe ].
 	t expect: 'removing an inherited selector from a subclass raises (own dict only)'
 		raises: NotFoundError in: [ ExtChild removeSelector: #printString ].
+	"An IMMEDIATE selector used to reach asObject inside the primitive, which
+	 aborts the VM on a debug build and dereferences a wild pointer on a release
+	 one. It has to fail the primitive into the Smalltalk body and raise."
+	t expect: 'removing with a SmallInteger selector raises instead of crashing'
+		raises: NotFoundError in: [ ExtChild removeSelector: 42 ].
+	t expect: 'removing with a nil selector raises instead of crashing'
+		raises: NotFoundError in: [ ExtChild removeSelector: nil ].
 
 	^t report
 ]

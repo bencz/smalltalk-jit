@@ -7,6 +7,7 @@
 #include "memory/Heap.h"
 #include "memory/HeapPage.h"
 #include "jit/TargetCodePatch.h"
+#include "jit/Tier.h"
 #include "os/Os.h"
 #include <stdio.h>
 
@@ -33,6 +34,10 @@ uint8_t *inlineCacheMiss(Value taggedClass, RawString *selector, IcCell *cell)
 	Class *classHandle = scopeHandle((RawClass *) asObject(taggedClass));
 
 	gIcStats.missCold++;
+	// Witness for the ST_TYPE_STATS census: getting here proves this site ran,
+	// which is what separates "never executed" from "the scavenge wiped it"
+	// when the tier later finds the cell unlinked (jit/Tier.h). No-op otherwise.
+	typeStatsNoteExecuted(cell);
 	// May allocate, compile and GC (parking this thread): the class may move
 	// (handle keeps it current) and the cell may be reset or advanced by a
 	// peer meanwhile. Probes the calling worker's TLS LookupCache first: the

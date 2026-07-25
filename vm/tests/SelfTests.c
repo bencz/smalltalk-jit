@@ -141,13 +141,21 @@ static void runIcStatsTest(void *arg)
 // TierHost>>double: holds TWO monomorphic dynamic sends to bump:, an
 // ELIGIBLE leaf: under the default tier these sites are INLINED (M2), and
 // under ST_TIER_INLINE_MAX=0 they are promoted to direct calls (M1).
-// TierJumpy>>jProbe: contains an inlined conditional (JUMP bytecodes), so it
-// is never inlined and its sites exercise the M1 promotion counters in every
-// mode. Answers are asserted per iteration inside the loops (any old/new-code
-// divergence counts); each eval returns the number of WRONG iterations. A
-// fresh eval per phase gives a fresh unlinked call site, which binds to the
-// CURRENT (post-recompile) code without needing a GC to reset old cells.
-// Class definitions are a top-level construct: they go through
+//
+// TierPromo>>pProbe: is the M1 promotion probe, and it is ineligible
+// STRUCTURALLY: it activates a block, so it carries a context, and no ceiling
+// can ever make it inlinable. That matters. This role used to belong to
+// TierJumpy>>jProbe:, which was ineligible only because it OUTGREW
+// tierInlineMax(); raising the default ceiling from 96 to 192 quietly turned it
+// into an inlined site and took three counter assertions down with it. A probe
+// for "the site was promoted, not inlined" must not depend on a size constant.
+//
+// TierJumpy stays as a pure CORRECTNESS check for a callee with jumps, which is
+// inlined now that it fits. Answers are asserted per iteration inside the loops
+// (any old/new-code divergence counts); each eval returns the number of WRONG
+// iterations. A fresh eval per phase gives a fresh unlinked call site, which
+// binds to the CURRENT (post-recompile) code without needing a GC to reset old
+// cells. Class definitions are a top-level construct: they go through
 // parseSourceAndInitialize, not evalCode. TierBlocky/TierNlry exist only for
 // the eligibility-filter unit assertions.
 #define TIER_DEFS \
@@ -156,6 +164,9 @@ static void runIcStatsTest(void *arg)
 	"TierJumpy := Object [ jProbe: x [ ^x > 0 ifTrue: [x + 3] ifFalse: [0 - x] ]" \
 	" jDouble: x [ ^(self jProbe: x) + (self jProbe: x) ] ]\n" \
 	"TierJumpySub := TierJumpy [ jProbe: x [ ^x + 7 ] ]\n" \
+	"TierPromo := Object [ pProbe: x [ ^[ x + 3 ] value ]" \
+	" pDouble: x [ ^(self pProbe: x) + (self pProbe: x) ] ]\n" \
+	"TierPromoSub := TierPromo [ pProbe: x [ ^x + 7 ] ]\n" \
 	"TierBlocky := Object [ blocky: x [ ^[ x + 1 ] value ] ]\n" \
 	"TierNlry := Object [ nlry: x [ #(1) do: [:e | ^x + e ]. ^0 ] ]\n"
 #define TIER_MONO_WORKLOAD \
@@ -170,6 +181,12 @@ static void runIcStatsTest(void *arg)
 #define TIER_JUMPY_SUB_WORKLOAD \
 	"[ | h wrong | h := TierJumpySub new. wrong := 0." \
 	" 1 to: 200 do: [:i | (h jDouble: i) = (i * 2 + 14) ifFalse: [wrong := wrong + 1]]. wrong ] value"
+#define TIER_PROMO_WORKLOAD \
+	"[ | h wrong | h := TierPromo new. wrong := 0." \
+	" 1 to: 5000 do: [:i | (h pDouble: i) = (i * 2 + 6) ifFalse: [wrong := wrong + 1]]. wrong ] value"
+#define TIER_PROMO_SUB_WORKLOAD \
+	"[ | h wrong | h := TierPromoSub new. wrong := 0." \
+	" 1 to: 200 do: [:i | (h pDouble: i) = (i * 2 + 14) ifFalse: [wrong := wrong + 1]]. wrong ] value"
 
 static int tierStatsFailures;
 
@@ -203,10 +220,12 @@ static int tierStatsSelfTest(void)
 		Class *blocky = scopeHandle(asObject(evalObject("TierBlocky")));
 		Class *nlry = scopeHandle(asObject(evalObject("TierNlry")));
 		Class *jumpy = scopeHandle(asObject(evalObject("TierJumpy")));
+		Class *promo = scopeHandle(asObject(evalObject("TierPromo")));
 		CompiledMethod *bump = lookupSelector(host, getSymbol("bump:"));
 		CompiledMethod *blockyM = lookupSelector(blocky, getSymbol("blocky:"));
 		CompiledMethod *nlryM = lookupSelector(nlry, getSymbol("nlry:"));
 		CompiledMethod *jumpyM = lookupSelector(jumpy, getSymbol("jProbe:"));
+		CompiledMethod *promoM = lookupSelector(promo, getSymbol("pProbe:"));
 		CompiledMethod *primM = lookupSelector(host, getSymbol("basicSize"));
 		tierStatsCheck(bump != NULL && optimizerInlineEligibleForTest(bump, host),
 			"leaf callee rejected by the filter");
@@ -217,8 +236,25 @@ static int tierStatsSelfTest(void)
 				|| compiledMethodGetHeader(nlryM).hasContext)
 			&& !optimizerInlineEligibleForTest(nlryM, nlry),
 			"filter accepted a callee with outer returns");
-		tierStatsCheck(jumpyM != NULL && !optimizerInlineEligibleForTest(jumpyM, jumpy),
-			"filter accepted a callee with jumps");
+		// A callee with JUMPS has been eligible since the inliner learned control
+		// flow; whether THIS one qualifies depends only on whether it fits the
+		// ceiling. Assert that pairing rather than a particular verdict, so
+		// moving tierInlineMax() can never silently invert this check the way it
+		// did when the old assertion read "filter accepted a callee with jumps".
+		if (jumpyM != NULL) {
+			CompiledCode jumpyCode;
+			initMethodCompiledCode(&jumpyCode, jumpyM);
+			_Bool fits = jumpyCode.bytecodesSize <= tierInlineMax();
+			tierStatsCheck(optimizerInlineEligibleForTest(jumpyM, jumpy) == fits,
+				"a callee with jumps is eligible exactly when it fits the ceiling");
+		} else {
+			tierStatsCheck(0, "TierJumpy>>jProbe: not found");
+		}
+		// The promotion probe, by contrast, must be ineligible for a reason no
+		// ceiling can undo: it activates a block, so it carries a context.
+		tierStatsCheck(promoM != NULL && compiledMethodGetHeader(promoM).hasContext
+			&& !optimizerInlineEligibleForTest(promoM, promo),
+			"promotion probe is not structurally ineligible");
 		tierStatsCheck(primM != NULL && compiledMethodGetHeader(primM).primitive != 0
 			&& !optimizerInlineEligibleForTest(primM, host),
 			"filter accepted a primitive callee");
@@ -258,25 +294,33 @@ static int tierStatsSelfTest(void)
 	tierStatsCheck(asCInt(evalCode(TIER_MONO_WORKLOAD)) == 0, "mono run wrong answers");
 	tierStatsCheck(asCInt(evalCode(TIER_SUB_WORKLOAD)) == 0, "sub run wrong answers");
 
-	// Promotion counters, exercised by a callee the inliner always REJECTS
-	// (jProbe: has jumps): jDouble:'s sites stay promoted direct calls in
-	// every mode. Warm up, force adoption (republishing touches neither bound
-	// cells nor the TLS LookupCache by design; a full GC stands in for the
-	// scavenges of a real workload), then measure.
+	// Correctness for a callee with CONTROL FLOW across the tiering crossing.
+	// This one is inlined at the default ceiling, so it covers the rewritten
+	// form; the counter assertions live on the promotion probe below.
 	tierStatsCheck(asCInt(evalCode(TIER_JUMPY_WORKLOAD)) == 0, "jumpy warmup wrong answers");
+	tierStatsCheck(asCInt(evalCode(TIER_JUMPY_WORKLOAD)) == 0, "jumpy run wrong answers");
+	tierStatsCheck(asCInt(evalCode(TIER_JUMPY_SUB_WORKLOAD)) == 0, "jumpy sub wrong answers");
+
+	// Promotion counters, exercised by a callee the inliner rejects
+	// STRUCTURALLY (pProbe: activates a block, so it carries a context):
+	// pDouble:'s sites stay promoted direct calls in every mode, whatever the
+	// size ceiling is. Warm up, force adoption (republishing touches neither
+	// bound cells nor the TLS LookupCache by design; a full GC stands in for the
+	// scavenges of a real workload), then measure.
+	tierStatsCheck(asCInt(evalCode(TIER_PROMO_WORKLOAD)) == 0, "promo warmup wrong answers");
 	evalCode("GarbageCollector collectGarbage");
 	TierStats base = gTierStats;
-	tierStatsCheck(asCInt(evalCode(TIER_JUMPY_WORKLOAD)) == 0, "jumpy run wrong answers");
+	tierStatsCheck(asCInt(evalCode(TIER_PROMO_WORKLOAD)) == 0, "promo run wrong answers");
 	size_t direct = gTierStats.directCalls - base.directCalls;
 	size_t fails = gTierStats.guardFails - base.guardFails;
 	tierStatsCheck(direct > 9000, "promoted guards not taken (~2 per iteration expected)");
 	tierStatsCheck(fails < direct / 10, "stable mono site failing its guard");
 
-	// Guard-fail run: TierJumpySub inherits jDouble: (the same tier-1 code),
-	// so the promoted exact-TierJumpy guard must MISS for every send and the
-	// IC fallback must dispatch TierJumpySub>>jProbe: correctly.
+	// Guard-fail run: TierPromoSub inherits pDouble: (the same tier-1 code),
+	// so the promoted exact-TierPromo guard must MISS for every send and the
+	// IC fallback must dispatch TierPromoSub>>pProbe: correctly.
 	base = gTierStats;
-	tierStatsCheck(asCInt(evalCode(TIER_JUMPY_SUB_WORKLOAD)) == 0, "jumpy sub wrong answers");
+	tierStatsCheck(asCInt(evalCode(TIER_PROMO_SUB_WORKLOAD)) == 0, "promo sub wrong answers");
 	tierStatsCheck(gTierStats.guardFails - base.guardFails >= 300,
 		"subclass receiver did not take the guard-fail fallback (~400 expected)");
 

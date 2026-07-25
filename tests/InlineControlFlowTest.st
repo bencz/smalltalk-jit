@@ -22,11 +22,15 @@
  iteration, before and after recompilation, so a divergence between the sent
  and the inlined form is a counted failure rather than a lucky sample.
 
- WARNING for whoever extends this: a callee that branches on one of its own
- INSTANCE VARIABLES is deliberately still rejected. adjustOperand rewrites an
- ivar into OPERAND_INST_VAR_OF, and generateClassCheck has no arm for that form
- on either backend, so it would hit the default FAIL(). InlineIvarBranch below
- pins that this stays correct (it must answer right whether or not it inlines)."
+ A callee that branches on one of its own INSTANCE VARIABLES used to be
+ rejected outright: adjustOperand rewrites the ivar into OPERAND_INST_VAR_OF,
+ and generateClassCheck had no arm for that form on either backend, so it hit
+ the default FAIL(). Both backends handle it now, which makes the ivar cases
+ below live inlining paths rather than pins on a rejection. The trap in that arm
+ is the offset: OPERAND_INST_VAR_OF carries the ABSOLUTE, pre-resolved slot, so
+ re-applying the instance shape reads a NEIGHBOURING ivar and guards on the
+ wrong class silently. InlineIvarShapeSkew below is aimed straight at it, with
+ ivars of different classes sitting on either side of the guarded one."
 
 "--- conditionals, both arms, plus a non-tail return ---"
 InlineCfA := Object [
@@ -112,7 +116,50 @@ InlineIvarBranch := Object [
 	drive [ ^self choose ]
 ]
 
-[ | t a b c d e f g sub bad hot |
+"--- the OFFSET trap in the INST_VAR_OF class check ---
+ adjustOperand bakes the callee receiver's shape into the index, so the operand
+ already carries an ABSOLUTE slot. Re-applying a shape in generateClassCheck
+ (which is what the adjacent OPERAND_INST_VAR arm correctly does, and therefore
+ the mistake anyone editing that code will make) shifts the load.
+
+ The shift is the CALLER's payloadSize + isIndexed, so it is ZERO for a plain
+ Object subclass and the bug is INVISIBLE unless the caller is indexed. Hence
+ InlineIvarSkewCaller carries <shape: IndexedShape>, which makes the skew one
+ slot. That lands the boolean guard on `next` instead of `flag`, and since the
+ guard decides which arm of the inlined ifTrue: runs while the body still reads
+ the right slot, the result is a WRONG ANSWER rather than a crash: #no for a
+ true flag. Verified by injecting the shape re-application into the x64 arm and
+ watching this case, and only this case, fail."
+InlineIvarSkewCallee := Object [
+	| flag next |
+	setUp: aBoolean [ flag := aBoolean. next := 7. ^self ]
+	choose [ flag ifTrue: [ ^#yes ]. ^#no ]
+	next [ ^next ]
+]
+
+InlineIvarSkewCaller := Object [
+	<shape: IndexedShape>
+	| helper |
+	setHelper: aHelper [ helper := aHelper. ^self ]
+	drive [ ^helper choose ]
+]
+
+"--- an inlined ivar branch inside a LOOP, so the back edge and the ivar load
+ land in the same caller stream ---"
+InlineIvarLoop := Object [
+	| flag |
+	setFlag: aBoolean [ flag := aBoolean. ^self ]
+	pick [ flag ifTrue: [ ^1 ]. ^2 ]
+	sum: n [
+		| total i |
+		total := 0.
+		i := 1.
+		[ i <= n ] whileTrue: [ total := total + self pick. i := i + 1 ].
+		^total
+	]
+]
+
+[ | t a b c d e f g sub bad hot skew callee loop |
 	t := TestRun named: 'InlineControlFlow'.
 	hot := 3000.
 
@@ -204,6 +251,34 @@ InlineIvarBranch := Object [
 	1 to: 500 do: [:i |
 		e drive == #no ifFalse: [bad := bad + 1]].
 	t check: 'a callee branching on an instance variable stays correct'
+		equals: 0 is: [ bad ].
+
+	"--- INDEXED caller, so a re-applied shape shifts the guard by one slot ---"
+	bad := 0.
+	callee := InlineIvarSkewCallee new setUp: true.
+	skew := InlineIvarSkewCaller new: 4.
+	skew setHelper: callee.
+	1 to: hot do: [:i |
+		skew drive == #yes ifFalse: [bad := bad + 1]].
+	callee setUp: false.
+	1 to: hot do: [:i |
+		skew drive == #no ifFalse: [bad := bad + 1]].
+	callee setUp: true.
+	1 to: hot do: [:i |
+		skew drive == #yes ifFalse: [bad := bad + 1].
+		callee next = 7 ifFalse: [bad := bad + 1]].
+	t check: 'an inlined ivar branch reads the ABSOLUTE slot, not a shape-skewed one'
+		equals: 0 is: [ bad ].
+
+	"--- inlined ivar branch inside a loop: back edge plus ivar load ---"
+	bad := 0.
+	loop := InlineIvarLoop new setFlag: true.
+	1 to: 200 do: [:i |
+		(loop sum: 50) = 50 ifFalse: [bad := bad + 1]].
+	loop setFlag: false.
+	1 to: 200 do: [:i |
+		(loop sum: 50) = 100 ifFalse: [bad := bad + 1]].
+	t check: 'an inlined ivar branch inside a loop answers correctly'
 		equals: 0 is: [ bad ].
 
 	^t report

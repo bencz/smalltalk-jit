@@ -107,6 +107,11 @@ Behavior := Object [
 
 
 	lookupSelector: aSymbol [
+		"The method this class would run for aSymbol, or nil. The primitive is
+		 the same superclass-chain walk in C; this body is its fallback for a
+		 selector that is neither Symbol nor String, and both answer nil when
+		 nothing in the chain implements it."
+		<primitive: BehaviorLookupSelectorPrimitive>
 		| class |
 
 		class := self.

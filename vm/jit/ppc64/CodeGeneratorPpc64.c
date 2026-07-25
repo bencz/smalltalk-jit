@@ -2006,6 +2006,46 @@ static void generateClassCheck(CodeGenerator *generator, Operand operand, RawCla
 		break;
 	}
 
+	case OPERAND_INST_VAR_OF: {
+		// The tier-1 inliner's rewrite of a callee ivar access, reached when the
+		// INLINED CALLEE branches on one of its own instance variables
+		// (`flag ifTrue: [...]`). Same form as the load path above: the instance
+		// is the spilled-receiver TEMP, and the index is the ABSOLUTE
+		// pre-resolved slot, so unlike OPERAND_INST_VAR the shape must NOT be
+		// applied again here (adjustOperand already did it, pinned by the site's
+		// exact-class guard). Applying it twice reads a neighbouring slot and
+		// answers a wrong class silently.
+		ASSERT(operand.instance.type == OPERAND_TEMP_VAR);
+		Variable *instance = variableAt(generator, operand.instance.index);
+		ptrdiff_t offset = varOffset(RawObject, body) + operand.index * sizeof(Value);
+		fillVar(generator, instance);
+
+		asmLdT(buffer, TMP, offset, varReg(instance));
+
+		if (class == Handles.SmallInteger->raw) {
+			asmAndiDot(buffer, R0, TMP, 3);
+			asmBne(buffer, label);
+		} else if (class == Handles.Character->raw) {
+			// exact tag 0b10 (see the TEMP_VAR variant)
+			asmAndiDot(buffer, R0, TMP, 3);
+			asmCmpldi(buffer, 0, R0, VALUE_CHAR);
+			asmBne(buffer, label);
+		} else if (class == Handles.SmallFloat64->raw) {
+			asmAndiDot(buffer, R0, TMP, 3);
+			asmCmpldi(buffer, 0, R0, VALUE_FLOAT);
+			asmBne(buffer, label);
+		} else {
+			// compute the class like generateSend does: generateLoadClass is
+			// immediate-safe and yields a tagged class, while the old raw
+			// class-word load dereferenced whatever non-pointer value was in TMP
+			generateLoadClass(buffer, TMP, R3);
+			generateLoadObject(buffer, (RawObject *) class, TMP, 1);
+			asmCmpd(buffer, 0, R3, TMP);
+			asmBne(buffer, label);
+		}
+		break;
+	}
+
 	case OPERAND_LITERAL: {
 		RawObject *literal = compiledCodeLiteralAt(&generator->code, operand.index);
 		if (class != literal->class) {

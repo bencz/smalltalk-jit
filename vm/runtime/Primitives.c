@@ -119,6 +119,7 @@ static PrimitiveResult collectGarbagePrimitive(Value receiver);
 static PrimitiveResult flushSendCachesPrimitive(Value receiver);
 static PrimitiveResult executablePathPrimitive(Value receiver);
 static PrimitiveResult classRemoveSelectorPrimitive(Value receiver, Value vSelector);
+static PrimitiveResult behaviorLookupSelectorPrimitive(Value receiver, Value vSelector);
 static PrimitiveResult buildClassInPrimitive(Value receiver, Value vNode, Value vNs);
 static PrimitiveResult compileMethodInPrimitive(Value receiver, Value vNode, Value class, Value vNs);
 static PrimitiveResult defaultNamespacePrimitive(Value receiver);
@@ -485,6 +486,11 @@ Primitive Primitives[] = {
 	{"LargeIntAsFloatPrimitive", CCALL, .cFunction = largeIntAsFloatPrimitive, 2},
 	{"LargeIntPrintStringPrimitive", CCALL, .cFunction = largeIntPrintStringPrimitive, 2},
 	{"LargeIntFromStringPrimitive", CCALL, .cFunction = largeIntFromStringPrimitive, 4},
+	// Appended (NEVER reorder this table): the method-dictionary walk behind
+	// Behavior>>lookupSelector:, which every perform: and every reflective send
+	// pays for. Fails into the Smalltalk walk for a non-Behavior receiver or a
+	// non-Symbol selector.
+	{"BehaviorLookupSelectorPrimitive", CCALL, .cFunction = behaviorLookupSelectorPrimitive, 2},
 };
 
 
@@ -1913,24 +1919,72 @@ static PrimitiveResult classRemoveSelectorPrimitive(Value receiver, Value vSelec
 	HandleScope scope;
 	openHandleScope(&scope);
 
-	Object *holder = scopeHandle(asObject(receiver));
-	String *selector = scopeHandle(asObject(vSelector));
-	// receiver must be a Class (its class is a metaclass) or a MetaClass
-	_Bool isClass = holder->raw->class != NULL
-		&& holder->raw->class->class == Handles.MetaClass->raw;
-	_Bool isMetaClass = holder->raw->class == Handles.MetaClass->raw;
+	// Tag-safe checks FIRST, on the tagged Values: the selector is an ordinary
+	// argument, so `removeSelector: 42` arrives as an IMMEDIATE and the old
+	// asObject-then-inspect order aborted the VM on it (assertion in a debug
+	// build, wild pointer in a release one) instead of failing into the
+	// Smalltalk body that raises properly. receiver must be a Class (its class
+	// is a metaclass) or a MetaClass.
+	RawClass *receiverClass = getClassOf(receiver);
+	RawClass *selectorClass = getClassOf(vSelector);
+	_Bool isClass = receiverClass != NULL
+		&& receiverClass->class == Handles.MetaClass->raw;
+	_Bool isMetaClass = receiverClass == Handles.MetaClass->raw;
 	if ((!isClass && !isMetaClass)
-			|| (selector->raw->class != Handles.Symbol->raw
-				&& selector->raw->class != Handles.String->raw)) {
+			|| (selectorClass != Handles.Symbol->raw
+				&& selectorClass != Handles.String->raw)) {
 		closeHandleScope(&scope, NULL);
 		return primFailed();
 	}
+	Object *holder = scopeHandle(asObject(receiver));
+	String *selector = scopeHandle(asObject(vSelector));
 	if (!classRemoveSelector(holder, selector)) {
 		closeHandleScope(&scope, NULL);
 		return primFailed();
 	}
 	closeHandleScope(&scope, NULL);
 	return primSuccess(receiver);
+}
+
+
+// Behavior>>lookupSelector: as the C walk it already is internally. The
+// Smalltalk version (packages/Core/src/Behavior.st) walks the superclass chain
+// with a dictionary send and a block activation PER LEVEL: measured at ~370ns a
+// call on this machine, and it sits under every perform: and every reflective
+// send in the image.
+//
+// Deliberately NOT routed through lookupNativeCode or the JIT's lookup cache.
+// Those answer a native code ENTRY, which is a dispatch decision and compiles
+// the method as a side effect; this answers the CompiledMethod OBJECT, which
+// callers only want to inspect. Same walk, same answer as the .st fallback
+// below it, including nil for not-found.
+static PrimitiveResult behaviorLookupSelectorPrimitive(Value receiver, Value vSelector)
+{
+	// EVERY check runs on the tagged Values, BEFORE any asObject. The selector
+	// is an ordinary argument, so `lookupSelector: 42` arrives here as an
+	// IMMEDIATE, and asObject on an immediate is an assertion failure in a debug
+	// build and a wild pointer in a release one. getClassOf is the tag-safe way
+	// to ask; anything that is not a Symbol or String falls into the Smalltalk
+	// walk below, which answers nil for it.
+	RawClass *receiverClass = getClassOf(receiver);
+	RawClass *selectorClass = getClassOf(vSelector);
+	_Bool isClass = receiverClass != NULL
+		&& receiverClass->class == Handles.MetaClass->raw;
+	_Bool isMetaClass = receiverClass == Handles.MetaClass->raw;
+	if ((!isClass && !isMetaClass)
+			|| (selectorClass != Handles.Symbol->raw
+				&& selectorClass != Handles.String->raw)) {
+		return primFailed();
+	}
+
+	HandleScope scope;
+	openHandleScope(&scope);
+	Class *class = scopeHandle(asObject(receiver));
+	String *selector = scopeHandle(asObject(vSelector));
+	CompiledMethod *method = lookupSelector(class, selector);
+	Value result = getTaggedPtr(method == NULL ? (Object *) Handles.nil : (Object *) method);
+	closeHandleScope(&scope, NULL);
+	return primSuccess(result);
 }
 
 

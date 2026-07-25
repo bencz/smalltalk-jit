@@ -2131,6 +2131,47 @@ static void generateClassCheck(CodeGenerator *generator, Operand operand, RawCla
 		break;
 	}
 
+	case OPERAND_INST_VAR_OF: {
+		// The tier-1 inliner's rewrite of a callee ivar access, reached when the
+		// INLINED CALLEE branches on one of its own instance variables
+		// (`flag ifTrue: [...]`). Same form as the load path above: the instance
+		// is the spilled-receiver TEMP, and the index is the ABSOLUTE
+		// pre-resolved slot, so unlike OPERAND_INST_VAR the shape must NOT be
+		// applied again here (adjustOperand already did it, pinned by the site's
+		// exact-class guard). Applying it twice reads a neighbouring slot and
+		// answers a wrong class silently.
+		ASSERT(operand.instance.type == OPERAND_TEMP_VAR);
+		Variable *instance = variableAt(generator, operand.instance.index);
+		ptrdiff_t offset = varOffset(RawObject, body) + operand.index * sizeof(Value);
+
+		asmMovqMem(buffer, asmMem(fillVarToReg(generator, instance, TMP), NO_REGISTER, SS_1, offset), TMP);
+
+		if (class == Handles.SmallInteger->raw) {
+			asmTestqImm(buffer, TMP, 3);
+			asmJ(buffer, COND_NOT_ZERO, label);
+		} else if (class == Handles.Character->raw) {
+			// exact tag 0b10 via scratch RAX (see the TEMP_VAR variant)
+			asmMovq(buffer, TMP, RAX);
+			asmAndqImm(buffer, RAX, 3);
+			asmCmpqImm(buffer, RAX, VALUE_CHAR);
+			asmJ(buffer, COND_NOT_EQUAL, label);
+		} else if (class == Handles.SmallFloat64->raw) {
+			asmMovq(buffer, TMP, RAX);
+			asmAndqImm(buffer, RAX, 3);
+			asmCmpqImm(buffer, RAX, VALUE_FLOAT);
+			asmJ(buffer, COND_NOT_EQUAL, label);
+		} else {
+			// compute the class like generateSend does: generateLoadClass is
+			// immediate-safe and yields a tagged class, while the old raw
+			// class-word load dereferenced whatever non-pointer value was in TMP
+			generateLoadClass(buffer, TMP, RAX);
+			generateLoadObject(buffer, (RawObject *) class, TMP, 1);
+			asmCmpq(buffer, RAX, TMP);
+			asmJ(buffer, COND_NOT_EQUAL, label);
+		}
+		break;
+	}
+
 	case OPERAND_LITERAL: {
 		RawObject *literal = compiledCodeLiteralAt(&generator->code, operand.index);
 		if (class != literal->class) {

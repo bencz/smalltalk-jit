@@ -27,8 +27,10 @@
 // ST_TIER_THRESHOLD=<n>  invocations before the recompile (default 1000).
 // ST_TIER_STATS=1  counters + exit dump; the JIT-emitted increments (guard
 //                  hits/fails) cost only under this flag.
+// ST_TYPE_STATS=1  send-classification census + exit dump (TypeStats below).
 
 #include "core/CompiledCode.h"
+#include "compiler/Bytecodes.h"
 #include <stdlib.h>
 #include <stdint.h>
 
@@ -50,6 +52,95 @@ typedef struct {
 	size_t guardFails;          // guard misses -> IC fallback, same gating
 } TierStats;
 extern TierStats gTierStats;
+
+
+// Send-classification census (ST_TYPE_STATS=1): how many sends this VM already
+// resolves without dispatch, and for the ones it does not, WHAT THE RECEIVER IS.
+// This is the measurement gate for optional type annotations: the whole thesis
+// is that declaring a parameter's class would let
+// compiledCodeResolveOperandClass answer for OPERAND_ARG_VAR (and
+// OPERAND_TEMP_VAR), at which point the backends' existing compile-time
+// devirtualization fires with no other change. The census says how much code
+// that would actually reach, before any syntax exists.
+//
+// TWO SCOPES, because they answer different questions:
+//
+//   ALL  every framed method the tier-0 codegen sees, counted once each. The
+//        shape of the source as WRITTEN, kernel included. A method compiled but
+//        never run counts the same as the hottest loop in the program.
+//   HOT  the same census over methods that reached TIER 1, counted in
+//        compiler/Optimizer.c. Reaching tier 1 IS the hotness filter, so this
+//        is the decision-relevant number; ALL is its denominator and sanity
+//        check. Use a low ST_TIER_THRESHOLD to widen the HOT sample.
+//
+// Neither scope weights a site by how many times it EXECUTES: a site in a loop
+// body counts once. Reading these as "fraction of dispatches" would overstate
+// cold code, so they are reported as what they are, a census of SITES.
+//
+// The refinement that decides the thesis, over HOT arg/temp receivers only:
+// what a declared class would actually BUY at that site. A site whose IC cell
+// is MONO has ALREADY been devirtualized by the tier (guarded direct call, or
+// inlined body), so an annotation buys the removal of a 2-to-5 instruction
+// guard, not the removal of a dispatch. A site whose cell is a PIC genuinely
+// sees several classes, so an EXACT declared type there would be a lie that
+// raises. Only the cold and mega buckets are places where a type declaration
+// tells the compiler something the runtime never learned.
+typedef struct {
+	// scope ALL
+	size_t methods;
+	size_t sendsStatic;      // receiver class resolvable today: no cell, no dispatch
+	size_t sendsIdentity;    // ==/~~/isNil/notNil: compiled inline, no cell
+	size_t sendsDynamic;
+	size_t dynSelf;          // OPERAND_TEMP_VAR at SELF_INDEX: annotation cannot help
+	size_t dynArg;           // OPERAND_ARG_VAR: the thesis target
+	size_t dynTemp;          // OPERAND_TEMP_VAR other than self: the thesis target
+	size_t dynInstVar;       // OPERAND_INST_VAR: typed-ivar territory, not M12
+	size_t dynContextVar;    // OPERAND_CONTEXT_VAR: captured, needs closure typing
+	size_t dynOther;         // ASSOC (globals), INST_VAR_OF, anything else
+	// scope HOT (tier-1 methods only)
+	size_t hotMethods;
+	size_t hotStatic;
+	size_t hotIdentity;
+	size_t hotDynamic;
+	size_t hotSelf;
+	size_t hotArg;
+	size_t hotTemp;
+	size_t hotInstVar;
+	size_t hotContextVar;
+	size_t hotOther;
+	// what an exact declared type would buy, over hotArg + hotTemp only
+	size_t annotMono;        // already devirtualized: buys a guard, not a dispatch
+	size_t annotPic;         // several classes seen: an exact type would be WRONG
+	size_t annotMega;        // megamorphic: a type would be new information
+	size_t annotColdNever;   // unlinked and never executed: a type IS new information
+	size_t annotColdReset;   // unlinked but executed earlier: the GC wiped what was known
+} TypeStats;
+extern TypeStats gTypeStats;
+
+void typePrintStats(void);
+
+// An unlinked cell at recompile time means one of two very different things,
+// and telling them apart is what makes the census decisive. A site that NEVER
+// RAN is a place where a declared type tells the compiler something the runtime
+// could not know. A site that ran and whose cell was then wiped by the STW
+// reset (icResetNativeCodeCells runs at every scavenge, so a long run resets
+// each cell many times over) is a place where the runtime ALREADY KNEW and the
+// collector threw it away: there, persistent type feedback is the cheap fix and
+// a type system is the expensive one.
+//
+// Reaching inlineCacheMiss at all proves the site executed, so recording the
+// cell there is an exact witness. Stats-only and gated: zero cost, and no more
+// thread-safe than the plain gIcStats increments next to it (measurement
+// tooling, single worker).
+void typeStatsNoteExecuted(struct IcCell *cell);
+
+// One census entry. `resolved` and `identity` are the caller's own
+// classification (jit/SendClassify.h), passed in rather than recomputed so the
+// census can never disagree with the decision the compiler actually made.
+// `cell` is the site's IC feedback and is meaningful only when hot; NULL
+// elsewhere. Costs nothing unless ST_TYPE_STATS is set.
+void typeStatsNoteSend(_Bool hot, Operand receiver, _Bool identity, _Bool resolved,
+	struct IcCell *cell);
 
 // The JIT prologue's slow path: `insts` is the code entry (NativeCode.insts)
 // of the method whose invocation counter just hit zero.
@@ -94,6 +185,16 @@ static _Bool tierStatsEnabled(void)
 }
 
 
+static _Bool typeStatsEnabled(void)
+{
+	static int enabled = -1;
+	if (enabled < 0) {
+		enabled = getenv("ST_TYPE_STATS") != NULL;
+	}
+	return enabled;
+}
+
+
 static size_t tierThreshold(void)
 {
 	static size_t threshold = 0;
@@ -122,18 +223,33 @@ static size_t tierThreshold(void)
 //   256       17 -> 24        93 -> 108
 //
 // So the size ceiling, not the straight-line rule, was the real gate. At 96 the
-// executed-instruction counts fall 0.79% on Richards and 1.40% on DeltaBlue,
-// while MixedArithBench, FloatBench and ArrayNumericBench move by 0.000%, so
-// the wider ceiling costs nothing measurable where it does not apply. 256 buys
-// Richards a little more and DeltaBlue nothing, which is not worth the code
-// growth on a lottery this VM has lost before (see the tier slow-path
+// executed-instruction counts fell 0.79% on Richards and 1.40% on DeltaBlue,
+// while MixedArithBench, FloatBench and ArrayNumericBench moved by 0.000%.
+//
+// The ceiling then sat at 96 for one reason only: a callee branching on its own
+// instance variable was REJECTED, because adjustOperand rewrites the ivar into
+// OPERAND_INST_VAR_OF and generateClassCheck had no arm for that form, so 128
+// crashed Richards. With both backends teaching generateClassCheck the form,
+// re-measured:
+//
+//   ceiling   Richards   DeltaBlue
+//   96        19         103        (unchanged: the arm alone admits nothing here)
+//   128       21         104
+//   192       25         105
+//   256       25         108
+//
+// 192 is the default now. Note what the arm is and is not worth: at 96 it
+// unlocks ZERO sites across the whole test corpus, so it only pays TOGETHER
+// with the higher ceiling, where it contributes 1 of Richards' 6 new sites. 256
+// buys DeltaBlue 3 more and Richards nothing, which is not worth the extra code
+// growth on a layout lottery this VM has lost before (see the tier slow-path
 // out-of-lining note below).
 static size_t tierInlineMax(void)
 {
 	static long limit = -1;
 	if (limit < 0) {
 		char *env = getenv("ST_TIER_INLINE_MAX");
-		limit = env != NULL ? atol(env) : 96;
+		limit = env != NULL ? atol(env) : 192;
 		if (limit < 0) {
 			limit = 0;
 		}
