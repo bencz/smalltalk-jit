@@ -393,6 +393,15 @@ static Value readObject(int64_t field, Snapshot *snapshot)
 	object->class = (RawClass *) asObject(readField(snapshot));
 	ASSERT(object->class != NULL);
 
+	// NOTE the payload words (shape.payloadSize, ahead of vars) are deliberately
+	// NOT written here, and are NOT in the stream either: writeObject never
+	// serializes them. For CompiledMethod/CompiledBlock that word is
+	// `nativeCode`, and reading it back as NULL is exactly what marks the method
+	// "not yet compiled". So this depends on a freshly allocated object's bytes
+	// being ZERO -- which osPageAlloc guarantees (see the contract in os/Os.h;
+	// mapHeapPage no longer re-zeroes data pages). It holds today because a
+	// snapshot is small enough that no scavenge runs during the load, so every
+	// object here comes from never-touched nursery.
 	Value *vars = getRawObjectVarsFromShape(object, shape);
 	for (size_t i = 0; i < size; i++) {
 		vars[i] = readField(snapshot);

@@ -103,9 +103,33 @@ HeapPage *mapHeapPage(size_t size, _Bool executable)
 	page->size = alignedSize;
 	page->bodySize = alignedSize - sizeof(*page);
 	page->body = (uint8_t *) page + sizeof(*page);
+	// Only EXECUTABLE pages get filled, and their filler is semantic: it is a
+	// trap pattern, so a stray jump into unwritten code faults instead of
+	// sliding (jit/TargetTraits.h).
+	//
+	// A data page is NOT zeroed here, because osPageAlloc already hands back
+	// zeroed memory and writing zeros over zeros is not free: it is what made
+	// startup 22.4 ms. The 64 MB nursery (Heap.c:47) dominates the ~67.6 MB this
+	// used to memset, and touching it forced the kernel to fault in and zero
+	// every one of ~16.5k pages up front, which was 16,827 of the process's
+	// minor faults and about 90% of startup at IPC 0.50. Skipping it lets those
+	// pages arrive on demand instead, so a program that uses a little of the
+	// heap pays for a little of the heap.
+	//
+	// This is safe because a page is never recycled: mapHeapPage is the only
+	// caller of osPageAlloc and always maps fresh, unmapHeapPage always munmaps,
+	// and there is no page cache. Nothing depends on zeroed heap bytes anyway --
+	// the freelist and the semispace flip already hand out bytes that were never
+	// re-zeroed (SCRUB_ABANDONED_SEMISPACE, Scavenger.c) -- with the single
+	// exception of snapshot load, which relies on a fresh object's payload words
+	// reading as zero (Snapshot.c readObject). That dependency is on ZERO, which
+	// osPageAlloc guarantees, not on this memset.
+	//
 	// PORT_ME(wxorx): executable pages are mapped RWX and never remapped; a
 	// hardened kernel or a W^X-enforcing arch needs a write->exec protocol here.
-	memset(page->body, executable ? TARGET_CODE_FILLER_BYTE : 0, page->bodySize);
+	if (executable) {
+		memset(page->body, TARGET_CODE_FILLER_BYTE, page->bodySize);
+	}
 	page->bodySize -= page->bodySize % HEAP_OBJECT_ALIGN;
 #if PRINT_PAGE_ALLOC
 	printf("Page %p %zu%s\n", page, size, executable ? " executable" : "");

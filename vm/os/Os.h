@@ -61,6 +61,15 @@ long osPageSize(void);
 
 // Committed RW (optionally executable) anonymous memory; NULL on failure.
 // Executable mappings are RWX today — see PORT_ME(wxorx) at the call site.
+//
+// MUST return ZERO-FILLED memory. This is not a courtesy: mapHeapPage stopped
+// zeroing data pages precisely because every backing primitive already does it
+// (linux mmap MAP_ANON, Win32 VirtualAlloc MEM_COMMIT, BSD/macOS mmap MAP_ANON
+// all zero-fill), and re-zeroing 64 MB of nursery cost ~90% of process startup.
+// Snapshot load leans on it directly: readObject leaves a fresh object's
+// payload words untouched and reads them back as the "not yet compiled" NULL.
+// A backend that returned recycled or uninitialised pages would corrupt the
+// image silently, so it must zero them itself before returning.
 void *osPageAlloc(size_t size, _Bool executable);
 
 // Reserve ADDRESS SPACE only (no RAM, no overcommit charge, faults on touch);
