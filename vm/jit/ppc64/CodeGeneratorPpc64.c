@@ -1493,37 +1493,47 @@ void generateLoadObject(AssemblerBuffer *buffer, RawObject *object, Register dst
 
 void generateLoadClass(AssemblerBuffer *buffer, Register src, Register dst)
 {
-	// Four-way exact dispatch on the 2-bit tag. The old shortcut (above
-	// VALUE_POINTER means Character) would classify a VALUE_FLOAT immediate
-	// (0b11) as a Character. One end label per arm: a label takes a single
-	// forward reference.
+	// Four-way exact dispatch on the 2-bit tag, laid out for the POINTER case;
+	// see the x64 twin for the full rationale. The dispatch stays exact (the old
+	// "above VALUE_POINTER means Character" shortcut misread a VALUE_FLOAT
+	// immediate); what changed is the order and the test.
+	//
+	// Pointer path: 5 instructions instead of 6. `addi dst,src,-1` untags and
+	// sets up the tag test at once, because a tagged pointer is
+	// `object + VALUE_POINTER` and object addresses have their low two bits
+	// clear, so `(src-1) & 3 == 0` holds for exactly the pointer tag; and the
+	// pointer arm is emitted LAST so it falls through instead of branching over
+	// the three immediate arms.
+	//
+	// The cold arms read the tag out of `dst` (still src-1) rather than `src`,
+	// because callers may pass src == dst. That shifts the mapping by one:
+	// (src-1)&3 is 1 for Character, 2 for SmallFloat64, 3 for SmallInteger.
 	AssemblerLabel pointer;
 	AssemblerLabel character;
 	AssemblerLabel floatImm;
-	AssemblerLabel endInt, endPtr, endChar;
+	AssemblerLabel endInt, endChar, endFloat;
 
 	asmInitLabel(&pointer);
 	asmInitLabel(&character);
 	asmInitLabel(&floatImm);
 	asmInitLabel(&endInt);
-	asmInitLabel(&endPtr);
 	asmInitLabel(&endChar);
+	asmInitLabel(&endFloat);
 
-	asmAndiDot(buffer, dst, src, 3);
-	asmCmpldi(buffer, 0, dst, VALUE_POINTER);
+	// `src` is never R0 here (it is a real receiver register), which matters:
+	// addi with RA = r0 reads the literal zero, not the register.
+	asmAddi(buffer, dst, src, -1);
+	asmAndiDot(buffer, R0, dst, 3);
 	asmBeq(buffer, &pointer);
-	asmCmpldi(buffer, 0, dst, VALUE_CHAR);
+
+	asmAndiDot(buffer, dst, dst, 3);
+	asmCmpldi(buffer, 0, dst, VALUE_CHAR - VALUE_POINTER);
 	asmBeq(buffer, &character);
-	asmCmpldi(buffer, 0, dst, VALUE_FLOAT);
+	asmCmpldi(buffer, 0, dst, VALUE_FLOAT - VALUE_POINTER);
 	asmBeq(buffer, &floatImm);
 
 	generateLoadObject(buffer, (RawObject *) Handles.SmallInteger->raw, dst, 1);
 	asmB(buffer, &endInt);
-
-	asmPpcLabelBind(buffer, &pointer, asmOffset(buffer));
-	asmLdT(buffer, dst, -1, src);   // class word of the tagged pointer
-	asmAddi(buffer, dst, dst, 1);   // tag the class
-	asmB(buffer, &endPtr);
 
 	asmPpcLabelBind(buffer, &character, asmOffset(buffer));
 	generateLoadObject(buffer, (RawObject *) Handles.Character->raw, dst, 1);
@@ -1531,10 +1541,17 @@ void generateLoadClass(AssemblerBuffer *buffer, Register src, Register dst)
 
 	asmPpcLabelBind(buffer, &floatImm, asmOffset(buffer));
 	generateLoadObject(buffer, (RawObject *) Handles.SmallFloat64->raw, dst, 1);
+	asmB(buffer, &endFloat);
 
-	asmPpcLabelBind(buffer, &endInt, asmOffset(buffer));
-	asmPpcLabelBind(buffer, &endPtr, asmOffset(buffer));
-	asmPpcLabelBind(buffer, &endChar, asmOffset(buffer));
+	// Pointer arm last: it falls straight out of the function.
+	asmPpcLabelBind(buffer, &pointer, asmOffset(buffer));
+	asmLdT(buffer, dst, 0, dst);    // class word of the now-untagged pointer
+	asmAddi(buffer, dst, dst, 1);   // tag the class
+
+	ptrdiff_t end = asmOffset(buffer);
+	asmPpcLabelBind(buffer, &endInt, end);
+	asmPpcLabelBind(buffer, &endChar, end);
+	asmPpcLabelBind(buffer, &endFloat, end);
 }
 
 

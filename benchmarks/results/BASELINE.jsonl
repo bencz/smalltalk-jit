@@ -354,3 +354,9 @@
 {"label":"phase1a-fuse-bool","bench":"BigIntBench","ms":139.260,"selfms":119,"insns":1625204470,"governor":"powersave","no_turbo":"0","nproc":16,"cpu":2,"env":""}
 {"label":"phase1a-fuse-bool","bench":"BigIntBench","ms":140.020,"selfms":118,"insns":1625204462,"governor":"powersave","no_turbo":"0","nproc":16,"cpu":2,"env":""}
 {"label":"phase1a-fuse-bool","bench":"BigIntBench","ms":137.850,"selfms":117,"insns":1625204433,"governor":"powersave","no_turbo":"0","nproc":16,"cpu":2,"env":""}
+{"label":"phase2a-loadclass","bench":"Richards","ms":523.420,"selfms":504,"insns":6468502930,"governor":"powersave","no_turbo":"0","nproc":16,"cpu":2,"env":""}
+{"label":"phase2a-loadclass","bench":"DeltaBlue","ms":293.550,"selfms":278,"insns":3968640811,"governor":"powersave","no_turbo":"0","nproc":16,"cpu":2,"env":""}
+{"label":"phase2a-loadclass","bench":"FloatBench","ms":334.480,"selfms":315,"insns":7082566159,"governor":"powersave","no_turbo":"0","nproc":16,"cpu":2,"env":""}
+{"label":"phase2a-loadclass","bench":"MixedArithBench","ms":322.340,"selfms":304,"insns":6567852876,"governor":"powersave","no_turbo":"0","nproc":16,"cpu":2,"env":""}
+{"label":"phase2a-loadclass","bench":"ArrayNumericBench","ms":426.060,"selfms":165,"insns":5552286846,"governor":"powersave","no_turbo":"0","nproc":16,"cpu":2,"env":""}
+{"label":"phase2a-loadclass","bench":"BigIntBench","ms":132.420,"selfms":112,"insns":1613345768,"governor":"powersave","no_turbo":"0","nproc":16,"cpu":2,"env":""}

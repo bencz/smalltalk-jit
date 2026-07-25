@@ -1588,38 +1588,55 @@ void generateLoadObject(AssemblerBuffer *buffer, RawObject *object, Register dst
 
 void generateLoadClass(AssemblerBuffer *buffer, Register src, Register dst)
 {
-	// Four-way exact dispatch on the 2-bit tag. The old shortcut (above
-	// VALUE_POINTER means Character) would classify a VALUE_FLOAT immediate
-	// (0b11) as a Character. Each label takes a single forward reference, so
-	// every arm exits through its own end label.
+	// Four-way exact dispatch on the 2-bit tag, laid out for the POINTER case.
+	// The old shortcut (above VALUE_POINTER means Character) would classify a
+	// VALUE_FLOAT immediate (0b11) as a Character, so the dispatch stays exact;
+	// what changed is the ORDER and the test.
+	//
+	// This runs before every dynamic send, 81 million times in one Richards
+	// run, and almost every receiver is a heap pointer. It used to cost 7
+	// executed instructions on that path (copy, and, cmp, taken branch, load,
+	// inc, jump); it now costs 5, because:
+	//
+	//   * `lea dst,[src-1]` does the untag and the tag test in one go. A tagged
+	//     pointer is `object + VALUE_POINTER` and object addresses have their
+	//     low two bits clear (that is what makes the tagging scheme work at
+	//     all, HEAP_OBJECT_ALIGN is 16), so `(src-1) & 3 == 0` is true for
+	//     exactly the pointer tag. It also leaves the RAW object address in
+	//     dst, which is what the class load wants.
+	//   * the pointer arm is emitted LAST, so it falls through to the end
+	//     instead of jumping over the three immediate arms.
+	//
+	// The cold arms recover the tag from `dst`, which still holds src-1, rather
+	// than re-reading `src`: callers are allowed to pass src == dst (the
+	// comment in generateClassCheckOnReg relies on it), and re-reading src
+	// after the lea would then read the already-clobbered register. The mapping
+	// is shifted by one accordingly: (src-1)&3 is 1 for Character, 2 for
+	// SmallFloat64 and 3 for SmallInteger.
 	AssemblerLabel pointer;
 	AssemblerLabel character;
 	AssemblerLabel floatImm;
-	AssemblerLabel endInt, endPtr, endChar;
+	AssemblerLabel endInt, endChar, endFloat;
 
 	asmInitLabel(&pointer);
 	asmInitLabel(&character);
 	asmInitLabel(&floatImm);
 	asmInitLabel(&endInt);
-	asmInitLabel(&endPtr);
 	asmInitLabel(&endChar);
+	asmInitLabel(&endFloat);
 
-	asmMovq(buffer, src, dst);
-	asmAndqImm(buffer, dst, 3);
-	asmCmpqImm(buffer, dst, VALUE_POINTER);
+	asmLeaq(buffer, asmMem(src, NO_REGISTER, SS_1, -1), dst);
+	asmTestqImm(buffer, dst, 3);
 	asmJ(buffer, COND_EQUAL, &pointer);
-	asmCmpqImm(buffer, dst, VALUE_CHAR);
+
+	asmAndqImm(buffer, dst, 3);
+	asmCmpqImm(buffer, dst, VALUE_CHAR - VALUE_POINTER);
 	asmJ(buffer, COND_EQUAL, &character);
-	asmCmpqImm(buffer, dst, VALUE_FLOAT);
+	asmCmpqImm(buffer, dst, VALUE_FLOAT - VALUE_POINTER);
 	asmJ(buffer, COND_EQUAL, &floatImm);
 
 	generateLoadObject(buffer, (RawObject *) Handles.SmallInteger->raw, dst, 1);
 	asmJmpLabel(buffer, &endInt);
-
-	asmLabelBind(buffer, &pointer, asmOffset(buffer));
-	asmMovqMem(buffer, asmMem(src, NO_REGISTER, SS_1, -1), dst);
-	asmIncq(buffer, dst);
-	asmJmpLabel(buffer, &endPtr);
 
 	asmLabelBind(buffer, &character, asmOffset(buffer));
 	generateLoadObject(buffer, (RawObject *) Handles.Character->raw, dst, 1);
@@ -1627,10 +1644,17 @@ void generateLoadClass(AssemblerBuffer *buffer, Register src, Register dst)
 
 	asmLabelBind(buffer, &floatImm, asmOffset(buffer));
 	generateLoadObject(buffer, (RawObject *) Handles.SmallFloat64->raw, dst, 1);
+	asmJmpLabel(buffer, &endFloat);
 
-	asmLabelBind(buffer, &endInt, asmOffset(buffer));
-	asmLabelBind(buffer, &endPtr, asmOffset(buffer));
-	asmLabelBind(buffer, &endChar, asmOffset(buffer));
+	// Pointer arm last: it falls straight out of the function.
+	asmLabelBind(buffer, &pointer, asmOffset(buffer));
+	asmMovqMem(buffer, asmMem(dst, NO_REGISTER, SS_1, 0), dst);
+	asmIncq(buffer, dst);
+
+	ptrdiff_t end = asmOffset(buffer);
+	asmLabelBind(buffer, &endInt, end);
+	asmLabelBind(buffer, &endChar, end);
+	asmLabelBind(buffer, &endFloat, end);
 }
 
 
