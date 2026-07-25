@@ -37,16 +37,35 @@ export LD_LIBRARY_PATH=$PWD/build
 ./build/st -s snapshot -f benchmarks/DeltaBlue.st
 ```
 
-Both print one line of the form `<name> <N> milliseconds`, where N is the mean
-over 100 iterations. Both verify their own results and raise an error if the
+Both print one line of the form `<name> <N> milliseconds`, where N is the TOTAL
+for the whole batch. Both verify their own results and raise an error if the
 computation is wrong, so a printed number also means the run was correct:
 Richards asserts `queuePacketCount = 23246` and `holdCount = 9297`, and
 DeltaBlue checks every variable its planner solved for.
 
-Integer division by the iteration count makes the resolution coarse (DeltaBlue
-usually reports `1 milliseconds`). That is the original benchmarks' own
-reporting, kept as-is so the figures stay comparable; for finer measurements,
-raise the iteration count.
+### The total, not the mean, and why that mattered
+
+Every benchmark here used to print the mean per iteration, computed with INTEGER
+division. That one detail cost this project its wall-clock signal for its whole
+recorded history. Richards printed `total // 100`, so it reported 6, 7 or 8 ms
+and nothing else, ever; DeltaBlue reported 0 or 1; `ArrayNumericBench` reported
+exactly `3` in every row that was ever recorded, and `BigIntBench` exactly `1`.
+Meanwhile the instruction counts underneath moved by real amounts. A change
+worth several percent was arithmetically incapable of showing up, so
+`scripts/report.awk` answered INCONCLUSIVE every single time and the conclusion
+"optimisations reduce instructions but do not produce real gains" followed from
+the measurement, not from the VM.
+
+Measured properly afterwards, the same tree showed the last change was worth
+**-2.6% wall clock on Richards and -1.0% on DeltaBlue**, in the same direction
+as its -3.3% instruction count.
+
+So: every benchmark now prints the batch total, and the iteration counts are
+scaled so each batch lands somewhere between 120 ms and 650 ms, which puts the
+1 ms printing resolution between 0.15% and 0.8%. Where raising the inner
+iteration count would have broken a bit-exact check against a C reference
+(`MixedArithBench`) or an identity check (`BigIntBench`), the whole verified run
+is repeated instead.
 
 ## What they cover
 
@@ -103,12 +122,28 @@ Three things it does that matter, and why:
   change add work" immediately, while the clock may need many runs to say
   anything. Prefer them, and treat wall clock as confirmation.
 
-* **It refuses to declare a winner it cannot see.** `report.awk` calls wall
-  clock INCONCLUSIVE whenever the median difference is smaller than the spread
-  within either label. Note that `Richards` and `DeltaBlue` divide their total
-  by 100 with integer division, so their wall-clock resolution is 1 ms per 100
-  iterations and is close to useless for A/B work; their instruction counts are
-  not. `MixedArithBench` reports a single untruncated total for this reason.
+* **It measures the process, and takes the fastest of several runs.** Each
+  recorded datum is the MINIMUM `task-clock` over `ST_AB_REPS` executions
+  (default 15). The minimum, not the mean, because the noise on this kind of
+  machine is one-sided: interference can only make a run slower. With the mean,
+  two disturbed samples out of eight were enough to hide a real 2.6% effect.
+  `ms` is that measured wall clock; `selfms` is what the benchmark printed about
+  its own timed region, kept because it brackets out VM startup.
+
+* **It refuses to declare a winner it cannot see**, using a SIGN TEST on the
+  paired differences. `ab.sh` runs ABBA so drift is common-mode between the two
+  labels within a round; run *i* of one label is subtracted from run *i* of the
+  other, and the verdict asks how surprising it is that the difference landed on
+  the same side that many times. The threshold is the two-sided test at 5%
+  (n=8 needs 7 agreeing, n=12 needs 10, n=20 needs 15). A percentile interval
+  was tried first and is wrong here: with nearest-rank and n=8, p10 IS the
+  minimum and p90 IS the maximum, so "the interval must not cross zero" quietly
+  became "not one single pair may disagree".
 
 `benchmarks/results/BASELINE.jsonl` is the committed record. Append to it, do
 not rewrite it: the point is to be able to see when a number moved and why.
+
+**WARNING when reading old rows.** The `ms` column changed meaning. Rows without
+a `selfms` field predate this and their `ms` is the benchmark's own truncated
+integer mean, which is a near-constant and comparable with nothing. Rows WITH
+`selfms` carry a real measured process wall clock. Do not plot the two together.

@@ -63,13 +63,21 @@ BigIntBenchmark := Object [
 	]
 
 	class standardBenchmark [
-		| watch size |
+		"REPEATS the run: after the C kernels landed, one run costs about 1 ms,
+		 and every BigInt row in benchmarks/results/BASELINE.jsonl reads exactly
+		 1 ms, i.e. the wall column carries nothing. 250 repeats put the total
+		 near 250 ms. Every repeat re-runs the full identity checks in `run`,
+		 so repeating does not weaken the verification."
+
+		| watch size repeats |
+		repeats := 250.
 		watch := Stopwatch new.
 		watch start.
-		size := self run.
+		repeats timesRepeat: [
+			size := self run.
+			size = 869 ifFalse: [
+				^self error: 'BigIntBench: 400! has ', size printString, ' digits, expected 869']].
 		watch stop.
-		size = 869 ifFalse: [
-			^self error: 'BigIntBench: 400! has ', size printString, ' digits, expected 869'].
 		Transcript
 			nextPutAll: 'BigInt ', watch elapsedMilliseconds printString, ' milliseconds';
 			lf

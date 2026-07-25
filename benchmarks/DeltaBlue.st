@@ -125,18 +125,24 @@ Planner := Object [
 
 
 	class report: string times: count run: aBlock [
-		"Report the time required to execute the given block."
+		"Report the TOTAL time for the whole batch, not the mean per run.
 
-		| time |
+		 The batch was already timed once in MICROseconds, which is right; the
+		 damage was the final division by the iteration count. The whole batch
+		 used to take about 80 ms over 100 runs, so the printed mean was 0 or 1
+		 and carried no information at all: every DeltaBlue row in
+		 benchmarks/results/BASELINE.jsonl reads 0 or 1 ms. Print the total."
 
-		time := DateTime currentMicroTime.
-		"time := Time millisecondsToRun: ["count timesRepeat: aBlock"]".
-		time := (DateTime currentMicroTime - time) // 1000.
+		| micros |
+
+		micros := DateTime currentMicroTime.
+		count timesRepeat: aBlock.
+		micros := DateTime currentMicroTime - micros.
 
 		Transcript
 			nextPutAll: string;
 			nextPut: Character space;
-			nextPutAll: (time // count) printString;
+			nextPutAll: (micros // 1000) printString;
 			nextPutAll: ' milliseconds';
 			lf.
 	]
@@ -147,9 +153,13 @@ Planner := Object [
 
 		"Planner standardBenchmark"
 
+		"400 rather than 100: the batch has to be long enough that a 1 ms
+		 printing resolution is a small fraction of it. At 100 the total was
+		 81 ms, so one tick was 1.2%; at 400 it is around 320 ms and a tick is
+		 0.3%, which is below the run-to-run spread of the machine."
 		self
 			report: 'Chain and projection tests'
-			times: 100
+			times: 400
 			run: [
 				self chainTest: 100.
 				self projectionTest: 100].

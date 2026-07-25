@@ -300,6 +300,13 @@ t0=$(now_ms)
 ST_TIER_INLINE_MAX=0 ST_TIER_STATS_TEST=1 "$BUILD/st" -s "$SNAP" </dev/null >/dev/null 2>&1
 rc=$?
 report_result "$rc" "ST_TIER_STATS_TEST(INLINE_MAX=0)" $(( $(now_ms) - t0 ))
+# The boolean class-check fast path compiles a DIFFERENT shape for every
+# inlined conditional in the image, so the tier apparatus has to be proven in
+# both shapes: with it off, every check goes back through generateLoadClass.
+t0=$(now_ms)
+ST_NO_FUSE_BOOL=1 ST_TIER_STATS_TEST=1 "$BUILD/st" -s "$SNAP" </dev/null >/dev/null 2>&1
+rc=$?
+report_result "$rc" "ST_TIER_STATS_TEST(NO_FUSE_BOOL)" $(( $(now_ms) - t0 ))
 
 # run_group <title> <image> <files...>: each file through the -f path against
 # the given image (core tests run on the core image; samples run on the

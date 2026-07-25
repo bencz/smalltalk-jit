@@ -49,11 +49,11 @@ ArrayNumericBenchmark := Object [
 		^a
 	]
 
-	class runFloatArray: a [
+	class runFloatArray: a passes: passes [
 		| sum dot |
 		sum := 0.0.
 		dot := 0.0.
-		1 to: 20 do: [:pass |
+		1 to: passes do: [:pass |
 			sum := a sum.
 			dot := a dot: a].
 		^Array with: sum with: dot
@@ -69,12 +69,12 @@ ArrayNumericBenchmark := Object [
 		^a
 	]
 
-	class runArray: a [
+	class runArray: a passes: passes [
 		| sum dot n |
 		n := a size.
 		sum := 0.0.
 		dot := 0.0.
-		1 to: 20 do: [:pass |
+		1 to: passes do: [:pass |
 			sum := 0.0.
 			dot := 0.0.
 			1 to: n do: [:i | | v |
@@ -98,20 +98,30 @@ ArrayNumericBenchmark := Object [
 	]
 
 	class standardBenchmark [
-		| fa arr watch faMs arrMs |
+		"The two sides get DIFFERENT pass counts on purpose. They differ by more
+		 than an order of magnitude, so one count cannot put both in a
+		 measurable range without making the slow side dominate the whole gate:
+		 at the old 20 passes the FloatArray side took 3 ms and every row ever
+		 recorded in benchmarks/results/BASELINE.jsonl reads exactly 3, which is
+		 no signal at all. Each side is scaled to land near 200 ms on its own,
+		 and the per-pass figures below are what make them comparable."
+
+		| fa arr watch faMs arrMs faPasses arrPasses |
+		faPasses := 1000.
+		arrPasses := 100.
 
 		fa := self buildFloatArray.
 		arr := self buildArray.
 
 		watch := Stopwatch new.
 		watch start.
-		self check: (self runFloatArray: fa) label: 'FloatArray'.
+		self check: (self runFloatArray: fa passes: faPasses) label: 'FloatArray'.
 		watch stop.
 		faMs := watch elapsedMilliseconds.
 
 		watch := Stopwatch new.
 		watch start.
-		self check: (self runArray: arr) label: 'Array'.
+		self check: (self runArray: arr passes: arrPasses) label: 'Array'.
 		watch stop.
 		arrMs := watch elapsedMilliseconds.
 
@@ -120,8 +130,10 @@ ArrayNumericBenchmark := Object [
 		 `<n> milliseconds` line, and the FloatArray number is the one worth
 		 tracking over time."
 		Transcript
-			nextPutAll: 'ArrayNumeric(Array) ', arrMs printString, ' milliseconds'; lf;
-			nextPutAll: 'ArrayNumeric(FloatArray) ', faMs printString, ' milliseconds'; lf
+			nextPutAll: 'ArrayNumeric(Array) ', arrMs printString, ' milliseconds (',
+				arrPasses printString, ' passes)'; lf;
+			nextPutAll: 'ArrayNumeric(FloatArray) ', faMs printString, ' milliseconds (',
+				faPasses printString, ' passes)'; lf
 	]
 
 ]

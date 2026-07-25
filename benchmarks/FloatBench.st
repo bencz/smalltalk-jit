@@ -13,10 +13,14 @@ FloatBench := Object [
 
 
 	class run [
-		"One measured run: returns elapsed milliseconds, raises on a wrong sum."
+		"One measured run: returns elapsed MICROseconds, raises on a wrong sum.
+
+		 Microseconds, not milliseconds: a run is about 28 ms, so a millisecond
+		 sample truncated away 3.5% and the caller then divided by the run count
+		 on top of that. See report below."
 
 		| mark sum x i |
-		mark := DateTime currentMicroTime // 1000.
+		mark := DateTime currentMicroTime.
 		sum := 0.0.
 		x := 0.0.
 		i := 0.
@@ -27,17 +31,21 @@ FloatBench := Object [
 			i := i + 1].
 		sum = self expectedSum ifFalse: [
 			self error: 'FloatBench sum mismatch: ' , sum printString].
-		^(DateTime currentMicroTime // 1000) - mark
+		^DateTime currentMicroTime - mark
 	]
 
 
 	class report [
-		| time count |
-		count := 5.
-		time := 0.
-		count timesRepeat: [time := time + self run].
+		"TOTAL of the batch, not the mean: see the note in Richards.st's
+		 report:times:run:. 12 runs rather than 5 so the total lands around
+		 340 ms and a 1 ms printing tick is 0.3%."
+
+		| micros count |
+		count := 12.
+		micros := 0.
+		count timesRepeat: [micros := micros + self run].
 		Transcript
-			nextPutAll: 'FloatBench hot loop ' , (time // count) printString , ' milliseconds';
+			nextPutAll: 'FloatBench hot loop ' , (micros // 1000) printString , ' milliseconds';
 			lf
 	]
 

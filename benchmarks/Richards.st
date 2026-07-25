@@ -139,13 +139,23 @@ RichardsBenchmark := RBObject [
 	"instance creation"
 
 	class report: string times: count run: aBlock [
-		"Report the time required to execute the given block."
+		"Report the TOTAL time for the whole batch, not the mean per run.
 
-		| time |
-		time := 0.
-		count timesRepeat: [time := time + aBlock value].
+		 The mean was the wrong thing to print and it cost this project its
+		 wall-clock signal: one run is about 6 ms, integer division by the
+		 iteration count quantised the answer to ~17%, and every Richards row
+		 ever recorded in benchmarks/results/BASELINE.jsonl reads 6, 7 or 8 ms
+		 while the instruction count moved by real amounts underneath. A change
+		 of a few percent could never show up. The block now answers
+		 MICROseconds, and the batch total is what gets printed, so the
+		 resolution is about 0.2% instead of 17%. Same convention as
+		 MixedArithBench.st, which worked around this years-equivalent earlier."
+
+		| micros |
+		micros := 0.
+		count timesRepeat: [micros := micros + aBlock value].
 		Transcript
-			nextPutAll: string , ' ' , (time // count) printString , ' milliseconds';
+			nextPutAll: string , ' ' , (micros // 1000) printString , ' milliseconds';
 			lf
 	]
 
@@ -411,7 +421,7 @@ RichardsBenchmark := RBObject [
 		self
 			initTrace: trace;
 			initScheduler.
-		mark1 := DateTime currentMicroTime // 1000.
+		mark1 := DateTime currentMicroTime.
 		tracing
 			ifTrue:
 				[Transcript
@@ -484,9 +494,9 @@ RichardsBenchmark := RBObject [
 				[Transcript
 					show: 'Starting';
 					cr].
-		mark2 := DateTime currentMicroTime // 1000.
+		mark2 := DateTime currentMicroTime.
 		self schedule.
-		mark3 := DateTime currentMicroTime // 1000.
+		mark3 := DateTime currentMicroTime.
 		tracing
 			ifTrue:
 				[Transcript
@@ -504,15 +514,18 @@ RichardsBenchmark := RBObject [
 					cr].
 		queuePacketCount = 23246 & (holdCount = 9297)
 			ifFalse: [self error: 'wrong result'].
-		mark4 := DateTime currentMicroTime // 1000.
+		mark4 := DateTime currentMicroTime.
 		tracing
 			ifTrue:
 				[Transcript
 					show: '***Scheduler time = ';
-					show: (mark3 - mark2) printString;
+					show: ((mark3 - mark2) // 1000) printString;
 					show: ' Total time = ';
-					show: (mark4 - mark1) printString;
+					show: ((mark4 - mark1) // 1000) printString;
 					cr].
+		"MICROseconds. A single scheduler run is about 6 ms, so returning
+		 milliseconds truncated every sample to one of {5,6,7} and the caller's
+		 mean was quantised to ~17%. See report:times:run: below."
 		^mark3 - mark2
 	]
 

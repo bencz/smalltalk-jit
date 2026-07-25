@@ -63,7 +63,8 @@ static void pushOperand(CodeGenerator *generator, Operand operand);
 static void movOperand(CodeGenerator *generator, Operand operand, Register reg);
 static void movToOperand(CodeGenerator *generator, Register reg, Operand operand, _Bool valueMayBePointer);
 static _Bool operandMayBePointer(Operand operand);
-static void generateClassCheck(CodeGenerator *generator, Operand operand, RawClass *class, AssemblerLabel *label);
+static void generateClassCheck(CodeGenerator *generator, Operand operand, RawClass *class,
+	AssemblerLabel *label, _Bool fuseBoolean);
 static void generateLoadBlock(CodeGenerator *generator, Operand operand);
 static void fillContext(CodeGenerator *generator, uint8_t level);
 static void fillAssoc(CodeGenerator *generator, uint8_t index);
@@ -520,13 +521,19 @@ static void generateBody(CodeGenerator *generator)
 			} else {
 				currentLabel->offset = target;
 			}
-			generateClassCheck(generator, receiver, (RawClass *) class, &currentLabel->label);
+			// Speculation guard or the compiler's boolean control flow? Both
+			// emit this bytecode; only the speculation needs a poisonable
+			// branch, and that requirement also rules out the multi-compare
+			// boolean fast path. Decided before emitting, mirroring x64.
+			_Bool isSpecGuard = tierSiteIsSpecGuard(generator->tierSiteMap,
+				generator->tierSiteMapSize, generator->bytecodeNumber);
+			generateClassCheck(generator, receiver, (RawClass *) class,
+				&currentLabel->label, !isSpecGuard);
 			// SPEC_GUARD registration, mirroring x64: see the comment there and
 			// jit/SpecSite.h. Every dynamic arm of generateClassCheck ends with
 			// exactly one `bc` word, so the branch starts one word back;
 			// targetPoisonGuardBranch asserts the primary opcode.
-			if (tierSiteIsSpecGuard(generator->tierSiteMap, generator->tierSiteMapSize,
-					generator->bytecodeNumber)) {
+			if (isSpecGuard) {
 				ASSERT(receiver.type == OPERAND_TEMP_VAR || receiver.type == OPERAND_ARG_VAR
 					|| receiver.type == OPERAND_CONTEXT_VAR || receiver.type == OPERAND_INST_VAR
 					|| receiver.type == OPERAND_ASSOC);
@@ -608,6 +615,17 @@ static _Bool floatInlineEnabled(void)
 	static int enabled = -1;
 	if (enabled < 0) {
 		enabled = getenv("ST_NO_INLINE_FLOAT") == NULL;
+	}
+	return enabled;
+}
+
+
+// Singleton fast path for a True/False class check (see the x64 twin).
+static _Bool fuseBooleanEnabled(void)
+{
+	static int enabled = -1;
+	if (enabled < 0) {
+		enabled = getenv("ST_NO_FUSE_BOOL") == NULL;
 	}
 	return enabled;
 }
@@ -1870,7 +1888,102 @@ static void movToOperand(CodeGenerator *generator, Register reg, Operand operand
 }
 
 
-static void generateClassCheck(CodeGenerator *generator, Operand operand, RawClass *class, AssemblerLabel *label)
+// The tail every DYNAMIC arm of generateClassCheck shares: `reg` holds the
+// value, emit "if its class is not `class`, jump to `label`". The x64 twin
+// carries the full rationale; the two invariants repeated here because breaking
+// either from this file is just as easy.
+//
+// 1. `label` may be referenced EXACTLY ONCE (asmEmitLabel32 asserts
+//    !isResolved), so every arm funnels its exits through local labels.
+// 2. With `fuseBoolean` clear the arm's LAST instruction is the single
+//    conditional branch to `label`, which is what jit/SpecSite.h locates by
+//    subtracting ASM_COND_BRANCH_SIZE and what targetPoisonGuardBranch rewrites
+//    into an unconditional branch. The boolean arm jumps forward over its own
+//    tail and so cannot be poisoned; the caller refuses it for speculations.
+static void generateClassCheckOnReg(CodeGenerator *generator, Register reg,
+	RawClass *class, AssemblerLabel *label, _Bool fuseBoolean)
+{
+	AssemblerBuffer *buffer = &generator->buffer;
+
+	if (class == Handles.SmallInteger->raw) {
+		asmAndiDot(buffer, R0, reg, 3);
+		asmBne(buffer, label);
+		return;
+	}
+	if (class == Handles.Character->raw) {
+		// exact tag 0b10: a lone bit-1 test would accept a VALUE_FLOAT
+		// immediate (0b11); single compare + branch, the label takes one
+		// forward reference
+		asmAndiDot(buffer, R0, reg, 3);
+		asmCmpldi(buffer, 0, R0, VALUE_CHAR);
+		asmBne(buffer, label);
+		return;
+	}
+	if (class == Handles.SmallFloat64->raw) {
+		asmAndiDot(buffer, R0, reg, 3);
+		asmCmpldi(buffer, 0, R0, VALUE_FLOAT);
+		asmBne(buffer, label);
+		return;
+	}
+	if (fuseBoolean && fuseBooleanEnabled()
+			&& (class == Handles.True->raw || class == Handles.False->raw)) {
+		// `true` and `false` are singletons, so "is this an instance of True" is
+		// a pointer compare against the one instance instead of
+		// generateLoadClass's four-way tag dispatch plus a class compare. This
+		// is the hottest class check in the VM: every ifTrue:, and:, or:,
+		// whileTrue: and to:do: the compiler inlines emits one.
+		//
+		// The generic check still runs for anything that is neither singleton,
+		// so a second instance of class True (`True new`) is classified exactly
+		// as before. Comparing pointers instead of classes would not be.
+		RawObject *wanted = class == Handles.True->raw
+			? Handles.true->raw : Handles.false->raw;
+		RawObject *other = class == Handles.True->raw
+			? Handles.false->raw : Handles.true->raw;
+		AssemblerLabel isWanted, isOther, genericMatch;
+		asmInitLabel(&isWanted);
+		asmInitLabel(&isOther);
+		asmInitLabel(&genericMatch);
+
+		generateLoadObject(buffer, wanted, R3, 1);
+		asmCmpd(buffer, 0, reg, R3);
+		asmBeq(buffer, &isWanted);
+
+		generateLoadObject(buffer, other, R3, 1);
+		asmCmpd(buffer, 0, reg, R3);
+		asmBeq(buffer, &isOther);
+
+		generateLoadClass(buffer, reg, R3);
+		generateLoadObject(buffer, (RawObject *) class, TMP, 1);
+		asmCmpd(buffer, 0, R3, TMP);
+		asmBeq(buffer, &genericMatch);
+
+		// asmPpcLabelBind, NOT the generic asmLabelBind: a PowerPC branch
+		// displacement is patched into the instruction WORD and its width
+		// depends on the form (I-form b, B-form bc), which the generic byte
+		// version knows nothing about. Getting this wrong produces a corrupt
+		// word, and the failure mode is an illegal-instruction trap during
+		// bootstrap rather than anything that points at this code.
+		asmPpcLabelBind(buffer, &isOther, asmOffset(buffer));
+		asmB(buffer, label);
+
+		ptrdiff_t matched = asmOffset(buffer);
+		asmPpcLabelBind(buffer, &isWanted, matched);
+		asmPpcLabelBind(buffer, &genericMatch, matched);
+		return;
+	}
+	// compute the class like generateSend does: generateLoadClass is
+	// immediate-safe and yields a tagged class, while the old raw class-word
+	// load dereferenced whatever non-pointer value was in the register
+	generateLoadClass(buffer, reg, R3);
+	generateLoadObject(buffer, (RawObject *) class, TMP, 1);
+	asmCmpd(buffer, 0, R3, TMP);
+	asmBne(buffer, label);
+}
+
+
+static void generateClassCheck(CodeGenerator *generator, Operand operand, RawClass *class,
+	AssemblerLabel *label, _Bool fuseBoolean)
 {
 	AssemblerBuffer *buffer = &generator->buffer;
 
@@ -1910,31 +2023,8 @@ static void generateClassCheck(CodeGenerator *generator, Operand operand, RawCla
 	case OPERAND_TEMP_VAR:
 	case OPERAND_ARG_VAR: {
 		Variable *var = variableAt(generator, operand.index);
-
-		if (class == Handles.SmallInteger->raw) {
-			fillVar(generator, var);
-			asmAndiDot(buffer, R0, varReg(var), 3);
-			asmBne(buffer, label);
-		} else if (class == Handles.Character->raw) {
-			// exact tag 0b10: a lone bit-1 test would accept a VALUE_FLOAT
-			// immediate (0b11); single compare + branch, the label takes one
-			// forward reference
-			fillVar(generator, var);
-			asmAndiDot(buffer, R0, varReg(var), 3);
-			asmCmpldi(buffer, 0, R0, VALUE_CHAR);
-			asmBne(buffer, label);
-		} else if (class == Handles.SmallFloat64->raw) {
-			fillVar(generator, var);
-			asmAndiDot(buffer, R0, varReg(var), 3);
-			asmCmpldi(buffer, 0, R0, VALUE_FLOAT);
-			asmBne(buffer, label);
-		} else {
-			fillVar(generator, var);
-			generateLoadClass(buffer, varReg(var), R3);
-			generateLoadObject(buffer, (RawObject *) class, TMP, 1);
-			asmCmpd(buffer, 0, R3, TMP);
-			asmBne(buffer, label);
-		}
+		fillVar(generator, var);
+		generateClassCheckOnReg(generator, varReg(var), class, label, fuseBoolean);
 		break;
 	}
 
@@ -1949,28 +2039,7 @@ static void generateClassCheck(CodeGenerator *generator, Operand operand, RawCla
 		ptrdiff_t offset = varOffset(RawContext, vars) + operand.index * sizeof(Value);
 		fillContext(generator, operand.level);
 		asmLdT(buffer, TMP, offset, varReg(context));
-
-		if (class == Handles.SmallInteger->raw) {
-			asmAndiDot(buffer, R0, TMP, 3);
-			asmBne(buffer, label);
-		} else if (class == Handles.Character->raw) {
-			// exact tag 0b10 (see the TEMP_VAR variant)
-			asmAndiDot(buffer, R0, TMP, 3);
-			asmCmpldi(buffer, 0, R0, VALUE_CHAR);
-			asmBne(buffer, label);
-		} else if (class == Handles.SmallFloat64->raw) {
-			asmAndiDot(buffer, R0, TMP, 3);
-			asmCmpldi(buffer, 0, R0, VALUE_FLOAT);
-			asmBne(buffer, label);
-		} else {
-			// compute the class like generateSend does: generateLoadClass is
-			// immediate-safe and yields a tagged class, while the old raw
-			// class-word load dereferenced whatever non-pointer value was in TMP
-			generateLoadClass(buffer, TMP, R3);
-			generateLoadObject(buffer, (RawObject *) class, TMP, 1);
-			asmCmpd(buffer, 0, R3, TMP);
-			asmBne(buffer, label);
-		}
+		generateClassCheckOnReg(generator, TMP, class, label, fuseBoolean);
 		break;
 	}
 
@@ -1981,28 +2050,7 @@ static void generateClassCheck(CodeGenerator *generator, Operand operand, RawCla
 		fillVar(generator, self);
 
 		asmLdT(buffer, TMP, offset, varReg(self));
-
-		if (class == Handles.SmallInteger->raw) {
-			asmAndiDot(buffer, R0, TMP, 3);
-			asmBne(buffer, label);
-		} else if (class == Handles.Character->raw) {
-			// exact tag 0b10 (see the TEMP_VAR variant)
-			asmAndiDot(buffer, R0, TMP, 3);
-			asmCmpldi(buffer, 0, R0, VALUE_CHAR);
-			asmBne(buffer, label);
-		} else if (class == Handles.SmallFloat64->raw) {
-			asmAndiDot(buffer, R0, TMP, 3);
-			asmCmpldi(buffer, 0, R0, VALUE_FLOAT);
-			asmBne(buffer, label);
-		} else {
-			// compute the class like generateSend does: generateLoadClass is
-			// immediate-safe and yields a tagged class, while the old raw
-			// class-word load dereferenced whatever non-pointer value was in TMP
-			generateLoadClass(buffer, TMP, R3);
-			generateLoadObject(buffer, (RawObject *) class, TMP, 1);
-			asmCmpd(buffer, 0, R3, TMP);
-			asmBne(buffer, label);
-		}
+		generateClassCheckOnReg(generator, TMP, class, label, fuseBoolean);
 		break;
 	}
 
@@ -2021,28 +2069,7 @@ static void generateClassCheck(CodeGenerator *generator, Operand operand, RawCla
 		fillVar(generator, instance);
 
 		asmLdT(buffer, TMP, offset, varReg(instance));
-
-		if (class == Handles.SmallInteger->raw) {
-			asmAndiDot(buffer, R0, TMP, 3);
-			asmBne(buffer, label);
-		} else if (class == Handles.Character->raw) {
-			// exact tag 0b10 (see the TEMP_VAR variant)
-			asmAndiDot(buffer, R0, TMP, 3);
-			asmCmpldi(buffer, 0, R0, VALUE_CHAR);
-			asmBne(buffer, label);
-		} else if (class == Handles.SmallFloat64->raw) {
-			asmAndiDot(buffer, R0, TMP, 3);
-			asmCmpldi(buffer, 0, R0, VALUE_FLOAT);
-			asmBne(buffer, label);
-		} else {
-			// compute the class like generateSend does: generateLoadClass is
-			// immediate-safe and yields a tagged class, while the old raw
-			// class-word load dereferenced whatever non-pointer value was in TMP
-			generateLoadClass(buffer, TMP, R3);
-			generateLoadObject(buffer, (RawObject *) class, TMP, 1);
-			asmCmpd(buffer, 0, R3, TMP);
-			asmBne(buffer, label);
-		}
+		generateClassCheckOnReg(generator, TMP, class, label, fuseBoolean);
 		break;
 	}
 
@@ -2058,28 +2085,7 @@ static void generateClassCheck(CodeGenerator *generator, Operand operand, RawCla
 		// Load the association's RUNTIME value and check ITS class (see x64).
 		generateLoadObject(buffer, compiledCodeLiteralAt(&generator->code, operand.index), TMP, 1);
 		asmLdT(buffer, TMP, varOffset(RawAssociation, value), TMP);
-
-		if (class == Handles.SmallInteger->raw) {
-			asmAndiDot(buffer, R0, TMP, 3);
-			asmBne(buffer, label);
-		} else if (class == Handles.Character->raw) {
-			// exact tag 0b10 (see the TEMP_VAR variant)
-			asmAndiDot(buffer, R0, TMP, 3);
-			asmCmpldi(buffer, 0, R0, VALUE_CHAR);
-			asmBne(buffer, label);
-		} else if (class == Handles.SmallFloat64->raw) {
-			asmAndiDot(buffer, R0, TMP, 3);
-			asmCmpldi(buffer, 0, R0, VALUE_FLOAT);
-			asmBne(buffer, label);
-		} else {
-			// compute the class like generateSend does: generateLoadClass is
-			// immediate-safe and yields a tagged class, while the old raw
-			// class-word load dereferenced whatever non-pointer value was in TMP
-			generateLoadClass(buffer, TMP, R3);
-			generateLoadObject(buffer, (RawObject *) class, TMP, 1);
-			asmCmpd(buffer, 0, R3, TMP);
-			asmBne(buffer, label);
-		}
+		generateClassCheckOnReg(generator, TMP, class, label, fuseBoolean);
 		break;
 	}
 

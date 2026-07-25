@@ -52,7 +52,8 @@ static void pushOperand(CodeGenerator *generator, Operand operand);
 static void movOperand(CodeGenerator *generator, Operand operand, Register reg);
 static void movToOperand(CodeGenerator *generator, Register reg, Operand operand, _Bool valueMayBePointer);
 static _Bool operandMayBePointer(Operand operand);
-static void generateClassCheck(CodeGenerator *generator, Operand operand, RawClass *class, AssemblerLabel *label);
+static void generateClassCheck(CodeGenerator *generator, Operand operand, RawClass *class,
+	AssemblerLabel *label, _Bool fuseBoolean);
 static void generateLoadBlock(CodeGenerator *generator, Operand operand);
 static void fillContext(CodeGenerator *generator, uint8_t level);
 static Register fillContextToReg(CodeGenerator *generator, uint8_t level, Register scratch);
@@ -536,20 +537,27 @@ static void generateBody(CodeGenerator *generator)
 			} else {
 				currentLabel->offset = target;
 			}
-			generateClassCheck(generator, receiver, (RawClass *) class, &currentLabel->label);
-			// If this guard is the optimizer's SPECULATIVE inline guard (and not
-			// the compiler's boolean control flow, which emits the same
-			// bytecode), record its branch so class redefinition can force the
-			// fallback edge. See jit/SpecSite.h and tierSiteIsSpecGuard.
+			// Is this the optimizer's SPECULATIVE inline guard, or the
+			// compiler's boolean control flow? Both emit this same bytecode, and
+			// only the speculation needs its branch poisonable on class
+			// redefinition (jit/SpecSite.h, tierSiteIsSpecGuard).
 			//
+			// Decided BEFORE the check is emitted, because it also decides the
+			// shape of the code: a speculation guard must end in exactly one
+			// fixed-width asmJ for targetPoisonGuardBranch to rewrite, which
+			// rules out the multi-compare boolean fast path. Boolean control
+			// flow, which is where that fast path pays, is never a speculation.
+			_Bool isSpecGuard = tierSiteIsSpecGuard(generator->tierSiteMap,
+				generator->tierSiteMapSize, generator->bytecodeNumber);
+			generateClassCheck(generator, receiver, (RawClass *) class,
+				&currentLabel->label, !isSpecGuard);
 			// Every DYNAMIC arm of generateClassCheck ends with exactly one
 			// fixed-width asmJ (0F 8x rel32, 6 bytes), so the branch starts that
 			// far back. The constant-folded arms cannot occur here: a
 			// speculation's receiver is restricted to the dynamic operand kinds
 			// by tryInlineSite. targetPoisonGuardBranch asserts the opcode, so a
 			// wrong offset fails loudly instead of corrupting code.
-			if (tierSiteIsSpecGuard(generator->tierSiteMap, generator->tierSiteMapSize,
-					generator->bytecodeNumber)) {
+			if (isSpecGuard) {
 				ASSERT(receiver.type == OPERAND_TEMP_VAR || receiver.type == OPERAND_ARG_VAR
 					|| receiver.type == OPERAND_CONTEXT_VAR || receiver.type == OPERAND_INST_VAR
 					|| receiver.type == OPERAND_ASSOC);
@@ -644,6 +652,20 @@ static _Bool floatInlineEnabled(void)
 	static int enabled = -1;
 	if (enabled < 0) {
 		enabled = getenv("ST_NO_INLINE_FLOAT") == NULL;
+	}
+	return enabled;
+}
+
+
+// Singleton fast path for a True/False class check: unset ST_NO_FUSE_BOOL =>
+// enabled. This is the isolation knob for the A/B, and a kill switch: with it
+// set, every boolean class check goes back through generateLoadClass's four-way
+// tag dispatch, which is what the VM did before and must still answer the same.
+static _Bool fuseBooleanEnabled(void)
+{
+	static int enabled = -1;
+	if (enabled < 0) {
+		enabled = getenv("ST_NO_FUSE_BOOL") == NULL;
 	}
 	return enabled;
 }
@@ -1984,7 +2006,111 @@ static void movToOperand(CodeGenerator *generator, Register reg, Operand operand
 }
 
 
-static void generateClassCheck(CodeGenerator *generator, Operand operand, RawClass *class, AssemblerLabel *label)
+// The tail every DYNAMIC arm of generateClassCheck shares: `reg` holds the
+// value, emit "if its class is not `class`, jump to `label`". Extracted because
+// the four dynamic operand kinds carried four byte-identical copies of this
+// ladder, and the boolean arm below would have made that eight.
+//
+// TWO INVARIANTS, both load-bearing and both easy to break from here.
+//
+// 1. `label` may be referenced EXACTLY ONCE. asmEmitLabel32 asserts
+//    !isResolved, so a second reference is a hard failure, not a silent one.
+//    Every arm therefore funnels its exits through its own local labels.
+//
+// 2. With `fuseBoolean` clear, the arm's LAST instruction is the single asmJ to
+//    `label`. jit/SpecSite.h locates a speculation guard's branch by
+//    subtracting ASM_COND_BRANCH_SIZE from the offset just past this call, and
+//    targetPoisonGuardBranch rewrites those 6 bytes into an unconditional jump
+//    to force the fallback edge. The boolean arm cannot satisfy that: it needs
+//    two compares and it jumps FORWARD over its own tail, so a poisoned site
+//    would skip the poison and keep running stale inlined code. Hence it is
+//    refused for speculation guards, and the caller decides.
+static void generateClassCheckOnReg(CodeGenerator *generator, Register reg,
+	RawClass *class, AssemblerLabel *label, _Bool fuseBoolean)
+{
+	AssemblerBuffer *buffer = &generator->buffer;
+
+	if (class == Handles.SmallInteger->raw) {
+		asmTestqImm(buffer, reg, 3);
+		asmJ(buffer, COND_NOT_ZERO, label);
+		return;
+	}
+	if (class == Handles.Character->raw) {
+		// exact tag 0b10 via scratch RAX: a lone bit-1 test would accept a
+		// VALUE_FLOAT immediate (0b11), and the label takes a single forward
+		// reference, so the compare must fold into one jump
+		asmMovq(buffer, reg, RAX);
+		asmAndqImm(buffer, RAX, 3);
+		asmCmpqImm(buffer, RAX, VALUE_CHAR);
+		asmJ(buffer, COND_NOT_EQUAL, label);
+		return;
+	}
+	if (class == Handles.SmallFloat64->raw) {
+		asmMovq(buffer, reg, RAX);
+		asmAndqImm(buffer, RAX, 3);
+		asmCmpqImm(buffer, RAX, VALUE_FLOAT);
+		asmJ(buffer, COND_NOT_EQUAL, label);
+		return;
+	}
+	if (fuseBoolean && fuseBooleanEnabled()
+			&& (class == Handles.True->raw || class == Handles.False->raw)) {
+		// `true` and `false` are singletons, so "is this value an instance of
+		// True" is answered by a pointer compare against the one instance.
+		// This is the hottest class check in the VM by a wide margin: the
+		// compiler turns every ifTrue:, ifFalse:, and:, or:, whileTrue: and
+		// to:do: into a JUMP_NOT_MEMBER_OF on a boolean, and each one used to
+		// run generateLoadClass's 13-instruction four-way tag dispatch on a
+		// value that can only be one of two immortal pointers.
+		//
+		// It REPLACES nothing: the generic check still runs for anything that
+		// is neither singleton, so a hypothetical second instance of class True
+		// (`True new`) is classified exactly as before. Comparing pointers
+		// instead of classes would have answered differently for it.
+		RawObject *wanted = class == Handles.True->raw
+			? Handles.true->raw : Handles.false->raw;
+		RawObject *other = class == Handles.True->raw
+			? Handles.false->raw : Handles.true->raw;
+		AssemblerLabel isWanted, isOther, genericMatch;
+		asmInitLabel(&isWanted);
+		asmInitLabel(&isOther);
+		asmInitLabel(&genericMatch);
+
+		generateLoadObject(buffer, wanted, RAX, 1);
+		asmCmpq(buffer, reg, RAX);
+		asmJ(buffer, COND_EQUAL, &isWanted);
+
+		generateLoadObject(buffer, other, RAX, 1);
+		asmCmpq(buffer, reg, RAX);
+		asmJ(buffer, COND_EQUAL, &isOther);
+
+		generateLoadClass(buffer, reg, RAX);
+		generateLoadObject(buffer, (RawObject *) class, TMP, 1);
+		asmCmpq(buffer, RAX, TMP);
+		asmJ(buffer, COND_EQUAL, &genericMatch);
+
+		asmLabelBind(buffer, &isOther, asmOffset(buffer));
+		asmJmpLabel(buffer, label);
+
+		ptrdiff_t matched = asmOffset(buffer);
+		asmLabelBind(buffer, &isWanted, matched);
+		asmLabelBind(buffer, &genericMatch, matched);
+		return;
+	}
+	// Compute the value's class exactly like generateSend does (generateLoadClass:
+	// correct tag handling, tagged result) into scratch RAX, and compare to the
+	// tested class in TMP. The VAR_CLASS cache is deliberately NOT touched here:
+	// generateSend owns it and stores it in a form this path must not corrupt.
+	// `reg` is consumed by generateLoadClass before TMP is reloaded, so
+	// reg == TMP is fine.
+	generateLoadClass(buffer, reg, RAX);
+	generateLoadObject(buffer, (RawObject *) class, TMP, 1);
+	asmCmpq(buffer, RAX, TMP);
+	asmJ(buffer, COND_NOT_EQUAL, label);
+}
+
+
+static void generateClassCheck(CodeGenerator *generator, Operand operand, RawClass *class,
+	AssemblerLabel *label, _Bool fuseBoolean)
 {
 	AssemblerBuffer *buffer = &generator->buffer;
 
@@ -2027,35 +2153,7 @@ static void generateClassCheck(CodeGenerator *generator, Operand operand, RawCla
 		// Spilling only starts once a method outgrows the register pool (5+ nested
 		// inlined conditionals will do it), which is why this stayed latent.
 		Register src = fillVarToReg(generator, var, TMP);
-
-		if (class == Handles.SmallInteger->raw) {
-			asmTestqImm(buffer, src, 3);
-			asmJ(buffer, COND_NOT_ZERO, label);
-		} else if (class == Handles.Character->raw) {
-			// exact tag 0b10 via scratch RAX: a lone bit-1 test would accept a
-			// VALUE_FLOAT immediate (0b11), and the label takes a single
-			// forward reference, so the compare must fold into one jump
-			asmMovq(buffer, src, RAX);
-			asmAndqImm(buffer, RAX, 3);
-			asmCmpqImm(buffer, RAX, VALUE_CHAR);
-			asmJ(buffer, COND_NOT_EQUAL, label);
-		} else if (class == Handles.SmallFloat64->raw) {
-			asmMovq(buffer, src, RAX);
-			asmAndqImm(buffer, RAX, 3);
-			asmCmpqImm(buffer, RAX, VALUE_FLOAT);
-			asmJ(buffer, COND_NOT_EQUAL, label);
-		} else {
-			// Compute the receiver's class exactly like generateSend does
-			// (generateLoadClass: correct tag handling, tagged result) into scratch
-			// RAX, and compare to the tested class in TMP. The VAR_CLASS cache is
-			// deliberately NOT touched here — generateSend owns it and stores it in
-			// a form this path must not corrupt. `src` is consumed by
-			// generateLoadClass before TMP is reloaded, so src == TMP is fine.
-			generateLoadClass(buffer, src, RAX);
-			generateLoadObject(buffer, (RawObject *) class, TMP, 1);
-			asmCmpq(buffer, RAX, TMP);
-			asmJ(buffer, COND_NOT_EQUAL, label);
-		}
+		generateClassCheckOnReg(generator, src, class, label, fuseBoolean);
 		break;
 	}
 
@@ -2071,30 +2169,7 @@ static void generateClassCheck(CodeGenerator *generator, Operand operand, RawCla
 		// consumed by this load, which then overwrites it with the context var.
 		asmMovqMem(buffer, asmMem(fillContextToReg(generator, operand.level, TMP),
 			NO_REGISTER, SS_1, offset), TMP);
-
-		if (class == Handles.SmallInteger->raw) {
-			asmTestqImm(buffer, TMP, 3);
-			asmJ(buffer, COND_NOT_ZERO, label);
-		} else if (class == Handles.Character->raw) {
-			// exact tag 0b10 via scratch RAX (see the TEMP_VAR variant)
-			asmMovq(buffer, TMP, RAX);
-			asmAndqImm(buffer, RAX, 3);
-			asmCmpqImm(buffer, RAX, VALUE_CHAR);
-			asmJ(buffer, COND_NOT_EQUAL, label);
-		} else if (class == Handles.SmallFloat64->raw) {
-			asmMovq(buffer, TMP, RAX);
-			asmAndqImm(buffer, RAX, 3);
-			asmCmpqImm(buffer, RAX, VALUE_FLOAT);
-			asmJ(buffer, COND_NOT_EQUAL, label);
-		} else {
-			// compute the class like generateSend does: generateLoadClass is
-			// immediate-safe and yields a tagged class, while the old raw
-			// class-word load dereferenced whatever non-pointer value was in TMP
-			generateLoadClass(buffer, TMP, RAX);
-			generateLoadObject(buffer, (RawObject *) class, TMP, 1);
-			asmCmpq(buffer, RAX, TMP);
-			asmJ(buffer, COND_NOT_EQUAL, label);
-		}
+		generateClassCheckOnReg(generator, TMP, class, label, fuseBoolean);
 		break;
 	}
 
@@ -2104,30 +2179,7 @@ static void generateClassCheck(CodeGenerator *generator, Operand operand, RawCla
 		ptrdiff_t offset = varOffset(RawObject, body) + (shape.payloadSize + operand.index + shape.isIndexed) * sizeof(Value);
 
 		asmMovqMem(buffer, asmMem(fillVarToReg(generator, self, TMP), NO_REGISTER, SS_1, offset), TMP);
-
-		if (class == Handles.SmallInteger->raw) {
-			asmTestqImm(buffer, TMP, 3);
-			asmJ(buffer, COND_NOT_ZERO, label);
-		} else if (class == Handles.Character->raw) {
-			// exact tag 0b10 via scratch RAX (see the TEMP_VAR variant)
-			asmMovq(buffer, TMP, RAX);
-			asmAndqImm(buffer, RAX, 3);
-			asmCmpqImm(buffer, RAX, VALUE_CHAR);
-			asmJ(buffer, COND_NOT_EQUAL, label);
-		} else if (class == Handles.SmallFloat64->raw) {
-			asmMovq(buffer, TMP, RAX);
-			asmAndqImm(buffer, RAX, 3);
-			asmCmpqImm(buffer, RAX, VALUE_FLOAT);
-			asmJ(buffer, COND_NOT_EQUAL, label);
-		} else {
-			// compute the class like generateSend does: generateLoadClass is
-			// immediate-safe and yields a tagged class, while the old raw
-			// class-word load dereferenced whatever non-pointer value was in TMP
-			generateLoadClass(buffer, TMP, RAX);
-			generateLoadObject(buffer, (RawObject *) class, TMP, 1);
-			asmCmpq(buffer, RAX, TMP);
-			asmJ(buffer, COND_NOT_EQUAL, label);
-		}
+		generateClassCheckOnReg(generator, TMP, class, label, fuseBoolean);
 		break;
 	}
 
@@ -2145,30 +2197,7 @@ static void generateClassCheck(CodeGenerator *generator, Operand operand, RawCla
 		ptrdiff_t offset = varOffset(RawObject, body) + operand.index * sizeof(Value);
 
 		asmMovqMem(buffer, asmMem(fillVarToReg(generator, instance, TMP), NO_REGISTER, SS_1, offset), TMP);
-
-		if (class == Handles.SmallInteger->raw) {
-			asmTestqImm(buffer, TMP, 3);
-			asmJ(buffer, COND_NOT_ZERO, label);
-		} else if (class == Handles.Character->raw) {
-			// exact tag 0b10 via scratch RAX (see the TEMP_VAR variant)
-			asmMovq(buffer, TMP, RAX);
-			asmAndqImm(buffer, RAX, 3);
-			asmCmpqImm(buffer, RAX, VALUE_CHAR);
-			asmJ(buffer, COND_NOT_EQUAL, label);
-		} else if (class == Handles.SmallFloat64->raw) {
-			asmMovq(buffer, TMP, RAX);
-			asmAndqImm(buffer, RAX, 3);
-			asmCmpqImm(buffer, RAX, VALUE_FLOAT);
-			asmJ(buffer, COND_NOT_EQUAL, label);
-		} else {
-			// compute the class like generateSend does: generateLoadClass is
-			// immediate-safe and yields a tagged class, while the old raw
-			// class-word load dereferenced whatever non-pointer value was in TMP
-			generateLoadClass(buffer, TMP, RAX);
-			generateLoadObject(buffer, (RawObject *) class, TMP, 1);
-			asmCmpq(buffer, RAX, TMP);
-			asmJ(buffer, COND_NOT_EQUAL, label);
-		}
+		generateClassCheckOnReg(generator, TMP, class, label, fuseBoolean);
 		break;
 	}
 
@@ -2189,30 +2218,7 @@ static void generateClassCheck(CodeGenerator *generator, Operand operand, RawCla
 		// and RAX (tested class), and the VAR_CLASS cache is left untouched.
 		generateLoadObject(buffer, compiledCodeLiteralAt(&generator->code, operand.index), TMP, 1);
 		asmMovqMem(buffer, asmMem(TMP, NO_REGISTER, SS_1, varOffset(RawAssociation, value)), TMP);
-
-		if (class == Handles.SmallInteger->raw) {
-			asmTestqImm(buffer, TMP, 3);
-			asmJ(buffer, COND_NOT_ZERO, label);
-		} else if (class == Handles.Character->raw) {
-			// exact tag 0b10 via scratch RAX (see the TEMP_VAR variant)
-			asmMovq(buffer, TMP, RAX);
-			asmAndqImm(buffer, RAX, 3);
-			asmCmpqImm(buffer, RAX, VALUE_CHAR);
-			asmJ(buffer, COND_NOT_EQUAL, label);
-		} else if (class == Handles.SmallFloat64->raw) {
-			asmMovq(buffer, TMP, RAX);
-			asmAndqImm(buffer, RAX, 3);
-			asmCmpqImm(buffer, RAX, VALUE_FLOAT);
-			asmJ(buffer, COND_NOT_EQUAL, label);
-		} else {
-			// compute the class like generateSend does: generateLoadClass is
-			// immediate-safe and yields a tagged class, while the old raw
-			// class-word load dereferenced whatever non-pointer value was in TMP
-			generateLoadClass(buffer, TMP, RAX);
-			generateLoadObject(buffer, (RawObject *) class, TMP, 1);
-			asmCmpq(buffer, RAX, TMP);
-			asmJ(buffer, COND_NOT_EQUAL, label);
-		}
+		generateClassCheckOnReg(generator, TMP, class, label, fuseBoolean);
 		break;
 	}
 

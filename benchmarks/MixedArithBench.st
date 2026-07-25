@@ -51,21 +51,30 @@ MixedArithBenchmark := Object [
 	]
 
 	class standardBenchmark [
-		| watch result sum x expectedSum |
+		"REPEATS the run rather than raising the iteration count inside it: the
+		 2000000 in `run` is baked into expectedSum by the C reference program
+		 quoted at the top of this file, so changing it would destroy the
+		 bit-exact check. Ten repeats put the total around 310 ms, which is long
+		 enough for the 1 ms printing resolution to be 0.3%; each repeat is
+		 verified on its own."
+
+		| watch result sum x expectedSum repeats |
 		expectedSum := 1987586.8066327267.
+		repeats := 10.
 
 		watch := Stopwatch new.
 		watch start.
-		result := self run.
-		watch stop.
+		repeats timesRepeat: [
+			result := self run.
 
-		sum := result at: 1.
-		x := result at: 2.
-		sum = expectedSum ifFalse: [
-			^self error: 'MixedArithBench WRONG: got ', sum printString,
-				' expected ', expectedSum printString].
-		x = 0.5 ifFalse: [
-			^self error: 'MixedArithBench WRONG: x is ', x printString, ' expected 0.5'].
+			sum := result at: 1.
+			x := result at: 2.
+			sum = expectedSum ifFalse: [
+				^self error: 'MixedArithBench WRONG: got ', sum printString,
+					' expected ', expectedSum printString].
+			x = 0.5 ifFalse: [
+				^self error: 'MixedArithBench WRONG: x is ', x printString, ' expected 0.5']].
+		watch stop.
 
 		Transcript
 			nextPutAll: 'MixedArith ', watch elapsedMilliseconds printString, ' milliseconds';
