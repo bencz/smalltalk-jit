@@ -1,0 +1,285 @@
+# O gate crescente
+
+Sob corte seco (ADR 0002) a suite nao fica verde a cada commit, entao ela nao
+pode ser o contrato de corretude. Este documento e o contrato.
+
+Uma escada de niveis. Cada nivel tem **um comando** e **um criterio objetivo**.
+O nivel atual fica em `scripts/gate.level`. Um commit e valido quando
+`scripts/gate.sh` passa, e `gate.sh` roda **todos os niveis ate o atual**, nao
+so o ultimo. **O nivel so sobe.** Descer exige apagar a linha do registro abaixo
+e escrever por que, no commit.
+
+## A escada
+
+| n | nome | criterio |
+|---|---|---|
+| 0 | aloca e coleta | self-test em C do subsistema de memoria, linkado SOZINHO |
+| 1 | troca de fiber | self-test em C do subsistema de fibers, tambem sozinho |
+| 2 | objetos e colecoes | String, Symbol, Array, OrderedCollection sob coleta |
+| 3 | JIT executa | bytecode escrito a mao, compilado e EXECUTADO, com perfil de tipos |
+| 4 | constroi SSA | bytecode vira SSA, com estado de deopt anexado |
+| 5 | otimiza | os passes, incluindo promocao de representacao de phi |
+| 6 | escapa e materializa | objeto apagado e RECONSTRUIDO a partir da receita |
+| 7 | primitivas | aritmetica por SEND, e o fallback quando a primitiva falha |
+| 8 | front end | fonte Smalltalk vira bytecode, compila e RODA |
+| 9 | compila | `cmake --build build` limpo, com `-Werror`, sem avisos |
+| 10 | executa | `st -e '(3 + 4) printNl'` imprime `7` |
+| 11 | bootstrap | `st -s snap -b packages/Core` completa e a imagem recarrega |
+| 12 | pacotes | os quatro pacotes compilam e a imagem do projeto e gerada |
+| 13 | paridade | `run_tests.sh` verde, **158 ok**, TUDO |
+| 14 | deopt-stress | a suite inteira verde com `ST_DEOPT_STRESS=1`, resultado identico |
+| 15 | performance | `vec3_flat`: zero alocacao, zero unbox, zero send no laco |
+
+Os niveis 0 a 8 sao subsistemas provados SOZINHOS, cada um linkado a mao com meia
+duzia de arquivos e nenhum CMake. Isso e deliberado: eles tem que continuar
+passando enquanto o resto do VM ainda nem compila, que e precisamente a janela
+que o corte seco abriu, e memoria, fibers, objetos, JIT, SSA, otimizador,
+materializacao, primitivas e front end sao justamente os subsistemas que nao
+dependem de um VM inteiro para serem verificados.
+
+Os niveis 9 a 13 sao o VM voltando a existir e alcancando PARIDADE COMPLETA com
+o v1. O 14 e o que torna a especulacao confiavel. O 15 e o alvo de performance.
+
+### Os niveis 7 e 8 foram INSERIDOS, e o que isso custou
+
+A escada original ia de "escapa e materializa" direto para "compila". Dois
+subsistemas faltavam ali, e os dois pela mesma razao: a fase 0 os tratou como
+itens de inventario e nao como coisas que dava para provar sozinhas.
+
+**7, primitivas.** `3 + 4` compilava para um SEND com **nada do outro lado**.
+Nenhum programa real roda assim.
+
+**8, front end.** Tudo abaixo dele foi provado com bytecode escrito a mao. O
+nivel 8 e onde o bytecode passa a vir de FONTE, e ele e provavel sozinho pelo
+mesmo motivo que os outros: parser mais emissor mais JIT mais primitivas nao
+precisam de um VM inteiro, precisam de um heap e de um kernel minimo.
+
+Inserir os dois custou renumerar de 7 para cima. Nao apagou historia nenhuma: o
+registro abaixo so tinha linhas ate o 6, e nenhum dos niveis deslocados havia
+sido alcancado. Se algum tivesse, a insercao teria ido para o fim da escada em
+vez do meio.
+
+## O criterio de aceitacao e paridade, nao o benchmark
+
+O alvo de `vec3_flat` (zero alocacao, zero unbox, zero send no laco) e o alvo de
+PERFORMANCE, e ele e o ULTIMO nivel justamente porque nao e o criterio de
+aceitacao.
+O criterio de aceitacao e que **tudo funcione**, e "tudo" tem tamanho medido:
+
+| | |
+|---|---|
+| arquivos em `tests/` | **141** |
+| pacotes | **4**: Core, Std.Http, Std.Actors, Std.Uuid |
+| fontes Smalltalk nesses pacotes | **160** |
+| testes proprios dos pacotes | 7 |
+| samples que a suite roda | 71 |
+| self-tests em C | 3 (`ST_SMALLFLOAT_TEST`, `ST_BIGINT_TEST`, `ST_ABI_EMIT_TEST`) |
+| **total de itens que `run_tests.sh` reporta** | **158** |
+
+E nao e so rodar: o nivel 12 exige que os quatro pacotes COMPILEM e que a imagem
+do projeto seja GERADA, porque `run_tests.sh` e `run_benchmarks.sh` fazem
+bootstrap de imagem nova a partir de `packages/Core` a cada execucao. A imagem e
+derivada, e e por isso que trocar o modelo de objeto foi possivel sem migracao;
+a contrapartida e que gerar a imagem faz parte do que tem que funcionar.
+
+Um JIT que faz `vec3_flat` chegar a zero alocacoes e nao roda `ExceptionTest.st`
+nao entregou o projeto. A ordem dos niveis diz isso: **paridade primeiro,
+performance depois**.
+
+Os niveis 0 e 1 sao **linkados a mao**, cada um com meia duzia de arquivos e
+nenhum CMake, e isso e deliberado: os dois tem que continuar passando enquanto
+o resto do VM ainda nem compila, que e precisamente a janela que o corte seco
+abriu. Memoria e fibers sao os dois unicos subsistemas que nao dependem de
+motor de execucao nenhum, e por isso sao os dois unicos que dava para provar no
+mesmo dia em que foram escritos.
+
+## Por que "aloca e coleta" vem ANTES de "compila"
+
+A primeira versao desta escada tinha "compila" no nivel 0, e isso estava errado
+de um jeito que so apareceu ao rodar. Sob corte seco, compilar o tree inteiro e
+o nivel MAIS DIFICIL, nao o mais facil: exige que o JIT ja exista, porque
+metade do VM chama `generateMethodCode` e companhia. Com ele no nivel 0, o gate
+ficaria vermelho por semanas e nao mediria nada durante todo esse tempo, que e
+exatamente o que um gate nao pode fazer.
+
+O subsistema de memoria, ao contrario, **nao depende de motor de execucao
+nenhum**. Ele compila e se auto-testa sozinho no dia em que e escrito. Por isso
+ele e o nivel 0: e a primeira coisa que da para provar, e prova-la antes de
+construir qualquer coisa em cima e o unico momento barato de faze-lo.
+
+O self-test do nivel 0 e linkado a mao, com sete arquivos e nenhum CMake, de
+proposito: ele tem que continuar passando enquanto o resto do VM ainda nem
+compila, que e precisamente a janela que o corte seco abriu.
+
+## Por que deopt-stress vem antes de performance
+
+Porque performance sem deopt-stress e uma mentira mensuravel. Zerar alocacao num laco e facil se voce
+nao precisar reconstruir o estado quando a especulacao falhar. O `--deopt-stress`
+e o que prova que da para desfazer, e sob corte seco ele e o **oraculo interno**
+que substitui o oraculo externo que perdemos: com todo guard falhando, todo teste
+e todo benchmark tem que produzir resultado identico ao do caminho normal.
+
+## O oraculo externo, que continua disponivel
+
+O corte seco tirou o v1 da branch, nao do repositorio. Para qualquer duvida de
+"o v2 esta respondendo certo", master continua a poucos segundos de distancia:
+
+```sh
+git worktree add /tmp/st-master master
+(cd /tmp/st-master && cmake -S . -B build && cmake --build build -j"$(nproc)")
+(cd /tmp/st-master && ./build/st -s snapshot -b packages/Core)
+
+# mesmo programa nos dois, saidas comparadas
+diff <(/tmp/st-master/build/st -s /tmp/st-master/snapshot -f prog.st) \
+     <(./build/st -s snapshot -f prog.st)
+```
+
+Isso nao ressuscita o v1 na branch e nao contamina o desenho novo: e uma
+referencia externa, usada sob demanda. **A partir do nivel 3 esta e a maneira
+certa de investigar qualquer resposta suspeita**, e e mais barata que ler codigo.
+
+Limite conhecido: a partir do momento em que o modelo de objeto mudar (ADR 0003,
+R4 a R6), o snapshot deixa de ser compativel entre os dois. Nao e problema:
+`run_tests.sh` regera a imagem a partir de `packages/Core` a cada execucao nos
+dois lados, entao o que se compara e a SAIDA do programa, nunca a imagem.
+
+## Registro de niveis
+
+Apendar, nunca reescrever. Data, commit, o que destravou.
+
+| data | nivel | commit | nota |
+|---|---|---|---|
+| 2026-07-27 | - | `583047d` | baseline v1 antes do corte: **158 ok**, 3375 ms, 141 testes + 4 pacotes |
+| 2026-07-27 | - | (nao commitado) | corte seco: 87 arquivos, 24.520 linhas fora |
+| 2026-07-27 | **0** | (nao commitado) | memoria nova: 17 de 17 no self-test, sem motor de execucao |
+| 2026-07-27 | **1** | (nao commitado) | fibers novos: 11 de 11; o self-test pegou `committedLow` sem `volatile` |
+| 2026-07-27 | 0 | (nao commitado) | handles: 22 de 22; o self-test pegou o TLAB sobrevivendo a coleta |
+| 2026-07-27 | **2** | (nao commitado) | camada de objetos: 23 de 23; pegou a tabela de simbolos sem write barrier |
+| 2026-07-27 | **3** | (nao commitado) | JIT executa: 28 de 28; perfil de tipos e emissao cruzada entre duas ABIs |
+| 2026-07-27 | **4** | (nao commitado) | SSA: 17 de 17; phis de back-edge, estado de deopt so com vivos |
+| 2026-07-27 | **5** | (nao commitado) | otimizador: 16 de 16; corpo de laco sem conversao nenhuma |
+| 2026-07-27 | **6** | (nao commitado) | escape + materializacao: 15 de 15 |
+| 2026-07-27 | **7** | (nao commitado) | primitivas: 98 de 98; a escada ganhou um degrau, ver acima |
+| 2026-07-27 | 0 | (nao commitado) | o nivel 7 achou DOIS bugs de GC pre-existentes, ver abaixo |
+| 2026-07-27 | **8** | (nao commitado) | front end: 40 de 40; fonte -> bytecode -> maquina, sem bloco nao-inlinado ainda |
+| 2026-07-27 | 8 | (nao commitado) | frames compilados viraram raizes: alocar de codigo compilado ficou seguro |
+
+## O que o nivel 7 encontrou, e por que so ele podia encontrar
+
+Dois bugs de raiz de GC, os dois anteriores ao nivel 7 e os dois invisiveis para
+todos os niveis abaixo dele. Ficam registrados porque a CAUSA de terem escapado
+importa mais que os bugs.
+
+**1. O scan de Cheney nao alcancava objeto PROMOVIDO** (`memory/Collector.c`). O
+ponteiro de scan varre a to-space em ordem de endereco, e isso e a lista de
+trabalho completa apenas para quem foi copiado PARA a to-space. Um objeto
+promovido para a old space e sobrevivente igual, com slots igualmente obsoletos,
+e nao esta naquela faixa. Os slots dele ficavam apontando para a semispace morta.
+
+Por que nenhum nivel via: o nivel 0 promovia e conferia o objeto promovido, mas
+nunca relia um PONTEIRO dele depois. E o sintoma nao aparece na coleta: o objeto
+esta intacto, a coleta reporta sucesso, e o dado so vira lixo quando a semispace
+for reusada, a uma distancia arbitraria do bug. O teste de regressao que ficou
+(`vm/tests/MemoryTest.c`) confere a GERACAO do alvo, e nao o conteudo dele: com o
+conserto removido, a checagem de conteudo **continua passando**, porque nada
+chegou a encaminhar o objeto abandonado.
+
+**2. `IcCell.selector` e `CodeUnit.literals` nao eram raizes** (`jit/Jit.c`). Um
+`CodeUnit` e um struct C de `malloc` com `Value`s tagueados dentro, e uma celula
+de cache guarda o seletor como ponteiro cru. Nenhum dos dois esta dentro de
+objeto de heap, entao nenhum provedor de raiz os encontrava, e uma coleta jovem
+move exatamente os objetos que eles nomeiam. Como lookup de seletor e por
+IDENTIDADE de Symbol interned, o sintoma e `doesNotUnderstand` para um metodo que
+existe, a partir da primeira coleta e nunca antes dela.
+
+Conserto: `rootsVisitCompiledCode` em `memory/Roots.h`, o mesmo seam de
+`rootsVisitNativeFrames`, com no-op fraco para quem linka sem JIT.
+
+**A licao operacional**: os dois so apareceram quando um teste passou a
+**coletar e continuar executando**. Todo nivel ate o 6 ou coletava no fim, ou
+executava sem coletar. Nivel novo que envolva heap deve fazer as duas coisas, e
+nessa ordem.
+
+## O que o nivel 8 encontrou
+
+**Um bug de precedencia no parser**, que sobreviveu ao v1 inteiro
+(`vm/compiler/Parser.c`). As macros de checagem de token nao parentizavam o
+parametro:
+
+```c
+if ((token->type & tokenType) == 0) { ... }
+```
+
+Os chamadores passam um CONJUNTO de alternativas, `TOKEN_IDENTIFIER |
+TOKEN_KEYWORD | ...`, e `&` liga mais forte que `|`, entao o teste lia
+`(type & PRIMEIRO) | RESTO`. Como RESTO e uma constante nao-zero, a condicao era
+sempre falsa e **a checagem aceitava qualquer token**, em todos os lugares onde
+uma alternativa era passada. Nunca reportou erro de sintaxe nesses pontos.
+
+Achado por `-Wparentheses`, nao por teste, e nao poderia ter sido achado por
+teste com facilidade: o efeito e aceitacao silenciosa, entao so um programa
+MALFORMADO que mesmo assim compila o revela.
+
+## Frames compilados viraram raizes, e o que quase deu errado
+
+`rootsVisitNativeFrames` era o no-op fraco de `memory/Roots.c`, entao NADA podia
+alocar com um frame compilado vivo. Isso bloqueava closures (que alocam),
+`Object new`, e todo o resto. Agora esta implementado, e duas coisas o tornaram
+barato:
+
+**O mapa de frame do tier 1 e UNIFORME.** Todo slot de um frame de template
+guarda um `Value` tagueado, sempre: o compilador de template nunca poe double cru
+nem inteiro cru num slot, e o prologo nilifica todo slot que nao recebe
+argumento. Entao o mapa e "slots 0 a frameSlots-1, todos ponteiros" e **nao
+existe tabela por safepoint neste tier**. Isso muda no tier 2, onde o backend de
+SSA guarda valores crus e o R1 do ADR 0003 passa a valer de verdade.
+
+**A ancora custa ZERO instrucao no codigo gerado.** O frame pointer sai do
+endereco de slot que a chamada ja passa, e o metodo sai de
+`__builtin_return_address(0)`. Nada foi emitido para isso.
+
+**O erro que quase passou**: ancorar so o segmento MAIS NOVO. Frames compilados
+vem em SEGMENTOS separados por frames C:
+
+```
+churn (compilado) -> jitDispatch (C) -> new: (compilado) -> primitiva (C)
+```
+
+Com uma ancora so, o walk achava o frame de `new:`, parava na fronteira C, e os
+registradores vivos de `churn` nunca eram varridos. As ancoras sao uma CADEIA.
+
+**E a licao do teste, que e a mesma de antes**: a checagem tem que ser a
+GERACAO do objeto, nao o conteudo dele. Um objeto que o coletor nunca viu fica
+abandonado na semispace evacuada com os bytes intactos, entao "ainda le 111"
+responde SIM mesmo com o walk desligado. Medido: a primeira versao da checagem
+passava com o walk inteiro removido. O que nao acontece por sorte e estar na OLD
+space, porque so um coletor que ACHOU o objeto duas vezes poderia te-lo
+promovido.
+
+## O que o front end ainda NAO faz
+
+Registrado aqui para nao virar surpresa no nivel 9:
+
+- **bloco nao inlinado**: `[:x | ...]` como valor exige closure plana com
+  celulas (ADR 0008) e ainda nao existe. O compilador RECUSA, com erro nomeado,
+  em vez de emitir algo que parece funcionar;
+- **`super`**: o emissor gera `SENDSUPER` e o tier 1 ainda nao o implementa, e
+  reporta o opcode pelo nome;
+- **retorno nao local** (`^` dentro de bloco), que depende do item 1.
+
+## O que o gate NAO cobre, e como cobrimos
+
+O gate mede **funcionamento**, nao **desempenho**, e no nivel 8 mede um alvo
+unico. Duas coisas ficam de fora e precisam de tratamento proprio:
+
+**Regressao de desempenho.** Fica com `scripts/ab.sh` mais
+`benchmarks/results/BASELINE.jsonl`, exatamente como hoje. Regra herdada e nao
+negociada: layout de codigo neste VM ja produziu 4% de variacao com instrucoes
+identicas, entao nenhum ganho abaixo disso e reivindicavel sem A/B intercalado, e
+a contagem de instrucoes retiradas manda sobre o relogio.
+
+**Corretude que nenhum teste alcanca.** A licao registrada deste repositorio e
+que um slot de stackmap faltando nao produz teste vermelho. A guarda certa nao e
+teste, e `ASSERT` no codegen, e esse e o requisito R2 do ADR 0003. Todo `ASSERT`
+novo que codifique uma invariante do mapa de deopt ou do stackmap vale mais que
+um teste, porque roda em toda compilacao de toda execucao da suite.

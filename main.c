@@ -18,6 +18,7 @@
 #include "vm/jit/TargetCpu.h"
 #include "vm/jit/InlineCache.h"
 #include "vm/jit/Tier.h"
+#include "vm/core/Instrument.h"
 #include "vm/tests/SelfTests.h"
 #include <unistd.h>
 #include <string.h>
@@ -231,6 +232,33 @@ int main(int argc, char **args)
 		}
 	}
 
+	// What THIS engine cannot see. A counter with no increment site must print
+	// "n/a", never 0: a zero that means "nothing counts this" is
+	// indistinguishable from a zero that means "this never happened", and the
+	// second is exactly what the jit-v2 acceptance criterion claims. See the
+	// second rule in core/Instrument.h.
+	//
+	// v1 cannot measure:
+	//   tagged_loads  no single site; it would mean instrumenting every load
+	//                 through a tagged pointer in emitted code
+	//   unboxes       the decode lives inside the float fast path, where TMP
+	//                 holds the receiver for the dispatch fall-through and no
+	//                 register is free without disturbing the [rsp] operands
+	//   f64_ops       same fast path, same reason
+	//   i64_ops       same
+	//   deopts        v1 has no deoptimization at all (jit/Tier.h says so)
+	// and the IC/tier counters only exist when their own emission flags are on.
+	instrumentSetUnmeasured(
+		ST_UNMEASURED(INSTR_TAGGED_LOADS) | ST_UNMEASURED(INSTR_UNBOXES)
+		| ST_UNMEASURED(INSTR_F64_OPS) | ST_UNMEASURED(INSTR_I64_OPS)
+		| ST_UNMEASURED(INSTR_DEOPTS));
+	if (!icStatsEnabled()) {
+		instrumentSetUnmeasured(ST_UNMEASURED(INSTR_IC_HITS) | ST_UNMEASURED(INSTR_IC_MISSES));
+	}
+	if (!tierStatsEnabled()) {
+		instrumentSetUnmeasured(ST_UNMEASURED(INSTR_GUARD_CHECKS) | ST_UNMEASURED(INSTR_GUARD_FAILS));
+	}
+
 	initThread(&CurrentThread);
 	// Project runs against a FRESH cache load the built project image; a stale
 	// (or first) build loads the base image and rebuilds below. Everything
@@ -311,6 +339,19 @@ int main(int argc, char **args)
 	schedulerSpawnC(runProgram, &ctx, 0);
 	schedulerRun();
 
+	// Execution counters (core/Instrument.h) under ST_INSTRUMENT_PRINT=1, in a
+	// -DST_INSTRUMENT=1 build. Two counters come from the existing JIT stats
+	// rather than their own emission sites, because those sites already exist
+	// and a second increment next to them would be pure duplication. This
+	// bridge is v1-specific and dies with the v1 JIT: in v2 both are ordinary
+	// counters at their own sites.
+	if (instrumentPrintEnabled()) {
+		gInstrument.c[INSTR_IC_HITS] = gIcStats.hits + gIcStats.picHits;
+		gInstrument.c[INSTR_IC_MISSES] = gIcStats.missCold;
+		gInstrument.c[INSTR_GUARD_CHECKS] = gTierStats.directCalls + gTierStats.guardFails;
+		gInstrument.c[INSTR_GUARD_FAILS] = gTierStats.guardFails;
+		instrumentPrint("exit");
+	}
 	// Inline-cache observability (jit/InlineCache.h): dump the counters at exit
 	// under ST_IC_STATS=1 (the same flag that makes the JIT emit the hit/poly
 	// increments; without it those two stay zero and the rest still counts).

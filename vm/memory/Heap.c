@@ -1,61 +1,58 @@
 #include "memory/Heap.h"
-#include "core/Handle.h"
-#include "core/Smalltalk.h"
-#include "memory/GarbageCollector.h"
+#include "memory/Collector.h"
+#include "memory/ObjectWalk.h"
 #include "core/Assert.h"
+#include "core/Handle.h"
+#include "core/Thread.h"
 #include "os/Os.h"
-#include "core/CompiledCode.h"
-#include "runtime/String.h"
-#include <string.h>
+#include <stdio.h>
 #include <stdlib.h>
-#include "os/OsThread.h"
-
-// From core/Lookup.c (not via Lookup.h: that header pulls CompiledCode/JIT
-// types this TU does not need). Flushes the calling thread's TLS LookupCache
-// when heap->gcEpoch moved past Thread.lookupCacheEpoch.
-void lookupCacheOnGcResume(Thread *self);
+#include <string.h>
 
 #define KB 1024
 #define MB (1024 * 1024)
 
-#define SCAVENGE_EVERY_ALLOC 0
-#define VERIFY_HEAP_AFTER_GC 0
+#define NURSERY_BYTES (32 * MB)
+#define OLD_PAGE_BYTES (256 * KB)
+#define EXEC_PAGE_BYTES (256 * KB)
+#define TLAB_BYTES (64 * KB)
 
-// Full GC (mark/sweep) runs only once old-space capacity grows past a threshold
-// that itself grows with the live set — instead of on every page growth. Without
-// this, a workload that steadily promotes (e.g. 100k live fibers' contexts)
-// triggers a full GC on nearly every scavenge = O(N) full GCs = O(N²).
+// A full collection runs only once the old space grows past a threshold that
+// itself grows with the live set. Without that, a workload that steadily
+// promotes triggers a full collection on nearly every young one, which is
+// O(N) full collections and therefore O(N^2).
 #define OLD_GC_MIN_THRESHOLD (16 * MB)
 #define OLD_GC_GROWTH 2
 
-static void nilVars(Value *vars, size_t count);
-static uint8_t *pageSpaceAllocate(PageSpace *pageSpace, size_t size);
-static void emptyRememberedSet(void);
-static void verifyObject(Heap *heap, RawObject *object);
-static void verifyPointer(Heap *heap, RawObject *object);
-static void printHeapPage(HeapPage *page);
-static void printFreeSpace(FreeSpace *freeSpace);
-static void printPageSpace(PageSpace *space);
+PER_ISOLATE GCStats LastGCStats;
+
+static PER_ISOLATE size_t gCodegenDepth;
+static PER_ISOLATE size_t gSymbolDepth;
 
 
 void initHeap(Heap *heap, struct Thread *thread)
 {
 	heap->thread = thread;
-	// Per-heap well-known handles (see Heap.h / the `Handles` macro). Zeroed; bootstrap
-	// (or an isolate's own bootstrap) populates the fields. Shared by this heap's workers.
-	heap->handles = calloc(1, sizeof(SmalltalkHandles));
-	initScavenger(&heap->newSpace, heap, 64 * MB);
-	initPageSpace(&heap->oldSpace, 256 * KB, 0);
-	initPageSpace(&heap->execSpace, 256 * KB, 1);
+	heap->handles = calloc(1, sizeof(SmalltalkHandles)); // populated by bootstrap
+	classTableInit(&heap->classes);
+	initNursery(&heap->newSpace, heap, NURSERY_BYTES);
+	initPageSpace(&heap->oldSpace, OLD_PAGE_BYTES, 0);
+	initPageSpace(&heap->execSpace, EXEC_PAGE_BYTES, 1);
 	heap->oldGcThreshold = OLD_GC_MIN_THRESHOLD;
+	heap->gcEpoch = 0;
+
 	osMutexInit(&heap->youngLock);
 	osMutexInit(&heap->oldLock);
 	osMutexInit(&heap->execLock);
 	osMutexInit(&heap->codegenLock);
-	osMutexInit(&heap->monitorLock); // retained for ABI/offset stability; unused
-	// Striped sync monitor: N = ST_MONITOR_STRIPES (default 64), clamped to a power of 2
-	// in [1, 4096]. N=1 => one lock (legacy behavior / escape hatch). Parsed ONCE here so
-	// every worker of this heap agrees; stripeForSyncObject mixes obj->hash into [0,N).
+	osMutexInit(&heap->symbolLock);
+	osMutexInit(&heap->gcLock);
+	osMutexInit(&heap->safepointLock);
+	osCondInit(&heap->safepointCond);
+	heap->safepointRequested = 0;
+
+	// Striped sync monitor: N = ST_MONITOR_STRIPES (default 64), clamped to a
+	// power of two in [1, 4096]. N = 1 is the single-lock escape hatch.
 	{
 		size_t requested = 64;
 		const char *env = getenv("ST_MONITOR_STRIPES");
@@ -67,7 +64,10 @@ void initHeap(Heap *heap, struct Thread *thread)
 		}
 		size_t n = 1;
 		unsigned log2n = 0;
-		while (n * 2 <= requested) { n *= 2; log2n++; }
+		while (n * 2 <= requested) {
+			n *= 2;
+			log2n++;
+		}
 		heap->monitorStripeCount = n;
 		heap->monitorStripeShift = (n <= 1) ? 0 : (32 - log2n);
 		heap->monitorLocks = malloc(n * sizeof(OsMutex));
@@ -76,88 +76,199 @@ void initHeap(Heap *heap, struct Thread *thread)
 			osMutexInit(&heap->monitorLocks[i]);
 		}
 	}
-	osMutexInit(&heap->symbolLock);
+
 	heap->symbolCount = 0;
-	heap->symbolCountValid = 0; // force a recount on first intern (snapshot restores the table only)
-	osMutexInit(&heap->gcLock);
-	osMutexInit(&heap->safepointLock);
-	osCondInit(&heap->safepointCond);
-	heap->safepointRequested = 0;
-	heap->gcEpoch = 0;
+	heap->symbolCountValid = 0;
 	heap->mutators = NULL;
-	initRememberedSet(&heap->rememberedSet); // consolidated old->young set (survives worker exit)
-	heap->sched = NULL; // allocated by schedulerInit, once per heap
-	for (int i = 0; i < STUB_COUNT; i++) {
-		heap->stubCode[i] = NULL; // JIT stubs generated lazily, once per heap
-	}
+	heap->sched = NULL;
 }
 
 
-// Register `thread` as a mutator of `heap` so the GC scans its roots. Taken under
-// gcLock (which the collector holds for the whole collection) so a worker can NEVER
-// join heap->mutators while a scavenge is walking that list / moving objects: the
-// registering thread simply waits for any in-progress collection to finish. This
-// mirrors heapEndMutator and closes the registration race (a worker that joined
-// after the collector's heapGcBegin snapshot used to run concurrently with the
-// scavenge, corrupting value slots). Registration is rare, so the extra lock is
-// free in practice; youngLock still guards the actual list write.
-void heapAddMutator(Heap *heap, struct Thread *thread)
+void freeHeap(Heap *heap)
 {
-	osMutexLock(&heap->gcLock);
-	osMutexLock(&heap->youngLock);
-	thread->nextMutator = heap->mutators;
-	heap->mutators = thread;
-	osMutexUnlock(&heap->youngLock);
-	osMutexUnlock(&heap->gcLock);
+	freeNursery(&heap->newSpace);
+	freePageSpace(&heap->oldSpace);
+	freePageSpace(&heap->execSpace);
+	classTableFree(&heap->classes);
+	for (size_t i = 0; i < heap->monitorStripeCount; i++) {
+		osMutexDestroy(&heap->monitorLocks[i]);
+	}
+	free(heap->monitorLocks);
+	heap->monitorLocks = NULL;
+	free(heap->handles);
+	heap->handles = NULL;
 }
 
 
-// Unregister an exiting worker thread from `heap->mutators` so a later GC never
-// scans the roots of a dead OS thread. Done under gcLock (which the collector
-// holds while iterating the list), so it never races a scavenge.
-void heapEndMutator(Heap *heap, Thread *thread)
-{
-	heapGcEnterBlocked(heap, thread); // waiting on gcLock counts as safe
-	osMutexLock(&heap->gcLock);
-	heapGcLeaveBlocked(heap, thread);
-	osMutexLock(&heap->youngLock);
-	Thread **link = &heap->mutators;
-	while (*link != NULL && *link != thread) {
-		link = &(*link)->nextMutator;
-	}
-	if (*link == thread) {
-		*link = thread->nextMutator;
-	}
-	osMutexUnlock(&heap->youngLock);
+// ---------------------------------------------------------------------------
+// Allocation
+// ---------------------------------------------------------------------------
 
-	// Splice this exiting worker's per-thread barrier delta (old->young edges recorded
-	// since the last GC) into the heap-level consolidated set, so they are NOT lost when
-	// the thread's TLS is reclaimed. Raw block-chain splice — NOT rememberedSetAdd: the
-	// entries keep TAG_REMEMBERED (rememberedSetAdd ASSERTs it is clear). Safe under
-	// gcLock (still held): the heap-level set is only ever touched under gcLock / STW.
-	RememberedSetBlock *front = thread->rememberedSet.blocks;
-	if (front != NULL) {
-		_Bool empty = (front->prev == NULL) && (front->current == front->objects);
-		if (empty) {
-			rememberedSetFreeBlocks(front); // lone empty head — nothing to transfer
-		} else {
-			RememberedSetBlock *tail = front; // oldest block has prev == NULL
-			while (tail->prev != NULL) {
-				tail = tail->prev;
-			}
-			tail->prev = heap->rememberedSet.blocks; // concatenate: thread chain -> heap chain
-			heap->rememberedSet.blocks = front;
+static uint8_t *allocateOld(Heap *heap, size_t bytes)
+{
+	osMutexLock(&heap->oldLock);
+	uint8_t *address = pageSpaceAllocate(&heap->oldSpace, bytes);
+	_Bool overThreshold = heap->oldSpace.allocated > heap->oldGcThreshold;
+	osMutexUnlock(&heap->oldLock);
+	if (address == NULL) {
+		fprintf(stderr, "out of memory: old space refused %zu bytes\n", bytes);
+		abort();
+	}
+	if (overThreshold) {
+		collectorMarkSweep(heap);
+		osMutexLock(&heap->oldLock);
+		size_t live = heap->oldSpace.allocated;
+		heap->oldGcThreshold = live * OLD_GC_GROWTH;
+		if (heap->oldGcThreshold < OLD_GC_MIN_THRESHOLD) {
+			heap->oldGcThreshold = OLD_GC_MIN_THRESHOLD;
 		}
-		thread->rememberedSet.blocks = NULL; // ownership transferred; thread is dying
+		osMutexUnlock(&heap->oldLock);
 	}
-
-	osMutexUnlock(&heap->gcLock);
+	return address;
 }
 
 
-// ---- stop-the-world safepoint handshake (per shared heap) ------------------
-// Mirrors vm/Safepoint.c but scoped to ONE heap's mutators (heap->mutators), so
-// a collection on the shared heap never stops threads of a different isolate.
+// Retire a TLAB: fill its unused tail with a free chunk and DROP it, so the
+// owning mutator's next allocation refills from the current young space.
+//
+// Both halves matter and for different reasons. The filling is so that a linear
+// walk, which strides on object headers, does not read the uncarved tail as
+// garbage. The DROPPING is what a collection depends on: a TLAB is a pointer
+// INTO one semispace, and a young collection swaps which semispace mutators
+// allocate from. A TLAB that survived a collection would keep handing out
+// addresses in the space that just became the next collection's DESTINATION,
+// and the next collection would then copy survivors straight over live objects.
+//
+// That is not hypothetical. It is exactly what the memory self-test caught:
+// 32 objects silently sharing addresses with 32 others, discovered because two
+// handles that had never met came back pointing at the same word.
+static void retireTlab(Thread *thread)
+{
+	size_t left = (size_t) (thread->tlab.end - thread->tlab.top);
+	if (left >= HEAP_OBJECT_ALIGN) {
+		freeChunkInit((RawObject *) thread->tlab.top, left);
+	}
+	thread->tlab.top = NULL;
+	thread->tlab.end = NULL;
+}
+
+
+void heapFillAllTlabTails(Heap *heap)
+{
+	for (Thread *t = heap->mutators; t != NULL; t = t->nextMutator) {
+		if (t->tlab.top != NULL) {
+			retireTlab(t);
+		}
+	}
+}
+
+
+static _Bool refillTlab(Heap *heap, Thread *thread)
+{
+	osMutexLock(&heap->youngLock);
+	uint8_t *chunk = nurseryCarve(&heap->newSpace, TLAB_BYTES);
+	osMutexUnlock(&heap->youngLock);
+	if (chunk == NULL) {
+		return 0;
+	}
+	thread->tlab.top = chunk;
+	thread->tlab.end = chunk + TLAB_BYTES;
+	return 1;
+}
+
+
+uint8_t *allocate(Heap *heap, size_t bytes)
+{
+	bytes = objectAlignSize(bytes);
+	// An object whose size does not fit the header's 8-bit field never enters
+	// the nursery. It would otherwise need its size in a word BEFORE the header,
+	// and a copying collector would have to carry that word along on every
+	// evacuation. Sending such objects straight to the non-moving old space
+	// removes that case from the copy path entirely. The cost is that a large
+	// array is old from birth and only a full collection can reclaim it, which
+	// is a policy worth measuring once there is something to measure.
+	if (bytes > SIZE_INLINE_MAX_BYTES) {
+		return allocateOld(heap, bytes);
+	}
+
+	Thread *thread = &CurrentThread;
+	if (thread->tlab.top != NULL
+			&& (size_t) (thread->tlab.end - thread->tlab.top) >= bytes) {
+		uint8_t *address = thread->tlab.top;
+		thread->tlab.top += bytes;
+		return address;
+	}
+
+	if (thread->tlab.top != NULL) {
+		retireTlab(thread);
+	}
+	if (refillTlab(heap, thread)) {
+		uint8_t *address = thread->tlab.top;
+		thread->tlab.top += bytes;
+		return address;
+	}
+
+	// Young space exhausted: collect, then try once more. The collection
+	// retires every TLAB itself, including this thread's.
+	collectorScavenge(heap);
+	if (refillTlab(heap, thread)) {
+		uint8_t *address = thread->tlab.top;
+		thread->tlab.top += bytes;
+		return address;
+	}
+	// A nursery that cannot host a TLAB even after a collection means the live
+	// young set fills it. Fall back to old space rather than loop.
+	return allocateOld(heap, bytes);
+}
+
+
+// 22 bits of identity hash, derived from the address at birth. Objects move, so
+// this is a birth-time value that then travels WITH the object, exactly like
+// the old 32-bit field: identity hash must be stable across collections.
+static uint32_t birthHash(void *address)
+{
+	uintptr_t bits = (uintptr_t) address >> 4;
+	bits ^= bits >> 22;
+	return (uint32_t) (bits & OBJ_HASH_MASK);
+}
+
+
+RawObject *allocateObject(Heap *heap, RawObject *class, size_t elements)
+{
+	RawClass *raw = (RawClass *) class;
+	InstanceShape shape = raw->instanceShape;
+	size_t bytes = objectSizeForShape(shape, elements);
+
+	uint8_t *address = allocate(heap, bytes);
+	RawObject *object = (RawObject *) address;
+	object->header = makeObjectHeader(raw->classIndex, birthHash(address),
+		(ObjectFormat) shape.format, bytes / sizeof(uint64_t));
+
+	// osPageAlloc promises zeroed pages and the collector never hands back a
+	// dirty chunk, so a fresh object's body is already zero. Only the element
+	// count and the nil-filling of pointer slots have to be written.
+	switch ((ObjectFormat) shape.format) {
+	case FORMAT_INDEXED_POINTERS:
+	case FORMAT_BYTES:
+	case FORMAT_DOUBLES:
+		rawObjectSetElementCount(object, elements);
+		break;
+	default:
+		break;
+	}
+	return object;
+}
+
+
+void collectGarbage(Heap *heap)
+{
+	collectorMarkSweep(heap);
+}
+
+
+// ---------------------------------------------------------------------------
+// Stop-the-world handshake
+// ---------------------------------------------------------------------------
 
 void heapGcPoll(Heap *heap, Thread *self)
 {
@@ -167,17 +278,17 @@ void heapGcPoll(Heap *heap, Thread *self)
 	osMutexLock(&heap->safepointLock);
 	if (__atomic_load_n(&heap->safepointRequested, __ATOMIC_ACQUIRE)) {
 		self->spAtSafepoint = 1;
-		osCondBroadcast(&heap->safepointCond); // wake a waiting collector
+		osCondBroadcast(&heap->safepointCond);
 		while (__atomic_load_n(&heap->safepointRequested, __ATOMIC_ACQUIRE)) {
 			osCondWait(&heap->safepointCond, &heap->safepointLock);
 		}
 		self->spAtSafepoint = 0;
 	}
 	osMutexUnlock(&heap->safepointLock);
-	lookupCacheOnGcResume(self); // the collection may have moved cached classes/selectors
 }
 
-static int heapAllSafe(Heap *heap, Thread *exclude)
+
+static int allSafe(Heap *heap, Thread *exclude)
 {
 	for (Thread *t = heap->mutators; t != NULL; t = t->nextMutator) {
 		if (t == exclude) {
@@ -190,24 +301,30 @@ static int heapAllSafe(Heap *heap, Thread *exclude)
 	return 1;
 }
 
+
 void heapGcBegin(Heap *heap, Thread *self)
 {
 	osMutexLock(&heap->safepointLock);
 	__atomic_store_n(&heap->safepointRequested, 1, __ATOMIC_RELEASE);
-	while (!heapAllSafe(heap, self)) {
+	while (!allSafe(heap, self)) {
 		osCondWait(&heap->safepointCond, &heap->safepointLock);
 	}
 	osMutexUnlock(&heap->safepointLock);
 }
 
-void heapGcEnd(Heap *heap)
+
+void heapGcEnd(Heap *heap, Thread *self)
 {
+	(void) self;
 	osMutexLock(&heap->safepointLock);
 	__atomic_store_n(&heap->safepointRequested, 0, __ATOMIC_RELEASE);
 	osCondBroadcast(&heap->safepointCond);
 	osMutexUnlock(&heap->safepointLock);
 }
 
+
+// A mutator about to block in a native wait declares itself safe: it holds no
+// heap pointers the collector could not reach, so a peer must not wait for it.
 void heapGcEnterBlocked(Heap *heap, Thread *self)
 {
 	osMutexLock(&heap->safepointLock);
@@ -215,6 +332,7 @@ void heapGcEnterBlocked(Heap *heap, Thread *self)
 	osCondBroadcast(&heap->safepointCond);
 	osMutexUnlock(&heap->safepointLock);
 }
+
 
 void heapGcLeaveBlocked(Heap *heap, Thread *self)
 {
@@ -224,26 +342,70 @@ void heapGcLeaveBlocked(Heap *heap, Thread *self)
 	}
 	self->spBlocked = 0;
 	osMutexUnlock(&heap->safepointLock);
-	lookupCacheOnGcResume(self); // a collection may have run while blocked
 }
 
 
-// ---- JIT code-generation lock (serializes codegen across worker threads) ----
-// Only ONE thread generates JIT code at a time. Held across a whole method/stub
-// generation, which allocates young objects and may scavenge — so acquisition uses
-// the "waiting counts as safe" pattern (enter the blocked state before blocking on
-// the lock) to avoid deadlocking a peer collector. A per-thread depth counter makes
-// it re-entrant (a stub is generated while a method is being compiled).
-static PER_ISOLATE int gCodegenDepth = 0;
+void heapAddMutator(Heap *heap, Thread *thread)
+{
+	// Under gcLock, which the collector holds for a whole collection, so a
+	// worker can never join the mutator list while one is walking it.
+	osMutexLock(&heap->gcLock);
+	osMutexLock(&heap->youngLock);
+	thread->nextMutator = heap->mutators;
+	heap->mutators = thread;
+	osMutexUnlock(&heap->youngLock);
+	osMutexUnlock(&heap->gcLock);
+}
+
+
+void heapEndMutator(Heap *heap, Thread *thread)
+{
+	heapGcEnterBlocked(heap, thread); // waiting on gcLock counts as safe
+	osMutexLock(&heap->gcLock);
+	heapGcLeaveBlocked(heap, thread);
+	osMutexLock(&heap->youngLock);
+	if (thread->tlab.top != NULL) {
+		retireTlab(thread);
+	}
+	Thread **link = &heap->mutators;
+	while (*link != NULL && *link != thread) {
+		link = &(*link)->nextMutator;
+	}
+	if (*link == thread) {
+		*link = thread->nextMutator;
+	}
+	osMutexUnlock(&heap->youngLock);
+
+	// Splice this worker's barrier log into the heap-level thread's, so the
+	// old-to-young edges it recorded are not lost when its storage goes away.
+	RememberedSetBlock *front = thread->rememberedSet.blocks;
+	if (front != NULL && heap->thread != NULL && heap->thread != thread) {
+		RememberedSetBlock *tail = front;
+		while (tail->prev != NULL) {
+			tail = tail->prev;
+		}
+		tail->prev = heap->thread->rememberedSet.blocks;
+		heap->thread->rememberedSet.blocks = front;
+		thread->rememberedSet.blocks = NULL;
+	}
+	osMutexUnlock(&heap->gcLock);
+}
+
+
+// ---------------------------------------------------------------------------
+// Locks
+// ---------------------------------------------------------------------------
 
 void heapCodegenLockEnter(Heap *heap)
 {
+	// Re-entrant: generating a stub while compiling a method takes it twice.
 	if (gCodegenDepth++ == 0) {
-		heapGcEnterBlocked(heap, &CurrentThread); // waiting on codegenLock counts as safe
+		heapGcEnterBlocked(heap, &CurrentThread); // waiting counts as GC-safe
 		osMutexLock(&heap->codegenLock);
 		heapGcLeaveBlocked(heap, &CurrentThread);
 	}
 }
+
 
 void heapCodegenLockLeave(Heap *heap)
 {
@@ -253,52 +415,15 @@ void heapCodegenLockLeave(Heap *heap)
 }
 
 
-// ---- Smalltalk sync monitor (Semaphore/Channel/...), striped per sync-object ----
-// Acquisition mirrors heapCodegenLockEnter: a fiber holding a stripe may allocate (the
-// critical sections do `waiting addLast:` etc.) and thus trigger a scavenge, and a fiber
-// WAITING on a stripe must not stall the STW handshake — so it enters the blocked state
-// before locking. Still NOT re-entrant: the sync primitives keep their critical sections
-// FLAT (one stripe at a time, never nested), which keeps spBlocked (a boolean) correct.
-void heapMonitorEnterStripe(Heap *heap, size_t stripe)
-{
-	heapGcEnterBlocked(heap, &CurrentThread); // waiting on a stripe counts as safe
-	osMutexLock(&heap->monitorLocks[stripe]);
-	heapGcLeaveBlocked(heap, &CurrentThread);
-}
-
-void heapMonitorExitStripe(Heap *heap, size_t stripe)
-{
-	osMutexUnlock(&heap->monitorLocks[stripe]);
-}
-
-// Legacy no-arg monitor == stripe 0 (the arity-1 primitives / any global use).
-void heapMonitorEnter(Heap *heap)
-{
-	heapMonitorEnterStripe(heap, 0);
-}
-
-void heapMonitorExit(Heap *heap)
-{
-	heapMonitorExitStripe(heap, 0);
-}
-
-
-// ---- symbol interning lock (asSymbol / growSymbolTable) ----
-// Re-entrant (growSymbolTable re-enters asSymbol through setGlobal to keep the Smalltalk
-// `SymbolTable` global in sync), with a per-thread depth counter like codegenLock. GC-safe
-// acquisition: interning allocates (a new Symbol, or a 2x table) and can scavenge, and a
-// thread waiting on this lock must not stall a peer's STW — so it enters the blocked state
-// before locking. A leaf lock (never taken while holding it another lock that could invert).
-static PER_ISOLATE int gSymbolDepth = 0;
-
 void heapSymbolLockEnter(Heap *heap)
 {
 	if (gSymbolDepth++ == 0) {
-		heapGcEnterBlocked(heap, &CurrentThread); // waiting on symbolLock counts as safe
+		heapGcEnterBlocked(heap, &CurrentThread);
 		osMutexLock(&heap->symbolLock);
 		heapGcLeaveBlocked(heap, &CurrentThread);
 	}
 }
+
 
 void heapSymbolLockLeave(Heap *heap)
 {
@@ -308,556 +433,61 @@ void heapSymbolLockLeave(Heap *heap)
 }
 
 
-void freeHeap(Heap *heap)
+// Stripe for a synchronization object, derived from its identity hash. Computed
+// ONCE at enter and stashed in the Thread; exit reads it back and never
+// recomputes, so enter and exit provably drop the same lock even if the object
+// moved or was become:-d inside the critical section.
+size_t heapMonitorEnterStripe(Heap *heap, RawObject *object)
 {
-	freeScavenger(&heap->newSpace);
-	freePageSpace(&heap->oldSpace);
-	freePageSpace(&heap->execSpace);
-	rememberedSetFreeBlocks(heap->rememberedSet.blocks); // free the whole chain (incl. head)
-	heap->rememberedSet.blocks = NULL;
-	for (size_t i = 0; i < heap->monitorStripeCount; i++) {
-		osMutexDestroy(&heap->monitorLocks[i]);
+	size_t stripe = 0;
+	if (heap->monitorStripeCount > 1) {
+		uint32_t hash = rawObjectHash(object);
+		stripe = (size_t) ((hash * 2654435761u) >> heap->monitorStripeShift)
+			& (heap->monitorStripeCount - 1);
 	}
-	free(heap->monitorLocks);
-	heap->monitorLocks = NULL;
-	free(heap->handles);
-	heap->handles = NULL;
+	osMutexLock(&heap->monitorLocks[stripe]);
+	return stripe;
 }
 
 
-RawObject *allocateObject(Heap *heap, RawClass *class, size_t size)
+void heapMonitorExitStripe(Heap *heap, size_t stripe)
 {
-	HandleScope scope;
-	openHandleScope(&scope);
-
-	InstanceShape shape = class->instanceShape;
-	size_t realSize = computeInstanceSize(class->instanceShape, size);
-	Class *classHandle = scopeHandle(class);
-#if SCAVENGE_EVERY_ALLOC
-	scavengerScavenge(&heap->newSpace);
-#endif
-	RawObject *object = (RawObject *) allocate(heap, realSize);
-
-	object->class = classHandle->raw;
-	object->hash = (Value) object >> 2; // XXX: replace with random hash generator
-	object->payloadSize = shape.payloadSize;
-	object->varsSize = shape.varsSize;
-	object->tags = 0;
-
-	// An exhausted young space sends this allocation to OLD space (allocate()'s
-	// tryAllocateOld fallback). C-side creators then initialize such an object with
-	// RAW stores that pass through no write barrier: this class word (young while a
-	// snapshot-loaded class is still un-promoted), copyResizedObject's field memcpy,
-	// primitive init loops. Any young referent stored that way is an UNTRACKED
-	// old->young edge — the next scavenge moves the referent and leaves this
-	// object's word dangling (seen as ST_PARFULLGC's corrupted-kernel-class family).
-	// Conservatively remember every old-space birth; the next scavenge re-scans it
-	// and drops it from the set again if it holds no young referent after all.
-	if (isOldObject(object)) {
-		rememberedSetAdd(&CurrentThread.rememberedSet, object);
-	}
-
-	if (shape.isIndexed) {
-		((RawIndexedObject *) object)->size = size;
-		memset(((RawIndexedObject *) object)->body, 0, shape.payloadSize * sizeof(Value));
-	} else {
-		memset(object->body, 0, shape.payloadSize * sizeof(Value));
-	}
-	if (shape.isBytes) {
-		nilVars(getRawObjectVars(object), class->instanceShape.varsSize);
-		memset(getRawObjectIndexedVars(object), 0, size);
-	} else {
-		nilVars(getRawObjectVars(object), class->instanceShape.varsSize + size);
-	}
-	closeHandleScope(&scope, NULL);
-	return object;
+	ASSERT(stripe < heap->monitorStripeCount);
+	osMutexUnlock(&heap->monitorLocks[stripe]);
 }
 
 
-static void nilVars(Value *vars, size_t count)
-{
-	Value nil = getTaggedPtr(Handles.nil);
-	Value *var = vars;
-	Value *end = vars + count;
+// ---------------------------------------------------------------------------
+// Reporting
+// ---------------------------------------------------------------------------
 
-	for (; var < end; var++) {
-		*var = nil;
-	}
+void resetGcStats(void)
+{
+	LastGCStats.count = 0;
+	LastGCStats.marked = 0;
+	LastGCStats.sweeped = 0;
+	LastGCStats.freed = 0;
+	LastGCStats.extended = 0;
+	LastGCStats.total = 0;
+	LastGCStats.time = 0;
+	LastGCStats.totalTime = 0;
 }
 
 
-void freeObject(PageSpace *space, RawObject *object)
+void printGcStats(void)
 {
-	FreeSpace *freeSpace = createFreeSpace((uint8_t *) object, align(computeRawObjectSize(object), HEAP_OBJECT_ALIGN));
-	freeListAddFreeSpace(&space->freeList, freeSpace);
-}
-
-
-NativeCode *allocateNativeCode(Heap *heap, size_t size, size_t pointersOffsetsSize, size_t icCellsSize,
-	size_t specSitesSize)
-{
-	// Sizing MUST agree with computeNativeCodeSize (the exec-space walkers'
-	// stride): both go through nativeCodePayloadSize.
-	size_t realSize = align(sizeof(NativeCode)
-		+ nativeCodePayloadSize(size, pointersOffsetsSize, icCellsSize, specSitesSize),
-		HEAP_OBJECT_ALIGN);
-	// Serialize concurrent exec-space carving across worker threads (see execLock).
-	osMutexLock(&heap->execLock);
-	NativeCode *code = (NativeCode *) pageSpaceAllocate(&heap->execSpace, realSize);
-	osMutexUnlock(&heap->execLock);
-	code->size = size;
-	code->pointersOffsetsSize = pointersOffsetsSize;
-	code->icCellsSize = icCellsSize;
-	code->specSitesSize = specSitesSize;
-	code->tags = 0;
-	return code;
-}
-
-
-static uint8_t *pageSpaceAllocate(PageSpace *pageSpace, size_t size)
-{
-	uint8_t *p = pageSpaceTryAllocate(pageSpace, size);
-	if (p == NULL) {
-		/* Grow by a fresh page. Pages are 256 KB by default, but a single
-		 * object can be larger than that (e.g. a big Array being promoted to
-		 * old space), so map a page large enough to actually hold it. */
-		size_t pageSize = 256 * KB;
-		size_t needed = size + sizeof(HeapPage) + HEAP_OBJECT_ALIGN;
-		if (needed > pageSize) {
-			pageSize = needed;
-		}
-		HeapPage *page = mapHeapPage(pageSize, pageSpace->pagesTail->isExecutable);
-		pageSpace->pagesTail->next = page;
-		pageSpace->pagesTail = page;
-		pageSpaceIndexAdd(pageSpace, page); // before the alloc below (its assert queries the index)
-		expandFreeList(&pageSpace->freeList, page);
-		p = pageSpaceTryAllocate(pageSpace, size);
-		ASSERT(p != NULL);
-		return p;
-	}
-	return p;
-}
-
-
-// How much young space a single TLAB refill carves. Small enough that several
-// worker OS threads share one nursery; large enough to amortise the lock.
-#define TLAB_CHUNK_BYTES (256 * KB)
-
-// Write a filler over an abandoned TLAB tail so the nursery stays linearly
-// parseable across the gap. Young addresses carry NEW_SPACE_TAG (so `p` is not
-// 16-aligned) — write the FreeSpace header inline rather than via createFreeSpace
-// (whose assert would reject the tagged pointer). Layout matches FreeSpace, so
-// linear walkers detect TAG_FREESPACE (offset 15) and skip `size` bytes.
-static void youngFill(uint8_t *p, size_t size)
-{
-	FreeSpace *filler = (FreeSpace *) p;
-	filler->next = NULL;
-	filler->size = size;
-	filler->tags = TAG_FREESPACE;
-}
-
-// Retire EVERY mutator's live TLAB tail into a FREESPACE filler so the whole young
-// space [fromSpace, newSpace.top) is linearly walkable. For become: under a
-// stop-the-world safepoint: all peers are parked, so their tlab.top/end are stable, and
-// a plain walker (swapObjectInNewSpace) can then skip the retired tails. Does NOT advance
-// tlab.top — each mutator resumes bump-allocating from where it left off (overwriting the
-// now-dead filler), so no TLAB space is lost.
-void heapFillAllTlabTails(Heap *heap)
-{
-	for (struct Thread *m = heap->mutators; m != NULL; m = m->nextMutator) {
-		size_t tail = (size_t) (m->tlab.end - m->tlab.top);
-		if (tail >= HEAP_OBJECT_ALIGN) {
-			youngFill(m->tlab.top, tail);
-		}
-	}
-}
-
-// Carve a fresh TLAB chunk from the shared young space for the CALLING OS thread.
-// The per-mutator bump (fast path, in allocate()/the JIT) is lock-free; only this
-// refill takes youngLock, so multiple workers can share one nursery. Returns 0 if
-// the nursery lacks room for `realSize` (caller scavenges + retries).
-static _Bool tlabRefill(Heap *heap, size_t realSize)
-{
-	osMutexLock(&heap->youngLock);
-	Scavenger *s = &heap->newSpace;
-	size_t available = (size_t) (s->end - s->top);
-	if (available < realSize) {
-		osMutexUnlock(&heap->youngLock);
-		return 0;
-	}
-
-	// Retire the tail of the current TLAB into a filler (only now, when we are
-	// actually replacing it) so the abandoned bytes remain walkable.
-	size_t tail = (size_t) (CurrentThread.tlab.end - CurrentThread.tlab.top);
-	if (tail >= HEAP_OBJECT_ALIGN) {
-		youngFill(CurrentThread.tlab.top, tail);
-	}
-
-	size_t chunk = TLAB_CHUNK_BYTES < realSize ? realSize : TLAB_CHUNK_BYTES;
-	chunk = align(chunk, HEAP_OBJECT_ALIGN);
-	if (chunk > available) {
-		chunk = available;
-	}
-	// tlab.top carries NEW_SPACE_TAG (inherited from s->top); free = end - top.
-	CurrentThread.tlab.top = s->top;
-	CurrentThread.tlab.end = s->top + chunk;
-	s->top += chunk;
-	osMutexUnlock(&heap->youngLock);
-	return 1;
-}
-
-
-// Run mark/sweep after a scavenge if old space grew past its (self-raising)
-// threshold. Factored out so both the single- and multi-mutator collection paths
-// share exactly one copy.
-static void maybeFullGc(Heap *heap)
-{
-	if (heap->newSpace.hasPromotionFailure && heap->oldSpace.totalBytes >= heap->oldGcThreshold) {
-		markAndSweep(&CurrentThread);
-		heap->oldGcThreshold = heap->oldSpace.totalBytes * OLD_GC_GROWTH;
-		if (heap->oldGcThreshold < OLD_GC_MIN_THRESHOLD) {
-			heap->oldGcThreshold = OLD_GC_MIN_THRESHOLD;
-		}
-	}
-}
-
-// Reclaim young space. Always taken under gcLock, so it is serialized with mutator
-// registration/deregistration (heapAddMutator/heapEndMutator also hold gcLock) and
-// with any peer collector. Deciding single- vs multi-mutator INSIDE the lock is
-// what makes it race-free: a worker cannot slip into heap->mutators between the
-// count check and the scavenge. Single mutator (main alone, or an isolate) collects
-// directly (no stop-the-world needed — it is the only mutator, and registration is
-// blocked on gcLock); several mutators coordinate a stop-the-world safepoint (park
-// every other mutator at a poll) so a scavenge never moves objects under a runner.
-static void heapCollectYoung(Heap *heap, size_t realSize)
-{
-	heapGcEnterBlocked(heap, &CurrentThread); // blocking on gcLock counts as safe
-	osMutexLock(&heap->gcLock);
-	heapGcLeaveBlocked(heap, &CurrentThread);
-
-	if (heap->mutators == NULL || heap->mutators->nextMutator == NULL) {
-		scavengerScavenge(&heap->newSpace);
-		maybeFullGc(heap);
-		heap->gcEpoch++;
-		lookupCacheOnGcResume(&CurrentThread);
-	} else {
-		// A peer may have freed space while we waited for gcLock; only collect if
-		// still needed. Read newSpace.top under youngLock — the lock that guards the
-		// bump cursor a peer's tlabRefill advances — so this re-check does not race
-		// the carve (a plain read here is a benign but real data race, per TSan).
-		osMutexLock(&heap->youngLock);
-		_Bool needed = (size_t) (heap->newSpace.end - heap->newSpace.top) < realSize;
-		osMutexUnlock(&heap->youngLock);
-		if (needed) {
-			heapGcBegin(heap, &CurrentThread); // park every other mutator
-			scavengerScavenge(&heap->newSpace);
-			maybeFullGc(heap);
-			heap->gcEpoch++; // peers flush their lookup caches on resume
-			heapGcEnd(heap);
-			lookupCacheOnGcResume(&CurrentThread);
-		}
-	}
-	osMutexUnlock(&heap->gcLock);
-}
-
-
-uint8_t *allocate(Heap *heap, size_t size)
-{
-	size_t realSize = align(size, HEAP_OBJECT_ALIGN);
-	TLAB *tlab = &CurrentThread.tlab;
-
-	// Fast path: bump the TLAB (also inlined by the JIT AllocateStub).
-	if ((size_t) (tlab->end - tlab->top) >= realSize) {
-		uint8_t *p = tlab->top;
-		tlab->top += realSize;
-		return p;
-	}
-
-	// Slow path = a GC safepoint poll point: if a peer mutator is collecting this
-	// shared heap, park here until it finishes (our TLAB is reset by its scavenge).
-	heapGcPoll(heap, &CurrentThread);
-
-	if (tlabRefill(heap, realSize)) {
-		uint8_t *p = tlab->top;
-		tlab->top += realSize;
-		return p;
-	}
-
-	heapCollectYoung(heap, realSize);
-
-	if (tlabRefill(heap, realSize)) {
-		uint8_t *p = tlab->top;
-		tlab->top += realSize;
-		return p;
-	}
-	return tryAllocateOld(heap, realSize, 1);
-}
-
-
-uint8_t *tryAllocateOld(Heap *heap, size_t size, _Bool grow)
-{
-	size_t realSize = align(size, HEAP_OBJECT_ALIGN);
-	osMutexLock(&heap->oldLock);
-	uint8_t *p = pageSpaceTryAllocate(&heap->oldSpace, realSize);
-	if (p == NULL && grow) {
-		p = pageSpaceAllocate(&heap->oldSpace, realSize);
-	}
-	osMutexUnlock(&heap->oldLock);
-	ASSERT(p == NULL || isOldObject((RawObject *) p));
-	return p;
-}
-
-
-void collectGarbage(Thread *thread)
-{
-	scavengerScavenge(&thread->heap->newSpace);
-	markAndSweep(thread);
-	// This raw path (GCPrimitive) moved young objects like any scavenge: bump
-	// the epoch and flush the caller's TLS LookupCache, exactly like
-	// heapCollectYoung does on the allocation-driven path. Without it a stale
-	// entry false-hits once the abandoned semispace is reused. (Known gap, out
-	// of scope here: this path still runs without the multi-mutator STW
-	// handshake.)
-	thread->heap->gcEpoch++;
-	lookupCacheOnGcResume(thread);
-}
-
-
-// Self-test observability (ST_PARFULLGC_TEST): count of full GCs run on any heap
-// across all OS threads, so a test can confirm the multi-mutator markAndSweep path
-// actually fired. Relaxed atomic — a diagnostic counter, never a synchronising fence.
-unsigned long gFullGcRuns = 0;
-
-void markAndSweep(Thread *thread)
-{
-	resetGcStats();
-	LastGCStats.count++;
-	__atomic_add_fetch(&gFullGcRuns, 1, __ATOMIC_RELAXED);
-	int64_t startTime = osCurrentMicroTime();
-
-	// Reset EVERY mutator's remembered set AND the heap-level consolidated set: they are
-	// all parked at this stop-the-world safepoint, and marking rebuilds all surviving
-	// old->young edges into the heap-level set (heap->rememberedSet), which the next
-	// scavenge reads. Leaving any set intact would keep stale (possibly swept) old
-	// objects in it -> next scavenge would walk freed memory.
-	for (Thread *m = thread->heap->mutators; m != NULL; m = m->nextMutator) {
-		rememberedSetReset(&m->rememberedSet);
-	}
-	rememberedSetReset(&thread->heap->rememberedSet);
-	gcMarkRoots(thread);
-	gcSweep(&thread->heap->oldSpace);
-
-	LastGCStats.time = osCurrentMicroTime() - startTime;
-	LastGCStats.totalTime += LastGCStats.time;
-
-#if VERIFY_HEAP_AFTER_GC
-	verifyHeap(thread->heap);
-#endif
-}
-
-
-void verifyHeap(Heap *heap)
-{
-	RawObject *object = (RawObject *) ((uintptr_t) heap->newSpace.fromSpace | NEW_SPACE_TAG);
-
-	// The young high-water is the TLAB cursor (newSpace.top was advanced when the
-	// TLAB carved its chunk, so it no longer marks the last live object).
-	while ((uint8_t *) object < CurrentThread.tlab.top) {
-		if ((object->tags & TAG_FREESPACE) != 0) { // retired TLAB tail
-			object = (RawObject *) ((uint8_t *) object + ((FreeSpace *) object)->size);
-			continue;
-		}
-		verifyObject(heap, object);
-		object = (RawObject *) ((uint8_t *) object + align(computeRawObjectSize(object), HEAP_OBJECT_ALIGN));
-	}
-
-	PageSpaceIterator iterator;
-	pageSpaceIteratorInit(&iterator, &heap->oldSpace);
-	object = pageSpaceIteratorNext(&iterator);
-
-	while (object != NULL) {
-		if ((object->tags & TAG_FREESPACE) == 0) {
-			verifyObject(heap, object);
-		}
-		object = pageSpaceIteratorNext(&iterator);
-	}
-
-	// Exec space: the iterator strides by computeNativeCodeSize, so this walk
-	// terminating cleanly proves the sizing chain (allocateNativeCode vs the
-	// walkers) stayed in sync; a divergent term makes it misparse an IcCell or
-	// padding as a header. Also check every IC cell: after a collection all
-	// cells must be back at the unlinked sentinel (the STW reset sweep ran),
-	// and a bound cell seen outside that window must hold a plausible state.
-	pageSpaceIteratorInit(&iterator, &heap->execSpace);
-	NativeCode *code = (NativeCode *) pageSpaceIteratorNext(&iterator);
-	while (code != NULL) {
-		if ((code->tags & TAG_FREESPACE) == 0) {
-			ASSERT(code->size > 0);
-			IcCell *cells = nativeCodeIcCells(code);
-			for (size_t i = 0; i < code->icCellsSize; i++) {
-				IcState *state = cells[i].state;
-				ASSERT(state != NULL);
-				if (state == &gIcUnlinked || state == &gIcMega) {
-					continue;
-				}
-				// A malloc'd IC_KIND_UNLINKED state is a RETIRED cell
-				// (icRetireCellsTargeting) awaiting the next sweep's free.
-				ASSERT(state->kind == IC_KIND_MONO || state->kind == IC_KIND_PIC
-					|| state->kind == IC_KIND_MEGA || state->kind == IC_KIND_UNLINKED);
-				if (state->kind == IC_KIND_MONO) {
-					ASSERT(valueTypeOf(state->class, VALUE_POINTER));
-					verifyPointer(heap, asObject(state->class));
-					ASSERT(state->target != NULL);
-				} else if (state->kind == IC_KIND_PIC) {
-					ASSERT(2 <= state->size && state->size <= IC_PIC_CAPACITY);
-					ASSERT(state->class == state->ways[0].class);
-					for (uintptr_t w = 0; w < state->size; w++) {
-						ASSERT(valueTypeOf(state->ways[w].class, VALUE_POINTER));
-						verifyPointer(heap, asObject(state->ways[w].class));
-						ASSERT(state->ways[w].target != NULL);
-					}
-				}
-			}
-		}
-		code = (NativeCode *) pageSpaceIteratorNext(&iterator);
-	}
-}
-
-
-static void verifyObject(Heap *heap, RawObject *object)
-{
-	verifyPointer(heap, (RawObject *) object->class);
-
-	Value *vars = getRawObjectVars(object);
-	size_t size = object->class->instanceShape.varsSize;
-	if (object->class->instanceShape.isIndexed && !object->class->instanceShape.isBytes) {
-		size += rawObjectSize(object);
-	}
-
-	for (size_t i = 0; i < size; i++) {
-		if (valueTypeOf(vars[i], VALUE_POINTER)) {
-			verifyPointer(heap, asObject(vars[i]));
-		}
-	}
-}
-
-
-static void verifyPointer(Heap *heap, RawObject *object)
-{
-	if (scavengerIncludes(&heap->newSpace, (uint8_t *) object)) {
-		return;
-	}
-	if (pageSpaceIncludes(&heap->oldSpace, (uint8_t *) object)) {
-		return;
-	}
-	FAIL();
+	printf("gc: %zu full, %zu young, %lld us young total, %zu bytes freed\n",
+		LastGCStats.count, LastGCStats.scavengeCount,
+		(long long) LastGCStats.scavengeTimeUs, LastGCStats.freed);
 }
 
 
 void printHeap(Heap *heap)
 {
-	printf("Scavenger\n\t");
-	printHeapPage(heap->newSpace.page);
-	printf("\tfree space: %zi\n", CurrentThread.tlab.top - heap->newSpace.fromSpace);
-
-	printf("Old space\n");
-	printPageSpace(&heap->oldSpace);
-
-	printf("Executable space\n");
-	printPageSpace(&heap->execSpace);
-}
-
-
-static void printHeapPage(HeapPage *page)
-{
-    printf("page %p size %zi%s\n", (void *)page, page->size, page->isExecutable ? " executable" : "");
-}
-
-static void printFreeSpace(FreeSpace *freeSpace)
-{
-    printf("free space %p size %llu\n", (void *)freeSpace, (unsigned long long)freeSpace->size);
-}
-
-
-static void printPageSpace(PageSpace *space)
-{
-	/*for (HeapPage *page = space->pages; page != NULL; page = page->next) {
-		printf("\t");
-		printHeapPage(page);
-	}
-	for (FreeSpace *freeSpace = space->spaces; freeSpace != NULL; freeSpace = freeSpace->next) {
-		printf("\t");
-		printFreeSpace(freeSpace);
-	}*/
-}
-
-
-// ---- concurrent shared-heap allocation self-test (ST_TLAB_TEST=1) ----------
-// N OS threads allocate from ONE shared young space at the same time, each via
-// the real allocate() path (lock-free TLAB bump + youngLock-guarded refill), and
-// stamp a unique 64-bit value into every object they are handed. If the locked
-// carve ever handed two threads overlapping memory, a stamp would be clobbered.
-// Sized to stay within the nursery so no scavenge/old-space fallback is hit.
-
-#define TLAB_TEST_WORKERS 8
-#define TLAB_TEST_ALLOCS  20000
-#define TLAB_TEST_OBJSIZE 48
-
-static Heap gTlabTestHeap;
-
-typedef struct {
-	long id;
-	uint8_t **ptrs;
-} TlabTestArg;
-
-static void tlabTestWorker(void *arg)
-{
-	TlabTestArg *ta = arg;
-	// A fresh thread-local mutator that SHARES the one test heap.
-	memset(&CurrentThread, 0, sizeof(Thread));
-	CurrentThread.heap = &gTlabTestHeap;
-	for (int i = 0; i < TLAB_TEST_ALLOCS; i++) {
-		// Alternate young (TLAB carve under youngLock) and old (free list under
-		// oldLock) so both shared allocators are hammered concurrently.
-		uint8_t *p = (i & 1)
-			? tryAllocateOld(&gTlabTestHeap, TLAB_TEST_OBJSIZE, 1)
-			: allocate(&gTlabTestHeap, TLAB_TEST_OBJSIZE);
-		*(uint64_t *) p = ((uint64_t) ta->id << 32) | (uint64_t) i; // stamp
-		ta->ptrs[i] = p;
-	}
-
-}
-
-int tlabConcurrencySelfTest(void)
-{
-	memset(&CurrentThread, 0, sizeof(Thread));
-	CurrentThread.heap = &gTlabTestHeap;
-	initHeap(&gTlabTestHeap, &CurrentThread);
-
-	OsThread threads[TLAB_TEST_WORKERS];
-	TlabTestArg args[TLAB_TEST_WORKERS];
-	for (long w = 0; w < TLAB_TEST_WORKERS; w++) {
-		args[w].id = w;
-		args[w].ptrs = malloc(TLAB_TEST_ALLOCS * sizeof(uint8_t *));
-		osThreadSpawn(&threads[w], tlabTestWorker, &args[w]);
-	}
-	for (int w = 0; w < TLAB_TEST_WORKERS; w++) {
-		osThreadJoin(&threads[w]);
-	}
-
-	long clobbered = 0;
-	for (long w = 0; w < TLAB_TEST_WORKERS; w++) {
-		for (int i = 0; i < TLAB_TEST_ALLOCS; i++) {
-			uint64_t expect = ((uint64_t) w << 32) | (uint64_t) i;
-			if (*(uint64_t *) args[w].ptrs[i] != expect) {
-				clobbered++;
-			}
-		}
-		free(args[w].ptrs);
-	}
-
-	long total = (long) TLAB_TEST_WORKERS * TLAB_TEST_ALLOCS;
-	fprintf(stderr, "shared-heap alloc self-test: %d threads x %d allocs = %ld objects (young+old) on ONE shared heap, clobbered=%ld -> %s\n",
-		TLAB_TEST_WORKERS, TLAB_TEST_ALLOCS, total, clobbered, clobbered == 0 ? "PASS" : "FAIL");
-	return clobbered == 0 ? 0 : 1;
+	printf("heap: young %zu/%zu bytes free, old %zu allocated of %zu mapped, "
+		"exec %zu of %zu, %zu classes\n",
+		nurseryAvailable(&heap->newSpace), heap->newSpace.semiSize,
+		heap->oldSpace.allocated, heap->oldSpace.capacity,
+		heap->execSpace.allocated, heap->execSpace.capacity,
+		heap->classes.size);
 }

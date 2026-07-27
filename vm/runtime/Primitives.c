@@ -1,6 +1,8 @@
 #include "runtime/Primitives.h"
 #include "jit/CodeGenerator.h"
 #include "jit/InlineCache.h"
+#include "jit/Tier.h"
+#include "core/Instrument.h"
 #include "core/Object.h"
 #include "core/Class.h"
 #include "memory/Heap.h"
@@ -120,6 +122,8 @@ static PrimitiveResult flushSendCachesPrimitive(Value receiver);
 static PrimitiveResult executablePathPrimitive(Value receiver);
 static PrimitiveResult classRemoveSelectorPrimitive(Value receiver, Value vSelector);
 static PrimitiveResult behaviorLookupSelectorPrimitive(Value receiver, Value vSelector);
+static PrimitiveResult instrumentMarkPrimitive(Value receiver);
+static PrimitiveResult instrumentReportPrimitive(Value receiver);
 static PrimitiveResult buildClassInPrimitive(Value receiver, Value vNode, Value vNs);
 static PrimitiveResult compileMethodInPrimitive(Value receiver, Value vNode, Value class, Value vNs);
 static PrimitiveResult defaultNamespacePrimitive(Value receiver);
@@ -494,6 +498,12 @@ Primitive Primitives[] = {
 	// pays for. Fails into the Smalltalk walk for a non-Behavior receiver or a
 	// non-Symbol selector.
 	{"BehaviorLookupSelectorPrimitive", CCALL, .cFunction = behaviorLookupSelectorPrimitive, 2},
+	// Appended (NEVER reorder this table): region bracketing for the execution
+	// counters (core/Instrument.h). A benchmark marks before its hot loop and
+	// reports after, so setup and warm-up allocations stay out of the numbers.
+	// Both are no-ops unless the VM was built with -DST_INSTRUMENT=1.
+	{"InstrumentMarkPrimitive", CCALL, .cFunction = instrumentMarkPrimitive, 1},
+	{"InstrumentReportPrimitive", CCALL, .cFunction = instrumentReportPrimitive, 1},
 };
 
 
@@ -1913,6 +1923,32 @@ static PrimitiveResult collectGarbagePrimitive(Value receiver)
 static PrimitiveResult flushSendCachesPrimitive(Value receiver)
 {
 	icInvalidateAllSends(NULL, NULL);
+	return primSuccess(receiver);
+}
+
+
+// Snapshot the counters (core/Instrument.h). A benchmark calls this immediately
+// before the region it wants measured, so the workload it had to BUILD does not
+// land in the numbers -- vec3_boxed allocates 200 Vec3 in setup, which would
+// otherwise be indistinguishable from allocations the hot loop failed to
+// eliminate. No-op in a build without -DST_INSTRUMENT=1.
+static PrimitiveResult instrumentMarkPrimitive(Value receiver)
+{
+	instrumentMark();
+	return primSuccess(receiver);
+}
+
+
+// Print the counter deltas since the last mark, one `#instr <name> <value>`
+// line each, which scripts/instr.sh parses. Counters this build cannot measure
+// print `n/a` rather than 0: see the second rule in core/Instrument.h.
+static PrimitiveResult instrumentReportPrimitive(Value receiver)
+{
+	gInstrument.c[INSTR_IC_HITS] = gIcStats.hits + gIcStats.picHits;
+	gInstrument.c[INSTR_IC_MISSES] = gIcStats.missCold;
+	gInstrument.c[INSTR_GUARD_CHECKS] = gTierStats.directCalls + gTierStats.guardFails;
+	gInstrument.c[INSTR_GUARD_FAILS] = gTierStats.guardFails;
+	instrumentPrintSince("region");
 	return primSuccess(receiver);
 }
 

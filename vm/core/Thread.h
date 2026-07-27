@@ -1,12 +1,14 @@
 #ifndef THREAD_H
 #define THREAD_H
 
+#include "core/Tls.h"
 #include "memory/Heap.h"
 
 struct HandleScope;
 struct StackFrame;
 struct EntryStackFrame;
 struct Fiber;
+struct CompiledFrameGuard;
 
 // Per-mutator thread-local allocation buffer: a chunk carved from the shared
 // young space that this OS thread bump-allocates into WITHOUT locking (Go's
@@ -37,7 +39,6 @@ typedef struct CodegenSites {
 
 typedef struct Thread {
 	Heap *heap; // heap-allocated; ONE heap per isolate, shared by its worker threads
-	struct Handle *handles;
 	struct HandleScope *handleScopes;
 	Value context;
 	struct EntryStackFrame *stackFramesTail;
@@ -86,6 +87,16 @@ typedef struct Thread {
 	// unchanged (the StoreCheck golden reads Thread offsets).
 	size_t heldMonitorStripe;
 	_Bool heldMonitor;
+
+	// The compiled frames this mutator has underneath it, in SEGMENTS separated
+	// by the C frames of the runtime helpers that were called from them. Newest
+	// first, NULL when no compiled code is on the stack at all.
+	//
+	// Pushed by whichever runtime helper can allocate, and each entry lives on
+	// that helper's own C stack frame, so the chain unwinds itself as they
+	// return. It costs NOTHING in generated code: the frame pointer follows from
+	// the slot address the call already passes (jit/Jit.h).
+	struct CompiledFrameGuard *compiledFrames;
 } Thread;
 
 extern __thread Thread CurrentThread;
@@ -97,14 +108,8 @@ extern __thread Thread CurrentThread;
 // shared code.
 extern ptrdiff_t gCurrentThreadTpoff;
 
-// Per-isolate VM globals (Handles, the scheduler, LookupCache, JIT stubs, ...)
-// are thread-local so every isolate OS-thread owns its own copy. They MUST use
-// the initial-exec TLS model: libVM.so is linked directly into `st` (never
-// dlopen'd) so IE is valid, and it is required for correctness — the default
-// general-dynamic model resolves a __thread address via a __tls_get_addr call,
-// which misbehaves when such a global is touched from JIT-generated code's C
-// callouts during a GC. IE is a direct %fs-relative access (also faster).
-#define PER_ISOLATE __thread __attribute__((tls_model("initial-exec")))
+// PER_ISOLATE now lives in core/Tls.h, so memory/Heap.h can declare per-isolate
+// globals without including this header (which includes Heap.h back).
 
 void initThread(Thread *thread);
 void initThreadContext(Thread *thread);
@@ -112,9 +117,13 @@ void freeThread(Thread *thread);
 void threadSetExitFrame(struct StackFrame *stackFrame);
 
 
+// The generational write barrier. Three tests, in the order that rejects
+// fastest: the store target must be old, the stored value young, and the target
+// not already logged. The GC_REMEMBERED bit is what bounds the log.
 static inline void rawObjectStorePtr(RawObject *object, Value *field, RawObject *value)
 {
-	if (isOldObject(object) && isNewObject(value) && (object->tags & TAG_REMEMBERED) == 0) {
+	if (isOldObject(object) && isNewObject(value)
+			&& !rawObjectHasGcBit(object, GC_REMEMBERED)) {
 		rememberedSetAdd(&CurrentThread.rememberedSet, object);
 	}
 	*field = tagPtr(value);
@@ -124,6 +133,24 @@ static inline void rawObjectStorePtr(RawObject *object, Value *field, RawObject 
 static inline void objectStorePtr(Object *object, Value *field, Object *value)
 {
 	rawObjectStorePtr(object->raw, field, value->raw);
+}
+
+
+// Store an ALREADY TAGGED value, which may be an immediate.
+//
+// The barrier above takes an untagged RawObject* and tags it, which is right
+// for the kernel fields that are known to hold objects. Anything storing a
+// Smalltalk value -- Array>>at:put:, an instance variable write from compiled
+// code -- has a tagged Value in hand and cannot know whether it is a pointer.
+// Written here, next to the barrier, rather than at each call site, so there is
+// one place where "does this store need remembering" is decided.
+static inline void rawObjectStoreValue(RawObject *object, Value *field, Value value)
+{
+	if (valueTypeOf(value, VALUE_POINTER)) {
+		rawObjectStorePtr(object, field, asObject(value));
+	} else {
+		*field = value;
+	}
 }
 
 #endif

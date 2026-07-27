@@ -1,358 +1,95 @@
 #include "jit/InlineCache.h"
-#include "core/CompiledCode.h"
-#include "core/Lookup.h"
-#include "core/Handle.h"
-#include "core/Class.h"
-#include "core/Thread.h"
-#include "memory/Heap.h"
-#include "memory/HeapPage.h"
-#include "jit/TargetCodePatch.h"
-#include "jit/Tier.h"
-#include "os/Os.h"
-#include <stdio.h>
-
-IcState gIcUnlinked = { 0, NULL, IC_KIND_UNLINKED, 0, NULL };
-IcState gIcMega = { 0, NULL, IC_KIND_MEGA, 0, NULL };
-IcStats gIcStats = { 0 };
-
-static size_t icStateSize(IcState *state);
-static IcState *icAllocState(uintptr_t kind, uintptr_t size, IcState *prev);
-static _Bool icPublish(IcCell *cell, IcState *expected, IcState *fresh);
+#include "core/ClassTable.h"
+#include "core/Assert.h"
 
 
-// The shared miss/transition handler behind the PicProbeStub's C path: the
-// stub already routed way hits and mega cells, so this runs only for an
-// unlinked cell, a way-0 miss on a mono, an exhausted pic walk, or the race
-// echoes of any of those. Every publish is a FRESH immutable state swung in
-// by one CAS; the superseded state is chained on `prev` for the next STW
-// sweep to free. Raw selector is handled before anything can GC, mirroring
-// lookupNativeCode; the class arrives TAGGED straight from the guard.
-uint8_t *inlineCacheMiss(Value taggedClass, RawString *selector, IcCell *cell)
+IcWay *icRecord(IcCell *cell, uint32_t receiverClass, uint32_t argumentClass)
 {
-	HandleScope scope;
-	openHandleScope(&scope);
-	Class *classHandle = scopeHandle((RawClass *) asObject(taggedClass));
-
-	gIcStats.missCold++;
-	// Witness for the ST_TYPE_STATS census: getting here proves this site ran,
-	// which is what separates "never executed" from "the scavenge wiped it"
-	// when the tier later finds the cell unlinked (jit/Tier.h). No-op otherwise.
-	typeStatsNoteExecuted(cell);
-	// May allocate, compile and GC (parking this thread): the class may move
-	// (handle keeps it current) and the cell may be reset or advanced by a
-	// peer meanwhile. Probes the calling worker's TLS LookupCache first: the
-	// global cache stays the fallback and the floor.
-	NativeCodeEntry entry = cachedLookupNativeCode(classHandle->raw, selector);
-
-	union PointerConverter converter;
-	converter.function_pointer = entry;
-	uint8_t *target = converter.object_pointer;
-	Value current = tagPtr(classHandle->raw);
-
-	// From here to the CAS there is no safepoint poll and no allocation, so no
-	// collection can interleave: the class read off the handle cannot go stale
-	// before it is published. Address dependence is not a C-level guarantee
-	// (unlike in the emitted probe), hence the explicit acquire.
-	IcState *seen = __atomic_load_n(&cell->state, __ATOMIC_ACQUIRE);
-	if (seen == &gIcUnlinked || seen->kind == IC_KIND_UNLINKED) {
-		// Either the shared sentinel or a malloc'd RETIRED state left by
-		// icRetireCellsTargeting; the latter is chained for the STW sweep.
-		IcState *fresh = icAllocState(IC_KIND_MONO, 1,
-			seen == &gIcUnlinked ? NULL : seen);
-		fresh->class = current;
-		fresh->target = target;
-		if (icPublish(cell, seen, fresh)) {
-			gIcStats.binds++;
+	cell->sends++;
+	for (uint8_t i = 0; i < cell->wayCount; i++) {
+		if (cell->ways[i].classIndex == receiverClass) {
+			cell->ways[i].count++;
+			// The argument class is kept as the LAST seen for this receiver
+			// class rather than as a full histogram. One word instead of a
+			// table, and it is enough for the decision it feeds: a site whose
+			// argument class actually varies is one where speculating on it
+			// would be wrong anyway, and the guard catches that.
+			cell->ways[i].argClassIndex = argumentClass;
+			return &cell->ways[i];
 		}
-	} else if (seen->kind == IC_KIND_MONO) {
-		if (seen->class == current) {
-			gIcStats.bindRaces++; // a peer bound our class between guard and here
-		} else {
-			// Promote to a 2-way pic. The OLD pair stays way 0 (the header the
-			// inline guard reads): the first-bound class keeps the fast path.
-			IcState *fresh = icAllocState(IC_KIND_PIC, 2, seen);
-			fresh->ways[0].class = seen->class;
-			fresh->ways[0].target = seen->target;
-			fresh->ways[1].class = current;
-			fresh->ways[1].target = target;
-			fresh->class = fresh->ways[0].class;
-			fresh->target = fresh->ways[0].target;
-			if (icPublish(cell, seen, fresh)) {
-				gIcStats.picBuilds++;
-			}
-		}
-	} else if (seen->kind == IC_KIND_PIC) {
-		_Bool covered = 0;
-		for (uintptr_t i = 0; i < seen->size; i++) {
-			covered |= seen->ways[i].class == current;
-		}
-		if (covered) {
-			gIcStats.bindRaces++; // a peer's extension already has our class
-		} else if (seen->size < IC_PIC_CAPACITY) {
-			IcState *fresh = icAllocState(IC_KIND_PIC, seen->size + 1, seen);
-			for (uintptr_t i = 0; i < seen->size; i++) {
-				fresh->ways[i] = seen->ways[i];
-			}
-			fresh->ways[seen->size].class = current;
-			fresh->ways[seen->size].target = target;
-			fresh->class = fresh->ways[0].class;
-			fresh->target = fresh->ways[0].target;
-			if (icPublish(cell, seen, fresh)) {
-				gIcStats.picExtends++;
-			}
-		} else {
-			// Capacity reached: permanently megamorphic. The malloc'd mega
-			// carries the superseded chain; the next STW sweep frees it and
-			// parks the cell on the static gIcMega.
-			IcState *fresh = icAllocState(IC_KIND_MEGA, 0, seen);
-			if (icPublish(cell, seen, fresh)) {
-				gIcStats.megaPromotes++;
-			}
-		}
-	} else {
-		gIcStats.bindRaces++; // a peer promoted to mega under us: nothing to do
 	}
-
-	closeHandleScope(&scope, NULL);
-	return target;
+	if (cell->wayCount == IC_MAX_WAYS) {
+		// Permanent. A site that has seen seven classes has demonstrated it has
+		// no dominant one, and letting it climb back down would make the
+		// optimizer speculate on a site that already refuted the speculation.
+		cell->megamorphic = 1;
+		return NULL;
+	}
+	IcWay *way = &cell->ways[cell->wayCount++];
+	way->classIndex = receiverClass;
+	way->argClassIndex = argumentClass;
+	way->count = 1;
+	way->target = NULL;
+	return way;
 }
 
 
-static size_t icStateSize(IcState *state)
+uint32_t icDominantClass(const IcCell *cell, double *fraction)
 {
-	return sizeof(IcState) + state->size * sizeof(IcWay);
-}
-
-
-static IcState *icAllocState(uintptr_t kind, uintptr_t size, IcState *prev)
-{
-	IcState *state = malloc(sizeof(IcState) + size * sizeof(IcWay));
-	state->class = 0;
-	state->target = NULL;
-	state->kind = kind;
-	state->size = size;
-	state->prev = prev;
-	return state;
-}
-
-
-// RELEASE publish: a reader that sees `fresh` sees its fields. The cell is
-// repointed only here (CAS) and by the STW reset sweep. The loser frees its
-// never-published state (no reader can hold it) and counts the race.
-static _Bool icPublish(IcCell *cell, IcState *expected, IcState *fresh)
-{
-	if (__atomic_compare_exchange_n(&cell->state, &expected, fresh, 0,
-			__ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
-		gIcStats.stateBytesLive += icStateSize(fresh);
-		return 1;
+	if (fraction != NULL) {
+		*fraction = 0.0;
 	}
-	free(fresh);
-	gIcStats.bindRaces++;
-	return 0;
-}
-
-
-// Free a published state and every superseded predecessor chained on `prev`.
-static void icFreeChain(IcState *state)
-{
-	while (state != NULL && state != &gIcUnlinked && state != &gIcMega) {
-		IcState *prev = state->prev;
-		gIcStats.stateBytesLive -= icStateSize(state);
-		free(state);
-		state = prev;
+	if (cell->megamorphic || cell->wayCount == 0 || cell->sends == 0) {
+		return CLASS_INDEX_INVALID;
 	}
-}
-
-
-// STW collectors only (scavenge, full GC, and the raw collectGarbage path):
-// every mutator is parked or blocked, and neither the emitted guard, the
-// PicProbeStub walk, nor the C handler holds an IcState pointer across a
-// safepoint poll, so freeing here cannot race a reader. Resetting EVERY
-// class-keyed cell (not only cells whose class moved or died) is required for
-// correctness, not a shortcut: method ADDITION does not invalidate anything
-// today (Class.c only rejects redefinition), so a cell surviving collections
-// could stay stale forever; the full reset mirrors the epoch flush of the TLS
-// LookupCache. Do NOT "optimize" this into a selective reset without adding
-// install-time invalidation first. Mega cells hold no class pointers (their
-// route is the class-independent global probe), so they stay mega: park them
-// on the static sentinel and free the malloc'd carrier plus its chain.
-void icResetNativeCodeCells(struct NativeCode *code)
-{
-	IcCell *cells = nativeCodeIcCells((NativeCode *) code);
-	size_t count = ((NativeCode *) code)->icCellsSize;
-	for (size_t i = 0; i < count; i++) {
-		IcState *state = cells[i].state;
-		if (state == &gIcUnlinked || state == &gIcMega) {
-			continue;
-		}
-		if (state->kind == IC_KIND_MEGA) {
-			icFreeChain(state);
-			cells[i].state = &gIcMega;
-			gIcStats.megaCells++;
-		} else {
-			icFreeChain(state);
-			cells[i].state = &gIcUnlinked;
-			gIcStats.cellsReset++;
+	const IcWay *best = &cell->ways[0];
+	for (uint8_t i = 1; i < cell->wayCount; i++) {
+		if (cell->ways[i].count > best->count) {
+			best = &cell->ways[i];
 		}
 	}
+	if (fraction != NULL) {
+		*fraction = (double) best->count / (double) cell->sends;
+	}
+	return best->classIndex;
 }
 
 
-// Poison every speculation site in `code` (jit/SpecSite.h). STW only, from the
-// icInvalidateAllSends bracket: each poison is a bounded, non-atomic rewrite of
-// live instructions, so no mutator may be executing them.
-//
-// Resetting IC cells is NOT enough for a speculation. A promoted send's hit
-// path reads no cell at all, and an inlined body IS the callee's bytecodes
-// copied into the caller. Both are gated by an exact-class guard, and
-// redefineMutate copies the new raw class OVER the old object, so the class
-// identity survives and the guard keeps matching. Poisoning forces the guard's
-// fallback edge, which is the untouched original send, so the site degrades to
-// exactly today's dispatch rather than to anything new.
-//
-// Poisoning is unconditional rather than dependency-filtered: a SpecSite
-// deliberately records no class or selector, and the alternative (a per-code
-// dependency list) would still need this same patch to act on. The cost is
-// that an unrelated redefinition also demotes hot sites, which the next tier
-// recompile undoes.
-static void codeInvalidateSpeculations(NativeCode *code)
+uint32_t icDominantArgumentClass(const IcCell *cell)
 {
-	SpecSite *sites = nativeCodeSpecSites(code);
-	for (size_t i = 0; i < code->specSitesSize; i++) {
-		switch (sites[i].kind) {
-		case SPEC_GUARD:
-			targetPoisonGuardBranch(code->insts + sites[i].patchOffset);
-			break;
-		case SPEC_STATIC:
-			targetPoisonStaticSkip(code->insts + sites[i].patchOffset);
-			break;
-		default:
-			FAIL();
+	if (cell->megamorphic || cell->wayCount == 0) {
+		return CLASS_INDEX_INVALID;
+	}
+	const IcWay *best = &cell->ways[0];
+	for (uint8_t i = 1; i < cell->wayCount; i++) {
+		if (cell->ways[i].count > best->count) {
+			best = &cell->ways[i];
 		}
 	}
-	if (code->specSitesSize > 0) {
-		// Publish the rewritten instructions to instruction fetch before any
-		// mutator resumes (no-op on x86, REQUIRED on POWER).
-		osFlushICache(code->insts, (size_t) code->size);
-	}
+	return best->argClassIndex;
 }
 
 
-// NON-STW retirement of every cell that dispatches into `oldCode`, called by
-// the tier-1 recompiler (jit/Tier.c) right after it republishes a method, so
-// callers rebind to the fresh code without waiting for the next scavenge.
-// Runs under codegenLock, which serializes ALL NativeCode creation: the exec
-// space cannot grow mid-walk, so the page iteration is stable without a
-// stop-the-world. Retirement follows the cell invariants to the letter: the
-// swing is a CAS to a FRESH immutable state (kind unlinked, class 0, so the
-// inline guard misses and the PicProbeStub falls through to the C handler,
-// which knows how to bind over it) that chains the superseded state on
-// `prev`; only the STW sweep ever frees. A lost CAS means a peer rebound
-// concurrently and is simply skipped (the next sweep evens it out). Peers
-// with a stale TLS LookupCache may rebind a retired cell back to the old
-// entry until their next epoch flush: documented staleness, not corruption.
-// Install-time invalidation for method-dictionary mutation: class
-// redefinition, additive extension, selector removal. Closes the staleness
-// window icResetNativeCodeCells documents (method ADDITION invalidated
-// nothing between scavenges). Stop the world exactly like objectBecome
-// (core/Smalltalk.c): gcLock + safepoint park of every peer, run the caller's
-// mutation on the frozen graph, then reset EVERY class-keyed IC cell in the
-// exec space (satisfying icResetNativeCodeCells' STW-only precondition) and
-// bump gcEpoch so parked peers flush their TLS LookupCaches on resume
-// (lookupCacheOnGcResume); the calling worker flushes its own before
-// resuming the world. Mega cells stay mega: their class-independent probe
-// re-resolves through the flushed lookup path. The mutation callback MUST
-// NOT allocate: the world is stopped with gcLock held.
-void icInvalidateAllSends(void (*mutate)(void *ctx), void *ctx)
+_Bool icIsMonomorphic(const IcCell *cell)
 {
-	Heap *heap = CurrentThread.heap;
-	_Bool multi = (heap->mutators != NULL && heap->mutators->nextMutator != NULL);
-	heapGcEnterBlocked(heap, &CurrentThread);
-	osMutexLock(&heap->gcLock);
-	heapGcLeaveBlocked(heap, &CurrentThread);
-	if (multi) {
-		heapGcBegin(heap, &CurrentThread);
-	}
-	heapFillAllTlabTails(heap);
+	return !cell->megamorphic && cell->wayCount == 1;
+}
 
-	if (mutate != NULL) {
-		mutate(ctx);
-	}
 
-	PageSpaceIterator iterator;
-	pageSpaceIteratorInit(&iterator, &heap->execSpace);
-	NativeCode *code = (NativeCode *) pageSpaceIteratorNext(&iterator);
-	while (code != NULL) {
-		if ((code->tags & TAG_FREESPACE) == 0) {
-			icResetNativeCodeCells((struct NativeCode *) code);
-			// Cells alone do not cover speculation: a promoted send's hit path
-			// reads no cell, and an inlined body is a copy of the callee.
-			codeInvalidateSpeculations(code);
+void icPromoteHottest(IcCell *cell)
+{
+	if (cell->wayCount < 2) {
+		return;
+	}
+	uint8_t hottest = 0;
+	for (uint8_t i = 1; i < cell->wayCount; i++) {
+		if (cell->ways[i].count > cell->ways[hottest].count) {
+			hottest = i;
 		}
-		code = (NativeCode *) pageSpaceIteratorNext(&iterator);
 	}
-
-	heap->gcEpoch++; // parked peers epoch-flush their TLS LookupCaches on resume
-	CurrentThread.lookupCacheEpoch = heap->gcEpoch;
-	flushLookupCache();
-
-	if (multi) {
-		heapGcEnd(heap);
+	if (hottest != 0) {
+		IcWay swap = cell->ways[0];
+		cell->ways[0] = cell->ways[hottest];
+		cell->ways[hottest] = swap;
 	}
-	osMutexUnlock(&heap->gcLock);
-}
-
-
-void icRetireCellsTargeting(struct NativeCode *oldCode)
-{
-	uint8_t *entry = ((NativeCode *) oldCode)->insts;
-	PageSpaceIterator iterator;
-	pageSpaceIteratorInit(&iterator, &CurrentThread.heap->execSpace);
-	NativeCode *code = (NativeCode *) pageSpaceIteratorNext(&iterator);
-
-	gIcStats.retireWalks++;
-	while (code != NULL) {
-		if ((code->tags & TAG_FREESPACE) == 0) {
-			IcCell *cells = nativeCodeIcCells(code);
-			for (size_t i = 0; i < code->icCellsSize; i++) {
-				IcState *seen = __atomic_load_n(&cells[i].state, __ATOMIC_ACQUIRE);
-				if (seen == &gIcUnlinked || seen == &gIcMega
-						|| seen->kind == IC_KIND_UNLINKED || seen->kind == IC_KIND_MEGA) {
-					continue;
-				}
-				_Bool targets = 0;
-				for (uintptr_t w = 0; w < seen->size; w++) {
-					targets |= seen->kind == IC_KIND_MONO
-						? seen->target == entry
-						: seen->ways[w].target == entry;
-				}
-				if (targets && icPublish(&cells[i],
-						seen, icAllocState(IC_KIND_UNLINKED, 0, seen))) {
-					gIcStats.cellsRetired++;
-				}
-			}
-		}
-		code = (NativeCode *) pageSpaceIteratorNext(&iterator);
-	}
-}
-
-
-void icPrintStats(void)
-{
-	printf("[IC] sites          %zu\n", gIcStats.sites);
-	printf("[IC] hits           %zu\n", gIcStats.hits);
-	printf("[IC] picHits        %zu\n", gIcStats.picHits);
-	printf("[IC] megaProbes     %zu\n", gIcStats.megaProbes);
-	printf("[IC] missCold       %zu\n", gIcStats.missCold);
-	printf("[IC] binds          %zu\n", gIcStats.binds);
-	printf("[IC] picBuilds      %zu\n", gIcStats.picBuilds);
-	printf("[IC] picExtends     %zu\n", gIcStats.picExtends);
-	printf("[IC] megaPromotes   %zu\n", gIcStats.megaPromotes);
-	printf("[IC] bindRaces      %zu\n", gIcStats.bindRaces);
-	printf("[IC] resetSweeps    %zu\n", gIcStats.resetSweeps);
-	printf("[IC] cellsReset     %zu\n", gIcStats.cellsReset);
-	printf("[IC] megaCells      %zu\n", gIcStats.megaCells);
-	printf("[IC] stateBytesLive %zu\n", gIcStats.stateBytesLive);
-	printf("[IC] retireWalks    %zu\n", gIcStats.retireWalks);
-	printf("[IC] cellsRetired   %zu\n", gIcStats.cellsRetired);
 }

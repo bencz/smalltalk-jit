@@ -15,6 +15,16 @@ set(CMAKE_C_FLAGS_RELWITHDEBINFO "-O2 -g")
 set(CMAKE_C_FLAGS_RELEASE "-O2")
 set(CMAKE_C_FLAGS_DEBUG "-O0 -g")
 
+# Execution counters for the jit-v2 work: -DST_INSTRUMENT=1 (vm/core/Instrument.h).
+# Off by default and it MUST stay that way: with it off every counter macro
+# compiles to nothing and every JIT emission site emits nothing, so an ordinary
+# build carries zero instructions of instrumentation. An instrumented build
+# emits a memory RMW inside the arithmetic fast paths, which is right for
+# counting and useless for timing — never take a clock reading from one.
+if(ST_INSTRUMENT)
+	string(APPEND CMAKE_C_FLAGS " -DST_INSTRUMENT=1")
+endif()
+
 # Optional sanitizer for debugging memory bugs: -DSANITIZE=address (or undefined).
 if(SANITIZE)
 	string(APPEND CMAKE_C_FLAGS " -fsanitize=${SANITIZE} -fno-sanitize-recover=all")
@@ -187,6 +197,7 @@ set(vmSources
 	vm/core/Entry.c
 	vm/core/Exception.c
 	vm/core/Handle.c
+	vm/core/Instrument.c
 	vm/core/Lookup.c
 	vm/core/Namespace.c
 	vm/core/Smalltalk.c

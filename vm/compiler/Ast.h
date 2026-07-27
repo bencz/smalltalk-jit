@@ -188,7 +188,7 @@ static void classNodeSetIsExtension(ClassNode *class, _Bool isExtension)
 
 static _Bool classNodeIsExtension(ClassNode *class)
 {
-	return asObject(class->raw->isExtension) == Handles.true->raw;
+	return asObject(class->raw->isExtension) == Handles.true_.raw;
 }
 
 
@@ -392,13 +392,13 @@ static SourceCode *blockNodeGetSourceCode(BlockNode *block)
 
 static void expressionNodeEnableReturn(ExpressionNode *expression)
 {
-	objectStorePtr((Object *) expression,  &expression->raw->returns, (Object *) Handles.true);
+	objectStorePtr((Object *) expression,  &expression->raw->returns, (Object *) &Handles.true_);
 }
 
 
 static void expressionNodeDisableReturn(ExpressionNode *expression)
 {
-	objectStorePtr((Object *) expression,  &expression->raw->returns, (Object *) Handles.false);
+	objectStorePtr((Object *) expression,  &expression->raw->returns, (Object *) &Handles.false_);
 }
 
 
