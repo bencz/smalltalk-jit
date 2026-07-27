@@ -163,6 +163,7 @@ Apendar, nunca reescrever. Data, commit, o que destravou.
 | 2026-07-27 | 0 | (nao commitado) | o nivel 7 achou DOIS bugs de GC pre-existentes, ver abaixo |
 | 2026-07-27 | **8** | (nao commitado) | front end: 40 de 40; fonte -> bytecode -> maquina, sem bloco nao-inlinado ainda |
 | 2026-07-27 | 8 | (nao commitado) | frames compilados viraram raizes: alocar de codigo compilado ficou seguro |
+| 2026-07-27 | 7 | (nao commitado) | closures planas com celulas (ADR 0008) em bytecode: 104 de 104 |
 
 ## O que o nivel 7 encontrou, e por que so ele podia encontrar
 
@@ -256,16 +257,65 @@ passava com o walk inteiro removido. O que nao acontece por sorte e estar na OLD
 space, porque so um coletor que ACHOU o objeto duas vezes poderia te-lo
 promovido.
 
-## O que o front end ainda NAO faz
+## Closures: metade feita, e qual metade
 
-Registrado aqui para nao virar surpresa no nivel 9:
+O ADR 0008 esta implementado **em bytecode** e verificado no nivel 7:
+`CLOSURE`, `GETUP`, `NEWCELL`, `GETCELL`, `SETCELL`, mais `value`/`value:` como
+primitivas (que sao SENDs, entao um sitio de chamada de bloco carrega cache
+inline como qualquer outro). Objeto `Closure` = contagem, metodo, capturas, tudo
+tagueado (`FORMAT_INDEXED_POINTERS`), entao o coletor nao tem caso especial.
 
-- **bloco nao inlinado**: `[:x | ...]` como valor exige closure plana com
-  celulas (ADR 0008) e ainda nao existe. O compilador RECUSA, com erro nomeado,
-  em vez de emitir algo que parece funcionar;
+Provado com bytecode escrito a mao, de proposito, pelo mesmo motivo dos niveis
+abaixo: o mecanismo erra de jeitos que o nivel de fonte esconde. O teste cobre
+captura por valor, celula mutada DEPOIS da captura (captura por valor
+responderia 1 em vez de 99), bloco com argumento proprio junto das capturas,
+aridade errada caindo no fallback, e sobrevivencia a coleta completa.
+
+**O que falta e a metade do FRONT END**: analise de captura (quais nomes sao
+capturados, quais sao mutados, logo quais precisam de celula) e emissao de
+`CLOSURE`. Ate la o compilador RECUSA um bloco nao inlinado, com erro nomeado,
+em vez de emitir algo que parece funcionar.
+
+Tambem faltam, e pelo mesmo motivo:
+
 - **`super`**: o emissor gera `SENDSUPER` e o tier 1 ainda nao o implementa, e
   reporta o opcode pelo nome;
-- **retorno nao local** (`^` dentro de bloco), que depende do item 1.
+- **retorno nao local** (`^` dentro de bloco), que depende do token de frame
+  home do ADR 0008.
+
+## O contrato REAL esta em packages/, e ele discorda dos meus nomes
+
+Achado tarde e registrado antes de virar retrabalho maior.
+
+`packages/Core/src/*.st` declara primitivas por PRAGMA NOMEADA, e sao **173
+nomes distintos** em uso:
+
+```smalltalk
++ aNumber [
+	<primitive: IntAddPrimitive>
+	...fallback em Smalltalk...
+]
+```
+
+Ou seja o enum de `runtime/Primitive.h` tem os nomes errados: `PRIM_ADD` deveria
+ser `IntAddPrimitive`, `PRIM_BASIC_NEW` deveria ser `BehaviorNewPrimitive`,
+`PRIM_CLOSURE_VALUE` deveria ser `BlockValuePrimitive`, e assim por diante. O
+mapeamento e mecanico e esta levantado; o que falta e o front end PARSEAR a
+pragma, que hoje ele ignora.
+
+Duas divergencias de desenho que a leitura revelou, e que nao sao renomeacao:
+
+1. **`AtPrimitive` e UMA primitiva polimorfica em `Object`**, herdada por String,
+   ByteArray e Array. Eu dividi em `PRIM_ARRAY_AT` / `PRIM_STRING_AT` /
+   `PRIM_BYTES_AT` porque o formato nao distingue String de ByteArray. Ou a
+   primitiva unica passa a consultar a classe, ou as subclasses declaram a sua.
+2. **`Block.st` ainda e o desenho de CONTEXTOS do v1**: `<shape: BlockShape>` com
+   `| compiledBlock receiver outerContext homeContext |`. O ADR 0008 substitui
+   isso por closure plana, entao esse arquivo muda. O ADR ja aceitou a mudanca de
+   comportamento observavel; o arquivo simplesmente ainda nao acompanhou.
+
+Ha tambem pragmas de CLASSE (`<shape: BytesShape>`, `<shape: IndexedShape>`, ...)
+que o bootstrap novo vai ter que ler para carimbar a forma da instancia.
 
 ## O que o gate NAO cobre, e como cobrimos
 

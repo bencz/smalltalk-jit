@@ -5,6 +5,7 @@
 #include "jit/CompiledMethod.h"
 #include "jit/InlineCache.h"
 #include "runtime/Dictionary.h"
+#include "runtime/Closure.h"
 #include "runtime/Primitive.h"
 #include "runtime/String.h"
 #include "core/Handle.h"
@@ -327,6 +328,83 @@ static Value jitStoreGlobal(void *unitPointer, Value *valueSlot,
 
 
 // ---------------------------------------------------------------------------
+// Closures (ADR 0008)
+// ---------------------------------------------------------------------------
+//
+// All three of these ALLOCATE, so all three anchor the calling frame. They take
+// the frame slot they were handed plus, in the packed integer, WHICH slot that
+// was, which is what turns the address back into a frame pointer.
+//
+// The packing is two or three 16-bit fields in an immediate the call sequence
+// was already materialising, so carrying them costs nothing.
+
+#define PACKED_LOW(packed) ((uint16_t) ((packed) & 0xFFFF))
+#define PACKED_MID(packed) ((uint16_t) (((packed) >> 16) & 0xFFFF))
+#define PACKED_SLOT(packed) ((uint16_t) (((packed) >> 32) & 0xFFFF))
+
+
+// Build a closure over `blocks[index]`, capturing the values in the `count`
+// registers starting at the base. Consecutive registers are consecutive slots
+// at DESCENDING addresses, so capture i is baseSlot[-i].
+static Value jitMakeClosure(void *unitPointer, Value *baseSlot, uint64_t packed)
+{
+	CompiledFrameGuard guard;
+	compiledFrameEnter(&guard, baseSlot, PACKED_SLOT(packed),
+		__builtin_return_address(0));
+
+	CodeUnit *unit = unitPointer;
+	uint16_t index = PACKED_LOW(packed);
+	uint16_t count = PACKED_MID(packed);
+
+	HandleScope scope;
+	openHandleScope(&scope);
+	RawArray *blocks = (RawArray *) asObject(unit->blocks);
+	Object *method = scopeHandle(asObject(blocks->vars[index]));
+	Closure *closure = newClosure(method, count);
+	// The captures are copied AFTER the allocation and read from the frame each
+	// time, because allocating the closure may have moved every one of them.
+	for (uint16_t i = 0; i < count; i++) {
+		rawObjectStoreValue((RawObject *) closure->raw, &closure->raw->captured[i],
+			baseSlot[-(intptr_t) i]);
+	}
+	Value answer = objectTagged(closure);
+	closeHandleScope(&scope, NULL);
+
+	compiledFrameLeave(&guard);
+	return answer;
+}
+
+
+static Value jitMakeCell(void *unused, Value *valueSlot, uint64_t packed)
+{
+	(void) unused;
+	CompiledFrameGuard guard;
+	compiledFrameEnter(&guard, valueSlot, PACKED_SLOT(packed),
+		__builtin_return_address(0));
+	Value answer = objectTagged(newCell(*valueSlot));
+	compiledFrameLeave(&guard);
+	return answer;
+}
+
+
+// Store into a cell, through the write barrier. A cell outlives the frame that
+// made it (that is the whole point of having one), so it is routinely old while
+// what goes into it is young.
+static Value jitSetCell(void *unused, Value *cellSlot, uint64_t packed)
+{
+	(void) unused;
+	uint16_t cellRegister = PACKED_SLOT(packed);
+	uint16_t valueRegister = PACKED_LOW(packed);
+	// Slot i sits at frame - 8*(i+1), so a higher register is a LOWER address.
+	Value *valueSlot = cellSlot
+		- ((intptr_t) valueRegister - (intptr_t) cellRegister);
+	RawObject *cell = asObject(*cellSlot);
+	rawObjectStoreValue(cell, &((RawCell *) cell)->value, *valueSlot);
+	return *valueSlot;
+}
+
+
+// ---------------------------------------------------------------------------
 // The compiler
 // ---------------------------------------------------------------------------
 
@@ -459,6 +537,44 @@ static _Bool emitInstruction(JitContext *jit, size_t index, Opcode *unsupported)
 
 	case OP_RET:
 		maEpilogue(ma, instruction->a);
+		return 1;
+
+	case OP_CLOSURE:
+		// blocks[b], capturing the n registers starting at c. The capture list
+		// was gathered into consecutive registers by the front end, for the same
+		// reason a send's arguments are: one address describes the whole run.
+		maCallRuntime3(ma, jitMakeClosure, jit->unit, instruction->c,
+			(uint64_t) instruction->b | ((uint64_t) instruction->n << 16)
+			| ((uint64_t) instruction->c << 32));
+		maStoreSlot(ma, instruction->a);
+		return 1;
+
+	case OP_GETUP:
+		// Register 0 of a block's frame IS the closure, so a captured value is
+		// one load at a known offset. This is what replaces the old VM's walk up
+		// a chain of contexts (ADR 0008).
+		maLoadSlot(ma, 0);
+		maLoadField(ma, CLOSURE_CAPTURE_FIELD(instruction->b));
+		maStoreSlot(ma, instruction->a);
+		return 1;
+
+	case OP_NEWCELL:
+		maCallRuntime3(ma, jitMakeCell, NULL, instruction->b,
+			(uint64_t) instruction->b << 32);
+		maStoreSlot(ma, instruction->a);
+		return 1;
+
+	case OP_GETCELL:
+		maLoadSlot(ma, instruction->b);
+		maLoadField(ma, CELL_VALUE_FIELD);
+		maStoreSlot(ma, instruction->a);
+		return 1;
+
+	case OP_SETCELL:
+		// Through the runtime because the store needs the generational write
+		// barrier, and a cell is exactly the object that outlives its frame.
+		maCallRuntime3(ma, jitSetCell, NULL, instruction->a,
+			(uint64_t) instruction->b | ((uint64_t) instruction->a << 32));
 		return 1;
 
 	case OP_SAFEPOINT:

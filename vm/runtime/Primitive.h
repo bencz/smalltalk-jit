@@ -133,6 +133,13 @@ typedef enum {
 	PRIM_BASIC_NEW,       // an instance with no indexed part
 	PRIM_BASIC_NEW_SIZED, // basicNew: n
 
+	// -- entering a block. `value` is an ordinary SEND to a Closure, so a block
+	// call carries an inline cache like everything else, and the optimizer sees
+	// which block a site actually runs.
+	PRIM_CLOSURE_VALUE,
+	PRIM_CLOSURE_VALUE1,
+	PRIM_CLOSURE_VALUE2,
+
 	// -- indexed access, one per storage format rather than one polymorphic
 	// primitive, because the ANSWER's type differs: a String's element is a
 	// Character and a ByteArray's is a SmallInteger, and the two share a format.

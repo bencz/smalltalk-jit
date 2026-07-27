@@ -34,6 +34,7 @@
 #include "memory/ObjectWalk.h"
 #include "runtime/Collection.h"
 #include "runtime/Dictionary.h"
+#include "runtime/Closure.h"
 #include "runtime/Primitive.h"
 #include "runtime/String.h"
 #include <stdio.h>
@@ -163,6 +164,8 @@ static void bootstrapMinimal(Heap *heap)
 	Handles.SmallFloat64.raw = classCreate(object, NULL, fixed0)->raw;
 	Handles.BoxedFloat64.raw = classCreate(object, NULL, boxedFloat)->raw;
 	Handles.Character.raw = classCreate(object, NULL, fixed0)->raw;
+	Handles.Closure.raw = classCreate(object, NULL, CLOSURE_SHAPE)->raw;
+	Handles.Cell.raw = classCreate(object, NULL, CELL_SHAPE)->raw;
 
 	Handles.symbolTable.raw = newArray(1024)->raw;
 
@@ -176,6 +179,7 @@ static void bootstrapMinimal(Heap *heap)
 	withMethods(&Handles.SmallFloat64);
 	withMethods(&Handles.BoxedFloat64);
 	withMethods(&Handles.Character);
+	withMethods(&Handles.Closure);
 
 	Handles.nil.raw = ((Object *) newObject(&Handles.UndefinedObject, 0))->raw;
 	Handles.true_.raw = ((Object *) newObject(&Handles.True, 0))->raw;
@@ -700,6 +704,117 @@ int main(void)
 	check("with the dominant one identified by COUNT and not by arrival order",
 		icDominantClass(polyCell, &fraction) == classIndexOf(smallInteger)
 		&& fraction > 0.74 && fraction < 0.76);
+
+	// ---- closures, at the bytecode level ------------------------------------
+	//
+	// ADR 0008: a block captures BY VALUE into itself, and a variable that is
+	// captured AND MUTATED gets a cell. Proved here on hand-written bytecode,
+	// before the front end emits any, for the same reason every level below did
+	// it that way: the mechanism can be wrong in ways the source level would
+	// hide.
+	printf("\n  -- closures: flat captures, and cells for what is mutated\n");
+	definePrimitive(&Handles.Closure, "value", PRIM_CLOSURE_VALUE, 0, FALLBACK_CONSTANT);
+	definePrimitive(&Handles.Closure, "value:", PRIM_CLOSURE_VALUE1, 1, FALLBACK_CONSTANT);
+
+	// The block: register 0 is the CLOSURE, so GETUP reaches a capture with one
+	// load and no chain to walk.
+	//   ^captured0 + captured1
+	static Instruction blockBody[] = {
+		{ OP_GETUP, 0, 1, 0, 0 },   // r1 := captured[0]
+		{ OP_GETUP, 0, 3, 1, 0 },   // r3 := captured[1]  (the send's argument)
+		{ OP_MOVE, 0, 2, 1, 0 },    // r2 := r1           (the send's receiver)
+		{ OP_SEND, 1, 4, 0, 2 },    // r4 := r2 + r3
+		{ OP_RET, 0, 4, 0, 0 },
+	};
+	CodeUnit *blockUnit = makeUnit(blockBody, 5, 5, 0, selectorLiterals("+"));
+	CompiledMethod *blockMethod = compiledMethodCreate(blockUnit,
+		asSymbol(stringFromC("aBlock")), &Handles.Closure);
+
+	// The enclosing method holds that block in its `blocks` array and closes over
+	// two of its own registers.
+	Array *blocks = newArray(1);
+	arrayAtPutObject(blocks, 0, (Object *) blockMethod);
+	static Instruction makesClosure[] = {
+		{ OP_MOVE, 0, 3, 1, 0 },      // r3 := arg0   (capture 0)
+		{ OP_MOVE, 0, 4, 2, 0 },      // r4 := arg1   (capture 1)
+		{ OP_CLOSURE, 2, 5, 0, 3 },   // r5 := closure over blocks[0], regs 3..4
+		{ OP_MOVE, 0, 6, 5, 0 },
+		{ OP_SEND, 0, 7, 0, 6 },      // r7 := r6 value
+		{ OP_RET, 0, 7, 0, 0 },
+	};
+	CodeUnit *closureUnit = makeUnit(makesClosure, 6, 8, 2, selectorLiterals("value"));
+	closureUnit->blocks = tagPtr(blocks->raw);
+	NativeCode *makesClosureCode = jitCompile(closureUnit, &unsupported);
+	check("a method that builds a closure compiles", makesClosureCode != NULL);
+	checkInt("the block sees BOTH captured values, by value and with no chain",
+		jitCall2(makesClosureCode, tagPtr(Handles.nil.raw), tagInt(30), tagInt(12)), 42);
+
+	// A CELL: the outer method mutates the variable after capturing it, so the
+	// closure has to see the NEW value. Capturing by value would answer 1.
+	static Instruction cellBlock[] = {
+		{ OP_GETUP, 0, 1, 0, 0 },   // r1 := the captured CELL
+		{ OP_GETCELL, 0, 2, 1, 0 }, // r2 := its contents
+		{ OP_RET, 0, 2, 0, 0 },
+	};
+	CodeUnit *cellBlockUnit = makeUnit(cellBlock, 3, 3, 0, NULL);
+	CompiledMethod *cellBlockMethod = compiledMethodCreate(cellBlockUnit,
+		asSymbol(stringFromC("cellBlock")), &Handles.Closure);
+	Array *cellBlocks = newArray(1);
+	arrayAtPutObject(cellBlocks, 0, (Object *) cellBlockMethod);
+
+	static Instruction mutatesAfterCapture[] = {
+		{ OP_LOADI, 0, 1, 1, 0 },      // r1 := 1
+		{ OP_NEWCELL, 0, 1, 1, 0 },    // r1 := cell holding 1
+		{ OP_MOVE, 0, 2, 1, 0 },       // the capture run
+		{ OP_CLOSURE, 1, 3, 0, 2 },    // r3 := closure capturing the CELL
+		{ OP_LOADI, 0, 4, 99, 0 },
+		{ OP_SETCELL, 0, 1, 4, 0 },    // cell := 99, AFTER the closure exists
+		{ OP_MOVE, 0, 5, 3, 0 },
+		{ OP_SEND, 0, 6, 0, 5 },       // r6 := r5 value
+		{ OP_RET, 0, 6, 0, 0 },
+	};
+	CodeUnit *cellUnit = makeUnit(mutatesAfterCapture, 9, 7, 0, selectorLiterals("value"));
+	cellUnit->blocks = tagPtr(cellBlocks->raw);
+	NativeCode *cellCode = jitCompile(cellUnit, &unsupported);
+	checkInt("a mutated capture goes through a CELL, so the block sees 99 and not 1",
+		jitCall0(cellCode, tagPtr(Handles.nil.raw)), 99);
+
+	// A block with an argument, so the block's own registers and its captures
+	// coexist: register 0 is the closure, 1 is the argument.
+	static Instruction argBlock[] = {
+		{ OP_GETUP, 0, 2, 0, 0 },   // r2 := captured[0]
+		{ OP_MOVE, 0, 3, 2, 0 },
+		{ OP_MOVE, 0, 4, 1, 0 },    // the block's own argument
+		{ OP_SEND, 1, 5, 0, 3 },    // r5 := captured + argument
+		{ OP_RET, 0, 5, 0, 0 },
+	};
+	CodeUnit *argBlockUnit = makeUnit(argBlock, 5, 6, 1, selectorLiterals("+"));
+	CompiledMethod *argBlockMethod = compiledMethodCreate(argBlockUnit,
+		asSymbol(stringFromC("argBlock")), &Handles.Closure);
+	Array *argBlocks = newArray(1);
+	arrayAtPutObject(argBlocks, 0, (Object *) argBlockMethod);
+	static Instruction callsWithArg[] = {
+		{ OP_MOVE, 0, 2, 1, 0 },
+		{ OP_CLOSURE, 1, 3, 0, 2 },
+		{ OP_MOVE, 0, 4, 3, 0 },
+		{ OP_LOADI, 0, 5, 5, 0 },
+		{ OP_SEND, 1, 6, 0, 4 },    // r6 := r4 value: 5
+		{ OP_RET, 0, 6, 0, 0 },
+	};
+	CodeUnit *argUnit = makeUnit(callsWithArg, 6, 7, 1, selectorLiterals("value:"));
+	argUnit->blocks = tagPtr(argBlocks->raw);
+	NativeCode *argCode = jitCompile(argUnit, &unsupported);
+	checkInt("value: passes the block's argument alongside its captures",
+		jitCall1(argCode, tagPtr(Handles.nil.raw), tagInt(37)), 42);
+	checkInt("value with the WRONG arity falls back rather than reading a slot "
+		"the block does not have",
+		jitCall2(makesClosureCode, tagPtr(Handles.nil.raw), tagInt(1), tagInt(2)), 3);
+
+	// A closure is an ordinary object, so it survives collection like one, and
+	// its captures are ordinary tagged slots the collector walks.
+	collectorMarkSweep(&heap);
+	checkInt("a closure and its captures survive a full collection",
+		jitCall2(makesClosureCode, tagPtr(Handles.nil.raw), tagInt(40), tagInt(2)), 42);
 
 	// ---- the primitive sequence on a FOREIGN ABI ---------------------------
 	//

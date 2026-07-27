@@ -117,7 +117,7 @@ level3() {
 		-Ivm -I. -Ivm/os/linux \
 		vm/tests/JitTest.c vm/jit/Jit.c vm/jit/CompiledMethod.c \
 		vm/jit/MacroAssembler.c vm/jit/Backends.c vm/jit/InlineCache.c \
-		vm/runtime/Primitive.c \
+		vm/runtime/Primitive.c vm/runtime/Closure.c \
 		vm/jit/x64/MacroAssemblerX64.c \
 		vm/jit/x64/abi/sysv/AbiSysV.c vm/jit/x64/abi/win64/AbiWin64.c \
 		vm/core/Class.c vm/core/ClassTable.c vm/core/Handle.c \
@@ -177,7 +177,7 @@ level6() {
 level7() {
 	gcc -std=gnu11 -pedantic -Wno-flexible-array-extensions -g -O1 \
 		-Ivm -I. -Ivm/os/linux \
-		vm/tests/PrimitiveTest.c vm/runtime/Primitive.c \
+		vm/tests/PrimitiveTest.c vm/runtime/Primitive.c vm/runtime/Closure.c \
 		vm/jit/Jit.c vm/jit/CompiledMethod.c \
 		vm/jit/MacroAssembler.c vm/jit/Backends.c vm/jit/InlineCache.c \
 		vm/jit/x64/MacroAssemblerX64.c \
@@ -201,6 +201,7 @@ level8() {
 		vm/tests/CompileTest.c vm/compiler/Compile.c vm/compiler/Parser.c \
 		vm/compiler/Tokenizer.c \
 		vm/runtime/Primitive.c vm/runtime/Number.c vm/runtime/BigInt.c \
+		vm/runtime/Closure.c \
 		vm/jit/Jit.c vm/jit/CompiledMethod.c \
 		vm/jit/MacroAssembler.c vm/jit/Backends.c vm/jit/InlineCache.c \
 		vm/jit/x64/MacroAssemblerX64.c \
