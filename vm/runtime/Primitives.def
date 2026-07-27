@@ -1,0 +1,199 @@
+// Every primitive the kernel can name, and which of them the VM implements.
+//
+// THE NAMES ARE THE CONTRACT. packages/Core declares a primitive by pragma:
+//
+//     + aNumber [
+//         <primitive: IntAddPrimitive>
+//         ...the general case, in Smalltalk...
+//     ]
+//
+// so this list is not the VM's private numbering, it is the vocabulary the
+// image speaks. It was extracted from packages/ rather than invented: 173
+// distinct names in 186 declarations.
+//
+// An X-macro, included once to build the enum and once to build the table, so a
+// name and its implementation cannot drift apart. The old VM kept a positional
+// array whose comment said in capitals never to reorder it; here the position is
+// generated from the name.
+//
+// A NULL implementation means DECLARED BUT NOT IMPLEMENTED YET. That is not an
+// error: the method still compiles, the primitive attempt is simply not emitted,
+// and the method runs the Smalltalk fallback it already carries. Which is also
+// how this file doubles as the parity checklist -- the count of non-NULL entries
+// is the honest measure of how much of the kernel can run.
+//
+//   PRIMITIVE(id, "KernelName", implementation-or-NULL)
+
+PRIMITIVE(ArrayEquals, "ArrayEqualsPrimitive", NULL)  // String>>= aCollection
+PRIMITIVE(At, "AtPrimitive", primAt)  // Object>>at: anInteger; Object>>basicAt: anInteger
+PRIMITIVE(AtPut, "AtPutPrimitive", primAtPut)  // Object>>at: anInteger put: anObject; Object>>basicAt: anInteger put: anObject
+PRIMITIVE(AtomicArrayAt, "AtomicArrayAtPrimitive", NULL)  // AtomicArray>>at: i
+PRIMITIVE(AtomicArrayAtPut, "AtomicArrayAtPutPrimitive", NULL)  // AtomicArray>>at: i put: aValue
+PRIMITIVE(AtomicArrayCompareAndSet, "AtomicArrayCompareAndSetPrimitive", NULL)  // AtomicArray>>at: i compareAndSet: expected with: newValue
+PRIMITIVE(AtomicArrayGetAndAdd, "AtomicArrayGetAndAddPrimitive", NULL)  // AtomicArray>>at: i getAndAdd: anInteger
+PRIMITIVE(AtomicArrayGetAndSet, "AtomicArrayGetAndSetPrimitive", NULL)  // AtomicArray>>at: i getAndSet: aValue
+PRIMITIVE(AtomicCompareAndSet, "AtomicCompareAndSetPrimitive", NULL)  // Atomic>>compareAndSet: expected with: newValue
+PRIMITIVE(AtomicGetAndAdd, "AtomicGetAndAddPrimitive", NULL)  // AtomicInteger>>getAndAdd: anInteger
+PRIMITIVE(AtomicGetAndSet, "AtomicGetAndSetPrimitive", NULL)  // Atomic>>getAndSet: aValue
+PRIMITIVE(AtomicLoad, "AtomicLoadPrimitive", NULL)  // Atomic>>get
+PRIMITIVE(AtomicStore, "AtomicStorePrimitive", NULL)  // Atomic>>set: aValue
+PRIMITIVE(Base64DecodeBytes, "Base64DecodeBytesPrimitive", NULL)  // Base64>>class decodeBytes: aString
+PRIMITIVE(Base64Decode, "Base64DecodePrimitive", NULL)  // Base64>>class decode: aString
+PRIMITIVE(Base64Encode, "Base64EncodePrimitive", NULL)  // Base64>>class encode: aCollection
+PRIMITIVE(Become, "BecomePrimitive", NULL)  // Object>>become: otherObject
+PRIMITIVE(BehaviorLookupSelector, "BehaviorLookupSelectorPrimitive", NULL)  // Behavior>>lookupSelector: aSymbol
+PRIMITIVE(BehaviorNew, "BehaviorNewPrimitive", primBasicNew)  // Behavior>>new; Behavior>>basicNew
+PRIMITIVE(BehaviorNewSize, "BehaviorNewSizePrimitive", primBasicNewSized)  // Behavior>>new: anInteger; Behavior>>basicNew: anInteger
+PRIMITIVE(BlockOnException, "BlockOnExceptionPrimitive", NULL)  // Block>>basicOn: anException do: aBlock
+PRIMITIVE(BlockUnwind, "BlockUnwindPrimitive", NULL)  // Block>>valueUnwindProtected: aBlock
+PRIMITIVE(BlockValueArgs, "BlockValueArgsPrimitive", NULL)  // Block>>valueWithArguments: anArray
+PRIMITIVE(BlockValue, "BlockValuePrimitive", primClosureValue)  // Block>>value
+PRIMITIVE(BlockValue1, "BlockValuePrimitive1", primClosureValue1)  // Block>>value: arg
+PRIMITIVE(BlockValue2, "BlockValuePrimitive2", primClosureValue2)  // Block>>value: arg1 value: arg2
+PRIMITIVE(BlockValue3, "BlockValuePrimitive3", NULL)  // Block>>value: arg1 value: arg2 value: arg3
+PRIMITIVE(BlockWhileTrue2, "BlockWhileTrue2Primitive", NULL)  // Block>>whileTrue: aBlock
+PRIMITIVE(BlockWhileTrue, "BlockWhileTruePrimitive", NULL)  // Block>>whileTrue
+PRIMITIVE(BuildClassIn, "BuildClassInPrimitive", NULL)  // Compiler>>basicBuildClass: aClassNode in: aNamespace
+PRIMITIVE(BuildClass, "BuildClassPrimitive", NULL)  // Compiler>>basicBuildClass: aClassNode
+PRIMITIVE(CharacterCode, "CharacterCodePrimitive", NULL)  // Character>>codePoint
+PRIMITIVE(CharacterNew, "CharacterNewPrimitive", NULL)  // Character>>class codePoint: anInteger
+PRIMITIVE(Class, "ClassPrimitive", primClass)  // Object>>class
+PRIMITIVE(ClassRemoveSelector, "ClassRemoveSelectorPrimitive", NULL)  // Behavior>>removeSelector: aSymbol
+PRIMITIVE(CommandLine, "CommandLinePrimitive", NULL)  // System>>class primitiveCommandLine
+PRIMITIVE(CompileMethodIn, "CompileMethodInPrimitive", NULL)  // Compiler>>basicCompileMethod: aMethodNode in: aClass namespace: aNamespace
+PRIMITIVE(CompileMethod, "CompileMethodPrimitive", NULL)  // Compiler>>basicCompileMethod: aMethodNode in: aClass
+PRIMITIVE(ContextArgumentAt, "ContextArgumentAt", NULL)  // Context>>argumentAt: anInteger
+PRIMITIVE(ContextParent, "ContextParentPrimitive", NULL)  // Context>>parent
+PRIMITIVE(ContextPositionDescriptor, "ContextPositionDescriptorPrimitive", NULL)  // Context>>positionDescriptor
+PRIMITIVE(ContextTemporaryAt, "ContextTemporaryAt", NULL)  // Context>>temporaryAt: anInteger
+PRIMITIVE(CpuCount, "CpuCountPrimitive", NULL)  // System>>class primitiveCpuCount
+PRIMITIVE(CurrentMicroTime, "CurrentMicroTimePrimitive", NULL)  // DateTime>>class currentMicroTime
+PRIMITIVE(DefaultNamespace, "DefaultNamespacePrimitive", NULL)  // Namespace>>class default
+PRIMITIVE(ExceptionSignal, "ExceptionSignal", NULL)  // Exception>>basicSignal; HandlerEscape>>signal
+PRIMITIVE(ExecutablePath, "ExecutablePathPrimitive", NULL)  // System>>class executablePath
+PRIMITIVE(ExitWithCode, "ExitWithCodePrimitive", NULL)  // System>>class primitiveExit: anInteger
+PRIMITIVE(FileChdir, "FileChdirPrimitive", NULL)  // System>>class primitiveChdir: aString
+PRIMITIVE(FileGetCwd, "FileGetCwdPrimitive", NULL)  // Directory>>class getCwd; System>>class primitiveGetCwd
+PRIMITIVE(FileListDir, "FileListDirPrimitive", NULL)  // Directory>>class listDirPath: aString
+PRIMITIVE(FileMkdir, "FileMkdirPrimitive", NULL)  // Directory>>class mkdirPath: aString
+PRIMITIVE(FileRealpath, "FileRealpathPrimitive", NULL)  // File>>class realpath: aPath
+PRIMITIVE(FileRename, "FileRenamePrimitive", NULL)  // File>>class renamePath: fromString to: toString
+PRIMITIVE(FileRmdir, "FileRmdirPrimitive", NULL)  // Directory>>class rmdirPath: aString
+PRIMITIVE(FileStat, "FileStatPrimitive", NULL)  // Directory>>class statPath: aString; File>>class statPath: aString
+PRIMITIVE(FileUnlink, "FileUnlinkPrimitive", NULL)  // File>>class unlinkPath: aString
+PRIMITIVE(FloatAdd, "FloatAddPrimitive", primAdd)  // Float>>+ aNumber
+PRIMITIVE(FloatArcCos, "FloatArcCosPrimitive", NULL)  // Float>>arcCos
+PRIMITIVE(FloatArcSin, "FloatArcSinPrimitive", NULL)  // Float>>arcSin
+PRIMITIVE(FloatArcTan2, "FloatArcTan2Primitive", NULL)  // Float>>arcTan: aNumber
+PRIMITIVE(FloatArcTan, "FloatArcTanPrimitive", NULL)  // Float>>arcTan
+PRIMITIVE(FloatArrayAt, "FloatArrayAtPrimitive", NULL)  // FloatArray>>at: index
+PRIMITIVE(FloatArrayAtPut, "FloatArrayAtPutPrimitive", NULL)  // FloatArray>>at: index put: aNumber
+PRIMITIVE(FloatArrayBinary, "FloatArrayBinaryPrimitive", NULL)  // FloatArray>>primBinary: other into: result op: opcode
+PRIMITIVE(FloatArrayDot, "FloatArrayDotPrimitive", NULL)  // FloatArray>>dot: aFloatArray
+PRIMITIVE(FloatArrayFill, "FloatArrayFillPrimitive", NULL)  // FloatArray>>atAllPut: aNumber
+PRIMITIVE(FloatArrayReduce, "FloatArrayReducePrimitive", NULL)  // FloatArray>>primReduce: opcode
+PRIMITIVE(FloatArrayScalar, "FloatArrayScalarPrimitive", NULL)  // FloatArray>>primScalar: scalar into: result op: opcode
+PRIMITIVE(FloatAsString, "FloatAsStringPrimitive", NULL)  // Float>>printString
+PRIMITIVE(FloatCeiling, "FloatCeilingPrimitive", NULL)  // Float>>ceiling
+PRIMITIVE(FloatCos, "FloatCosPrimitive", NULL)  // Float>>cos
+PRIMITIVE(FloatDiv, "FloatDivPrimitive", primDivide)  // Float>>/ aNumber
+PRIMITIVE(FloatEquals, "FloatEqualsPrimitive", primNumericEqual)  // Float>>= aNumber
+PRIMITIVE(FloatExp, "FloatExpPrimitive", NULL)  // Float>>exp
+PRIMITIVE(FloatExponent, "FloatExponentPrimitive", NULL)  // Float>>exponent
+PRIMITIVE(FloatFloor, "FloatFloorPrimitive", NULL)  // Float>>floor
+PRIMITIVE(FloatLessThan, "FloatLessThanPrimitive", primLess)  // Float>>< aNumber
+PRIMITIVE(FloatLn, "FloatLnPrimitive", NULL)  // Float>>ln
+PRIMITIVE(FloatMul, "FloatMulPrimitive", primMultiply)  // Float>>* aNumber
+PRIMITIVE(FloatRounded, "FloatRoundedPrimitive", NULL)  // Float>>rounded
+PRIMITIVE(FloatSin, "FloatSinPrimitive", NULL)  // Float>>sin
+PRIMITIVE(FloatSqrt, "FloatSqrtPrimitive", NULL)  // Float>>sqrt
+PRIMITIVE(FloatSub, "FloatSubPrimitive", primSubtract)  // Float>>- aNumber
+PRIMITIVE(FloatTan, "FloatTanPrimitive", NULL)  // Float>>tan
+PRIMITIVE(FloatTimesTwoPower, "FloatTimesTwoPowerPrimitive", NULL)  // Float>>timesTwoPower: anInteger
+PRIMITIVE(FloatTruncated, "FloatTruncatedPrimitive", NULL)  // Float>>truncated
+PRIMITIVE(FlushSendCaches, "FlushSendCachesPrimitive", NULL)  // System>>class flushSendCaches
+PRIMITIVE(GC, "GCPrimitive", NULL)  // GarbageCollector>>class collectGarbage
+PRIMITIVE(GetEnv, "GetEnvPrimitive", NULL)  // System>>class primitiveGetEnv: aString
+PRIMITIVE(Hash, "HashPrimitive", primIdentityHash)  // Symbol>>hash; Object>>hash
+PRIMITIVE(Identity, "IdentityPrimitive", primIdentical)  // Object>>= anObject; Object>>== anObject
+PRIMITIVE(IndexOfByte, "IndexOfBytePrimitive", NULL)  // String>>indexOfByte: anInteger startingAt: start
+PRIMITIVE(InstVarAt, "InstVarAtPrimitive", NULL)  // Object>>instVarAt: anInteger
+PRIMITIVE(InstVarAtPut, "InstVarAtPutPrimitive", NULL)  // Object>>instVarAt: anInteger put: anObject
+PRIMITIVE(IntAdd, "IntAddPrimitive", primAdd)  // SmallInteger>>+ aNumber
+PRIMITIVE(IntAnd, "IntAndPrimitive", primBitAnd)  // SmallInteger>>bitAnd: anInteger
+PRIMITIVE(IntAsFloat, "IntAsFloatPrimitive", primAsFloat)  // SmallInteger>>asFloat
+PRIMITIVE(IntAsStringBase, "IntAsStringBasePrimitive", NULL)  // SmallInteger>>printStringBase: base
+PRIMITIVE(IntFloorDiv, "IntFloorDivPrimitive", primFloorDivide)  // SmallInteger>>// aNumber
+PRIMITIVE(IntLessThan, "IntLessThanPrimitive", primLess)  // SmallInteger>>< aNumber
+PRIMITIVE(IntMod, "IntModPrimitive", primFloorModulo)  // SmallInteger>>\\ aNumber
+PRIMITIVE(IntMul, "IntMulPrimitive", primMultiply)  // SmallInteger>>* aNumber
+PRIMITIVE(IntNeg, "IntNegPrimitive", primNegated)  // SmallInteger>>negated
+PRIMITIVE(IntOr, "IntOrPrimitive", primBitOr)  // SmallInteger>>bitOr: anInteger
+PRIMITIVE(IntQuo, "IntQuoPrimitive", primQuotient)  // SmallInteger>>quo: aNumber
+PRIMITIVE(IntRem, "IntRemPrimitive", primRemainder)  // SmallInteger>>rem: aNumber
+PRIMITIVE(IntShift, "IntShiftPrimitive", primBitShift)  // SmallInteger>>bitShift: anInteger
+PRIMITIVE(IntSub, "IntSubPrimitive", primSubtract)  // SmallInteger>>- aNumber
+PRIMITIVE(IntXor, "IntXorPrimitive", primBitXor)  // SmallInteger>>bitXor: anInteger
+PRIMITIVE(Interrupt, "InterruptPrimitive", NULL)  // Debugger>>class break
+PRIMITIVE(JsonEncode, "JsonEncodePrimitive", NULL)  // JsonError>>class encode: anObject; JsonError>>class primEncode: anObject
+PRIMITIVE(JsonParse, "JsonParsePrimitive", NULL)  // JsonError>>class parse: aString
+PRIMITIVE(LargeIntAsFloat, "LargeIntAsFloatPrimitive", NULL)  // LargeInteger>>primAsFloatWithClasses: classPair
+PRIMITIVE(LargeIntBinary, "LargeIntBinaryPrimitive", NULL)  // Integer>>primLargeWith: aNumber op: opcode classes: classPair
+PRIMITIVE(LargeIntCompare, "LargeIntComparePrimitive", NULL)  // Integer>>primLargeCompareWith: aNumber classes: classPair
+PRIMITIVE(LargeIntFromString, "LargeIntFromStringPrimitive", NULL)  // String>>largeIntegerBase: anInteger negative: aBoolean classes: classPair
+PRIMITIVE(LargeIntPrintString, "LargeIntPrintStringPrimitive", NULL)  // LargeInteger>>digitsStringBase: anInteger
+PRIMITIVE(LargeIntShift, "LargeIntShiftPrimitive", NULL)  // Integer>>primLargeShift: anInteger classes: classPair
+PRIMITIVE(LastGCStats, "LastGCStatsPrimitive", NULL)  // GarbageCollector>>class lastStats
+PRIMITIVE(LastIoError, "LastIoErrorPrimitive", NULL)  // IoError>>class last
+PRIMITIVE(LocalUtcOffset, "LocalUtcOffsetPrimitive", NULL)  // DateTime>>class localUtcOffsetAt: epochSeconds
+PRIMITIVE(MemoryReleaseFence, "MemoryReleaseFencePrimitive", NULL)  // Atomic>>class releaseFence
+PRIMITIVE(MethodSendArgs, "MethodSendArgsPrimitive", NULL)  // CompiledMethod>>sendTo: anObject withArguments: anArray
+PRIMITIVE(MethodSend, "MethodSendPrimitive", NULL)  // CompiledMethod>>sendTo: anObject
+PRIMITIVE(MonitorEnterOn, "MonitorEnterOnPrimitive", NULL)  // ProcessorScheduler>>monitorEnterOn: anObject
+PRIMITIVE(MonitorEnter, "MonitorEnterPrimitive", NULL)  // ProcessorScheduler>>monitorEnter
+PRIMITIVE(MonitorExit, "MonitorExitPrimitive", NULL)  // ProcessorScheduler>>monitorExit
+PRIMITIVE(MonitorPark, "MonitorParkPrimitive", NULL)  // ProcessorScheduler>>parkOnMonitor
+PRIMITIVE(MonotonicNanoTime, "MonotonicNanoTimePrimitive", NULL)  // Stopwatch>>class monotonicNanos; System>>class primitiveMonotonicNanos
+PRIMITIVE(ParseClass, "ParseClassPrimitive", NULL)  // Parser>>basicParseClass
+PRIMITIVE(ParseMethodOrBlock, "ParseMethodOrBlockPrimitive", NULL)  // Parser>>basicParseMethodOrBlock
+PRIMITIVE(ParseMethod, "ParseMethodPrimitive", NULL)  // Parser>>basicParseMethod
+PRIMITIVE(PrintHeap, "PrintHeapPrimitive", NULL)  // GarbageCollector>>class printHeap
+PRIMITIVE(ProcessCurrentId, "ProcessCurrentIdPrimitive", NULL)  // ProcessorScheduler>>currentId
+PRIMITIVE(ProcessResume, "ProcessResumePrimitive", NULL)  // ProcessorScheduler>>resumeId: anId
+PRIMITIVE(ProcessSleep, "ProcessSleepPrimitive", NULL)  // ProcessorScheduler>>sleepMicroseconds: micros
+PRIMITIVE(ProcessSpawn, "ProcessSpawnPrimitive", NULL)  // Block>>basicSpawn
+PRIMITIVE(ProcessSuspend, "ProcessSuspendPrimitive", NULL)  // ProcessorScheduler>>suspendCurrent
+PRIMITIVE(ProcessTerminate, "ProcessTerminatePrimitive", NULL)  // ProcessorScheduler>>terminateId: anId
+PRIMITIVE(ProcessYield, "ProcessYieldPrimitive", NULL)  // ProcessorScheduler>>yield
+PRIMITIVE(RandomBytes, "RandomBytesPrimitive", NULL)  // Random>>primitiveRandomBytes: aByteArray; System>>class primitiveRandomBytes: aByteArray
+PRIMITIVE(ReplaceBytes, "ReplaceBytesPrimitive", NULL)
+PRIMITIVE(SetDefaultNamespace, "SetDefaultNamespacePrimitive", NULL)  // Namespace>>class default: aNamespace
+PRIMITIVE(Size, "SizePrimitive", primBasicSize)  // Object>>size; Object>>basicSize
+PRIMITIVE(SocketAccept, "SocketAcceptPrimitive", NULL)  // ServerSocket>>basicAccept
+PRIMITIVE(SocketBind, "SocketBindPrimitive", NULL)  // ServerSocket>>class bind: address port: port queueSize: queueSize
+PRIMITIVE(SocketConnect, "SocketConnectPrimitive", NULL)  // Socket>>class connect: address port: port
+PRIMITIVE(SocketHostLookup, "SocketHostLookup", NULL)  // InternetAddress>>class lookup: aString
+PRIMITIVE(SocketRead, "SocketReadPrimitive", NULL)  // Socket>>class read: descriptor into: aString size: anInteger startingAt: start
+PRIMITIVE(SocketSetNoDelay, "SocketSetNoDelayPrimitive", NULL)  // Socket>>class setNoDelay: descriptor
+PRIMITIVE(SocketWrite, "SocketWritePrimitive", NULL)  // Socket>>class write: descriptor from: aString size: anInteger
+PRIMITIVE(StreamAvailable, "StreamAvailablePrimitive", NULL)  // ExternalStream>>class available: descriptor
+PRIMITIVE(StreamClose, "StreamClosePrimitive", NULL)  // ExternalStream>>class close: descriptor
+PRIMITIVE(StreamFlush, "StreamFlushPrimitive", NULL)  // ExternalStream>>class flush: descriptor
+PRIMITIVE(StreamGetPosition, "StreamGetPositionPrimitive", NULL)  // ExternalStream>>class position: descriptor
+PRIMITIVE(StreamOpen, "StreamOpenPrimitive", NULL)  // FileStream>>class open: aString mode: anInteger
+PRIMITIVE(StreamRead, "StreamReadPrimitive", NULL)  // ExternalStream>>class read: descriptor next: anInteger into: aString startingAt: start
+PRIMITIVE(StreamSetPosition, "StreamSetPositionPrimitive", NULL)  // ExternalStream>>class position: descriptor to: anInteger
+PRIMITIVE(StreamWrite, "StreamWritePrimitive", NULL)  // ExternalStream>>class write: descriptor next: anInteger from: aString
+PRIMITIVE(StringAsSymbol, "StringAsSymbolPrimitive", NULL)  // String>>asSymbol
+PRIMITIVE(StringAsciiCaseEquals, "StringAsciiCaseEqualsPrimitive", NULL)  // String>>sameAsciiCaseAs: aString
+PRIMITIVE(StringAsciiLowercase, "StringAsciiLowercasePrimitive", NULL)  // String>>asLowercase
+PRIMITIVE(StringAsciiUppercase, "StringAsciiUppercasePrimitive", NULL)  // String>>asUppercase
+PRIMITIVE(StringCopyFromTo, "StringCopyFromToPrimitive", NULL)  // SequenceableCollection>>copyFrom: start to: stop
+PRIMITIVE(StringHash, "StringHashPrimitive", NULL)  // String>>hash
+PRIMITIVE(StringSplitBy, "StringSplitByPrimitive", NULL)  // SequenceableCollection>>splitBy: anObject
+PRIMITIVE(StringStartsWithAsciiCase, "StringStartsWithAsciiCasePrimitive", NULL)  // String>>startsWithAsciiCase: aPrefix
+PRIMITIVE(StringToInteger, "StringToIntegerPrimitive", NULL)  // String>>asNumber
+PRIMITIVE(StringTrimSeparators, "StringTrimSeparatorsPrimitive", NULL)  // String>>trimSeparators
+PRIMITIVE(UnhandledErrorNote, "UnhandledErrorNotePrimitive", NULL)  // Exception>>noteUnhandled
+PRIMITIVE(UnhandledErrorTake, "UnhandledErrorTakePrimitive", NULL)  // ProcessorScheduler>>takeUnhandledErrorCount
+PRIMITIVE(WorkerParallel, "WorkerParallelPrimitive", NULL)  // Worker>>class parallel: anArrayOfBlocks

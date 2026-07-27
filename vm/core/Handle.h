@@ -135,6 +135,9 @@ void *scopeHandle(void *rawObject);
 // wrapped in a handle. THE ONLY way C code should create objects: the raw
 // allocator hands back a pointer that the very next allocation may invalidate.
 void *newObject(Class *class, size_t elements);
+// An instance that will NEVER MOVE (memory/Heap.h). For nil, true and false,
+// whose addresses generated code bakes as immediates.
+void *newImmortalObject(Class *class, size_t elements);
 
 // Visit the heap's well-known objects. Walked as a flat slot array, so a field
 // added above is scanned without touching this.

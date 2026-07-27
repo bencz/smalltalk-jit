@@ -101,6 +101,22 @@ uint8_t *allocate(Heap *heap, size_t bytes);
 // indexed elements.
 RawObject *allocateObject(Heap *heap, RawObject *class, size_t elements);
 
+// An object that will NEVER MOVE, allocated straight into the non-moving old
+// space (ADR 0005).
+//
+// This exists for exactly one reason: generated code BAKES the addresses of
+// nil, true and false as immediates. `x ifTrue:` compiles to a compare against
+// the true singleton, and the prologue fills unused frame slots with nil, and
+// both of those are one instruction only because the address is a constant.
+//
+// An immortal singleton makes that constant permanently correct. Put one of
+// them in the nursery instead and everything works until the first collection
+// moves it, after which every baked compare silently stops matching: a method
+// answers neither true nor false and lands in the mustBeBoolean path, for a
+// value that IS false. Measured, and it is why this function exists rather
+// than a comment asking callers to be careful.
+RawObject *allocateImmortalObject(Heap *heap, RawObject *class, size_t elements);
+
 void collectGarbage(Heap *heap);
 void printHeap(Heap *heap);
 void resetGcStats(void);

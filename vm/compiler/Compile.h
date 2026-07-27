@@ -38,6 +38,7 @@ typedef enum {
 	COMPILE_TOO_MANY_LITERALS,
 	COMPILE_TOO_MANY_INSTRUCTIONS,
 	COMPILE_BAD_INLINE_BLOCK,   // a block where the shape required one
+	COMPILE_UNKNOWN_PRIMITIVE,  // <primitive: Foo> naming nothing the VM knows
 	COMPILE_UNSUPPORTED,        // reached a construct this stage does not do yet
 } CompileStatus;
 

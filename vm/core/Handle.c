@@ -114,6 +114,13 @@ void *newObject(Class *class, size_t elements)
 }
 
 
+void *newImmortalObject(Class *class, size_t elements)
+{
+	return scopeHandle(allocateImmortalObject(CurrentThread.heap,
+		(RawObject *) class->raw, elements));
+}
+
+
 Object *copyResizedObject(Object *object, size_t elements)
 {
 	HandleScope scope;

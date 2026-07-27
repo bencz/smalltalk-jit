@@ -44,6 +44,7 @@
 
 #include "core/Object.h"
 #include "jit/Jit.h"
+#include <stddef.h>
 #include <stdint.h>
 
 // The failure signal, in band.
@@ -88,73 +89,28 @@ static inline Value primitiveArgument(Value *args, uint64_t index)
 }
 
 
-// The primitives, by name.
+// The primitives, generated from runtime/Primitives.def.
 //
-// An ENUM and not a table position. The old VM numbered primitives by their
-// order in a C array and baked that number into every CompiledMethod in the
-// snapshot, so reordering the table silently rebound every method in the image.
-// Here the snapshot is derived (docs/jit-v2/03-escopo-revisado.md), so a name
-// costs nothing and a mistake is a compile error.
+// The .def is extracted from packages/, so the NAMES here are the ones the
+// kernel writes in its <primitive: ...> pragmas, not a numbering this file
+// invented. PRIM_NONE stays 0 so a zeroed CodeUnit means "no primitive".
 typedef enum {
 	PRIM_NONE = 0,
-
-	// -- arithmetic. Receiver and argument may each be a SmallInteger or a
-	// Float; anything else fails, and so does any result needing a heap box.
-	PRIM_ADD,
-	PRIM_SUBTRACT,
-	PRIM_MULTIPLY,
-	PRIM_DIVIDE,        // exact division only: 7/2 fails, and Fraction is the
-	                    // fallback's business, not this file's
-	PRIM_FLOOR_DIVIDE,  // //   SmallInteger only
-	PRIM_FLOOR_MODULO,  // \\   SmallInteger only
-
-	// -- comparison. Same operand rule; answers true or false.
-	PRIM_LESS,
-	PRIM_GREATER,
-	PRIM_LESS_EQUAL,
-	PRIM_GREATER_EQUAL,
-	PRIM_NUMERIC_EQUAL,
-	PRIM_NUMERIC_NOT_EQUAL,
-
-	// -- bit operations, SmallInteger only
-	PRIM_BIT_AND,
-	PRIM_BIT_OR,
-	PRIM_BIT_XOR,
-	PRIM_BIT_SHIFT,     // positive shifts left, negative shifts right
-
-	// -- identity and reflection. These never fail.
-	PRIM_IDENTICAL,     // ==
-	PRIM_NOT_IDENTICAL, // ~~
-	PRIM_CLASS,
-	PRIM_IDENTITY_HASH,
-
-	// -- allocation, and the only primitives here that touch the heap. They
-	// anchor the calling frame; see the note at the top of this file.
-	PRIM_BASIC_NEW,       // an instance with no indexed part
-	PRIM_BASIC_NEW_SIZED, // basicNew: n
-
-	// -- entering a block. `value` is an ordinary SEND to a Closure, so a block
-	// call carries an inline cache like everything else, and the optimizer sees
-	// which block a site actually runs.
-	PRIM_CLOSURE_VALUE,
-	PRIM_CLOSURE_VALUE1,
-	PRIM_CLOSURE_VALUE2,
-
-	// -- indexed access, one per storage format rather than one polymorphic
-	// primitive, because the ANSWER's type differs: a String's element is a
-	// Character and a ByteArray's is a SmallInteger, and the two share a format.
-	// The class that installs the primitive is what decides, which is where the
-	// decision belongs.
-	PRIM_BASIC_SIZE,
-	PRIM_ARRAY_AT,
-	PRIM_ARRAY_AT_PUT,
-	PRIM_STRING_AT,
-	PRIM_STRING_AT_PUT,
-	PRIM_BYTES_AT,
-	PRIM_BYTES_AT_PUT,
-
+#define PRIMITIVE(id, name, function) PRIM_##id,
+#include "runtime/Primitives.def"
+#undef PRIMITIVE
 	PRIM_COUNT
 } PrimitiveNumber;
+
+// The primitive a pragma names, or PRIM_NONE when the name is not one the
+// kernel uses. `length` is explicit because the caller has a counted Smalltalk
+// String and not a C string.
+PrimitiveNumber primitiveNumberNamed(const char *name, size_t length);
+
+// How many of the declared primitives are actually implemented, and how many
+// there are. The parity checklist, readable at runtime so a build can print it
+// rather than a human counting NULLs.
+void primitiveCoverage(size_t *implemented, size_t *declared);
 
 // The implementation of a primitive, or NULL for PRIM_NONE. Out-of-range is an
 // assertion, not a NULL: a method naming a primitive that does not exist is a

@@ -233,6 +233,43 @@ static uint32_t birthHash(void *address)
 }
 
 
+// Shared by the ordinary and the immortal allocator: everything except WHERE
+// the bytes come from is identical, and a second copy of the header stamping is
+// how the two would drift.
+static RawObject *initializeObject(RawObject *object, RawClass *raw, size_t bytes,
+	size_t elements)
+{
+	InstanceShape shape = raw->instanceShape;
+	object->header = makeObjectHeader(raw->classIndex, birthHash(object),
+		(ObjectFormat) shape.format, bytes / sizeof(uint64_t));
+	switch ((ObjectFormat) shape.format) {
+	case FORMAT_INDEXED_POINTERS:
+	case FORMAT_BYTES:
+	case FORMAT_DOUBLES:
+		rawObjectSetElementCount(object, elements);
+		break;
+	default:
+		break;
+	}
+	return object;
+}
+
+
+RawObject *allocateImmortalObject(Heap *heap, RawObject *class, size_t elements)
+{
+	RawClass *raw = (RawClass *) class;
+	size_t bytes = objectSizeForShape(raw->instanceShape, elements);
+	// The OLD space, which never moves and never compacts (ADR 0005). Reachable
+	// from the well-known handles, so the mark phase keeps it alive; what it
+	// must never do is change address.
+	RawObject *object = (RawObject *) allocateOld(heap, bytes);
+	ASSERT(object != NULL);
+	initializeObject(object, raw, bytes, elements);
+	ASSERT(isOldObject(object)); // the whole point: bit 3 says non-moving
+	return object;
+}
+
+
 RawObject *allocateObject(Heap *heap, RawObject *class, size_t elements)
 {
 	RawClass *raw = (RawClass *) class;

@@ -7,6 +7,7 @@
 #include "memory/Heap.h"
 #include "jit/CompiledMethod.h"
 #include "runtime/Closure.h"
+#include <string.h>
 
 // The implementations.
 //
@@ -304,6 +305,68 @@ static Value primFloorModulo(Value *args, uint64_t argc)
 }
 
 
+// quo: and rem: TRUNCATE toward zero, which is what C division already does, so
+// they are the pair that needs no correction. // and \\ are the ones that round
+// toward negative infinity; keeping both pairs is not redundancy, it is the
+// difference between -7 quo: 2 = -3 and -7 // 2 = -4.
+static Value primQuotient(Value *args, uint64_t argc)
+{
+	if (argc != 1) {
+		return PRIMITIVE_FAILED;
+	}
+	Value receiver = primitiveReceiver(args);
+	Value argument = primitiveArgument(args, 0);
+	if (!bothSmallIntegers(receiver, argument) || asCInt(argument) == 0) {
+		return PRIMITIVE_FAILED;
+	}
+	intptr_t quotient = asCInt(receiver) / asCInt(argument);
+	return smallIntFits(quotient) ? tagInt(quotient) : PRIMITIVE_FAILED;
+}
+
+
+static Value primRemainder(Value *args, uint64_t argc)
+{
+	if (argc != 1) {
+		return PRIMITIVE_FAILED;
+	}
+	Value receiver = primitiveReceiver(args);
+	Value argument = primitiveArgument(args, 0);
+	if (!bothSmallIntegers(receiver, argument) || asCInt(argument) == 0) {
+		return PRIMITIVE_FAILED;
+	}
+	return tagInt(asCInt(receiver) % asCInt(argument));
+}
+
+
+static Value primNegated(Value *args, uint64_t argc)
+{
+	if (argc != 0) {
+		return PRIMITIVE_FAILED;
+	}
+	Value receiver = primitiveReceiver(args);
+	if (!valueTypeOf(receiver, VALUE_INT)) {
+		return PRIMITIVE_FAILED;
+	}
+	// minVal has no positive counterpart: the payload range is asymmetric, so
+	// negating it overflows and the LargeInteger fallback takes over.
+	intptr_t negated = -asCInt(receiver);
+	return smallIntFits(negated) ? tagInt(negated) : PRIMITIVE_FAILED;
+}
+
+
+static Value primAsFloat(Value *args, uint64_t argc)
+{
+	if (argc != 0) {
+		return PRIMITIVE_FAILED;
+	}
+	Value receiver = primitiveReceiver(args);
+	if (!valueTypeOf(receiver, VALUE_INT)) {
+		return PRIMITIVE_FAILED;
+	}
+	return floatResult((double) asCInt(receiver));
+}
+
+
 // ---------------------------------------------------------------------------
 // Comparison
 // ---------------------------------------------------------------------------
@@ -368,12 +431,12 @@ static Value compareNumbers(Value *args, uint64_t argc, Comparison how)
 }
 
 
+// Only `<` and `=` are primitives, because only those two are what the kernel
+// declares: Magnitude derives >, <= and >= from < in Smalltalk. The other four
+// comparison shapes stay reachable through compareNumbers so that promoting one
+// to a primitive later is a line in Primitives.def and not a rewrite.
 static Value primLess(Value *a, uint64_t n) { return compareNumbers(a, n, CMP_LESS); }
-static Value primGreater(Value *a, uint64_t n) { return compareNumbers(a, n, CMP_GREATER); }
-static Value primLessEqual(Value *a, uint64_t n) { return compareNumbers(a, n, CMP_LESS_EQUAL); }
-static Value primGreaterEqual(Value *a, uint64_t n) { return compareNumbers(a, n, CMP_GREATER_EQUAL); }
 static Value primNumericEqual(Value *a, uint64_t n) { return compareNumbers(a, n, CMP_EQUAL); }
-static Value primNumericNotEqual(Value *a, uint64_t n) { return compareNumbers(a, n, CMP_NOT_EQUAL); }
 
 
 // ---------------------------------------------------------------------------
@@ -741,88 +804,115 @@ static Value primBasicSize(Value *args, uint64_t argc)
 }
 
 
-static Value primArrayAt(Value *args, uint64_t argc)
+// ONE polymorphic at:, because that is what the kernel declares: AtPrimitive
+// sits on Object and String, ByteArray, Array and FloatArray all inherit it.
+//
+// The storage format answers almost everything, and the one case it cannot is
+// String versus ByteArray: both are FORMAT_BYTES, and at: answers a Character
+// for one and a SmallInteger for the other. That is decided by CLASS, which is
+// the only place in this file where the format is not enough.
+static _Bool receiverIsString(RawObject *object)
 {
-	RawObject *object;
-	size_t index;
-	if (!indexedTarget(args, argc, 1, FORMAT_INDEXED_POINTERS, &object, &index)) {
-		return PRIMITIVE_FAILED;
-	}
-	return indexedPointerBase(object)[index];
+	uint32_t index = rawObjectClassIndex(object);
+	return (Handles.String.raw != NULL && index == classIndexOf(&Handles.String))
+		|| (Handles.Symbol.raw != NULL && index == classIndexOf(&Handles.Symbol));
 }
 
 
-static Value primArrayAtPut(Value *args, uint64_t argc)
+static Value primAt(Value *args, uint64_t argc)
 {
-	RawObject *object;
-	size_t index;
-	if (!indexedTarget(args, argc, 2, FORMAT_INDEXED_POINTERS, &object, &index)) {
+	if (argc != 1) {
 		return PRIMITIVE_FAILED;
 	}
+	Value receiver = primitiveReceiver(args);
+	Value indexValue = primitiveArgument(args, 0);
+	if (!valueTypeOf(receiver, VALUE_POINTER) || !valueTypeOf(indexValue, VALUE_INT)) {
+		return PRIMITIVE_FAILED;
+	}
+	RawObject *object = asObject(receiver);
+	ObjectFormat format = rawObjectFormat(object);
+	if (format != FORMAT_INDEXED_POINTERS && format != FORMAT_BYTES
+			&& format != FORMAT_DOUBLES) {
+		return PRIMITIVE_FAILED; // not indexed at all
+	}
+	intptr_t oneBased = asCInt(indexValue);
+	if (oneBased < 1 || (size_t) oneBased > rawObjectElementCount(object)) {
+		return PRIMITIVE_FAILED; // the fallback raises a useful IndexOutOfBounds
+	}
+	size_t index = (size_t) oneBased - 1;
+
+	switch (format) {
+	case FORMAT_INDEXED_POINTERS:
+		return indexedPointerBase(object)[index];
+	case FORMAT_DOUBLES:
+		return floatResult(rawObjectDoubles(object)[index]);
+	default:
+		return receiverIsString(object)
+			? tagChar((char) rawObjectBytes(object)[index])
+			: tagInt((intptr_t) rawObjectBytes(object)[index]);
+	}
+}
+
+
+static Value primAtPut(Value *args, uint64_t argc)
+{
+	if (argc != 2) {
+		return PRIMITIVE_FAILED;
+	}
+	Value receiver = primitiveReceiver(args);
+	Value indexValue = primitiveArgument(args, 0);
 	Value value = primitiveArgument(args, 1);
-	// Through the generational write barrier, always. An old Array storing a
-	// young pointer without logging it is the bug that survives every test until
-	// the young object is collected while still reachable only from old space.
-	rawObjectStoreValue(object, &indexedPointerBase(object)[index], value);
-	return value; // at:put: answers the value stored
-}
-
-
-static Value primStringAt(Value *args, uint64_t argc)
-{
-	RawObject *object;
-	size_t index;
-	if (!indexedTarget(args, argc, 1, FORMAT_BYTES, &object, &index)) {
+	if (!valueTypeOf(receiver, VALUE_POINTER) || !valueTypeOf(indexValue, VALUE_INT)) {
 		return PRIMITIVE_FAILED;
 	}
-	return tagChar((char) rawObjectBytes(object)[index]);
-}
-
-
-static Value primStringAtPut(Value *args, uint64_t argc)
-{
-	RawObject *object;
-	size_t index;
-	if (!indexedTarget(args, argc, 2, FORMAT_BYTES, &object, &index)) {
+	RawObject *object = asObject(receiver);
+	ObjectFormat format = rawObjectFormat(object);
+	intptr_t oneBased = asCInt(indexValue);
+	if (format != FORMAT_INDEXED_POINTERS && format != FORMAT_BYTES
+			&& format != FORMAT_DOUBLES) {
 		return PRIMITIVE_FAILED;
 	}
-	Value value = primitiveArgument(args, 1);
-	if (!valueTypeOf(value, VALUE_CHAR)) {
+	if (oneBased < 1 || (size_t) oneBased > rawObjectElementCount(object)) {
 		return PRIMITIVE_FAILED;
 	}
-	rawObjectBytes(object)[index] = (uint8_t) (unsigned char) asCChar(value);
-	return value;
-}
+	size_t index = (size_t) oneBased - 1;
 
+	switch (format) {
+	case FORMAT_INDEXED_POINTERS:
+		// Through the generational write barrier, always. An old Array storing a
+		// young pointer without logging it is the bug that survives every test
+		// until the young object is collected while still reachable only from
+		// old space.
+		rawObjectStoreValue(object, &indexedPointerBase(object)[index], value);
+		return value;
 
-static Value primBytesAt(Value *args, uint64_t argc)
-{
-	RawObject *object;
-	size_t index;
-	if (!indexedTarget(args, argc, 1, FORMAT_BYTES, &object, &index)) {
-		return PRIMITIVE_FAILED;
+	case FORMAT_DOUBLES: {
+		Number number = numberOf(value);
+		if (number.kind == NUM_NOT) {
+			return PRIMITIVE_FAILED;
+		}
+		rawObjectDoubles(object)[index] = number.asFloat;
+		return value;
 	}
-	return tagInt((intptr_t) rawObjectBytes(object)[index]);
-}
 
-
-static Value primBytesAtPut(Value *args, uint64_t argc)
-{
-	RawObject *object;
-	size_t index;
-	if (!indexedTarget(args, argc, 2, FORMAT_BYTES, &object, &index)) {
-		return PRIMITIVE_FAILED;
+	default:
+		if (receiverIsString(object)) {
+			if (!valueTypeOf(value, VALUE_CHAR)) {
+				return PRIMITIVE_FAILED;
+			}
+			rawObjectBytes(object)[index] = (uint8_t) (unsigned char) asCChar(value);
+			return value;
+		}
+		if (!valueTypeOf(value, VALUE_INT)) {
+			return PRIMITIVE_FAILED;
+		}
+		intptr_t byte = asCInt(value);
+		if (byte < 0 || byte > 255) {
+			return PRIMITIVE_FAILED;
+		}
+		rawObjectBytes(object)[index] = (uint8_t) byte;
+		return value;
 	}
-	Value value = primitiveArgument(args, 1);
-	if (!valueTypeOf(value, VALUE_INT)) {
-		return PRIMITIVE_FAILED;
-	}
-	intptr_t byte = asCInt(value);
-	if (byte < 0 || byte > 255) {
-		return PRIMITIVE_FAILED;
-	}
-	rawObjectBytes(object)[index] = (uint8_t) byte;
-	return value;
 }
 
 
@@ -839,45 +929,9 @@ static const struct {
 	const char *name;
 } gPrimitives[PRIM_COUNT] = {
 	[PRIM_NONE] = { NULL, "none" },
-
-	[PRIM_ADD] = { primAdd, "+" },
-	[PRIM_SUBTRACT] = { primSubtract, "-" },
-	[PRIM_MULTIPLY] = { primMultiply, "*" },
-	[PRIM_DIVIDE] = { primDivide, "/" },
-	[PRIM_FLOOR_DIVIDE] = { primFloorDivide, "//" },
-	[PRIM_FLOOR_MODULO] = { primFloorModulo, "\\\\" },
-
-	[PRIM_LESS] = { primLess, "<" },
-	[PRIM_GREATER] = { primGreater, ">" },
-	[PRIM_LESS_EQUAL] = { primLessEqual, "<=" },
-	[PRIM_GREATER_EQUAL] = { primGreaterEqual, ">=" },
-	[PRIM_NUMERIC_EQUAL] = { primNumericEqual, "=" },
-	[PRIM_NUMERIC_NOT_EQUAL] = { primNumericNotEqual, "~=" },
-
-	[PRIM_BIT_AND] = { primBitAnd, "bitAnd:" },
-	[PRIM_BIT_OR] = { primBitOr, "bitOr:" },
-	[PRIM_BIT_XOR] = { primBitXor, "bitXor:" },
-	[PRIM_BIT_SHIFT] = { primBitShift, "bitShift:" },
-
-	[PRIM_IDENTICAL] = { primIdentical, "==" },
-	[PRIM_NOT_IDENTICAL] = { primNotIdentical, "~~" },
-	[PRIM_CLASS] = { primClass, "class" },
-	[PRIM_IDENTITY_HASH] = { primIdentityHash, "identityHash" },
-
-	[PRIM_BASIC_NEW] = { primBasicNew, "basicNew" },
-	[PRIM_BASIC_NEW_SIZED] = { primBasicNewSized, "basicNew:" },
-
-	[PRIM_CLOSURE_VALUE] = { primClosureValue, "value" },
-	[PRIM_CLOSURE_VALUE1] = { primClosureValue1, "value:" },
-	[PRIM_CLOSURE_VALUE2] = { primClosureValue2, "value:value:" },
-
-	[PRIM_BASIC_SIZE] = { primBasicSize, "basicSize" },
-	[PRIM_ARRAY_AT] = { primArrayAt, "Array>>at:" },
-	[PRIM_ARRAY_AT_PUT] = { primArrayAtPut, "Array>>at:put:" },
-	[PRIM_STRING_AT] = { primStringAt, "String>>at:" },
-	[PRIM_STRING_AT_PUT] = { primStringAtPut, "String>>at:put:" },
-	[PRIM_BYTES_AT] = { primBytesAt, "ByteArray>>at:" },
-	[PRIM_BYTES_AT_PUT] = { primBytesAtPut, "ByteArray>>at:put:" },
+#define PRIMITIVE(id, name, function) [PRIM_##id] = { function, name },
+#include "runtime/Primitives.def"
+#undef PRIMITIVE
 };
 
 
@@ -886,10 +940,8 @@ PrimitiveFunction primitiveFunctionAt(PrimitiveNumber number)
 	// An out-of-range number is a bug in whoever built the method, and it must
 	// not degrade into a send that quietly answers nothing.
 	ASSERT(number < PRIM_COUNT);
-	// Every slot past PRIM_NONE must be filled: a hole would be a method whose
-	// primitive silently never runs, which reads as a performance mystery rather
-	// than as the wiring mistake it is.
-	ASSERT(number == PRIM_NONE || gPrimitives[number].function != NULL);
+	// NULL is legal and means DECLARED BUT NOT IMPLEMENTED: the method compiles
+	// and runs its Smalltalk fallback. The caller checks; nothing here guesses.
 	return gPrimitives[number].function;
 }
 
@@ -898,4 +950,35 @@ const char *primitiveName(PrimitiveNumber number)
 {
 	ASSERT(number < PRIM_COUNT);
 	return gPrimitives[number].name;
+}
+
+
+PrimitiveNumber primitiveNumberNamed(const char *name, size_t length)
+{
+	// Linear over 173 entries, once per method COMPILED, which is not a path
+	// worth a hash table until it shows up in a profile.
+	for (int i = 1; i < PRIM_COUNT; i++) {
+		const char *candidate = gPrimitives[i].name;
+		if (strncmp(candidate, name, length) == 0 && candidate[length] == 0) {
+			return (PrimitiveNumber) i;
+		}
+	}
+	return PRIM_NONE;
+}
+
+
+void primitiveCoverage(size_t *implemented, size_t *declared)
+{
+	size_t have = 0;
+	for (int i = 1; i < PRIM_COUNT; i++) {
+		if (gPrimitives[i].function != NULL) {
+			have++;
+		}
+	}
+	if (implemented != NULL) {
+		*implemented = have;
+	}
+	if (declared != NULL) {
+		*declared = (size_t) PRIM_COUNT - 1;
+	}
 }

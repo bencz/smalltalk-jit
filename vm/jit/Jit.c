@@ -597,9 +597,28 @@ NativeCode *jitCompile(CodeUnit *unit, Opcode *unsupported)
 // Compile for a SPECIFIC backend. The host case is what runs; a foreign backend
 // is what the cross-emission test uses to check byte-for-byte output on a
 // machine that cannot execute it.
+// The three singletons whose addresses generated code BAKES: nil in the
+// prologue's slot fill and in OP_LOADNIL, true and false in OP_LOADTRUE /
+// OP_LOADFALSE and in every inlined conditional's compare.
+//
+// Baking is legal ONLY because they never move (memory/Heap.h,
+// allocateImmortalObject). This is asserted at EVERY compilation rather than
+// trusted to a bootstrap, because the failure is silent: everything works until
+// the first collection moves the singleton, after which a value that IS false
+// stops matching the baked false and the method falls into its mustBeBoolean
+// path. Measured, not imagined -- it is how this assertion came to exist.
+static void assertSingletonsAreImmortal(void)
+{
+	ASSERT(Handles.nil.raw != NULL && isOldObject(Handles.nil.raw));
+	ASSERT(Handles.true_.raw != NULL && isOldObject(Handles.true_.raw));
+	ASSERT(Handles.false_.raw != NULL && isOldObject(Handles.false_.raw));
+}
+
+
 NativeCode *jitCompileFor(const MacroAssemblerOps *ops, CodeUnit *unit,
 	Opcode *unsupported)
 {
+	assertSingletonsAreImmortal();
 	JitContext jit;
 	jit.unit = unit;
 	jit.assembler = maCreate(ops, unit->registerCount, unit->argumentCount);
@@ -633,10 +652,16 @@ NativeCode *jitCompileFor(const MacroAssemblerOps *ops, CodeUnit *unit,
 	// Note also what this does to the bci map: machineOffsetAt[0] points PAST
 	// the primitive attempt, which is correct, because arriving at bci 0 through
 	// deoptimization or OSR means the primitive has already failed once.
-	if (unit->primitive != PRIM_NONE) {
-		maCallPrimitive(jit.assembler,
-			primitiveFunctionAt((PrimitiveNumber) unit->primitive),
-			unit->argumentCount);
+	//
+	// A DECLARED but not yet IMPLEMENTED primitive emits nothing at all, and the
+	// method runs its Smalltalk fallback. That is what lets the whole kernel
+	// compile while the VM implements the primitives a few at a time: 173 names
+	// are declared in packages/ and only some have C behind them
+	// (runtime/Primitives.def).
+	PrimitiveFunction primitive = unit->primitive != PRIM_NONE
+		? primitiveFunctionAt((PrimitiveNumber) unit->primitive) : NULL;
+	if (primitive != NULL) {
+		maCallPrimitive(jit.assembler, primitive, unit->argumentCount);
 	}
 
 	_Bool ok = 1;

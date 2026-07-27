@@ -181,9 +181,14 @@ static void bootstrapMinimal(Heap *heap)
 	withMethods(&Handles.Character);
 	withMethods(&Handles.Closure);
 
-	Handles.nil.raw = ((Object *) newObject(&Handles.UndefinedObject, 0))->raw;
-	Handles.true_.raw = ((Object *) newObject(&Handles.True, 0))->raw;
-	Handles.false_.raw = ((Object *) newObject(&Handles.False, 0))->raw;
+	// IMMORTAL, and that is load-bearing rather than tidy: generated code bakes
+	// these three addresses as immediates -- `ifTrue:` is a compare against the
+	// true singleton, the prologue fills unused slots with nil -- so they must
+	// never move. In the nursery everything works until the first collection,
+	// after which a value that IS false stops matching the baked false.
+	Handles.nil.raw = ((Object *) newImmortalObject(&Handles.UndefinedObject, 0))->raw;
+	Handles.true_.raw = ((Object *) newImmortalObject(&Handles.True, 0))->raw;
+	Handles.false_.raw = ((Object *) newImmortalObject(&Handles.False, 0))->raw;
 
 	// Immediates have no header, so their classes are found by tag. Unlike the
 	// level-3 test, these are three DISTINCT classes here, because the whole
@@ -357,13 +362,13 @@ int main(void)
 	// The numeric primitives go on BOTH numeric classes, which is what makes
 	// `3 + 4.0` and `3.0 + 4` reach the same code from opposite receivers.
 	static const struct { const char *selector; PrimitiveNumber primitive; } binary[] = {
-		{ "+", PRIM_ADD }, { "-", PRIM_SUBTRACT }, { "*", PRIM_MULTIPLY },
-		{ "/", PRIM_DIVIDE }, { "//", PRIM_FLOOR_DIVIDE }, { "\\\\", PRIM_FLOOR_MODULO },
-		{ "<", PRIM_LESS }, { ">", PRIM_GREATER },
-		{ "<=", PRIM_LESS_EQUAL }, { ">=", PRIM_GREATER_EQUAL },
-		{ "=", PRIM_NUMERIC_EQUAL }, { "~=", PRIM_NUMERIC_NOT_EQUAL },
-		{ "bitAnd:", PRIM_BIT_AND }, { "bitOr:", PRIM_BIT_OR },
-		{ "bitXor:", PRIM_BIT_XOR }, { "bitShift:", PRIM_BIT_SHIFT },
+		{ "+", PRIM_IntAdd }, { "-", PRIM_IntSub }, { "*", PRIM_IntMul },
+		{ "/", PRIM_FloatDiv }, { "//", PRIM_IntFloorDiv }, { "\\\\", PRIM_IntMod },
+		// Only < and = : the kernel derives >, <= and >= from < in Smalltalk
+		// (Magnitude), so those are not primitives and are not faked here.
+		{ "<", PRIM_IntLessThan }, { "=", PRIM_FloatEquals },
+		{ "bitAnd:", PRIM_IntAnd }, { "bitOr:", PRIM_IntOr },
+		{ "bitXor:", PRIM_IntXor }, { "bitShift:", PRIM_IntShift },
 	};
 	for (size_t i = 0; i < sizeof(binary) / sizeof(binary[0]); i++) {
 		definePrimitive(smallInteger, binary[i].selector, binary[i].primitive, 1,
@@ -470,17 +475,14 @@ int main(void)
 	// ---- comparison ---------------------------------------------------------
 	printf("\n  -- comparison\n");
 	NativeCode *less = binarySender("<");
-	NativeCode *greaterEqual = binarySender(">=");
 	NativeCode *equal = binarySender("=");
-	NativeCode *notEqual = binarySender("~=");
 	checkBoolean("3 < 4", sendBinary(less, tagInt(3), tagInt(4)), 1);
 	checkBoolean("4 < 3", sendBinary(less, tagInt(4), tagInt(3)), 0);
 	checkBoolean("3 < 3", sendBinary(less, tagInt(3), tagInt(3)), 0);
 	checkBoolean("-1 < 1, where an unsigned compare would disagree",
 		sendBinary(less, tagInt(-1), tagInt(1)), 1);
-	checkBoolean("3 >= 3", sendBinary(greaterEqual, tagInt(3), tagInt(3)), 1);
 	checkBoolean("3 = 3", sendBinary(equal, tagInt(3), tagInt(3)), 1);
-	checkBoolean("3 ~= 4", sendBinary(notEqual, tagInt(3), tagInt(4)), 1);
+	checkBoolean("3 = 4", sendBinary(equal, tagInt(3), tagInt(4)), 0);
 	checkBoolean("2.5 < 3", sendBinary(less, tagFloat(2.5), tagInt(3)), 1);
 	checkBoolean("3 = 3.0 across representations",
 		sendBinary(equal, tagInt(3), tagFloat(3.0)), 1);
@@ -520,8 +522,8 @@ int main(void)
 	// checked by reading slots back after the fact.
 	printf("\n  -- the frame, on both sides of the call\n");
 	Class *frameProbe = defineClass((InstanceShape) DEFINE_SHAPE(FORMAT_POINTERS, 0, 0, 0));
-	definePrimitive(frameProbe, "echoReceiver:", PRIM_ADD, 1, FALLBACK_RECEIVER);
-	definePrimitive(frameProbe, "echoArgument:", PRIM_ADD, 1, FALLBACK_ARGUMENT);
+	definePrimitive(frameProbe, "echoReceiver:", PRIM_IntAdd, 1, FALLBACK_RECEIVER);
+	definePrimitive(frameProbe, "echoArgument:", PRIM_IntAdd, 1, FALLBACK_ARGUMENT);
 	Object *probe = newObject(frameProbe, 0);
 	check("a failed primitive leaves the RECEIVER slot intact for the fallback",
 		sendBinary(binarySender("echoReceiver:"), tagPtr(probe->raw), tagInt(5))
@@ -545,9 +547,9 @@ int main(void)
 	printf("\n  -- identity and reflection\n");
 	// On Object ONLY, so a SmallInteger receiver has to reach them through the
 	// superclass walk rather than finding them in its own dictionary.
-	definePrimitive(&Handles.ObjectClass, "==", PRIM_IDENTICAL, 1, FALLBACK_CONSTANT);
-	definePrimitive(&Handles.ObjectClass, "class", PRIM_CLASS, 0, FALLBACK_CONSTANT);
-	definePrimitive(&Handles.ObjectClass, "identityHash", PRIM_IDENTITY_HASH, 0,
+	definePrimitive(&Handles.ObjectClass, "==", PRIM_Identity, 1, FALLBACK_CONSTANT);
+	definePrimitive(&Handles.ObjectClass, "class", PRIM_Class, 0, FALLBACK_CONSTANT);
+	definePrimitive(&Handles.ObjectClass, "identityHash", PRIM_Hash, 0,
 		FALLBACK_CONSTANT);
 	NativeCode *identical = binarySender("==");
 	NativeCode *classOfSender = unarySender("class");
@@ -577,15 +579,15 @@ int main(void)
 	// because String and ByteArray share FORMAT_BYTES and at: answers a
 	// Character for one and a SmallInteger for the other.
 	printf("\n  -- at:, at:put: and size, which are sends like everything else\n");
-	definePrimitive(&Handles.Array, "at:", PRIM_ARRAY_AT, 1, FALLBACK_CONSTANT);
-	definePrimitive(&Handles.Array, "at:put:", PRIM_ARRAY_AT_PUT, 2, FALLBACK_CONSTANT);
-	definePrimitive(&Handles.Array, "basicSize", PRIM_BASIC_SIZE, 0, FALLBACK_CONSTANT);
-	definePrimitive(&Handles.String, "at:", PRIM_STRING_AT, 1, FALLBACK_CONSTANT);
-	definePrimitive(&Handles.String, "at:put:", PRIM_STRING_AT_PUT, 2, FALLBACK_CONSTANT);
-	definePrimitive(&Handles.String, "basicSize", PRIM_BASIC_SIZE, 0, FALLBACK_CONSTANT);
-	definePrimitive(&Handles.ByteArray, "at:", PRIM_BYTES_AT, 1, FALLBACK_CONSTANT);
-	definePrimitive(&Handles.ByteArray, "at:put:", PRIM_BYTES_AT_PUT, 2, FALLBACK_CONSTANT);
-	definePrimitive(&Handles.ObjectClass, "basicSize", PRIM_BASIC_SIZE, 0,
+	definePrimitive(&Handles.Array, "at:", PRIM_At, 1, FALLBACK_CONSTANT);
+	definePrimitive(&Handles.Array, "at:put:", PRIM_AtPut, 2, FALLBACK_CONSTANT);
+	definePrimitive(&Handles.Array, "basicSize", PRIM_Size, 0, FALLBACK_CONSTANT);
+	definePrimitive(&Handles.String, "at:", PRIM_At, 1, FALLBACK_CONSTANT);
+	definePrimitive(&Handles.String, "at:put:", PRIM_AtPut, 2, FALLBACK_CONSTANT);
+	definePrimitive(&Handles.String, "basicSize", PRIM_Size, 0, FALLBACK_CONSTANT);
+	definePrimitive(&Handles.ByteArray, "at:", PRIM_At, 1, FALLBACK_CONSTANT);
+	definePrimitive(&Handles.ByteArray, "at:put:", PRIM_AtPut, 2, FALLBACK_CONSTANT);
+	definePrimitive(&Handles.ObjectClass, "basicSize", PRIM_Size, 0,
 		FALLBACK_CONSTANT);
 
 	NativeCode *at = binarySender("at:");
@@ -705,6 +707,34 @@ int main(void)
 		icDominantClass(polyCell, &fraction) == classIndexOf(smallInteger)
 		&& fraction > 0.74 && fraction < 0.76);
 
+	// ---- the NAMES, which are the contract with packages/ -------------------
+	//
+	// A primitive is reached from Smalltalk by pragma, `<primitive: IntAddPrimitive>`,
+	// and runtime/Primitives.def was extracted from packages/ rather than
+	// invented. These checks are what keeps the two from drifting.
+	printf("\n  -- the names packages/ actually writes\n");
+	check("a kernel name resolves to its primitive",
+		primitiveNumberNamed("IntAddPrimitive", 15) == PRIM_IntAdd
+		&& primitiveNumberNamed("BlockValuePrimitive", 19) == PRIM_BlockValue);
+	check("a name that is only a PREFIX of a real one does not match",
+		primitiveNumberNamed("IntAdd", 6) == PRIM_NONE);
+	check("a name nobody declares answers PRIM_NONE rather than guessing",
+		primitiveNumberNamed("NoSuchPrimitive", 15) == PRIM_NONE);
+	check("Int and Float arithmetic share ONE implementation, which is what makes "
+		"mixed arithmetic a fast path instead of a coercion send",
+		primitiveFunctionAt(PRIM_IntAdd) == primitiveFunctionAt(PRIM_FloatAdd)
+		&& primitiveFunctionAt(PRIM_IntLessThan) == primitiveFunctionAt(PRIM_FloatLessThan));
+	check("a DECLARED but unimplemented primitive is a real number with no "
+		"function, so the method compiles and runs its fallback",
+		PRIM_FloatSin != PRIM_NONE && primitiveFunctionAt(PRIM_FloatSin) == NULL);
+	{
+		size_t implemented = 0, declared = 0;
+		primitiveCoverage(&implemented, &declared);
+		printf("        primitives: %zu of %zu declared by packages/ are implemented\n",
+			implemented, declared);
+		check("every name packages/ uses is declared here", declared == 173);
+	}
+
 	// ---- closures, at the bytecode level ------------------------------------
 	//
 	// ADR 0008: a block captures BY VALUE into itself, and a variable that is
@@ -713,8 +743,8 @@ int main(void)
 	// it that way: the mechanism can be wrong in ways the source level would
 	// hide.
 	printf("\n  -- closures: flat captures, and cells for what is mutated\n");
-	definePrimitive(&Handles.Closure, "value", PRIM_CLOSURE_VALUE, 0, FALLBACK_CONSTANT);
-	definePrimitive(&Handles.Closure, "value:", PRIM_CLOSURE_VALUE1, 1, FALLBACK_CONSTANT);
+	definePrimitive(&Handles.Closure, "value", PRIM_BlockValue, 0, FALLBACK_CONSTANT);
+	definePrimitive(&Handles.Closure, "value:", PRIM_BlockValue1, 1, FALLBACK_CONSTANT);
 
 	// The block: register 0 is the CLOSURE, so GETUP reaches a capture with one
 	// load and no chain to walk.
@@ -830,7 +860,7 @@ int main(void)
 	crossCode[0] = (Instruction) { OP_LOADI, 0, 2, 0, 0 };
 	crossCode[1] = (Instruction) { OP_RET, 0, 2, 0, 0 };
 	CodeUnit *crossUnit = makeUnit(crossCode, 2, 3, 1, NULL);
-	crossUnit->primitive = PRIM_ADD;
+	crossUnit->primitive = PRIM_IntAdd;
 	const MacroAssemblerOps *sysv = maBackendNamed("x64");
 	const MacroAssemblerOps *win64 = maBackendNamed("x64-win64");
 	NativeCode *forSysV = jitCompileFor(sysv, crossUnit, &unsupported);

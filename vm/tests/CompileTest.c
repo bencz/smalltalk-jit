@@ -155,9 +155,14 @@ static void bootstrapKernel(Heap *heap)
 	Handles.FalseNode.raw = fixedClass(object, 2)->raw;
 
 	Handles.symbolTable.raw = newArray(1024)->raw;
-	Handles.nil.raw = ((Object *) newObject(&Handles.UndefinedObject, 0))->raw;
-	Handles.true_.raw = ((Object *) newObject(&Handles.True, 0))->raw;
-	Handles.false_.raw = ((Object *) newObject(&Handles.False, 0))->raw;
+	// IMMORTAL, and that is load-bearing rather than tidy: generated code bakes
+	// these three addresses as immediates -- `ifTrue:` is a compare against the
+	// true singleton, the prologue fills unused slots with nil -- so they must
+	// never move. In the nursery everything works until the first collection,
+	// after which a value that IS false stops matching the baked false.
+	Handles.nil.raw = ((Object *) newImmortalObject(&Handles.UndefinedObject, 0))->raw;
+	Handles.true_.raw = ((Object *) newImmortalObject(&Handles.True, 0))->raw;
+	Handles.false_.raw = ((Object *) newImmortalObject(&Handles.False, 0))->raw;
 
 	gImmediateClasses.smallInteger = classIndexOf(&Handles.SmallInteger);
 	gImmediateClasses.character = classIndexOf(&Handles.Character);
@@ -209,11 +214,10 @@ static void installPrimitives(void)
 		PrimitiveNumber primitive;
 		uint16_t argumentCount;
 	} arithmetic[] = {
-		{ "+", PRIM_ADD, 1 }, { "-", PRIM_SUBTRACT, 1 }, { "*", PRIM_MULTIPLY, 1 },
-		{ "//", PRIM_FLOOR_DIVIDE, 1 }, { "\\\\", PRIM_FLOOR_MODULO, 1 },
-		{ "<", PRIM_LESS, 1 }, { ">", PRIM_GREATER, 1 },
-		{ "<=", PRIM_LESS_EQUAL, 1 }, { ">=", PRIM_GREATER_EQUAL, 1 },
-		{ "=", PRIM_NUMERIC_EQUAL, 1 }, { "~=", PRIM_NUMERIC_NOT_EQUAL, 1 },
+		{ "+", PRIM_IntAdd, 1 }, { "-", PRIM_IntSub, 1 }, { "*", PRIM_IntMul, 1 },
+		{ "//", PRIM_IntFloorDiv, 1 }, { "\\\\", PRIM_IntMod, 1 },
+		// Only < and = are primitives, because that is all the kernel declares.
+		{ "<", PRIM_IntLessThan, 1 }, { "=", PRIM_FloatEquals, 1 },
 	};
 	for (size_t i = 0; i < sizeof(arithmetic) / sizeof(arithmetic[0]); i++) {
 		definePrimitive(&Handles.SmallInteger, arithmetic[i].selector,
@@ -221,15 +225,15 @@ static void installPrimitives(void)
 		definePrimitive(&Handles.SmallFloat64, arithmetic[i].selector,
 			arithmetic[i].primitive, arithmetic[i].argumentCount);
 	}
-	definePrimitive(&Handles.ObjectClass, "==", PRIM_IDENTICAL, 1);
-	definePrimitive(&Handles.ObjectClass, "class", PRIM_CLASS, 0);
-	definePrimitive(&Handles.Array, "at:", PRIM_ARRAY_AT, 1);
-	definePrimitive(&Handles.Array, "at:put:", PRIM_ARRAY_AT_PUT, 2);
-	definePrimitive(&Handles.Array, "size", PRIM_BASIC_SIZE, 0);
+	definePrimitive(&Handles.ObjectClass, "==", PRIM_Identity, 1);
+	definePrimitive(&Handles.ObjectClass, "class", PRIM_Class, 0);
+	definePrimitive(&Handles.Array, "at:", PRIM_At, 1);
+	definePrimitive(&Handles.Array, "at:put:", PRIM_AtPut, 2);
+	definePrimitive(&Handles.Array, "size", PRIM_Size, 0);
 	// `new` is a send to a CLASS, so the primitives go on the class-of-classes:
 	// its instances are the classes themselves.
-	definePrimitive(&Handles.ClassClass, "new", PRIM_BASIC_NEW, 0);
-	definePrimitive(&Handles.ClassClass, "new:", PRIM_BASIC_NEW_SIZED, 1);
+	definePrimitive(&Handles.ClassClass, "new", PRIM_BehaviorNew, 0);
+	definePrimitive(&Handles.ClassClass, "new:", PRIM_BehaviorNewSize, 1);
 }
 
 
@@ -347,6 +351,14 @@ int main(void)
 	rawObjectStorePtr((RawObject *) counter->raw, &counter->raw->instanceVariables,
 		(RawObject *) ivars->raw);
 	Object *instance = newObject(counter, 0);
+
+	// `>` and `<=` are NOT primitives: the kernel derives the whole relational
+	// protocol from `<` in Smalltalk (Magnitude), so they are defined here the
+	// same way. Everything below that compares goes through these, which means
+	// the loops are exercising real dispatch and not a C shortcut.
+	define(&Handles.SmallInteger, "> aNumber [ ^aNumber < self ]");
+	define(&Handles.SmallInteger,
+		"<= aNumber [ (aNumber < self) ifTrue: [ ^false ]. ^true ]");
 
 	// ---- the smallest thing that can work ----------------------------------
 	printf("  -- literals and arguments\n");

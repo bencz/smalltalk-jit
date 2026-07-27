@@ -3,6 +3,7 @@
 #include "core/Class.h"
 #include "core/Smalltalk.h"
 #include "runtime/Collection.h"
+#include "runtime/Primitive.h"
 #include "runtime/String.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -860,6 +861,39 @@ CodeUnit *compileMethod(MethodNode *method, const CompileContext *context,
 
 	BlockNode *body = methodNodeGetBody(method);
 
+	// <primitive: IntAddPrimitive>
+	//
+	// The pragma is how a method declares what runs before its Smalltalk body,
+	// and the NAME is the contract with packages/ (runtime/Primitives.def). A
+	// name the VM has never heard of is an ERROR, because it is a typo or a
+	// primitive nobody wrote; a name that is known but NOT IMPLEMENTED is fine,
+	// and the method simply runs the fallback it already carries. Those two
+	// cases look identical from the outside and must not be treated the same.
+	uint16_t primitive = PRIM_NONE;
+	OrderedCollection *pragmas = methodNodeGetPragmas(method);
+	size_t pragmaCount = pragmas == NULL ? 0 : ordCollSize(pragmas);
+	for (size_t i = 0; i < pragmaCount; i++) {
+		MessageExpressionNode *pragma = scopeHandle(asObject(ordCollAt(pragmas, i)));
+		if (!stringEqualsC(messageExpressionNodeGetSelector(pragma), "primitive:")) {
+			continue;
+		}
+		OrderedCollection *arguments = messageExpressionNodeGetArgs(pragma);
+		if (arguments == NULL || ordCollSize(arguments) != 1) {
+			continue;
+		}
+		LiteralNode *named = scopeHandle(asObject(ordCollAt(arguments, 0)));
+		String *name = literalNodeGetStringValue(named);
+		PrimitiveNumber number = primitiveNumberNamed(name->raw->contents,
+			rawStringSize(name->raw));
+		if (number == PRIM_NONE) {
+			error->status = COMPILE_UNKNOWN_PRIMITIVE;
+			error->what = name;
+			closeHandleScope(&outer, NULL);
+			return NULL;
+		}
+		primitive = (uint16_t) number;
+	}
+
 	Scope scope;
 	scopePush(&e, &scope);
 
@@ -905,6 +939,7 @@ CodeUnit *compileMethod(MethodNode *method, const CompileContext *context,
 	unit->instructionCount = e.count;
 	unit->registerCount = e.registerCount;
 	unit->argumentCount = (uint16_t) argumentCount;
+	unit->primitive = primitive;
 	unit->literals = objectTagged(ordCollAsArray(e.literals));
 	unit->selector = objectTagged(asSymbol(methodNodeGetSelector(method)));
 	if (context->ownerClass != NULL) {
@@ -924,6 +959,7 @@ const char *compileStatusName(CompileStatus status)
 	case COMPILE_TOO_MANY_LITERALS: return "too many literals";
 	case COMPILE_TOO_MANY_INSTRUCTIONS: return "too many instructions";
 	case COMPILE_BAD_INLINE_BLOCK: return "block of the wrong shape";
+	case COMPILE_UNKNOWN_PRIMITIVE: return "unknown primitive name";
 	default: return "unsupported construct";
 	}
 }

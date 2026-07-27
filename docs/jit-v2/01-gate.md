@@ -164,6 +164,7 @@ Apendar, nunca reescrever. Data, commit, o que destravou.
 | 2026-07-27 | **8** | (nao commitado) | front end: 40 de 40; fonte -> bytecode -> maquina, sem bloco nao-inlinado ainda |
 | 2026-07-27 | 8 | (nao commitado) | frames compilados viraram raizes: alocar de codigo compilado ficou seguro |
 | 2026-07-27 | 7 | (nao commitado) | closures planas com celulas (ADR 0008) em bytecode: 104 de 104 |
+| 2026-07-27 | 7 | (nao commitado) | nomes de primitiva alinhados a packages/ (173 declaradas, 31 implementadas): 109 de 109 |
 
 ## O que o nivel 7 encontrou, e por que so ele podia encontrar
 
@@ -283,7 +284,29 @@ Tambem faltam, e pelo mesmo motivo:
 - **retorno nao local** (`^` dentro de bloco), que depende do token de frame
   home do ADR 0008.
 
-## O contrato REAL esta em packages/, e ele discorda dos meus nomes
+## Um baked pointer que o coletor movia
+
+O terceiro da mesma familia (celula de IC, literal de CodeUnit, e agora este), e o
+mais barato de errar: **`nil`, `true` e `false` sao BAKEADOS como imediatos no
+codigo gerado.** `ifTrue:` inlinado e um compare contra o singleton `true`, e o
+prologo enche os slots nao usados com `nil`, e as duas coisas sao uma instrucao
+so porque o endereco e constante.
+
+So que os tres eram alocados na NURSERY, entao a primeira coleta os movia e todo
+compare bakeado parava de casar. O sintoma: um metodo que recebe `false` nao
+entra em nenhum dos dois bracos e cai no caminho `mustBeBoolean`, para um valor
+que E `false`. Nada quebra ate a primeira coleta, e o programa que revelou isso
+alocava 64 MB num laco.
+
+**Conserto**: `allocateImmortalObject` poe os tres na old space, que nao move
+(ADR 0005), entao o endereco e permanente e bakear passa a ser legitimo.
+
+**A guarda e um ASSERT, nao um teste**: `jitCompileFor` confere em TODA
+compilacao que os tres sao `isOldObject`. Vale mais que teste porque roda em toda
+compilacao de toda execucao da suite, e porque o modo de falha e silencio. Ele
+imediatamente pegou o bootstrap do nivel 3, que ainda alocava `nil` na nursery.
+
+## O contrato REAL esta em packages/, e ele agora e o que o VM fala
 
 Achado tarde e registrado antes de virar retrabalho maior.
 
@@ -297,18 +320,37 @@ nomes distintos** em uso:
 ]
 ```
 
-Ou seja o enum de `runtime/Primitive.h` tem os nomes errados: `PRIM_ADD` deveria
-ser `IntAddPrimitive`, `PRIM_BASIC_NEW` deveria ser `BehaviorNewPrimitive`,
-`PRIM_CLOSURE_VALUE` deveria ser `BlockValuePrimitive`, e assim por diante. O
-mapeamento e mecanico e esta levantado; o que falta e o front end PARSEAR a
-pragma, que hoje ele ignora.
+FEITO. `vm/runtime/Primitives.def` foi **extraido de packages/**, nao inventado:
+as 173 declaradas, cada uma com o nome que o kernel escreve. E um X-macro
+incluido duas vezes, uma para o enum e outra para a tabela, entao nome e
+implementacao nao tem como divergir. O front end le a pragma.
+
+Tres regras que sairam disso:
+
+- **nome desconhecido e ERRO de compilacao** (e typo, ou primitiva que ninguem
+  escreveu). **Nome conhecido sem implementacao NAO e erro**: o metodo compila, a
+  tentativa de primitiva simplesmente nao e emitida, e ele roda o fallback
+  Smalltalk que ja carrega. As duas situacoes sao indistinguiveis de fora e
+  tratar iguais seria esconder o typo;
+- por isso o `.def` e tambem o **checklist de paridade**: hoje **31 de 173**, e
+  `primitiveCoverage()` responde isso em runtime em vez de alguem contar NULLs;
+- `IntAddPrimitive` e `FloatAddPrimitive` apontam para a MESMA funcao. E de graca
+  e e exatamente o caminho rapido de aritmetica mista que o v1 nao tinha e pagava
+  100x.
+
+Uma consequencia de desenho: o kernel declara so `<` e `=` como primitiva de
+comparacao, e deriva `>`, `<=` e `>=` em Smalltalk (Magnitude). Os testes
+passaram a fazer o mesmo, entao o laco de `to:do:` agora exercita despacho de
+verdade e nao um atalho em C.
 
 Duas divergencias de desenho que a leitura revelou, e que nao sao renomeacao:
 
 1. **`AtPrimitive` e UMA primitiva polimorfica em `Object`**, herdada por String,
-   ByteArray e Array. Eu dividi em `PRIM_ARRAY_AT` / `PRIM_STRING_AT` /
-   `PRIM_BYTES_AT` porque o formato nao distingue String de ByteArray. Ou a
-   primitiva unica passa a consultar a classe, ou as subclasses declaram a sua.
+   ByteArray, Array e FloatArray. RESOLVIDO do jeito do kernel: uma so, que
+   decide pelo FORMATO. O unico caso que o formato nao resolve e String contra
+   ByteArray (os dois sao `FORMAT_BYTES` e `at:` responde Character para um e
+   SmallInteger para o outro), e esse desempata por CLASSE. E o unico lugar deste
+   arquivo onde o formato nao basta, e esta dito la.
 2. **`Block.st` ainda e o desenho de CONTEXTOS do v1**: `<shape: BlockShape>` com
    `| compiledBlock receiver outerContext homeContext |`. O ADR 0008 substitui
    isso por closure plana, entao esse arquivo muda. O ADR ja aceitou a mudanca de

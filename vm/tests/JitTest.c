@@ -124,10 +124,11 @@ static void bootstrapMinimal(Heap *heap)
 	Handles.SmallInteger.raw = classCreate(NULL, NULL, fixed0)->raw;
 
 	Handles.symbolTable.raw = newArray(1024)->raw;
-	Handles.nil.raw = newObject(&Handles.UndefinedObject, 0);
-	Handles.nil.raw = ((Object *) Handles.nil.raw)->raw;
-	Handles.true_.raw = ((Object *) newObject(&Handles.True, 0))->raw;
-	Handles.false_.raw = ((Object *) newObject(&Handles.False, 0))->raw;
+	// IMMORTAL: generated code bakes these three addresses as immediates, so
+	// they must never move. jitCompileFor asserts it on every compilation.
+	Handles.nil.raw = ((Object *) newImmortalObject(&Handles.UndefinedObject, 0))->raw;
+	Handles.true_.raw = ((Object *) newImmortalObject(&Handles.True, 0))->raw;
+	Handles.false_.raw = ((Object *) newImmortalObject(&Handles.False, 0))->raw;
 
 	// Immediates have no header, so their classes are found by tag.
 	gImmediateClasses.smallInteger = classIndexOf(&Handles.SmallInteger);
