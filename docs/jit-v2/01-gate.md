@@ -956,6 +956,143 @@ deixa, e `-f` e o primeiro que constroi um.
 item entre outros, sao o que destranca a suite. O unwind que o retorno nao local
 ja construiu e a metade que existe.
 
+## Excecoes: UMA cadeia, tres tipos de entrada
+
+Feito. `on:do:`, `signal`, `ensure:`, `ifCurtailed:`, `resume:`, `return:`,
+`retry`, `pass`, `outer`, `resignalAs:`. O PROTOCOLO inteiro ja estava escrito em
+Smalltalk (`Exception.st`, `HandlerEscape.st`, `Block.st`) e nao foi tocado; o
+que entrou sao **tres primitivas** e o que Smalltalk nao consegue expressar:
+tomar um destino de salto, achar um handler atravessando frames que a linguagem
+nao ve, e rodar um cleanup na saida.
+
+**Uma cadeia so, com tres tipos de entrada** (`UNWIND_HOME`, `UNWIND_HANDLER`,
+`UNWIND_CLEANUP`). Os tres sao "um ponto na pilha C, ordenado por aninhamento,
+que sair atravessando tem que notar"; em tres cadeias separadas, toda varredura
+teria que intercala-las corretamente de qualquer jeito. O retorno nao local ja
+tinha a primeira, e ganhou de graca o que faltava: agora ele roda os `ensure:`
+que atravessa.
+
+**A ORDEM E O PROTOCOLO INTEIRO, e ela e o contrario da obvia**: o handler roda
+ANTES de qualquer coisa desenrolar. Procura para fora o primeiro handler
+habilitado cuja classe responde `handles:`, roda ele EM CIMA dos frames que
+sinalizaram (`runHandledBy:`), e so entao decide: `false -> valor` e resume, com
+nada desempilhado e todo `ensure:` pendente ainda armado; `true -> valor`
+desenrola. Decidir primeiro e desenrolar depois e o que torna `resume:`
+expressavel; um handler de longjmp comum destroi os frames em que a resumacao
+tem que voltar antes de alguem dizer se resume.
+
+Um handler que esta RODANDO fica desabilitado, entao uma excecao levantada dentro
+de um handler procura para FORA em vez de reentrar no que ja esta tratando uma.
+
+**A cadeia e RAIZ DE GC**, e isso nao e formalidade: o bloco handler e segurado
+durante a avaliacao INTEIRA do bloco protegido, que aloca como qualquer codigo.
+Verificado desligando: com `rootsVisitUnwindRecords` fora do coletor, um
+`on:do:` cujo bloco aloca 200.000 vezes morre lendo indice de classe de um
+cadaver. Com ela, responde.
+
+### Dois bugs que so apareceram porque excecoes existem
+
+**1. O ANDAIME EMBUTIDO SOMBREAVA o kernel de verdade.** O bootstrap instalava
+`at:`, `at:put:` e `size` em Array, ByteArray e String, uma copia em cada, que e
+onde o `at:` de uma colecao indexada obviamente mora. Mas `packages/Core` declara
+`at:` UMA vez, em Object, e deixa a primitiva decidir pelo FORMATO. Um metodo de
+andaime mais especifico ganhava toda busca, e a versao de `packages/Core` nunca
+rodava.
+
+Invisivel enquanto a primitiva ACERTA, porque as duas fazem o mesmo. O que
+diferia era o caminho de falha: o andaime diz `primitiveFailed:` e para, o real
+sinaliza um `OutOfRangeError` que um handler pega. Entao
+`[#(1 2 3) at: 9] on: Error do: [...]` nao tinha como funcionar, e o motivo nao
+tinha nada a ver com excecoes. **A regra do andaime e uma so: ele vai onde
+`packages/Core` poe o de verdade, ou sombreia para sempre.**
+
+**2. `allocateOld` COLETAVA DEPOIS DE ENTREGAR OS BYTES.** Ele carvava a regiao,
+checava o limiar, chamava o mark-sweep e so entao devolvia o endereco. A varredura
+entao andava por uma regiao ja entregue cujo CABECALHO O CHAMADOR AINDA NAO
+ESCREVEU: lia zeros e calculava passo zero.
+
+O assert era a metade de sorte. A outra metade e que a varredura LIBERA o que nao
+esta marcado, e nada marca um objeto que ainda nao existe, entao a alocacao
+fresca ia para uma free list enquanto o chamador estava prestes a inicializa-la:
+um endereco, dois donos, descoberto em outro lugar. **Reproduzido com o kernel
+embutido e imagem nenhuma**, alocando alem do limiar num laco, entao e anterior a
+tudo desta campanha. Conserto: coletar ANTES de carvar.
+
+O teste do nivel 0 que ficou precisou de duas correcoes minhas para valer alguma
+coisa, e as duas valem registro: a primeira versao alocava objetos PEQUENOS, que
+vao para a nursery e nunca chegam em `allocateOld`, entao passava com o bug no
+lugar; e ela achou um bug meu, `initHeap` nao inicializando `gcInhibited`, num
+struct que rotineiramente e variavel de pilha, o que desliga a coleta em silencio.
+
+### O numero
+
+**40 dos 141** arquivos de `tests/` saem com codigo zero, contra 3 antes.
+
+## A cauda: 23 primitivas, e tres bugs de DECODIFICACAO
+
+Depois das excecoes o que sobrou deixou de ser uma parede e virou cauda longa.
+Um lote de primitivas e tres bugs, e os tres bugs sao a mesma doenca: **duas
+metades do sistema decodificando a mesma coisa de dois jeitos.**
+
+**23 primitivas** entraram de uma vez, e a cobertura foi de 40 para **66 de 175**:
+a matematica de Float inteira (`sqrt`, as trigonometricas, `exp`, `ln`, `floor`,
+`ceiling`, `truncated`, `rounded`, `exponent`, `timesTwoPower:`), tempo
+(`MonotonicNanoTime`, `CurrentMicroTime`), `StringHash`, `StringAsSymbol`, e o
+par do coletor. Todas eram declaradas com CORPO VAZIO, entao antes disso cada uma
+respondia o proprio receptor: um programa que tirava raiz quadrada seguia com o
+numero de onde partiu.
+
+**Imprimir Float** e o unico que nao e mecanico. E a decimal MAIS CURTA que le de
+volta como o mesmo double, achada pedindo um digito significativo e alargando ate
+`strtod` casar. Precisao fixa erra dos dois lados de um jeito que o usuario ve:
+`%.17g` imprime 3.14 como 3.1400000000000001, e qualquer coisa mais curta para de
+fazer o round-trip. E a NOTACAO e escolhida separadamente do numero de digitos,
+porque `%g` decide por uma regra que ninguem quer aqui: com dois digitos
+significativos ele imprime `1500.0` como `1.5e+03`, que faz round-trip e e a
+resposta errada.
+
+### `Behavior>>isIndexable` decodificava o shape do V1
+
+`packages/Core` lia a palavra de shape com os deslocamentos do modelo antigo.
+Nenhuma classe do sistema respondia verdadeiro, **incluindo Array**, e o estrago
+foi silencioso e largo: `shallowCopy` pega o braco nao-indexado, entao
+`#(1 2 3) copy` voltava um Array VAZIO, e tudo construido sobre copy (`sort`,
+`replaceAll:`, `replaceFrom:to:with:`, `Dictionary copy`) devolvia colecao vazia
+como RESPOSTA, sem falhar.
+
+Junto saiu um defeito do lado do VM: `primInstanceShape` empacotava a palavra com
+`memcpy` de um struct **com padding**, e o C deixa byte de padding indeterminado.
+Agora e campo a campo, e o layout esta escrito nos dois lugares que o usam e em
+nenhum outro.
+
+### Slot vazio de Array: ZERO em C, `nil` em Smalltalk
+
+`Object new respondsTo: #foo` bastava para derrubar o processo, e o caminho e
+curto: `respondsTo:` procura um seletor que ninguem implementa, que e exatamente
+a busca que ALCANCA um slot vazio do dicionario de metodos. O probe do kernel
+acha slot livre com `isNil`; um dicionario construido em C tem o ZERO do
+alocador, que e o SmallInteger 0. Todo slot vazio lia como OCUPADO, e o kernel
+mandava `key` para um inteiro.
+
+`newArray` passou a escrever nil, que e a MESMA fronteira que `Array new:` ja
+atravessava na primitiva dele. E como as duas grafias de vazio agora coexistem
+num sistema rodando (a tabela de simbolos nasce antes de nil e fica com zeros),
+todo probe em C passa por `slotIsEmpty`, que aceita as duas. Aceitar so uma faz
+metade dos dicionarios do sistema parecer permanentemente cheia.
+
+**53 dos 141** com isso.
+
+E uma licao de manutencao junto: o nivel 7 tinha uma checagem que NOMEAVA
+`PRIM_FloatSin` como exemplo de primitiva nao implementada, e ela quebrou no dia
+em que `sin` foi implementada. Ela agora PROCURA uma na tabela, porque o que ela
+quer afirmar e um fato sobre a tabela e nao sobre uma primitiva. E os tres niveis
+que linkam `Primitive.c` a mao precisaram de `-lm`, que e a armadilha ja
+registrada aqui sobre os niveis 0 a 8 linkarem a mao.
+`ExceptionProtocolTest` responde **23 de 23**, que e o protocolo resumivel
+inteiro. O que resta e cauda longa de primitiva ausente, nao mais uma parede: 7
+`ParseClass`, 6 LargeInteger, 5 `ProcessSpawn`, 5 `MonotonicNanoTime`, 4
+`WorkerParallel`, 4 `ParseMethod`, 4 `MonitorEnterOn`, e o resto com 1 a 3 cada.
+
 E compilar nao e rodar. A IMAGEM esta feita (nivel 11, acima). O que resta entre
 isto e `run_tests.sh` verde, em ordem e agora com numero: as EXCECOES (`signal`,
 `on:do:`, `ensure:`, o segundo cliente do unwind que o retorno nao local ja

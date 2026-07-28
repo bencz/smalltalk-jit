@@ -62,7 +62,7 @@ static size_t probe(RawArray *contents, RawString *key, uint32_t hash,
 	size_t index = hash & (capacity - 1);
 	for (size_t step = 0; step < capacity; step++) {
 		Value slot = contents->vars[index];
-		if (!valueTypeOf(slot, VALUE_POINTER)) {
+		if (slotIsEmpty(slot)) {
 			*found = 0;
 			return index;
 		}
@@ -99,7 +99,7 @@ static void dictGrow(Dictionary *dictionary, _Bool byIdentity)
 	KeyMatch match = byIdentity ? matchByIdentity : matchByContent;
 	for (size_t i = 0; i < oldCapacity; i++) {
 		Value slot = old->vars[i];
-		if (!valueTypeOf(slot, VALUE_POINTER)) {
+		if (slotIsEmpty(slot)) {
 			continue;
 		}
 		RawAssociation *association = (RawAssociation *) asObject(slot);

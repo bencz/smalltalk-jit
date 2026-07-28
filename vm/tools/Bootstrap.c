@@ -309,15 +309,23 @@ static void bootstrapMethods(void)
 	defineNumberMethods(&Handles.SmallFloat64);
 	defineNumberMethods(&Handles.BoxedFloat64);
 
-	definePrimitiveMethod(&Handles.Array, "at:", PRIM_At, 1);
-	definePrimitiveMethod(&Handles.Array, "at:put:", PRIM_AtPut, 2);
-	definePrimitiveMethod(&Handles.Array, "size", PRIM_Size, 0);
-	definePrimitiveMethod(&Handles.ByteArray, "at:", PRIM_At, 1);
-	definePrimitiveMethod(&Handles.ByteArray, "at:put:", PRIM_AtPut, 2);
-	definePrimitiveMethod(&Handles.ByteArray, "size", PRIM_Size, 0);
-	definePrimitiveMethod(&Handles.String, "at:", PRIM_At, 1);
-	definePrimitiveMethod(&Handles.String, "at:put:", PRIM_AtPut, 2);
-	definePrimitiveMethod(&Handles.String, "size", PRIM_Size, 0);
+	// ON OBJECT, and this is scaffolding's ONE placement rule: a scaffold method
+	// goes where packages/Core puts the real one, or it SHADOWS it forever.
+	//
+	// These were on Array, ByteArray and String, one copy each, because that is
+	// where an indexed collection's `at:` obviously belongs. But packages/Core
+	// declares `at:` ONCE, on Object, and lets the primitive decide by FORMAT
+	// (runtime/Primitives.def) -- so a more specific scaffold method won every
+	// lookup and packages/Core's version never ran.
+	//
+	// Invisible while the primitive SUCCEEDS, because both do the same thing.
+	// What differed was the failure path: the scaffold's fallback says
+	// `primitiveFailed:` and stops, and the real one signals an OutOfRangeError
+	// that a handler can catch. So `[#(1 2 3) at: 9] on: Error do: [...]` could
+	// not work, and the reason had nothing to do with exceptions.
+	definePrimitiveMethod(&Handles.ObjectClass, "at:", PRIM_At, 1);
+	definePrimitiveMethod(&Handles.ObjectClass, "at:put:", PRIM_AtPut, 2);
+	definePrimitiveMethod(&Handles.ObjectClass, "size", PRIM_Size, 0);
 
 	definePrimitiveMethod(&Handles.Closure, "value", PRIM_BlockValue, 0);
 	definePrimitiveMethod(&Handles.Closure, "value:", PRIM_BlockValue1, 1);

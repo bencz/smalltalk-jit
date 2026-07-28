@@ -51,8 +51,8 @@ PRIMITIVE(BehaviorLookupSelector, "BehaviorLookupSelectorPrimitive", NULL)  // B
 PRIMITIVE(BehaviorInstanceShape, "BehaviorInstanceShapePrimitive", primInstanceShape)  // Behavior>>instanceShape
 PRIMITIVE(BehaviorNew, "BehaviorNewPrimitive", primBasicNew)  // Behavior>>new; Behavior>>basicNew
 PRIMITIVE(BehaviorNewSize, "BehaviorNewSizePrimitive", primBasicNewSized)  // Behavior>>new: anInteger; Behavior>>basicNew: anInteger
-PRIMITIVE(BlockOnException, "BlockOnExceptionPrimitive", NULL)  // Block>>basicOn: anException do: aBlock
-PRIMITIVE(BlockUnwind, "BlockUnwindPrimitive", NULL)  // Block>>valueUnwindProtected: aBlock
+PRIMITIVE(BlockOnException, "BlockOnExceptionPrimitive", primBlockOnException)  // Block>>basicOn: anException do: aBlock
+PRIMITIVE(BlockUnwind, "BlockUnwindPrimitive", primBlockUnwindProtected)  // Block>>valueUnwindProtected: aBlock
 PRIMITIVE(BlockValueArgs, "BlockValueArgsPrimitive", NULL)  // Block>>valueWithArguments: anArray
 PRIMITIVE(BlockValue, "BlockValuePrimitive", primClosureValue)  // Block>>value
 PRIMITIVE(BlockValue1, "BlockValuePrimitive1", primClosureValue1)  // Block>>value: arg
@@ -74,9 +74,9 @@ PRIMITIVE(ContextParent, "ContextParentPrimitive", NULL)  // Context>>parent
 PRIMITIVE(ContextPositionDescriptor, "ContextPositionDescriptorPrimitive", NULL)  // Context>>positionDescriptor
 PRIMITIVE(ContextTemporaryAt, "ContextTemporaryAt", NULL)  // Context>>temporaryAt: anInteger
 PRIMITIVE(CpuCount, "CpuCountPrimitive", NULL)  // System>>class primitiveCpuCount
-PRIMITIVE(CurrentMicroTime, "CurrentMicroTimePrimitive", NULL)  // DateTime>>class currentMicroTime
+PRIMITIVE(CurrentMicroTime, "CurrentMicroTimePrimitive", primCurrentMicroTime)  // DateTime>>class currentMicroTime
 PRIMITIVE(DefaultNamespace, "DefaultNamespacePrimitive", NULL)  // Namespace>>class default
-PRIMITIVE(ExceptionSignal, "ExceptionSignal", NULL)  // Exception>>basicSignal; HandlerEscape>>signal
+PRIMITIVE(ExceptionSignal, "ExceptionSignal", primExceptionSignal)  // Exception>>basicSignal; HandlerEscape>>signal
 PRIMITIVE(ExecutablePath, "ExecutablePathPrimitive", NULL)  // System>>class executablePath
 PRIMITIVE(ExitWithCode, "ExitWithCodePrimitive", NULL)  // System>>class primitiveExit: anInteger
 PRIMITIVE(FileChdir, "FileChdirPrimitive", NULL)  // System>>class primitiveChdir: aString
@@ -89,10 +89,10 @@ PRIMITIVE(FileRmdir, "FileRmdirPrimitive", NULL)  // Directory>>class rmdirPath:
 PRIMITIVE(FileStat, "FileStatPrimitive", NULL)  // Directory>>class statPath: aString; File>>class statPath: aString
 PRIMITIVE(FileUnlink, "FileUnlinkPrimitive", NULL)  // File>>class unlinkPath: aString
 PRIMITIVE(FloatAdd, "FloatAddPrimitive", primAdd)  // Float>>+ aNumber
-PRIMITIVE(FloatArcCos, "FloatArcCosPrimitive", NULL)  // Float>>arcCos
-PRIMITIVE(FloatArcSin, "FloatArcSinPrimitive", NULL)  // Float>>arcSin
-PRIMITIVE(FloatArcTan2, "FloatArcTan2Primitive", NULL)  // Float>>arcTan: aNumber
-PRIMITIVE(FloatArcTan, "FloatArcTanPrimitive", NULL)  // Float>>arcTan
+PRIMITIVE(FloatArcCos, "FloatArcCosPrimitive", primFloatArcCos)  // Float>>arcCos
+PRIMITIVE(FloatArcSin, "FloatArcSinPrimitive", primFloatArcSin)  // Float>>arcSin
+PRIMITIVE(FloatArcTan2, "FloatArcTan2Primitive", primFloatArcTan2)  // Float>>arcTan: aNumber
+PRIMITIVE(FloatArcTan, "FloatArcTanPrimitive", primFloatArcTan)  // Float>>arcTan
 PRIMITIVE(FloatArrayAt, "FloatArrayAtPrimitive", NULL)  // FloatArray>>at: index
 PRIMITIVE(FloatArrayAtPut, "FloatArrayAtPutPrimitive", NULL)  // FloatArray>>at: index put: aNumber
 PRIMITIVE(FloatArrayBinary, "FloatArrayBinaryPrimitive", NULL)  // FloatArray>>primBinary: other into: result op: opcode
@@ -100,26 +100,26 @@ PRIMITIVE(FloatArrayDot, "FloatArrayDotPrimitive", NULL)  // FloatArray>>dot: aF
 PRIMITIVE(FloatArrayFill, "FloatArrayFillPrimitive", NULL)  // FloatArray>>atAllPut: aNumber
 PRIMITIVE(FloatArrayReduce, "FloatArrayReducePrimitive", NULL)  // FloatArray>>primReduce: opcode
 PRIMITIVE(FloatArrayScalar, "FloatArrayScalarPrimitive", NULL)  // FloatArray>>primScalar: scalar into: result op: opcode
-PRIMITIVE(FloatAsString, "FloatAsStringPrimitive", NULL)  // Float>>printString
-PRIMITIVE(FloatCeiling, "FloatCeilingPrimitive", NULL)  // Float>>ceiling
-PRIMITIVE(FloatCos, "FloatCosPrimitive", NULL)  // Float>>cos
+PRIMITIVE(FloatAsString, "FloatAsStringPrimitive", primFloatAsString)  // Float>>printString
+PRIMITIVE(FloatCeiling, "FloatCeilingPrimitive", primFloatCeiling)  // Float>>ceiling
+PRIMITIVE(FloatCos, "FloatCosPrimitive", primFloatCos)  // Float>>cos
 PRIMITIVE(FloatDiv, "FloatDivPrimitive", primDivide)  // Float>>/ aNumber
 PRIMITIVE(FloatEquals, "FloatEqualsPrimitive", primNumericEqual)  // Float>>= aNumber
-PRIMITIVE(FloatExp, "FloatExpPrimitive", NULL)  // Float>>exp
-PRIMITIVE(FloatExponent, "FloatExponentPrimitive", NULL)  // Float>>exponent
-PRIMITIVE(FloatFloor, "FloatFloorPrimitive", NULL)  // Float>>floor
+PRIMITIVE(FloatExp, "FloatExpPrimitive", primFloatExp)  // Float>>exp
+PRIMITIVE(FloatExponent, "FloatExponentPrimitive", primFloatExponent)  // Float>>exponent
+PRIMITIVE(FloatFloor, "FloatFloorPrimitive", primFloatFloor)  // Float>>floor
 PRIMITIVE(FloatLessThan, "FloatLessThanPrimitive", primLess)  // Float>>< aNumber
-PRIMITIVE(FloatLn, "FloatLnPrimitive", NULL)  // Float>>ln
+PRIMITIVE(FloatLn, "FloatLnPrimitive", primFloatLn)  // Float>>ln
 PRIMITIVE(FloatMul, "FloatMulPrimitive", primMultiply)  // Float>>* aNumber
-PRIMITIVE(FloatRounded, "FloatRoundedPrimitive", NULL)  // Float>>rounded
-PRIMITIVE(FloatSin, "FloatSinPrimitive", NULL)  // Float>>sin
-PRIMITIVE(FloatSqrt, "FloatSqrtPrimitive", NULL)  // Float>>sqrt
+PRIMITIVE(FloatRounded, "FloatRoundedPrimitive", primFloatRounded)  // Float>>rounded
+PRIMITIVE(FloatSin, "FloatSinPrimitive", primFloatSin)  // Float>>sin
+PRIMITIVE(FloatSqrt, "FloatSqrtPrimitive", primFloatSqrt)  // Float>>sqrt
 PRIMITIVE(FloatSub, "FloatSubPrimitive", primSubtract)  // Float>>- aNumber
-PRIMITIVE(FloatTan, "FloatTanPrimitive", NULL)  // Float>>tan
-PRIMITIVE(FloatTimesTwoPower, "FloatTimesTwoPowerPrimitive", NULL)  // Float>>timesTwoPower: anInteger
-PRIMITIVE(FloatTruncated, "FloatTruncatedPrimitive", NULL)  // Float>>truncated
+PRIMITIVE(FloatTan, "FloatTanPrimitive", primFloatTan)  // Float>>tan
+PRIMITIVE(FloatTimesTwoPower, "FloatTimesTwoPowerPrimitive", primFloatTimesTwoPower)  // Float>>timesTwoPower: anInteger
+PRIMITIVE(FloatTruncated, "FloatTruncatedPrimitive", primFloatTruncated)  // Float>>truncated
 PRIMITIVE(FlushSendCaches, "FlushSendCachesPrimitive", NULL)  // System>>class flushSendCaches
-PRIMITIVE(GC, "GCPrimitive", NULL)  // GarbageCollector>>class collectGarbage
+PRIMITIVE(GC, "GCPrimitive", primCollectGarbage)  // GarbageCollector>>class collectGarbage
 PRIMITIVE(GetEnv, "GetEnvPrimitive", NULL)  // System>>class primitiveGetEnv: aString
 PRIMITIVE(Hash, "HashPrimitive", primIdentityHash)  // Symbol>>hash; Object>>hash
 PRIMITIVE(Identity, "IdentityPrimitive", primIdentical)  // Object>>= anObject; Object>>== anObject
@@ -160,11 +160,11 @@ PRIMITIVE(MonitorEnterOn, "MonitorEnterOnPrimitive", NULL)  // ProcessorSchedule
 PRIMITIVE(MonitorEnter, "MonitorEnterPrimitive", NULL)  // ProcessorScheduler>>monitorEnter
 PRIMITIVE(MonitorExit, "MonitorExitPrimitive", NULL)  // ProcessorScheduler>>monitorExit
 PRIMITIVE(MonitorPark, "MonitorParkPrimitive", NULL)  // ProcessorScheduler>>parkOnMonitor
-PRIMITIVE(MonotonicNanoTime, "MonotonicNanoTimePrimitive", NULL)  // Stopwatch>>class monotonicNanos; System>>class primitiveMonotonicNanos
+PRIMITIVE(MonotonicNanoTime, "MonotonicNanoTimePrimitive", primMonotonicNanos)  // Stopwatch>>class monotonicNanos; System>>class primitiveMonotonicNanos
 PRIMITIVE(ParseClass, "ParseClassPrimitive", NULL)  // Parser>>basicParseClass
 PRIMITIVE(ParseMethodOrBlock, "ParseMethodOrBlockPrimitive", NULL)  // Parser>>basicParseMethodOrBlock
 PRIMITIVE(ParseMethod, "ParseMethodPrimitive", NULL)  // Parser>>basicParseMethod
-PRIMITIVE(PrintHeap, "PrintHeapPrimitive", NULL)  // GarbageCollector>>class printHeap
+PRIMITIVE(PrintHeap, "PrintHeapPrimitive", primPrintHeap)  // GarbageCollector>>class printHeap
 PRIMITIVE(PrintValue, "PrintValuePrimitive", primPrintValue)  // the BUILT-IN kernel's Object>>printNl, see the note at the top
 PRIMITIVE(ProcessCurrentId, "ProcessCurrentIdPrimitive", NULL)  // ProcessorScheduler>>currentId
 PRIMITIVE(ProcessResume, "ProcessResumePrimitive", NULL)  // ProcessorScheduler>>resumeId: anId
@@ -192,12 +192,12 @@ PRIMITIVE(StreamOpen, "StreamOpenPrimitive", NULL)  // FileStream>>class open: a
 PRIMITIVE(StreamRead, "StreamReadPrimitive", primStreamRead)  // ExternalStream>>class read: descriptor next: anInteger into: aString startingAt: start
 PRIMITIVE(StreamSetPosition, "StreamSetPositionPrimitive", NULL)  // ExternalStream>>class position: descriptor to: anInteger
 PRIMITIVE(StreamWrite, "StreamWritePrimitive", primStreamWrite)  // ExternalStream>>class write: descriptor next: anInteger from: aString
-PRIMITIVE(StringAsSymbol, "StringAsSymbolPrimitive", NULL)  // String>>asSymbol
+PRIMITIVE(StringAsSymbol, "StringAsSymbolPrimitive", primStringAsSymbol)  // String>>asSymbol
 PRIMITIVE(StringAsciiCaseEquals, "StringAsciiCaseEqualsPrimitive", NULL)  // String>>sameAsciiCaseAs: aString
 PRIMITIVE(StringAsciiLowercase, "StringAsciiLowercasePrimitive", NULL)  // String>>asLowercase
 PRIMITIVE(StringAsciiUppercase, "StringAsciiUppercasePrimitive", NULL)  // String>>asUppercase
 PRIMITIVE(StringCopyFromTo, "StringCopyFromToPrimitive", NULL)  // SequenceableCollection>>copyFrom: start to: stop
-PRIMITIVE(StringHash, "StringHashPrimitive", NULL)  // String>>hash
+PRIMITIVE(StringHash, "StringHashPrimitive", primStringHash)  // String>>hash
 PRIMITIVE(StringSplitBy, "StringSplitByPrimitive", NULL)  // SequenceableCollection>>splitBy: anObject
 PRIMITIVE(StringStartsWithAsciiCase, "StringStartsWithAsciiCasePrimitive", NULL)  // String>>startsWithAsciiCase: aPrefix
 PRIMITIVE(StringToInteger, "StringToIntegerPrimitive", NULL)  // String>>asNumber

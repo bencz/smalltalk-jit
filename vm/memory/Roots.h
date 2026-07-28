@@ -101,4 +101,15 @@ void rootsVisitNativeFrames(struct Thread *thread, RootVisitor visit, void *ctx)
 // frame walk above: the collector is built and self-tested with no JIT at all.
 void rootsVisitCompiledCode(RootVisitor visit, void *ctx);
 
+// The heap references the UNWIND CHAIN holds, which also live outside the heap.
+//
+// A record sits on a C frame and carries tagged Values: the class and the block
+// of an `on:do:`, the cleanup block of an `ensure:`, and the value an unwind is
+// carrying out. A handler block is held for the ENTIRE evaluation of the block
+// it protects, which allocates as freely as any other code, so these are
+// ordinary long-lived roots. Without this the first collection inside a
+// protected block leaves the handler pointing at a corpse, and the symptom only
+// appears when the protected block allocated enough to collect.
+void rootsVisitUnwindRecords(struct Thread *thread, RootVisitor visit, void *ctx);
+
 #endif

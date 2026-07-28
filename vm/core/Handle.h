@@ -180,6 +180,24 @@ static inline void *objectIndexedVars(void *handle)
 // the final length until it has read the last keyword.
 Object *copyResizedObject(Object *object, size_t elements);
 
+// Is this slot EMPTY, in either of the two spellings the VM produces?
+//
+// The allocator writes ZERO into a slot nobody set, which is the SmallInteger 0
+// and is what ABSENT means inside the VM (memory/Heap.c). But an Array that
+// SMALLTALK reads holds nil in its empty slots instead, because nil is the only
+// absent Smalltalk has and the kernel's own hash probes test `isNil`
+// (runtime/Collection.c, newArray).
+//
+// Both spellings therefore exist in one running system: an Array allocated
+// before nil did carries zeros, every one after carries nil. Every hash probe in
+// C has to accept both, or a table built on one side reads as permanently full
+// from the other, and the probe walks off into a slot it thinks is occupied.
+static inline _Bool slotIsEmpty(Value slot)
+{
+	return !valueTypeOf(slot, VALUE_POINTER) || asObject(slot) == Handles.nil.raw;
+}
+
+
 // Class index of a handled class, which is what generated code and inline
 // caches compare against.
 static inline uint32_t classIndexOf(Class *class)

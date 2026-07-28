@@ -8,7 +8,12 @@
 #include "memory/ObjectWalk.h"
 #include "jit/CompiledMethod.h"
 #include "runtime/Closure.h"
+#include "os/Os.h"
 #include "os/OsFile.h"
+#include "runtime/String.h"
+#include <limits.h>
+#include <stdlib.h>
+#include <math.h>
 #include <string.h>
 
 // The implementations.
@@ -685,12 +690,17 @@ static Value primBasicNewSized(Value *args, uint64_t argc)
 // as receiver: register 0 of a block's frame is the closure itself, which is how
 // GETUP reaches the captured values with one load.
 
+static _Bool isClosure(Value value)
+{
+	return valueTypeOf(value, VALUE_POINTER) && Handles.Closure.raw != NULL
+		&& rawObjectClassIndex(asObject(value)) == classIndexOf(&Handles.Closure);
+}
+
+
 static Value enterClosure(Value *args, uint64_t argc)
 {
 	Value receiver = primitiveReceiver(args);
-	if (!valueTypeOf(receiver, VALUE_POINTER)
-			|| Handles.Closure.raw == NULL
-			|| rawObjectClassIndex(asObject(receiver)) != classIndexOf(&Handles.Closure)) {
+	if (!isClosure(receiver)) {
 		return PRIMITIVE_FAILED;
 	}
 	RawClosure *closure = (RawClosure *) asObject(receiver);
@@ -758,6 +768,400 @@ static Value primClosureValue2(Value *args, uint64_t argc)
 }
 
 
+// ---------------------------------------------------------------------------
+// Float mathematics
+// ---------------------------------------------------------------------------
+//
+// Every one of these was DECLARED with an empty body, so before this each one
+// answered its receiver and a program that took a square root carried on with
+// the number it started from. They are batched because they are the same three
+// lines each: classify the receiver, call libm, fail if the result does not fit
+// the immediate window so the kernel's own code can box it.
+//
+// FAILING ON A NON-FLOAT RECEIVER IS THE POINT of numberOf answering NUM_NOT:
+// `4 sqrt` has an Integer receiver and belongs to Number's Smalltalk code, not
+// here.
+
+typedef double (*UnaryMath)(double);
+
+static Value floatUnary(Value *args, uint64_t argc, UnaryMath fn)
+{
+	if (argc != 0) {
+		return PRIMITIVE_FAILED;
+	}
+	Number self = numberOf(primitiveReceiver(args));
+	if (self.kind == NUM_NOT) {
+		return PRIMITIVE_FAILED;
+	}
+	return floatResult(fn(self.asFloat));
+}
+
+#define FLOAT_UNARY(name, fn) \
+	static Value name(Value *args, uint64_t argc) \
+	{ \
+		return floatUnary(args, argc, fn); \
+	}
+
+FLOAT_UNARY(primFloatSqrt, sqrt)
+FLOAT_UNARY(primFloatSin, sin)
+FLOAT_UNARY(primFloatCos, cos)
+FLOAT_UNARY(primFloatTan, tan)
+FLOAT_UNARY(primFloatArcSin, asin)
+FLOAT_UNARY(primFloatArcCos, acos)
+FLOAT_UNARY(primFloatArcTan, atan)
+FLOAT_UNARY(primFloatExp, exp)
+FLOAT_UNARY(primFloatLn, log)
+
+
+static Value primFloatArcTan2(Value *args, uint64_t argc)
+{
+	if (argc != 1) {
+		return PRIMITIVE_FAILED;
+	}
+	Number self = numberOf(primitiveReceiver(args));
+	Number other = numberOf(primitiveArgument(args, 0));
+	if (self.kind == NUM_NOT || other.kind == NUM_NOT) {
+		return PRIMITIVE_FAILED;
+	}
+	return floatResult(atan2(self.asFloat, other.asFloat));
+}
+
+
+// A whole double as a SmallInteger, or failure.
+//
+// The window is the tagged one and NOT the double's: a finite double of
+// magnitude 2^53 or more is already integral and the kernel answers it by a
+// different route, so overflowing here is an ordinary fall-through and not an
+// error. Written as a double comparison rather than a cast, because casting a
+// double outside the integer range is undefined behaviour in C and would be a
+// wrong answer rather than a failure.
+static Value integerResult(double value)
+{
+	if (!(value >= -4611686018427387904.0 && value <= 4611686018427387903.0)) {
+		return PRIMITIVE_FAILED; // NaN and infinity land here too, by !(...)
+	}
+	return tagInt((intptr_t) value);
+}
+
+
+#define FLOAT_TO_INTEGER(name, fn) \
+	static Value name(Value *args, uint64_t argc) \
+	{ \
+		if (argc != 0) { \
+			return PRIMITIVE_FAILED; \
+		} \
+		Number self = numberOf(primitiveReceiver(args)); \
+		if (self.kind == NUM_NOT) { \
+			return PRIMITIVE_FAILED; \
+		} \
+		return integerResult(fn(self.asFloat)); \
+	}
+
+FLOAT_TO_INTEGER(primFloatFloor, floor)
+FLOAT_TO_INTEGER(primFloatCeiling, ceil)
+FLOAT_TO_INTEGER(primFloatTruncated, trunc)
+FLOAT_TO_INTEGER(primFloatRounded, nearbyint)
+
+
+// Base-2 exponent: 1.0 answers 0, 0.5 answers -1. Zero, infinity and NaN have
+// none, and the kernel raises for them, so this fails on all three.
+static Value primFloatExponent(Value *args, uint64_t argc)
+{
+	if (argc != 0) {
+		return PRIMITIVE_FAILED;
+	}
+	Number self = numberOf(primitiveReceiver(args));
+	if (self.kind == NUM_NOT || !isfinite(self.asFloat) || self.asFloat == 0.0) {
+		return PRIMITIVE_FAILED;
+	}
+	return tagInt((intptr_t) ilogb(self.asFloat));
+}
+
+
+// self * 2^n, EXACT: ldexp touches the exponent and leaves the mantissa alone,
+// which is what `asExactedFraction` depends on to recover the mantissa bits.
+static Value primFloatTimesTwoPower(Value *args, uint64_t argc)
+{
+	if (argc != 1) {
+		return PRIMITIVE_FAILED;
+	}
+	Number self = numberOf(primitiveReceiver(args));
+	Value power = primitiveArgument(args, 0);
+	if (self.kind == NUM_NOT || !valueTypeOf(power, VALUE_INT)) {
+		return PRIMITIVE_FAILED;
+	}
+	intptr_t n = asCInt(power);
+	if (n < INT_MIN || n > INT_MAX) {
+		return PRIMITIVE_FAILED;
+	}
+	return floatResult(ldexp(self.asFloat, (int) n));
+}
+
+
+// A Float as the SHORTEST decimal that reads back as the same double.
+//
+// Shortest-round-trip and not a fixed precision, because both fixed choices are
+// wrong in a way a user sees: `%.17g` prints 3.14 as 3.1400000000000001, and
+// anything shorter stops round-tripping, so `x printString asNumber = x` becomes
+// false for ordinary values. The loop is the standard way to get it without a
+// Grisu implementation: ask for one significant digit, read it back, and widen
+// until it matches. Seventeen always matches, so it terminates.
+//
+// The trailing `.0` is Smalltalk's, not C's: a Float that happens to be integral
+// still prints as a Float, or `1500.0 printString` would answer '1500' and the
+// value would read back as an Integer.
+static Value primFloatAsString(Value *args, uint64_t argc)
+{
+	if (argc != 0) {
+		return PRIMITIVE_FAILED;
+	}
+	Number self = numberOf(primitiveReceiver(args));
+	if (self.kind == NUM_NOT) {
+		return PRIMITIVE_FAILED;
+	}
+	double value = self.asFloat;
+
+	char buffer[64];
+	if (isnan(value)) {
+		snprintf(buffer, sizeof buffer, "nan");
+	} else if (isinf(value)) {
+		snprintf(buffer, sizeof buffer, value < 0 ? "-inf" : "inf");
+	} else {
+		// `%e` and not `%g` to FIND the digit count, because %g also decides the
+		// notation, and it decides it by a rule nobody here wants: at two
+		// significant digits it renders 1500.0 as "1.5e+03", which round-trips
+		// and is the wrong answer for `1500.0 printString`.
+		int digits = 17;
+		for (int d = 1; d <= 17; d++) {
+			snprintf(buffer, sizeof buffer, "%.*e", d - 1, value);
+			if (strtod(buffer, NULL) == value) {
+				digits = d;
+				break;
+			}
+		}
+		// The notation is then chosen SEPARATELY, on the decimal exponent that
+		// %e just reported. Plain for everything a reader would write plainly,
+		// scientific only where plain would be a wall of zeros.
+		const char *marker = strchr(buffer, 'e');
+		long exponent10 = marker == NULL ? 0 : strtol(marker + 1, NULL, 10);
+		if (exponent10 >= -5 && exponent10 <= 15) {
+			int decimals = (int) (digits - 1 - exponent10);
+			snprintf(buffer, sizeof buffer, "%.*f", decimals < 0 ? 0 : decimals,
+				value);
+		}
+		// A bare digit string has to read back as a Float, so it gets ".0"; a
+		// scientific mantissa with no point gets one before the exponent.
+		if (strpbrk(buffer, ".n") == NULL) {
+			char *exponent = strpbrk(buffer, "eE");
+			if (exponent == NULL) {
+				size_t length = strlen(buffer);
+				if (length + 3 <= sizeof buffer) {
+					memcpy(buffer + length, ".0", 3);
+				}
+			} else {
+				char tail[64];
+				snprintf(tail, sizeof tail, "%s", exponent);
+				size_t head = (size_t) (exponent - buffer);
+				if (head + 2 + strlen(tail) + 1 <= sizeof buffer) {
+					memcpy(buffer + head, ".0", 2);
+					memcpy(buffer + head + 2, tail, strlen(tail) + 1);
+				}
+			}
+		}
+	}
+
+	// Allocates, so the caller's compiled frames are anchored first.
+	PRIMITIVE_ALLOCATES(args);
+	Value answer = objectTagged(stringFromC(buffer));
+	PRIMITIVE_DONE_ALLOCATING();
+	return answer;
+}
+
+
+// ---------------------------------------------------------------------------
+// Time, and the heap's own numbers
+// ---------------------------------------------------------------------------
+
+static Value primMonotonicNanos(Value *args, uint64_t argc)
+{
+	(void) args;
+	if (argc != 0) {
+		return PRIMITIVE_FAILED;
+	}
+	// A monotonic reading is 60-odd bits after a few weeks of uptime, so it can
+	// legitimately outgrow the tagged window; failing is right, and the kernel's
+	// own code is where a LargeInteger would come from.
+	int64_t nanos = osMonotonicNanos();
+	return smallIntFits(nanos) ? tagInt((intptr_t) nanos) : PRIMITIVE_FAILED;
+}
+
+
+static Value primCurrentMicroTime(Value *args, uint64_t argc)
+{
+	(void) args;
+	if (argc != 0) {
+		return PRIMITIVE_FAILED;
+	}
+	int64_t micros = osCurrentMicroTime();
+	return smallIntFits(micros) ? tagInt((intptr_t) micros) : PRIMITIVE_FAILED;
+}
+
+
+static Value primCollectGarbage(Value *args, uint64_t argc)
+{
+	(void) args;
+	if (argc != 0) {
+		return PRIMITIVE_FAILED;
+	}
+	// A COLLECTION FROM SMALLTALK, so the caller's compiled frames underneath
+	// have to be reachable. PRIMITIVE_ALLOCATES is what anchors them, and it is
+	// needed here for the same reason an allocating primitive needs it even
+	// though nothing is allocated: the collector walks from the anchor.
+	PRIMITIVE_ALLOCATES(args);
+	collectGarbage(CurrentThread.heap);
+	PRIMITIVE_DONE_ALLOCATING();
+	return primitiveReceiver(args);
+}
+
+
+static Value primPrintHeap(Value *args, uint64_t argc)
+{
+	(void) args;
+	if (argc != 0) {
+		return PRIMITIVE_FAILED;
+	}
+	printHeap(CurrentThread.heap);
+	return primitiveReceiver(args);
+}
+
+
+// ---------------------------------------------------------------------------
+// Strings
+// ---------------------------------------------------------------------------
+
+// A String's hash is over its CONTENTS, and that is what makes it agree with an
+// interned Symbol's identity hash by construction (runtime/String.c, asSymbol).
+static Value primStringHash(Value *args, uint64_t argc)
+{
+	if (argc != 0) {
+		return PRIMITIVE_FAILED;
+	}
+	Value receiver = primitiveReceiver(args);
+	if (!valueTypeOf(receiver, VALUE_POINTER)
+			|| rawObjectFormat(asObject(receiver)) != FORMAT_BYTES) {
+		return PRIMITIVE_FAILED;
+	}
+	return tagInt(stringHash((RawString *) asObject(receiver)));
+}
+
+
+static Value primStringAsSymbol(Value *args, uint64_t argc)
+{
+	if (argc != 0) {
+		return PRIMITIVE_FAILED;
+	}
+	Value receiver = primitiveReceiver(args);
+	if (!valueTypeOf(receiver, VALUE_POINTER)
+			|| rawObjectFormat(asObject(receiver)) != FORMAT_BYTES) {
+		return PRIMITIVE_FAILED;
+	}
+	// Interning ALLOCATES when the symbol is new, and it can grow the symbol
+	// table, so the caller's frames have to be anchored first.
+	PRIMITIVE_ALLOCATES(args);
+	String *symbol = asSymbol((String *) scopeHandle(asObject(primitiveReceiver(args))));
+	Value answer = objectTagged(symbol);
+	PRIMITIVE_DONE_ALLOCATING();
+	return answer;
+}
+
+
+// ---------------------------------------------------------------------------
+// Exceptions
+// ---------------------------------------------------------------------------
+//
+// Three primitives and one chain (jit/Jit.h). The kernel writes the whole
+// PROTOCOL in Smalltalk -- `signal`, `return:`, `resume:`, `retry`, `pass`,
+// `ensure:` -- and what is here is only what Smalltalk cannot express: taking a
+// jump destination, finding a handler across frames the language cannot see, and
+// running a cleanup on the way out.
+//
+// THE SETJMP IS TAKEN IN THE PRIMITIVE'S OWN FRAME, and it has to be: a jump
+// resumes in the frame that took the destination, so pushing it one call deeper
+// would resume in a frame that no longer exists. That is the same rule
+// ENTER_COMPILED follows for a non-local return, and it is why these three are
+// written out here instead of being one helper each.
+
+// Block>>basicOn: anExceptionClass do: aHandlerBlock
+static Value primBlockOnException(Value *args, uint64_t argc)
+{
+	if (argc != 2) {
+		return PRIMITIVE_FAILED;
+	}
+	Value protectedBlock = primitiveReceiver(args);
+	if (!isClosure(protectedBlock)) {
+		return PRIMITIVE_FAILED;
+	}
+	PRIMITIVE_ALLOCATES(args);
+
+	UnwindRecord record;
+	unwindPushHandler(&record, primitiveArgument(args, 0),
+		primitiveArgument(args, 1));
+	Value answer;
+	if (setjmp(record.destination) != 0) {
+		// A handler chose to unwind to here. Everything between the signal and
+		// this frame is gone, and unwindAnswer is what puts back the bookkeeping
+		// those frames would have restored on the way out.
+		answer = unwindAnswer(&record);
+	} else {
+		answer = jitSendUnary(protectedBlock, "value", NULL);
+		unwindPop(&record);
+	}
+	PRIMITIVE_DONE_ALLOCATING();
+	return answer;
+}
+
+
+// Exception>>basicSignal, and HandlerEscape>>signal, which is the same
+// mechanism used by the machinery that implements resume:/return:/retry.
+static Value primExceptionSignal(Value *args, uint64_t argc)
+{
+	if (argc != 0) {
+		return PRIMITIVE_FAILED;
+	}
+	PRIMITIVE_ALLOCATES(args);
+	// PRIMITIVE_FAILED when nothing handled it, which is not an error here: the
+	// method's own `^self defaultAction` is the general case, exactly as the
+	// fall-through works for every other primitive.
+	Value answer = jitSignalException(primitiveReceiver(args));
+	PRIMITIVE_DONE_ALLOCATING();
+	return answer;
+}
+
+
+// Block>>valueUnwindProtected: aCleanupBlock
+//
+// On the NORMAL path this answers and the kernel's `ensure:` runs the cleanup
+// itself, one line later. On an UNWIND the unwinder runs it, and this frame is
+// never returned to. Exactly once either way, which is the whole contract.
+static Value primBlockUnwindProtected(Value *args, uint64_t argc)
+{
+	if (argc != 1) {
+		return PRIMITIVE_FAILED;
+	}
+	Value protectedBlock = primitiveReceiver(args);
+	if (!isClosure(protectedBlock)) {
+		return PRIMITIVE_FAILED;
+	}
+	PRIMITIVE_ALLOCATES(args);
+	UnwindRecord record;
+	unwindPushCleanup(&record, primitiveArgument(args, 0));
+	Value answer = jitSendUnary(protectedBlock, "value", NULL);
+	unwindPop(&record);
+	PRIMITIVE_DONE_ALLOCATING();
+	return answer;
+}
+
+
 // The packed shape word of a class, which Smalltalk cannot read as a field:
 // jit-v2 keeps it in the class's RAW TRAILER so the collector never walks it
 // (ADR 0005), and that is exactly the kind of thing a primitive is for.
@@ -770,10 +1174,27 @@ static Value primInstanceShape(Value *args, uint64_t argc)
 	if (class == NULL) {
 		return PRIMITIVE_FAILED;
 	}
+	// PACKED FIELD BY FIELD, and not by memcpy of the struct.
+	//
+	// InstanceShape has PADDING between pointerWords and fixedSlots, and the C
+	// standard leaves padding bytes indeterminate. A memcpy therefore hands
+	// Smalltalk a word with garbage bits in it, and the number a class answers
+	// for its own shape could differ between two builds, or two runs, for
+	// reasons no reader could see.
+	//
+	// The layout below is the CONTRACT with Behavior in packages/Core, which
+	// decodes it. It is stated here and repeated there, and nowhere else:
+	//
+	//   bits  0..7   format (ObjectFormat)
+	//   bits  8..15  rawWords
+	//   bits 16..23  pointerWords
+	//   bits 24..39  fixedSlots
 	InstanceShape shape = class->raw->instanceShape;
-	uint64_t packed;
-	memcpy(&packed, &shape, sizeof(packed) < sizeof(shape) ? sizeof(packed) : sizeof(shape));
-	return tagInt((intptr_t) (packed & 0x3FFFFFFFFFFFFFFFull));
+	uint64_t packed = (uint64_t) shape.format
+		| ((uint64_t) shape.rawWords << 8)
+		| ((uint64_t) shape.pointerWords << 16)
+		| ((uint64_t) shape.fixedSlots << 24);
+	return tagInt((intptr_t) packed);
 }
 
 

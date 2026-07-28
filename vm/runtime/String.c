@@ -113,7 +113,7 @@ static _Bool symbolTableInsert(RawArray *table, RawObject *symbol, uint32_t hash
 	size_t index = hash & (capacity - 1);
 	for (size_t probe = 0; probe < capacity; probe++) {
 		Value slot = table->vars[index];
-		if (!valueTypeOf(slot, VALUE_POINTER)) {
+		if (slotIsEmpty(slot)) {
 			// THROUGH THE BARRIER. The symbol table is 8 KB on its first
 			// allocation, which sends it straight to the non-moving old space,
 			// while every symbol it holds is born young. An old-to-young edge
@@ -143,7 +143,7 @@ String *asSymbol(String *string)
 
 	for (size_t probe = 0; probe < capacity; probe++) {
 		Value slot = table->vars[index];
-		if (!valueTypeOf(slot, VALUE_POINTER)) {
+		if (slotIsEmpty(slot)) {
 			break; // empty slot: not present
 		}
 		RawString *candidate = (RawString *) asObject(slot);
@@ -203,7 +203,7 @@ static void growSymbolTable(void)
 	RawArray *to = fresh->raw;
 	for (size_t i = 0; i < oldCapacity; i++) {
 		Value slot = from->vars[i];
-		if (!valueTypeOf(slot, VALUE_POINTER)) {
+		if (slotIsEmpty(slot)) {
 			continue;
 		}
 		RawObject *symbol = asObject(slot);

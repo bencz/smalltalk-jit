@@ -40,6 +40,11 @@ void initHeap(Heap *heap, struct Thread *thread)
 	initPageSpace(&heap->execSpace, EXEC_PAGE_BYTES, 1);
 	heap->oldGcThreshold = OLD_GC_MIN_THRESHOLD;
 	heap->gcEpoch = 0;
+	// A Heap is routinely a stack variable, so this is not tidiness: left
+	// uninitialized it reads whatever was there, and a nonzero value turns
+	// collection OFF for the life of the heap without a word. The memory
+	// self-test caught it as a threshold crossed 3x over with no collection.
+	heap->gcInhibited = 0;
 
 	osMutexInit(&heap->youngLock);
 	osMutexInit(&heap->oldLock);
@@ -104,17 +109,27 @@ void freeHeap(Heap *heap)
 // Allocation
 // ---------------------------------------------------------------------------
 
+// COLLECT FIRST, THEN CARVE, and the order is the whole point.
+//
+// This used to allocate, then check the threshold, then collect, and hand the
+// address back afterwards. That gives the sweep a region that has been carved
+// out of the page but whose HEADER HAS NOT BEEN WRITTEN yet: the caller writes
+// it after this returns. The heap walk strides on the header, so it read zeroes
+// and computed a stride of 0, which is the assertion in pageSpaceSweep.
+//
+// The assertion was the lucky outcome. The sweep also FREES what is not marked,
+// and nothing marks an object that does not exist yet, so the other half of this
+// bug is the fresh allocation going onto a free list while the caller is still
+// about to initialize it: two owners for one address, found later and elsewhere.
+//
+// Reproduced from the built-in kernel with no image at all, by allocating past
+// the threshold in a loop.
 static uint8_t *allocateOld(Heap *heap, size_t bytes)
 {
 	osMutexLock(&heap->oldLock);
-	uint8_t *address = pageSpaceAllocate(&heap->oldSpace, bytes);
 	_Bool overThreshold = heap->oldSpace.allocated > heap->oldGcThreshold
 		&& !heap->gcInhibited;
 	osMutexUnlock(&heap->oldLock);
-	if (address == NULL) {
-		fprintf(stderr, "out of memory: old space refused %zu bytes\n", bytes);
-		abort();
-	}
 	if (overThreshold) {
 		collectorMarkSweep(heap);
 		osMutexLock(&heap->oldLock);
@@ -124,6 +139,14 @@ static uint8_t *allocateOld(Heap *heap, size_t bytes)
 			heap->oldGcThreshold = OLD_GC_MIN_THRESHOLD;
 		}
 		osMutexUnlock(&heap->oldLock);
+	}
+
+	osMutexLock(&heap->oldLock);
+	uint8_t *address = pageSpaceAllocate(&heap->oldSpace, bytes);
+	osMutexUnlock(&heap->oldLock);
+	if (address == NULL) {
+		fprintf(stderr, "out of memory: old space refused %zu bytes\n", bytes);
+		abort();
 	}
 	return address;
 }
@@ -283,14 +306,18 @@ static RawObject *initializeObject(Heap *heap, RawObject *object,
 RawObject *allocateImmortalObject(Heap *heap, RawObject *class, size_t elements)
 {
 	RawClass *raw = (RawClass *) class;
-	size_t bytes = objectSizeForShape(raw->instanceShape, elements);
+	// Read out of the class BEFORE allocating, the same rule allocateObject
+	// follows: allocating can collect, a full collection scavenges first, and a
+	// scavenge MOVES a class that still lives in the nursery.
+	InstanceShape shape = raw->instanceShape;
+	uint32_t classIndex = raw->classIndex;
+	size_t bytes = objectSizeForShape(shape, elements);
 	// The OLD space, which never moves and never compacts (ADR 0005). Reachable
 	// from the well-known handles, so the mark phase keeps it alive; what it
 	// must never do is change address.
 	RawObject *object = (RawObject *) allocateOld(heap, bytes);
 	ASSERT(object != NULL);
-	initializeObject(heap, object, raw->instanceShape, raw->classIndex, bytes,
-		elements);
+	initializeObject(heap, object, shape, classIndex, bytes, elements);
 	ASSERT(isOldObject(object)); // the whole point: bit 3 says non-moving
 	return object;
 }

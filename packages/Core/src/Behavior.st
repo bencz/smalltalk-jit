@@ -42,20 +42,51 @@ Behavior := Object [
 	"shape and size"
 
 	instanceSize [
-		^(self instanceShape bitShift: -14) bitAnd: 16rFF
+		"Named instance variables. The `fixedSlots` field of the shape word."
+		^(self instanceShape bitShift: -24) bitAnd: 16rFFFF
 	]
 
 
 	instanceShape [
 		"The packed shape word out of the class's raw trailer. A primitive
-		 because it is not a tagged field: see the note at the top."
+		 because it is not a tagged field: see the note at the top.
+
+		 THE LAYOUT IS THE CONTRACT with primInstanceShape (vm/runtime/
+		 Primitive.c), which is the only other place it is written:
+
+		    bits  0..7   format
+		    bits  8..15  rawWords
+		    bits 16..23  pointerWords
+		    bits 24..39  fixedSlots
+
+		 This is the jit-v2 shape and it is NOT the one this file used to
+		 decode. The old fields were at other offsets entirely, so isIndexable
+		 answered false for every class in the system, including Array, and the
+		 damage was silent and wide: shallowCopy takes the not-indexed branch,
+		 so `#(1 2 3) copy` came back an EMPTY Array, and everything built on
+		 copy (sort, replaceAll:, replaceFrom:to:with:, Dictionary copy) got an
+		 empty collection and reported a plain wrong answer rather than failing."
 		<primitive: BehaviorInstanceShapePrimitive>
 		^0
 	]
 
 
+	instanceFormat [
+		"The ObjectFormat of instances: 0 no pointers, 1 pointers, 2 indexed
+		 pointers, 3 bytes, 4 doubles, 5 mixed pointers, 6 mixed bytes."
+		^self instanceShape bitAnd: 16rFF
+	]
+
+
 	isIndexable [
-		^((self instanceShape bitShift: -22) bitAnd: 16rFF) = 1
+		"Exactly the three formats whose basicSize is an element count and whose
+		 basicAt: is an element accessor, which is what every caller here means:
+		 indexed pointers, bytes and doubles. The MIXED formats are deliberately
+		 out, and that agrees with the size primitive, which refuses them."
+		| format |
+
+		format := self instanceFormat.
+		^format = 2 or: [format = 3 or: [format = 4]]
 	]
 
 

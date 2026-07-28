@@ -310,6 +310,52 @@ int main(void)
 	}
 	check("the old space still walks end to end after a sweep", walked > 0);
 
+	// ---- 7b: a collection TRIGGERED BY an old-space allocation ---------------
+	//
+	// The one above calls collectorMarkSweep directly, which is the easy case:
+	// nothing is half-allocated at that moment. The hard case is the collection
+	// the ALLOCATOR itself starts on crossing its threshold, and the order there
+	// is the whole thing: carve first and the sweep walks a region that has been
+	// handed out but whose header the caller has not written yet, so the walk
+	// reads zeroes and strides by zero.
+	//
+	// The stride assertion is the LUCKY half. The other half is that the sweep
+	// frees what is not marked, and nothing marks an object that does not exist
+	// yet, so the fresh allocation lands on a free list while its caller is still
+	// about to initialize it: one address, two owners, discovered somewhere else
+	// entirely.
+	//
+	// The check is that the walk stays consistent, which is what a stride of zero
+	// destroys. Verified by putting the collection back after the carve: this
+	// aborts inside pageSpaceSweep.
+	{
+		// BIG objects, because only those reach allocateOld: anything that fits
+		// the header's size field is a nursery allocation and never crosses this
+		// threshold at all. That is why the first version of this check passed
+		// with the bug in place.
+		size_t elements = SIZE_INLINE_MAX_BYTES + 64;
+		size_t fullsBefore = LastGCStats.count;
+		heap.oldGcThreshold = heap.oldSpace.allocated + 256 * 1024;
+		for (int i = 0; i < 400; i++) {
+			RawObject *big = allocateObject(&heap, classOfBytes, elements);
+			big->body[sizeof(uint64_t)] = (uint8_t) i;
+		}
+		check("allocating big objects triggered a full collection from INSIDE "
+			"the allocator, which is the path this checks",
+			LastGCStats.count > fullsBefore);
+
+		size_t seen = 0;
+		PageSpaceIterator each;
+		pageSpaceIteratorInit(&each, &heap.oldSpace, &heap.classes);
+		for (RawObject *object = pageSpaceIteratorNext(&each);
+				object != NULL; object = pageSpaceIteratorNext(&each)) {
+			seen++;
+		}
+		check("and the old space still walks end to end afterwards", seen > 0);
+		check("and the reachable set came through it",
+			((Value *) asObject(roots[0])->body)[0] == tagInt(1234));
+	}
+
 	// ---- 8: handles ---------------------------------------------------------
 	// A handle is how C code holds an object across an allocation. The check
 	// that matters is the second one: an object reachable ONLY through a handle

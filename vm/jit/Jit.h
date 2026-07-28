@@ -26,6 +26,7 @@
 
 #include "compiler/Bytecode.h"
 #include "core/Object.h"
+#include <setjmp.h>
 #include <stddef.h>
 
 #define JIT_MAX_REGISTER_ARGS 5 // receiver plus five, the SysV integer set
@@ -81,11 +82,80 @@ Value jitCall4(NativeCode *code, Value receiver, Value a, Value b, Value c, Valu
 Value jitCall5(NativeCode *code, Value receiver, Value a, Value b, Value c, Value d,
 	Value e);
 
-// Send a UNARY message from C, compiling the target on the way in if it has not
-// run yet. `understood` says whether anything answered; a caller that wants to
-// know rather than to crash passes it, because the bootstrap legitimately asks
+// Send a message from C, compiling the target on the way in if it has not run
+// yet. `understood` says whether anything answered; a caller that wants to know
+// rather than to crash passes it, because the bootstrap legitimately asks
 // classes a question most of them do not answer (a class-side `initialize`).
+Value jitSend(Value receiver, const char *selector, uint64_t argc,
+	const Value *argv, _Bool *understood);
 Value jitSendUnary(Value receiver, const char *selector, _Bool *understood);
+
+
+// ---- unwinding: non-local return, on:do: and ensure: ------------------------
+//
+// ONE CHAIN, three kinds of entry, and that is the whole design. All three are
+// "a point on the C stack, ordered by nesting, that leaving through has to
+// notice", and keeping them apart would mean three chains that have to be
+// interleaved correctly by every walk anyway.
+//
+// What each kind is for:
+//
+//   HOME     an activation a `^` inside a block can return from (ADR 0008).
+//            Pushed only when the front end saw such a `^` (CodeUnit.couldBeHome);
+//   HANDLER  an `on:do:` frame. The signal walks OUTWARD for the first one whose
+//            class answers `handles:`, runs the handler ON TOP of the signaling
+//            frames, and only then unwinds, which is what makes `resume:`
+//            possible at all: at decision time nothing has been popped yet;
+//   CLEANUP  an `ensure:`/`ifCurtailed:` registration. It runs when an unwind of
+//            EITHER other kind passes through it, innermost first, and the
+//            kernel's `ensure:` runs it itself on the normal path.
+//
+// The Values in here are GC ROOTS and are visited through
+// rootsVisitUnwindRecords (memory/Roots.h). A handler block is held across the
+// whole evaluation of the block it protects, which allocates freely, so this is
+// not a technicality: without it the first collection inside a protected block
+// leaves the handler pointing at a corpse.
+typedef enum {
+	UNWIND_HOME,
+	UNWIND_HANDLER,
+	UNWIND_CLEANUP,
+} UnwindKind;
+
+typedef struct UnwindRecord {
+	struct UnwindRecord *previous;
+	uint8_t kind;
+	// A handler that is RUNNING is skipped by the search, so an exception raised
+	// inside a handler goes outward instead of back into the handler that is
+	// already dealing with one.
+	_Bool disabled;
+	uint64_t token;       // UNWIND_HOME
+	Value exceptionClass; // UNWIND_HANDLER
+	Value handlerBlock;   // UNWIND_HANDLER
+	Value cleanupBlock;   // UNWIND_CLEANUP
+	jmp_buf destination;  // UNWIND_HOME and UNWIND_HANDLER
+	Value answer;
+	// Thread state to put back, because the jump skips every frame in between
+	// and each of them would otherwise leave its bookkeeping on these chains.
+	struct CompiledFrameGuard *savedFrames;
+	struct HandleScope *savedScopes;
+	uint64_t savedHomeToken;
+} UnwindRecord;
+
+// Push and pop. The setjmp must be taken in the frame that will be RESUMED, so
+// the caller owns the record and the buffer; these only maintain the chain.
+void unwindPushHandler(UnwindRecord *record, Value exceptionClass,
+	Value handlerBlock);
+void unwindPushCleanup(UnwindRecord *record, Value cleanupBlock);
+void unwindPop(UnwindRecord *record);
+// Arrived by a jump: put back the thread state the skipped frames would have
+// restored on the way out, and answer what the unwinder left.
+Value unwindAnswer(UnwindRecord *record);
+
+// Find a handler for `exception` and act on its decision. Answers the value the
+// signal expression should have, or PRIMITIVE_FAILED when no handler matched,
+// which is how `Exception>>basicSignal` falls through to its `^self
+// defaultAction`. Does not return at all when the handler chose to unwind.
+Value jitSignalException(Value exception);
 
 // Executable memory. Never moved and never freed, exactly like the old exec
 // space: a frame still running inside superseded code has to stay valid, and

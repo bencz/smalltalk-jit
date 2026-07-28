@@ -443,12 +443,26 @@ Value jitDispatchSuper(void *cellPointer, Value *receiverSlot, uint64_t packed)
 // Smalltalk-level place to run it from. It goes through the same lookup and the
 // same entry as every other send, so a method reached this way is compiled,
 // cached and profiled exactly like one reached from bytecode.
-Value jitSendUnary(Value receiver, const char *selector, _Bool *understood)
+Value jitSend(Value receiver, const char *selector, uint64_t argc,
+	const Value *argv, _Bool *understood)
 {
+	ASSERT(argc <= 2); // what the callers in this file need; widen when one does
 	HandleScope scope;
 	openHandleScope(&scope);
+	// EVERY operand goes in a handle, arguments included: looking the selector up
+	// interns a Symbol, which allocates, and an argument held as a bare Value
+	// across that is a corpse by the time the call is made.
 	Object *held = valueTypeOf(receiver, VALUE_POINTER)
 		? (Object *) scopeHandle(asObject(receiver)) : NULL;
+	Object *heldArgs[2] = { NULL, NULL };
+	Value rawArgs[2] = { 0, 0 };
+	for (uint64_t i = 0; i < argc; i++) {
+		if (valueTypeOf(argv[i], VALUE_POINTER)) {
+			heldArgs[i] = (Object *) scopeHandle(asObject(argv[i]));
+		} else {
+			rawArgs[i] = argv[i];
+		}
+	}
 	String *name = asSymbol(stringFromC(selector));
 
 	RawCompiledMethod *method = lookupMethod(classOf(
@@ -474,10 +488,23 @@ Value jitSendUnary(Value receiver, const char *selector, _Bool *understood)
 			return tagPtr(Handles.nil.raw);
 		}
 	}
-	Value answer = jitCall0(method->native,
-		held != NULL ? tagPtr(held->raw) : receiver);
+	Value self = held != NULL ? tagPtr(held->raw) : receiver;
+	Value a0 = heldArgs[0] != NULL ? tagPtr(heldArgs[0]->raw) : rawArgs[0];
+	Value a1 = heldArgs[1] != NULL ? tagPtr(heldArgs[1]->raw) : rawArgs[1];
+	Value answer;
+	switch (argc) {
+	case 0: answer = jitCall0(method->native, self); break;
+	case 1: answer = jitCall1(method->native, self, a0); break;
+	default: answer = jitCall2(method->native, self, a0, a1); break;
+	}
 	closeHandleScope(&scope, NULL);
 	return answer;
+}
+
+
+Value jitSendUnary(Value receiver, const char *selector, _Bool *understood)
+{
+	return jitSend(receiver, selector, 0, NULL, understood);
 }
 
 
@@ -511,34 +538,52 @@ Value jitSendUnary(Value receiver, const char *selector, _Bool *understood)
 // to build this and would tax the hottest path in the system for a feature most
 // sends never use.
 
-typedef struct UnwindRecord {
-	struct UnwindRecord *previous;
-	uint64_t token;
-	jmp_buf destination;
-	Value answer;
-	// Thread state to put back, because the jump skips every frame in between
-	// and each of them would otherwise leave its bookkeeping on these chains.
-	struct CompiledFrameGuard *savedFrames;
-	struct HandleScope *savedScopes;
-	uint64_t savedHomeToken;
-} UnwindRecord;
-
-
-// Make the activation about to be entered findable by a non-local return.
-static void unwindPush(UnwindRecord *record)
+// The fields common to every kind. The Values start as nil rather than as the
+// allocator's zero because the record is a GC root from the moment it is on the
+// chain, and a collection may look at it before it is fully filled.
+static void unwindPushCommon(UnwindRecord *record, UnwindKind kind)
 {
-	record->token = ++CurrentThread.nextHomeToken;
+	record->kind = (uint8_t) kind;
+	record->disabled = 0;
+	record->token = 0;
+	record->exceptionClass = tagPtr(Handles.nil.raw);
+	record->handlerBlock = tagPtr(Handles.nil.raw);
+	record->cleanupBlock = tagPtr(Handles.nil.raw);
 	record->answer = tagPtr(Handles.nil.raw);
 	record->savedFrames = CurrentThread.compiledFrames;
 	record->savedScopes = CurrentThread.handleScopes;
 	record->savedHomeToken = CurrentThread.homeToken;
 	record->previous = CurrentThread.unwinds;
 	CurrentThread.unwinds = record;
+}
+
+
+// Make the activation about to be entered findable by a non-local return.
+static void unwindPush(UnwindRecord *record)
+{
+	unwindPushCommon(record, UNWIND_HOME);
+	record->token = ++CurrentThread.nextHomeToken;
 	CurrentThread.homeToken = record->token;
 }
 
 
-static void unwindPop(UnwindRecord *record)
+void unwindPushHandler(UnwindRecord *record, Value exceptionClass,
+	Value handlerBlock)
+{
+	unwindPushCommon(record, UNWIND_HANDLER);
+	record->exceptionClass = exceptionClass;
+	record->handlerBlock = handlerBlock;
+}
+
+
+void unwindPushCleanup(UnwindRecord *record, Value cleanupBlock)
+{
+	unwindPushCommon(record, UNWIND_CLEANUP);
+	record->cleanupBlock = cleanupBlock;
+}
+
+
+void unwindPop(UnwindRecord *record)
 {
 	ASSERT(CurrentThread.unwinds == record);
 	CurrentThread.unwinds = record->previous;
@@ -550,15 +595,118 @@ static void unwindPop(UnwindRecord *record)
 // so their entries on these chains are put back from what was saved.
 //
 // PENDING: the handle scopes of the skipped frames are dropped by restoring the
-// head, which leaks their overflow chunks. Bounded by one unwind and worth
-// fixing when unwinding gets its second client, which is `ensure:`.
-static Value unwindAnswer(UnwindRecord *record)
+// head, which leaks their overflow chunks. Bounded by one unwind.
+Value unwindAnswer(UnwindRecord *record)
 {
 	CurrentThread.unwinds = record->previous;
 	CurrentThread.compiledFrames = record->savedFrames;
 	CurrentThread.handleScopes = record->savedScopes;
 	CurrentThread.homeToken = record->savedHomeToken;
 	return record->answer;
+}
+
+
+// The tagged fields of every record on this thread's chain.
+//
+// A handler block is held across the ENTIRE evaluation of the block it
+// protects, which allocates as freely as any other code, so these are ordinary
+// long-lived roots and not a technicality. Without this the first collection
+// inside a protected block leaves the handler pointing at a corpse, and the
+// symptom is an `on:do:` that runs garbage only when the block allocated enough
+// to collect.
+void rootsVisitUnwindRecords(struct Thread *thread, RootVisitor visit, void *ctx)
+{
+	for (UnwindRecord *record = thread->unwinds; record != NULL;
+			record = record->previous) {
+		Value *fields[] = { &record->exceptionClass, &record->handlerBlock,
+			&record->cleanupBlock, &record->answer };
+		for (size_t i = 0; i < sizeof fields / sizeof fields[0]; i++) {
+			if (valueTypeOf(*fields[i], VALUE_POINTER)) {
+				visit(ctx, fields[i]);
+			}
+		}
+	}
+}
+
+
+// Run every `ensure:` cleanup between here and `target`, innermost first, and
+// leave the chain head at `target`.
+//
+// Each record is UNLINKED BEFORE its block runs. A cleanup can signal, or do a
+// non-local return of its own, and the unwind that follows must not find this
+// same cleanup still armed and run it a second time.
+static void unwindRunCleanupsTo(UnwindRecord *target)
+{
+	while (CurrentThread.unwinds != NULL && CurrentThread.unwinds != target) {
+		UnwindRecord *record = CurrentThread.unwinds;
+		CurrentThread.unwinds = record->previous;
+		if (record->kind != UNWIND_CLEANUP) {
+			continue;
+		}
+		_Bool understood = 0;
+		jitSendUnary(record->cleanupBlock, "value", &understood);
+	}
+}
+
+
+// ---------------------------------------------------------------------------
+// Signalling
+// ---------------------------------------------------------------------------
+//
+// The order here is the whole resumable protocol, and it is the opposite of the
+// obvious one: the handler runs BEFORE anything unwinds.
+//
+//   1. walk outward for the first enabled handler whose class answers `handles:`;
+//   2. run it ON TOP of the signaling frames, through `runHandledBy:`, which
+//      answers an Association saying what to do;
+//   3. `false -> value` means RESUME: answer `value` from the signal expression,
+//      with nothing popped and every pending `ensure:` still armed;
+//   4. `true -> value` means UNWIND: run the cleanups between here and the
+//      handler, then jump to its `on:do:`, which answers `value`.
+//
+// Deciding first and unwinding second is what makes `resume:` expressible at
+// all. Unwinding first, as a plain longjmp handler would, destroys the frames
+// the resumption has to return into before anyone has said whether to resume.
+Value jitSignalException(Value exception)
+{
+	for (UnwindRecord *record = CurrentThread.unwinds; record != NULL;
+			record = record->previous) {
+		if (record->kind != UNWIND_HANDLER || record->disabled) {
+			continue;
+		}
+		_Bool understood = 0;
+		Value matched = jitSend(record->exceptionClass, "handles:", 1, &exception,
+			&understood);
+		if (!understood || matched != tagPtr(Handles.true_.raw)) {
+			continue;
+		}
+
+		// DISABLED while it runs, so an exception raised inside a handler
+		// searches OUTWARD instead of re-entering the handler already dealing
+		// with one. Restored on the resume path, where this activation lives on.
+		record->disabled = 1;
+		Value decision = jitSend(exception, "runHandledBy:", 1,
+			&record->handlerBlock, &understood);
+		record->disabled = 0;
+		if (!understood || !valueTypeOf(decision, VALUE_POINTER)) {
+			return PRIMITIVE_FAILED;
+		}
+
+		// An Association: key says whether to unwind, value is the result.
+		RawAssociation *association = (RawAssociation *) asObject(decision);
+		Value unwind = association->key;
+		Value answer = association->value;
+		if (unwind != tagPtr(Handles.true_.raw)) {
+			return answer; // resume: the signal expression answers this
+		}
+		record->answer = answer;
+		unwindRunCleanupsTo(record);
+		longjmp(record->destination, 1);
+	}
+	// Nobody handled it. The primitive FAILS, and `Exception>>basicSignal` falls
+	// through to its own `^self defaultAction`, which is where the kernel decides
+	// what an unhandled exception of this class means.
+	return PRIMITIVE_FAILED;
 }
 
 
@@ -576,10 +724,14 @@ static Value jitReturnOuter(void *unused, Value *valueSlot, uint64_t packed)
 
 	for (UnwindRecord *record = CurrentThread.unwinds; record != NULL;
 			record = record->previous) {
-		if (record->token != token) {
+		if (record->kind != UNWIND_HOME || record->token != token) {
 			continue;
 		}
 		record->answer = *valueSlot;
+		// A non-local return is an unwind like any other, so every `ensure:`
+		// between here and the home runs on the way out. This is the second of
+		// the three paths that has to do it; the third is the exception unwind.
+		unwindRunCleanupsTo(record);
 		longjmp(record->destination, 1);
 	}
 	// The home activation has already returned. ADR 0008 says this RAISES rather

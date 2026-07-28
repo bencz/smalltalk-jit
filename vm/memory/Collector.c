@@ -63,6 +63,9 @@ void collectorVisitRoots(Heap *heap, RootVisitor visit, void *ctx)
 	for (struct Thread *t = heap->mutators; t != NULL; t = t->nextMutator) {
 		handlesVisitRoots(t, visit, ctx);
 		rootsVisitNativeFrames(t, visit, ctx);
+		// The unwind chain: an on:do:'s class and handler block, an ensure:'s
+		// cleanup block. They sit on C frames and nothing else can reach them.
+		rootsVisitUnwindRecords(t, visit, ctx);
 	}
 }
 

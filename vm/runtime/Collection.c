@@ -11,9 +11,33 @@
 #define ORDCOLL_MIN_CAPACITY 8
 
 
+// An Array's empty slots hold NIL, not the zero the allocator leaves.
+//
+// This is the SAME boundary `Array new:` already crosses in its primitive
+// (runtime/Primitive.c, allocateInstance): inside the VM an unset slot means
+// ABSENT and is the SmallInteger 0, and in Smalltalk the only absent is nil. An
+// Array built in C is read from Smalltalk like any other, so it has to obey the
+// Smalltalk rule, and until it did the two disagreed silently.
+//
+// What that cost: a class's method dictionary is built in C, so its empty slots
+// were SmallInteger 0, and the kernel's probe finds a free slot with `isNil`.
+// It therefore read every empty slot as OCCUPIED and sent `key` to a
+// SmallInteger. `Object new respondsTo: #foo` was enough to hit it, because a
+// selector nobody implements is exactly the lookup that reaches an empty slot.
+//
+// Before nil EXISTS this does nothing, which covers only the symbol table: it is
+// allocated ahead of nil during bootstrap, is never read from Smalltalk, and the
+// C probes below treat both spellings of empty as empty.
 Array *newArray(size_t size)
 {
-	return newObject(&Handles.Array, size);
+	Array *array = newObject(&Handles.Array, size);
+	if (Handles.nil.raw != NULL) {
+		Value nil = tagPtr(Handles.nil.raw);
+		for (size_t i = 0; i < size; i++) {
+			array->raw->vars[i] = nil; // immortal, so no write barrier
+		}
+	}
+	return array;
 }
 
 

@@ -23,3 +23,12 @@ void rootsVisitCompiledCode(RootVisitor visit, void *ctx)
 	(void) visit;
 	(void) ctx;
 }
+
+
+__attribute__((weak))
+void rootsVisitUnwindRecords(struct Thread *thread, RootVisitor visit, void *ctx)
+{
+	(void) thread;
+	(void) visit;
+	(void) ctx;
+}

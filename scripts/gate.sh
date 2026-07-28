@@ -128,7 +128,7 @@ level3() {
 		vm/memory/Nursery.c vm/memory/RememberedSet.c vm/memory/Roots.c \
 		vm/os/linux/OsFile.c \
 		vm/os/linux/OsMemory.c vm/os/linux/OsThread.c vm/os/linux/OsTime.c \
-		-o "$SCRATCH/jittest" -lpthread || return 1
+		-o "$SCRATCH/jittest" -lpthread -lm || return 1
 	"$SCRATCH/jittest"
 }
 
@@ -192,7 +192,7 @@ level7() {
 		vm/memory/Nursery.c vm/memory/RememberedSet.c vm/memory/Roots.c \
 		vm/os/linux/OsFile.c \
 		vm/os/linux/OsMemory.c vm/os/linux/OsThread.c vm/os/linux/OsTime.c \
-		-o "$SCRATCH/primtest" -lpthread || return 1
+		-o "$SCRATCH/primtest" -lpthread -lm || return 1
 	"$SCRATCH/primtest"
 }
 
@@ -217,7 +217,7 @@ level8() {
 		vm/memory/Nursery.c vm/memory/RememberedSet.c vm/memory/Roots.c \
 		vm/os/linux/OsFile.c \
 		vm/os/linux/OsMemory.c vm/os/linux/OsThread.c vm/os/linux/OsTime.c \
-		-o "$SCRATCH/compiletest" -lpthread || return 1
+		-o "$SCRATCH/compiletest" -lpthread -lm || return 1
 	"$SCRATCH/compiletest"
 }
 

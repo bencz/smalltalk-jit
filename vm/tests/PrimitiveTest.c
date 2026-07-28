@@ -724,10 +724,24 @@ int main(void)
 		"mixed arithmetic a fast path instead of a coercion send",
 		primitiveFunctionAt(PRIM_IntAdd) == primitiveFunctionAt(PRIM_FloatAdd)
 		&& primitiveFunctionAt(PRIM_IntLessThan) == primitiveFunctionAt(PRIM_FloatLessThan));
-	check("a DECLARED but unimplemented primitive is a real number with no "
-		"function, so the method compiles and runs its fallback",
-		PRIM_FloatSin != PRIM_NONE && primitiveFunctionAt(PRIM_FloatSin) == NULL);
 	{
+		// SEARCHED, not named. This used to point at PRIM_FloatSin, and the check
+		// then failed the day sin was implemented: it was asserting a fact about
+		// one primitive when what it means to assert is a fact about the TABLE,
+		// that a declared name with no function is still a real number so the
+		// method compiles and runs its fallback.
+		PrimitiveNumber unimplemented = PRIM_NONE;
+		for (int i = 1; i < PRIM_COUNT; i++) {
+			if (primitiveFunctionAt((PrimitiveNumber) i) == NULL) {
+				unimplemented = (PrimitiveNumber) i;
+				break;
+			}
+		}
+		check("a DECLARED but unimplemented primitive is a real number with no "
+			"function, so the method compiles and runs its fallback",
+			unimplemented != PRIM_NONE
+			&& primitiveFunctionAt(unimplemented) == NULL);
+
 		size_t implemented = 0, declared = 0;
 		primitiveCoverage(&implemented, &declared);
 		printf("        primitives: %zu of %zu declared by packages/ are implemented\n",
