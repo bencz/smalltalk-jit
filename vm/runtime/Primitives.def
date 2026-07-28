@@ -81,7 +81,7 @@ PRIMITIVE(BuildClass, "BuildClassPrimitive", primBuildClass)  // Compiler>>basic
 PRIMITIVE(CharacterCode, "CharacterCodePrimitive", primCharacterCode)  // Character>>codePoint
 PRIMITIVE(CharacterNew, "CharacterNewPrimitive", primCharacterNew)  // Character>>class codePoint: anInteger
 PRIMITIVE(Class, "ClassPrimitive", primClass)  // Object>>class
-PRIMITIVE_ABSENT(ClassRemoveSelector, "ClassRemoveSelectorPrimitive")  // Behavior>>removeSelector: aSymbol
+PRIMITIVE(ClassRemoveSelector, "ClassRemoveSelectorPrimitive", primClassRemoveSelector)  // Behavior>>removeSelector: aSymbol
 PRIMITIVE_ABSENT(CommandLine, "CommandLinePrimitive")  // System>>class primitiveCommandLine
 PRIMITIVE(CompileMethodIn, "CompileMethodInPrimitive", primCompileMethodIn)  // Compiler>>basicCompileMethod: aMethodNode in: aClass namespace: aNamespace
 PRIMITIVE(CompileMethod, "CompileMethodPrimitive", primCompileMethod)  // Compiler>>basicCompileMethod: aMethodNode in: aClass
@@ -169,13 +169,13 @@ PRIMITIVE_ABSENT(LargeIntShift, "LargeIntShiftPrimitive")  // Integer>>primLarge
 PRIMITIVE_ABSENT(LastGCStats, "LastGCStatsPrimitive")  // GarbageCollector>>class lastStats
 PRIMITIVE_ABSENT(LastIoError, "LastIoErrorPrimitive")  // IoError>>class last
 PRIMITIVE_ABSENT(LocalUtcOffset, "LocalUtcOffsetPrimitive")  // DateTime>>class localUtcOffsetAt: epochSeconds
-PRIMITIVE_ABSENT(MemoryReleaseFence, "MemoryReleaseFencePrimitive")  // Atomic>>class releaseFence
+PRIMITIVE(MemoryReleaseFence, "MemoryReleaseFencePrimitive", primMemoryReleaseFence)  // Atomic>>class releaseFence
 PRIMITIVE(MethodSendArgs, "MethodSendArgsPrimitive", primMethodSendArgs)  // CompiledMethod>>sendTo: anObject withArguments: anArray
 PRIMITIVE(MethodSend, "MethodSendPrimitive", primMethodSend)  // CompiledMethod>>sendTo: anObject
-PRIMITIVE_ABSENT(MonitorEnterOn, "MonitorEnterOnPrimitive")  // ProcessorScheduler>>monitorEnterOn: anObject
-PRIMITIVE_ABSENT(MonitorEnter, "MonitorEnterPrimitive")  // ProcessorScheduler>>monitorEnter
-PRIMITIVE_ABSENT(MonitorExit, "MonitorExitPrimitive")  // ProcessorScheduler>>monitorExit
-PRIMITIVE_ABSENT(MonitorPark, "MonitorParkPrimitive")  // ProcessorScheduler>>parkOnMonitor
+PRIMITIVE(MonitorEnterOn, "MonitorEnterOnPrimitive", primMonitorEnterOn)  // ProcessorScheduler>>monitorEnterOn: anObject
+PRIMITIVE(MonitorEnter, "MonitorEnterPrimitive", primMonitorEnter)  // ProcessorScheduler>>monitorEnter
+PRIMITIVE(MonitorExit, "MonitorExitPrimitive", primMonitorExit)  // ProcessorScheduler>>monitorExit
+PRIMITIVE(MonitorPark, "MonitorParkPrimitive", primMonitorPark)  // ProcessorScheduler>>parkOnMonitor
 PRIMITIVE(MonotonicNanoTime, "MonotonicNanoTimePrimitive", primMonotonicNanos)  // Stopwatch>>class monotonicNanos; System>>class primitiveMonotonicNanos
 PRIMITIVE(ParseClass, "ParseClassPrimitive", primParseClass)  // Parser>>basicParseClass
 PRIMITIVE(ParseMethodOrBlock, "ParseMethodOrBlockPrimitive", primParseMethodOrBlock)  // Parser>>basicParseMethodOrBlock

@@ -69,9 +69,24 @@ Value primFloatArcTan2(Value *args, uint64_t argc)
 // error. Written as a double comparison rather than a cast, because casting a
 // double outside the integer range is undefined behaviour in C and would be a
 // wrong answer rather than a failure.
+//
+// THE BOUNDS COME FROM THE ONE PLACE THAT HAS THEM. They used to be written out
+// here as +-2^62, which is the range the payload would have if it were
+// UNSIGNED; it is signed, so the real window is [-2^61, 2^61-1], and the
+// literals let through everything between 2^61 and 2^62. tagInt asserts that
+// range, so `(1.0 timesTwoPower: 61) truncated` did not answer a
+// LargePositiveInteger -- it ABORTED THE VM. That is the asymmetry
+// runtime/primitives/Shared.h states in capitals, got wrong by a factor of two.
+//
+// The upper test is `<` against 2^61 rather than `<=` against 2^61-1 on purpose:
+// 2^61-1 has no exact double, so the nearest one is 2^61 and `<=` would let 2^61
+// itself through again. -2^61 IS exact and IS a SmallInteger, so the lower test
+// is inclusive.
 static Value integerResult(double value)
 {
-	if (!(value >= -4611686018427387904.0 && value <= 4611686018427387903.0)) {
+	double smallest = (double) SMALL_INT_MIN;    // -2^61, exact
+	double justPastLargest = -(double) SMALL_INT_MIN; // 2^61, exact
+	if (!(value >= smallest && value < justPastLargest)) {
 		return PRIMITIVE_FAILED; // NaN and infinity land here too, by !(...)
 	}
 	return tagInt((intptr_t) value);
@@ -94,7 +109,13 @@ static Value integerResult(double value)
 FLOAT_TO_INTEGER(primFloatFloor, floor)
 FLOAT_TO_INTEGER(primFloatCeiling, ceil)
 FLOAT_TO_INTEGER(primFloatTruncated, trunc)
-FLOAT_TO_INTEGER(primFloatRounded, nearbyint)
+// round() and NOT nearbyint(). Smalltalk's `rounded` breaks ties AWAY FROM
+// ZERO, so 0.5 is 1 and 2.5 is 3; nearbyint follows the current rounding mode,
+// which is ties-to-EVEN by default, so it answered 0 and 2. It is the same
+// thing said in two places disagreeing: packages/Core/src/Magnitudes/Number.st
+// documents `rounded` as "ties away from zero, matching the C round() behind
+// Float>>rounded", and the C behind it was not round().
+FLOAT_TO_INTEGER(primFloatRounded, round)
 
 
 // Base-2 exponent: 1.0 answers 0, 0.5 answers -1. Zero, infinity and NaN have

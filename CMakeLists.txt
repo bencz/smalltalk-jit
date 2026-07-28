@@ -199,6 +199,7 @@ set(vmSources
 	# scripts/gate.sh, which links these by hand, does glob -- see the note
 	# there for why the two answers differ.
 	vm/runtime/Primitive.c
+	vm/runtime/primitives/Atomics.c
 	vm/runtime/primitives/Allocation.c
 	vm/runtime/primitives/Arithmetic.c
 	vm/runtime/primitives/Bits.c

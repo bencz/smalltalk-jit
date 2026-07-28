@@ -32,6 +32,11 @@ typedef struct {
 	// own, which is the rule Fiber.h states: a peer must not be able to pop and
 	// run a stack that is still switching off.
 	Fiber *parking;
+	// Who holds the sync monitor, or NULL. IN HERE and not a file-static of its
+	// own, because this struct IS the per-process scheduler state named at the
+	// top of this section: when it becomes per-worker, the monitor has to travel
+	// with the ready queue rather than be found later as a stray global.
+	Fiber *monitorOwner;
 	size_t nextId;
 	_Bool started;
 } Scheduler;
@@ -60,17 +65,11 @@ static void registryAdd(Fiber *fiber)
 }
 
 
-static void registryRemove(Fiber *fiber)
-{
-	for (size_t i = 0; i < gScheduler.count; i++) {
-		if (gScheduler.all[i] == fiber) {
-			gScheduler.all[i] = gScheduler.all[--gScheduler.count];
-			return;
-		}
-	}
-}
-
-
+// There is no registryRemove. A fiber leaves the registry in exactly one place,
+// reapFinished below, which is walking the array anyway and so drops it by INDEX
+// instead of searching for it. A second way out is what a terminate that
+// reclaimed the victim's stack directly would have needed, and terminating is
+// now an unwind the victim performs on itself (schedulerTerminate).
 static Fiber *fiberWithId(size_t id)
 {
 	for (size_t i = 0; i < gScheduler.count; i++) {
@@ -291,6 +290,29 @@ static void switchTo(Fiber *next)
 }
 
 
+// If this fiber has been condemned by somebody else, die now.
+//
+// POLLED RATHER THAN DONE TO IT, and that is the whole design of terminating a
+// fiber that is not the one running. Its pending `ensure:`/`ifCurtailed:`
+// cleanups belong to activations on ITS stack, and that stack is the only place
+// they can run: a cleanup that does a non-local return, or that registers
+// another cleanup, means something on the victim's chain and something else on
+// the terminator's. So schedulerTerminate MARKS and SCHEDULES, and the fiber
+// leaves through the same unwindToExit a self-terminate takes. One mechanism,
+// not two.
+//
+// Every point where a fiber regains the CPU is either the return of the park
+// below or the start of runSpawnedFiber, so those are the two places this is
+// asked.
+static void terminateIfCondemned(void)
+{
+	Fiber *self = fiberCurrent();
+	if (self != NULL && self->terminating) {
+		unwindToExit(); // never returns
+	}
+}
+
+
 // Park the running fiber with `intent` and give the CPU to someone else.
 // Answers 0 when there was nobody to give it to.
 static _Bool parkAndSwitch(ParkIntent intent)
@@ -305,6 +327,7 @@ static _Bool parkAndSwitch(ParkIntent intent)
 	gScheduler.parking = self;
 	switchTo(next);
 	self->state = FIBER_RUNNING;
+	terminateIfCondemned();
 	return 1;
 }
 
@@ -313,12 +336,40 @@ static _Bool parkAndSwitch(ParkIntent intent)
 // The entry trampoline
 // ---------------------------------------------------------------------------
 
+// Evaluate a fiber's block, and BE the place terminating that fiber lands.
+//
+// A FUNCTION OF ITS OWN, and it has to be one. A jump resumes in the frame that
+// took the destination, so the setjmp has to sit in a frame that is still there
+// when the jump happens; and a frame with no locals of its own is a frame with
+// nothing for a longjmp to leave indeterminate, which is the rule the C standard
+// states about setjmp and the one that is easiest to violate by accident.
+//
+// `block` is handed straight to jitSendUnary, which puts it in a handle before
+// anything allocates, so it is never a bare Value across a collection.
+static void runFiberBody(Value block)
+{
+	UnwindRecord bottom;
+	unwindPushExit(&bottom);
+	if (setjmp(bottom.destination) != 0) {
+		// Terminated. The cleanups already ran on the way here; this puts back
+		// the bookkeeping of every frame the jump skipped, exactly as the
+		// non-local return and the exception unwind do at their landing sites.
+		unwindAnswer(&bottom);
+		return;
+	}
+	if (valueTypeOf(block, VALUE_POINTER)) {
+		jitSendUnary(block, "value", NULL);
+	}
+	unwindPop(&bottom);
+}
+
+
 // What a spawned fiber starts on, reached from Fiber.c's own trampoline
 // through cEntry/cArg.
 //
-// What a spawned fiber starts on. It evaluates the block and then has to hand
-// control back WITHOUT returning, because there is nothing to return to: the
-// bottom of this stack was primed by fiberPrimeStack, not called from anywhere.
+// It evaluates the block and then has to hand control back WITHOUT returning,
+// because there is nothing to return to: the bottom of this stack was primed by
+// fiberPrimeStack, not called from anywhere.
 static void runSpawnedFiber(void *arg)
 {
 	Fiber *self = arg;
@@ -337,11 +388,16 @@ static void runSpawnedFiber(void *arg)
 	commitPendingPark();
 	reapFinished();
 
-	if (valueTypeOf(self->entryBlock, VALUE_POINTER)) {
-		jitSendUnary(self->entryBlock, "value", NULL);
+	// Condemned before it ever ran, which is legal: `newProcess` answers a
+	// suspended process and terminating one is not required to wait for it to
+	// start. Its chain is empty, so this only skips the block.
+	if (!self->terminating) {
+		runFiberBody(self->entryBlock);
 	}
 
-	// Done. Drop the block so a finished fiber stops keeping its closure, and
+	// Done, whether the block ran out or the fiber terminated itself: the two
+	// paths join here so a fiber has ONE ending, and everything below is that
+	// ending. Drop the block so a finished fiber stops keeping its closure, and
 	// everything the closure captured, alive until it is reaped.
 	self->entryBlock = tagInt(0);
 	self->state = FIBER_DONE;
@@ -490,35 +546,134 @@ _Bool schedulerResume(size_t id)
 }
 
 
+// Terminate a fiber by id, answering whether it is going to die.
+//
+// THE KERNEL'S CONTRACT IS THAT CLEANUPS RUN. `Block>>ensure:` promises its
+// block runs "whether the receiver completes normally or is unwound (by an
+// exception, a non-local return, or termination)", and
+// `Block>>valueUnwindProtected:` names Process terminate outright. So a
+// terminate is an UNWIND and not a stack being dropped, and an unwind runs on
+// the stack it is unwinding.
+//
+// TERMINATING YOURSELF NEVER ANSWERS. It is a change of stack that does not come
+// back: the pending cleanups run here, on this still-live stack, and control
+// leaves through this fiber's exit record (jit/Jit.h). Whether that ends the
+// program or just this fiber is decided by the frame that pushed the record --
+// main() for the main process, runSpawnedFiber above for every other -- and not
+// here, which is why the main fiber needs no case of its own.
+//
+// TERMINATING SOMEBODY ELSE marks and schedules, and the victim dies the moment
+// it next has the CPU (terminateIfCondemned above). It answers before that has
+// happened, and that is the honest thing to answer: the alternative is running
+// the victim's cleanups on the terminator's stack, where a cleanup's non-local
+// return would look for a home activation that is not on this chain.
 _Bool schedulerTerminate(size_t id)
 {
 	schedulerInit();
 	Fiber *fiber = fiberWithId(id);
-	if (fiber == NULL || fiber == fiberCurrent() || fiber == gScheduler.main) {
+	if (fiber == NULL || fiber->state == FIBER_DONE) {
+		return 0; // nothing there, or already finished
+	}
+	if (fiber == fiberCurrent()) {
+		unwindToExit(); // never returns
+	}
+	if (fiber->terminating) {
+		return 1; // already condemned; asking twice is not an error
+	}
+	fiber->terminating = 1;
+	// Runnable, because the cleanups are ITS work. A sleeper's deadline is
+	// cancelled for the same reason `resume` cancels one: it is on the ready
+	// queue now, and waking it again later would push it a second time.
+	sleepersDrop(fiber);
+	if (fiber->state == FIBER_SUSPENDED) {
+		fiber->state = FIBER_READY;
+		readyPush(fiber);
+	}
+	return 1;
+}
+
+
+// ---------------------------------------------------------------------------
+// The sync monitor
+// ---------------------------------------------------------------------------
+//
+// ONE MONITOR, A PLAIN FIELD, AND NO LOCK, and all three follow from the same
+// fact rather than from three separate decisions: this scheduler runs ONE OS
+// THREAD (Scheduler.h says so in capitals, and nothing in the v2 build spawns a
+// second one -- WorkerParallelPrimitive is not implemented).
+//
+// What that buys, and it is worth being precise because the shape looks wrong
+// for a system meant to run hundreds of fibers:
+//
+//   * NO ATOMICS. Two fibers cannot execute at once, so a read-modify-write of
+//     the owner cannot race. An atomic here would be describing a hazard that
+//     does not exist and hiding the assumption that it does not.
+//   * NO CONTENTION TO STRIPE AWAY. A critical section is never held ACROSS a
+//     switch: the only way out of one while holding the monitor is
+//     parkOnMonitor, which releases it first. So two unrelated sync objects
+//     sharing one monitor cost nothing here -- unlike the old VM, where many
+//     OS threads serialising on one lock was measured and answered with
+//     striping.
+//   * ONE FIELD, in the Scheduler struct above, so it becomes per-worker with
+//     the rest of the scheduler state instead of surviving as a global that
+//     nobody notices.
+//
+// WHAT HAS TO CHANGE WHEN WORKERS RETURN, stated so it is not rediscovered: the
+// owner needs a real lock or an atomic compare-and-swap, `enter` needs to block
+// rather than yield, and the object argument to monitorEnterOn: stops being
+// ignored and picks the stripe. That is a rewrite of these three functions and
+// of nothing above them, which is why the seam is here.
+
+_Bool schedulerMonitorEnter(void)
+{
+	schedulerInit();
+	Fiber *self = fiberCurrent();
+	if (gScheduler.monitorOwner == self) {
+		// Re-entry. `ProcessorScheduler>>monitorEnterOn:` says in capitals that
+		// critical sections stay FLAT, and a section that enters twice would
+		// release on the first exit while the outer one believed it still held
+		// the monitor. Answering 0 makes that say so.
 		return 0;
 	}
-	// Unlink it from wherever it is waiting, then drop it. Its stack is
-	// reclaimed without running anything on it: an `ensure:` block in a
-	// terminated fiber would have to be run ON that stack, which is the
-	// unwinder's job and is not implemented here. Said out loud because the
-	// difference is observable.
-	sleepersDrop(fiber);
-	if (fiber->state == FIBER_READY) {
-		Fiber **link = &gScheduler.readyHead;
-		Fiber *previous = NULL;
-		while (*link != NULL && *link != fiber) {
-			previous = *link;
-			link = &(*link)->queueNext;
-		}
-		if (*link == fiber) {
-			*link = fiber->queueNext;
-			if (gScheduler.readyTail == fiber) {
-				gScheduler.readyTail = previous;
-			}
+	while (gScheduler.monitorOwner != NULL) {
+		// Held by somebody else, which in a cooperative scheduler means a fiber
+		// that parked while holding it. Yield until it lets go; if nobody else
+		// can run, waiting would be waiting forever and this says so instead.
+		if (!parkAndSwitch(PARK_YIELD)) {
+			return 0;
 		}
 	}
-	registryRemove(fiber);
-	fiberDestroy(fiber);
+	gScheduler.monitorOwner = self;
+	return 1;
+}
+
+
+_Bool schedulerMonitorExit(void)
+{
+	schedulerInit();
+	if (gScheduler.monitorOwner != fiberCurrent()) {
+		return 0; // exiting a monitor this fiber does not hold
+	}
+	gScheduler.monitorOwner = NULL;
+	return 1;
+}
+
+
+_Bool schedulerMonitorPark(void)
+{
+	schedulerInit();
+	Fiber *self = fiberCurrent();
+	if (gScheduler.monitorOwner != self) {
+		return 0;
+	}
+	// RELEASE THEN PARK, with nothing in between that could switch. A waker has
+	// to hold the monitor to dequeue this fiber's id, so it cannot act until the
+	// release; and the park is committed on the next fiber's stack before any
+	// Smalltalk runs there (commitPendingPark), so it cannot act before this
+	// fiber's parked state is published either. Both halves of the lost-wakeup
+	// window are closed by the switch protocol rather than by a lock.
+	gScheduler.monitorOwner = NULL;
+	schedulerSuspendCurrent();
 	return 1;
 }
 

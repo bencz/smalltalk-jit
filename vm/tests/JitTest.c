@@ -30,6 +30,7 @@
 #include "runtime/Collection.h"
 #include "runtime/Dictionary.h"
 #include "runtime/String.h"
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -188,6 +189,53 @@ int main(void)
 	check("arguments land in their frame slots",
 		jitCall2(answerSecond, tagPtr(Handles.nil.raw), tagInt(11), tagInt(22))
 			== tagInt(22));
+
+	// ---- WIDE arguments: more than the ABI's register set holds ------------
+	//
+	// `DateTime year:month:day:hour:minute:second:millisecond:` is seven
+	// arguments and a receiver, and SysV has six integer argument registers.
+	// The prologue used to ASSERT on it, so the kernel could not be compiled.
+	// Past the set the method takes ONE pointer instead, to the caller's
+	// receiver slot, with the arguments at descending addresses (jit/Jit.h).
+	//
+	// EVERY SLOT IS CHECKED, not just one, and that is the point of the loop: a
+	// copy that walked the block the WRONG WAY still puts the receiver in slot
+	// 0 and would pass any single-argument check. The eighth call is what
+	// catches it, because reversed it answers the receiver.
+	check("a method past the register set is compiled WIDE",
+		jitCompile(makeUnit(second, 2, 12, 9, NULL), &unsupported)->wide);
+	check("and one that still fits is NOT",
+		!jitCompile(makeUnit(second, 2, 4, 2, NULL), &unsupported)->wide);
+
+	Value block[8];
+	for (uint16_t k = 0; k < 8; k++) {
+		Instruction *pick = calloc(2, sizeof(Instruction));
+		pick[0] = (Instruction) { OP_MOVE, 0, 8, k, 0 };
+		pick[1] = (Instruction) { OP_RET, 0, 8, 0, 0 };
+		// Seven arguments plus self, so nine registers: eight incoming and one
+		// to answer from.
+		NativeCode *wide = jitCompile(makeUnit(pick, 2, 9, 7, NULL), &unsupported);
+		// The block as a compiled caller's frame has it: receiver HIGHEST,
+		// arguments descending. Values are 700, 701, ... so a slot holding the
+		// wrong one is visible rather than plausible.
+		for (uint16_t i = 0; i < 8; i++) {
+			block[7 - i] = tagInt(700 + i);
+		}
+		char what[64];
+		snprintf(what, sizeof what, "wide argument %u lands in slot %u", k, k);
+		check(what, jitCallWide(wide, &block[7]) == tagInt(700 + k));
+	}
+
+	// The SAME unit, narrow for SysV and wide for Win64, because Win64 carries
+	// four integer arguments and SysV carries six. This is the divergence a
+	// backend vtable exists to keep honest (ADR 0009): a single constant for
+	// "how many fit" would be right on one of them and silently wrong on the
+	// other, and the way it goes wrong is a callee reading a register nobody
+	// wrote.
+	CodeUnit *fourArgs = makeUnit(second, 2, 6, 4, NULL);
+	check("four arguments are narrow under SysV and WIDE under Win64",
+		!jitCompileFor(maBackendNamed("x64"), fourArgs, &unsupported)->wide
+		&& jitCompileFor(maBackendNamed("x64-win64"), fourArgs, &unsupported)->wide);
 
 	// ---- instance variables ------------------------------------------------
 	Class *point = defineClass(2);

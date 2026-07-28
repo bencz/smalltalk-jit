@@ -56,9 +56,37 @@ void schedulerSleep(int64_t micros);
 // false is how the caller can tell.
 _Bool schedulerResume(size_t id);
 
-// Stop a fiber and reclaim it. Terminating the RUNNING fiber is not supported
-// here and answers 0: it would have to unwind the caller's own stack, which is
-// the unwinder's job and not the scheduler's.
+// Terminate a fiber, answering whether it is going to die. Terminating the
+// RUNNING one NEVER ANSWERS: it unwinds this stack and leaves through the
+// fiber's exit record (jit/Jit.h). Terminating another marks it and makes it
+// runnable, and it dies the next time it has the CPU, on its own stack, because
+// that is the only place its `ensure:` blocks can run.
 _Bool schedulerTerminate(size_t id);
+
+// ---- the sync monitor ------------------------------------------------------
+//
+// What Semaphore, Channel, SharedDictionary and ConcurrentDictionary are built
+// on: a critical section, plus a park that releases it.
+//
+// ONE MONITOR, not a striped set. The old VM striped by sync object because it
+// ran many OS threads and unrelated objects serializing on one lock was a
+// measured bottleneck (docs, monitor-sharding). This scheduler is cooperative
+// and single-threaded (top of this file), so there is no parallelism for
+// stripes to recover: a critical section here is never CONTENDED, only ever
+// re-entered or parked out of. `monitorEnterOn:` therefore takes its object and
+// ignores it, and the day workers arrive the stripe comes back as an
+// implementation detail behind these three calls.
+//
+// EACH ANSWERS 0 RATHER THAN ASSERTING when the caller is out of protocol --
+// entering twice, exiting without holding, parking without holding. The kernel
+// declares all four with empty bodies, so a 0 becomes `self primitiveFailed:`,
+// which names the primitive and can be caught. Aborting the VM for a Smalltalk
+// program's mistake is the other option and it is worse.
+_Bool schedulerMonitorEnter(void);
+_Bool schedulerMonitorExit(void);
+// Release the monitor and park, in that order and with nothing in between.
+// Atomic for free here: no switch point separates the two, so a would-be waker
+// cannot run in the window that a preemptive scheduler has to close explicitly.
+_Bool schedulerMonitorPark(void);
 
 #endif

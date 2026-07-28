@@ -72,6 +72,7 @@ WEAK_FRONTEND_PRIMITIVE(primParseClass)
 WEAK_FRONTEND_PRIMITIVE(primParseMethod)
 WEAK_FRONTEND_PRIMITIVE(primParseMethodOrBlock)
 WEAK_FRONTEND_PRIMITIVE(primBuildClass)
+WEAK_FRONTEND_PRIMITIVE(primClassRemoveSelector)
 WEAK_FRONTEND_PRIMITIVE(primCompileMethod)
 WEAK_FRONTEND_PRIMITIVE(primDefaultNamespace)
 WEAK_FRONTEND_PRIMITIVE(primSetDefaultNamespace)
@@ -84,6 +85,10 @@ WEAK_FRONTEND_PRIMITIVE(primProcessSuspend)
 WEAK_FRONTEND_PRIMITIVE(primProcessSleep)
 WEAK_FRONTEND_PRIMITIVE(primProcessResume)
 WEAK_FRONTEND_PRIMITIVE(primProcessTerminate)
+WEAK_FRONTEND_PRIMITIVE(primMonitorEnter)
+WEAK_FRONTEND_PRIMITIVE(primMonitorEnterOn)
+WEAK_FRONTEND_PRIMITIVE(primMonitorExit)
+WEAK_FRONTEND_PRIMITIVE(primMonitorPark)
 
 
 // Designated initialisers, so the array is indexed by the enum and a primitive

@@ -74,6 +74,21 @@ uint16_t maArgumentCount(MacroAssembler *assembler) { return assembler->argument
 const Abi *maAbi(MacroAssembler *assembler) { return assembler->ops->abi; }
 
 
+// The one derivation of narrow-or-wide; the reasoning is at the declaration.
+//
+// TWO CEILINGS, and the lower one decides. The ABI's register set is the
+// obvious one. The other is that the narrow convention is entered from C
+// through positional entry points and there are only six of them
+// (JIT_MAX_NARROW_ARGS), so a method past that is wide even on an ABI with the
+// registers to carry it: narrow code nothing can call is not an improvement.
+_Bool maUsesWideArguments(MacroAssembler *assembler)
+{
+	uint32_t incoming = (uint32_t) assembler->argumentCount + 1;
+	return incoming > (uint32_t) JIT_MAX_NARROW_ARGS + 1
+		|| incoming > assembler->ops->abi->argumentRegisterCount;
+}
+
+
 const MacroAssemblerOps *maBackendNamed(const char *name)
 {
 	for (const MacroAssemblerOps *const *ops = gMacroAssemblerBackends;

@@ -24,7 +24,7 @@ ExtParent := Object [
 ExtChild := ExtParent [
 ]
 
-[ | t ns before |
+[ | t ns before survivors missing |
 	t := TestRun named: 'ClassExtension'.
 
 	t check: 'a top-level extension adds an instance method to a core class'
@@ -90,6 +90,42 @@ ExtChild := ExtParent [
 		raises: NotFoundError in: [ ExtChild removeSelector: 42 ].
 	t expect: 'removing with a nil selector raises instead of crashing'
 		raises: NotFoundError in: [ ExtChild removeSelector: nil ].
+
+	"THE PROBE CHAIN SURVIVES A REMOVAL, which is the silent half of removing
+	 from an open-addressed dictionary. Probing is linear and stops at the first
+	 empty slot, so emptying a slot cuts every chain that ran through it: an
+	 unrelated selector whose home index is before the hole and whose entry is
+	 after it becomes unfindable while still occupying a slot.
+
+	 So this removes ONE selector and then looks for the ones it did NOT remove.
+	 Enough of them that collisions are certain, and every one is checked,
+	 because a cut chain loses an arbitrary subset."
+	Compiler new buildClass: (Parser parseString:
+		'ExtManySelectors := Object [
+			s01 [ ^1 ] s02 [ ^2 ] s03 [ ^3 ] s04 [ ^4 ] s05 [ ^5 ] s06 [ ^6 ]
+			s07 [ ^7 ] s08 [ ^8 ] s09 [ ^9 ] s10 [ ^10 ] s11 [ ^11 ] s12 [ ^12 ]
+			s13 [ ^13 ] s14 [ ^14 ] s15 [ ^15 ] s16 [ ^16 ] s17 [ ^17 ] s18 [ ^18 ]
+			s19 [ ^19 ] s20 [ ^20 ] s21 [ ^21 ] s22 [ ^22 ] s23 [ ^23 ] s24 [ ^24 ]
+		]') parseClass.
+	survivors := OrderedCollection new.
+	1 to: 24 do: [ :i |
+		survivors add: (i < 10
+			ifTrue: [ ('s0', i printString) asSymbol ]
+			ifFalse: [ ('s', i printString) asSymbol ]) ].
+	"remove a third of them, spread through the table"
+	1 to: 24 by: 3 do: [ :i | ExtManySelectors removeSelector: (survivors at: i) ].
+	missing := OrderedCollection new.
+	1 to: 24 do: [ :i |
+		| selector present |
+		selector := survivors at: i.
+		present := ExtManySelectors new respondsTo: selector.
+		(i - 1) \\ 3 = 0
+			ifTrue: [ present ifTrue: [ missing add: selector -> #stillThere ] ]
+			ifFalse: [ present ifFalse: [ missing add: selector -> #lost ] ] ].
+	t check: 'removing selectors leaves every other one findable'
+		equals: 0 is: [ missing size ].
+	t check: 'and the survivors still answer their own value'
+		equals: 24 is: [ ExtManySelectors new s24 ].
 
 	^t report
 ]

@@ -108,11 +108,20 @@ Float := Number [
 
 		 A result outside the immediate window is NOT one of those cases: the
 		 primitive boxes it into a BoxedFloat64 and answers normally, which is
-		 why `1.0e300 * 10.0` is an ordinary Float and not an error. What is left
-		 is a zero divisor, which is ZeroDivide, and anything unforeseen, which
-		 stops with a name instead of recursing."
+		 why `1.0e300 * 10.0` is an ordinary Float and not an error.
+
+		 NEITHER IS A ZERO DIVISOR. Float division is IEEE 754 division and
+		 answers what IEEE 754 answers: 1.0/0.0 is +inf, -1.0/0.0 is -inf and
+		 0.0/0.0 is a NaN, all three produced by the primitive. ZeroDivide is
+		 what INTEGER division by zero raises, and the two are different
+		 operations rather than one operation with a policy: tests/ZeroDivide
+		 Test.st asks for it from SmallInteger, Fraction and LargeInteger and
+		 never from a Float, and tests/FloatEdgeTest.st asks for the three IEEE
+		 answers by name.
+
+		 So what is left is anything unforeseen, which stops with a name instead
+		 of recursing."
 		(aNumber isKindOf: Float) ifTrue: [
-			aNumber = 0.0 ifTrue: [^ZeroDivide new signal: 'division by zero'].
 			^self error: 'float ', self class name, ' operation failed on a Float'].
 		^self retry: #/ coercing: aNumber
 	]

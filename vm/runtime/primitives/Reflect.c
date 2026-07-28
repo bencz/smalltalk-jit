@@ -262,7 +262,16 @@ Value primParseMethodOrBlock(Value *args, uint64_t argc)
 // class builder produced. Same rule as a parse error: an answer, not a failure.
 static Value buildErrorFrom(const ClassBuildError *error)
 {
-	Class *errorClass = getClass("Error");
+	// The class the builder NAMED, when it named one. `on: RedefinitionError
+	// do: [...]` in the image cannot work if every build failure arrives as
+	// Error, and the message string is not something a handler can match on.
+	// A name the image does not have falls back to Error rather than failing:
+	// reporting the wrong class of error still reports the error.
+	Class *errorClass = error->errorClass != NULL
+		? getClass((char *) error->errorClass) : NULL;
+	if (errorClass == NULL) {
+		errorClass = getClass("Error");
+	}
 	if (errorClass == NULL) {
 		return PRIMITIVE_FAILED;
 	}
@@ -288,6 +297,24 @@ static Value buildErrorFrom(const ClassBuildError *error)
 }
 
 
+// What a build answers, once. Three outcomes and not two.
+//
+// THE THIRD ONE IS WHY THIS EXISTS: a build can succeed and define NO CLASS.
+// `Name := Namespace [ ... ]` is a container of definitions, so there is no
+// single class to answer, and classBuildIn says so by answering NULL with no
+// error. Both primitives used to tag that NULL, and objectTagged dereferences
+// its argument, so declaring a namespace SEGFAULTED the VM. nil is the right
+// answer and the image is already written for it: PackageLoader and
+// Compiler>>compileStream: both skip the answer when `node isNamespace`.
+static Value buildAnswer(Class *class, const ClassBuildError *error)
+{
+	if (error->message != NULL) {
+		return buildErrorFrom(error);
+	}
+	return class == NULL ? tagPtr(Handles.nil.raw) : objectTagged((Object *) class);
+}
+
+
 Value primBuildClass(Value *args, uint64_t argc)
 {
 	if (argc != 1) {
@@ -301,11 +328,9 @@ Value primBuildClass(Value *args, uint64_t argc)
 	HandleScope scope;
 	openHandleScope(&scope);
 	ClassNode *node = scopeHandle(asObject(primitiveArgument(args, 0)));
-	ClassBuildError error = { NULL, NULL, NULL, COMPILE_OK };
+	ClassBuildError error = CLASS_BUILD_ERROR_NONE;
 	Class *class = classBuild(node, &error);
-	Value answer = error.message != NULL
-		? buildErrorFrom(&error)
-		: objectTagged((Object *) class);
+	Value answer = buildAnswer(class, &error);
 	closeHandleScope(&scope, NULL);
 	PRIMITIVE_DONE_ALLOCATING();
 	return answer;
@@ -348,11 +373,9 @@ Value primBuildClassIn(Value *args, uint64_t argc)
 		answer = PRIMITIVE_FAILED;
 	} else {
 		ClassNode *node = scopeHandle(asObject(primitiveArgument(args, 0)));
-		ClassBuildError error = { NULL, NULL, NULL, COMPILE_OK };
+		ClassBuildError error = CLASS_BUILD_ERROR_NONE;
 		Class *class = classBuildIn(node, namespace, &error);
-		answer = error.message != NULL
-			? buildErrorFrom(&error)
-			: objectTagged((Object *) class);
+		answer = buildAnswer(class, &error);
 	}
 	closeHandleScope(&scope, NULL);
 	PRIMITIVE_DONE_ALLOCATING();
@@ -380,7 +403,7 @@ Value primCompileMethodIn(Value *args, uint64_t argc)
 	} else {
 		MethodNode *node = scopeHandle(asObject(primitiveArgument(args, 0)));
 		Class *target = receiverAsClass(primitiveArgument(args, 1));
-		ClassBuildError error = { NULL, NULL, NULL, COMPILE_OK };
+		ClassBuildError error = CLASS_BUILD_ERROR_NONE;
 		CompiledMethod *method =
 			classCompileMethodInto(node, target, NULL, namespace, &error);
 		answer = error.message != NULL
@@ -450,6 +473,59 @@ Value primSetDefaultNamespace(Value *args, uint64_t argc)
 }
 
 
+// Behavior>>removeSelector: aSymbol
+//
+// The receiver's OWN dictionary, which is what the kernel's comment says and is
+// the only thing that can be undone: an inherited method is not the receiver's
+// to remove, and "removing" one by shadowing it would be an addition wearing the
+// wrong name.
+//
+// FAILS when there is no such selector, rather than answering. The kernel is
+// written for that -- the fallback signals a NotFoundError -- and it is the
+// right split: a selector that is not here is a program error, and answering
+// self would let `removeSelector:` on a typo look like success.
+//
+// AND IT FLUSHES THE SEND CACHES. A warm site holds the NativeCode it dispatched
+// to last time, so without this the removed method keeps being called from
+// exactly the sites that ran often enough to matter.
+Value primClassRemoveSelector(Value *args, uint64_t argc)
+{
+	if (argc != 1) {
+		return PRIMITIVE_FAILED;
+	}
+	Class *class = receiverAsClass(primitiveReceiver(args));
+	Value selector = primitiveArgument(args, 0);
+	// TEXT, not merely a pointer. `nil` IS a pointer, so a bare VALUE_POINTER
+	// test hands nil to asSymbol, which reads a byte count out of an
+	// UndefinedObject and interns a Symbol of whatever length it finds. That is
+	// the same family as reading an immediate through asObject, and it is
+	// checked here for the same reason: the argument comes from Smalltalk and
+	// nothing above stops a caller passing anything at all.
+	if (class == NULL || !valueTypeOf(selector, VALUE_POINTER)
+			|| rawObjectFormat(asObject(selector)) != FORMAT_BYTES) {
+		return PRIMITIVE_FAILED;
+	}
+	// asSymbol ALLOCATES when the argument is a String rather than an interned
+	// Symbol, so the frame is anchored before it and not after.
+	PRIMITIVE_ALLOCATES(args);
+	HandleScope scope;
+	openHandleScope(&scope);
+	String *name = scopeHandle(asObject(primitiveArgument(args, 0)));
+	Value methods = class->raw->methodDictionary;
+	_Bool removed = 0;
+	if (valueTypeOf(methods, VALUE_POINTER)) {
+		removed = symbolDictRemove(scopeHandle(asObject(methods)), asSymbol(name));
+	}
+	if (removed) {
+		jitFlushSendCaches();
+	}
+	Value answer = removed ? primitiveReceiver(args) : PRIMITIVE_FAILED;
+	closeHandleScope(&scope, NULL);
+	PRIMITIVE_DONE_ALLOCATING();
+	return answer;
+}
+
+
 Value primCompileMethod(Value *args, uint64_t argc)
 {
 	if (argc != 2) {
@@ -464,7 +540,7 @@ Value primCompileMethod(Value *args, uint64_t argc)
 	openHandleScope(&scope);
 	MethodNode *node = scopeHandle(asObject(primitiveArgument(args, 0)));
 	Class *target = receiverAsClass(primitiveArgument(args, 1));
-	ClassBuildError error = { NULL, NULL, NULL, COMPILE_OK };
+	ClassBuildError error = CLASS_BUILD_ERROR_NONE;
 	// classVariableScope NULL, meaning "same as the target". The caller named
 	// the class it wants the method in, exactly as the old VM's form did, and
 	// nothing here can second-guess which side it meant.

@@ -33,6 +33,9 @@ Association *symbolDictAtPut(Dictionary *dictionary, String *key, Value value);
 Association *symbolDictAtPutObject(Dictionary *dictionary, String *key, Object *value);
 Value symbolDictAt(Dictionary *dictionary, String *key);
 Association *symbolDictAssocAt(Dictionary *dictionary, String *key);
+// Answers whether there was a binding. The probe chain is REPAIRED, not left
+// with a hole in it; the reason that is not optional is at the definition.
+_Bool symbolDictRemove(Dictionary *dictionary, String *key);
 
 // String keys: content comparison, for keys not yet interned.
 Association *stringDictAtPut(Dictionary *dictionary, String *key, Value value);

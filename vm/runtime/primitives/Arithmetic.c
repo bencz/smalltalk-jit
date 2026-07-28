@@ -121,13 +121,24 @@ Value primDivide(Value *args, uint64_t argc)
 	if (a.kind == NUM_NOT || b.kind == NUM_NOT) {
 		return PRIMITIVE_FAILED;
 	}
-	if (b.asFloat == 0.0) {
-		// The quotient would be an infinity or a NaN, neither of which fits an
-		// immediate, so this is the same answer floatResult would give. Said
-		// here so the intent is division by zero and not a representation
-		// accident.
-		return PRIMITIVE_FAILED;
-	}
+	// A ZERO DIVISOR IS NOT A FAILURE HERE, and the split is between the two
+	// halves of this function rather than between two classes.
+	//
+	// Everything above answered with BOTH operands SmallIntegers, and there a
+	// zero divisor fails into Smalltalk and raises ZeroDivide, which is what
+	// `1 / 0` has to do. Everything reaching this line has at least one FLOAT in
+	// it, so the operation is IEEE 754 division and IEEE 754 answers: 1.0/0.0 is
+	// +inf, -1.0/0.0 is -inf, 0.0/0.0 is a NaN. Failing instead made every one of
+	// those raise, which is why a program could not compute an infinity by the
+	// one route that always produces one.
+	//
+	// tests/ZeroDivideTest.st and tests/FloatEdgeTest.st are the two halves of
+	// this written down: the first asks for ZeroDivide from SmallInteger,
+	// Fraction and LargeInteger, and never from a Float; the second asks for the
+	// three IEEE answers by name. Neither is a Float raising ZeroDivide.
+	//
+	// The quotient does not fit the immediate window, so FLOAT_RESULT boxes it,
+	// exactly as it already boxed the overflow of an ordinary multiply.
 	FLOAT_RESULT(args, a.asFloat / b.asFloat);
 }
 

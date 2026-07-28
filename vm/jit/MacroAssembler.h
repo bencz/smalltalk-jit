@@ -127,6 +127,18 @@ uint16_t maFrameSlots(MacroAssembler *assembler);
 uint16_t maArgumentCount(MacroAssembler *assembler);
 const Abi *maAbi(MacroAssembler *assembler);
 
+// Does the receiver plus the arguments fit this ABI's integer argument
+// registers? When they do not, the method is compiled for the WIDE convention
+// (jit/Jit.h): one pointer to the caller's receiver slot.
+//
+// THE RULE LIVES HERE AND NOWHERE ELSE. The prologue asks it to decide what to
+// emit and jitCompileFor asks it to record what was emitted, and two answers
+// that could disagree would be a callee reading arguments out of registers
+// nobody wrote. It is per-ABI and not a constant because the sets differ: SysV
+// has six integer argument registers and Win64 has four, so the same method is
+// narrow for one and wide for the other.
+_Bool maUsesWideArguments(MacroAssembler *assembler);
+
 // ---- the neutral vocabulary, thin dispatchers ------------------------------
 
 void maPrologue(MacroAssembler *assembler, Value nilValue);

@@ -60,12 +60,44 @@ Value primMethodSend(Value *args, uint64_t argc)
 }
 
 
+// A wide method called reflectively: the arguments have to be laid out the way
+// a compiled caller's frame already has them, receiver highest and the rest at
+// descending addresses (jit/Jit.h). An Array holds them the other way round, so
+// this is a reversal into a block and not a pointer into the Array.
+//
+// MALLOC'D AND NOT A STACK BUFFER, because the arity of a wide method has no
+// ceiling and a fixed buffer would put one back in exactly the reflective path
+// whose whole job is not to be narrower than the direct one.
+//
+// The block is filled and used with NOTHING allocating in between. It is C
+// memory the collector does not know about, so a collection between the copy
+// and the call would leave it holding addresses of objects that had moved --
+// the same rule the narrow path below states, and the reason both read out of
+// the Array as late as possible.
+static Value sendWide(RawCompiledMethod *method, Value receiver, RawArray *array,
+	size_t count)
+{
+	Value *block = malloc((count + 1) * sizeof(Value));
+	if (block == NULL) {
+		return PRIMITIVE_FAILED;
+	}
+	block[count] = receiver;
+	for (size_t i = 0; i < count; i++) {
+		block[count - 1 - i] = array->vars[i];
+	}
+	Value answer = jitCallWide(method->native, &block[count]);
+	free(block);
+	return answer;
+}
+
+
 // CompiledMethod>>sendTo: anObject withArguments: anArray
 //
-// The arity ceiling is the ABI's, receiver plus five (jit/Jit.h), and passing
-// more FAILS rather than calling with arguments nobody wrote. That is the same
-// ceiling an ordinary send has, so the reflective path is not narrower than the
-// direct one, and the kernel's `Error signal` fallback reports it.
+// NO ARITY CEILING, and that is the point: a send of any arity works here for
+// the same reason it works from bytecode, because both go through whichever of
+// the two calling conventions the method was compiled with. This used to stop
+// at receiver plus five and FAIL above it, which made the reflective path
+// narrower than the direct one.
 Value primMethodSendArgs(Value *args, uint64_t argc)
 {
 	if (argc != 2) {
@@ -77,9 +109,6 @@ Value primMethodSendArgs(Value *args, uint64_t argc)
 		return PRIMITIVE_FAILED;
 	}
 	size_t count = rawObjectElementCount(asObject(arguments));
-	if (count > 5) {
-		return PRIMITIVE_FAILED;
-	}
 
 	PRIMITIVE_ALLOCATES(args);
 	RawCompiledMethod *method = runnableMethod(primitiveReceiver(args), count);
@@ -92,22 +121,26 @@ Value primMethodSendArgs(Value *args, uint64_t argc)
 	// afterwards would be read through an address a collection may have moved.
 	Value receiver = primitiveArgument(args, 0);
 	RawArray *array = (RawArray *) asObject(primitiveArgument(args, 1));
-	Value slot[5];
-	for (size_t i = 0; i < count; i++) {
-		slot[i] = array->vars[i];
-	}
 
 	Value answer;
-	switch (count) {
-	case 0: answer = jitCall0(method->native, receiver); break;
-	case 1: answer = jitCall1(method->native, receiver, slot[0]); break;
-	case 2: answer = jitCall2(method->native, receiver, slot[0], slot[1]); break;
-	case 3: answer = jitCall3(method->native, receiver, slot[0], slot[1], slot[2]);
-		break;
-	case 4: answer = jitCall4(method->native, receiver, slot[0], slot[1], slot[2],
-		slot[3]); break;
-	default: answer = jitCall5(method->native, receiver, slot[0], slot[1], slot[2],
-		slot[3], slot[4]); break;
+	if (method->native->wide) {
+		answer = sendWide(method, receiver, array, count);
+	} else {
+		Value slot[JIT_MAX_NARROW_ARGS];
+		for (size_t i = 0; i < count; i++) {
+			slot[i] = array->vars[i];
+		}
+		switch (count) {
+		case 0: answer = jitCall0(method->native, receiver); break;
+		case 1: answer = jitCall1(method->native, receiver, slot[0]); break;
+		case 2: answer = jitCall2(method->native, receiver, slot[0], slot[1]); break;
+		case 3: answer = jitCall3(method->native, receiver, slot[0], slot[1], slot[2]);
+			break;
+		case 4: answer = jitCall4(method->native, receiver, slot[0], slot[1], slot[2],
+			slot[3]); break;
+		default: answer = jitCall5(method->native, receiver, slot[0], slot[1], slot[2],
+			slot[3], slot[4]); break;
+		}
 	}
 	PRIMITIVE_DONE_ALLOCATING();
 	return answer;

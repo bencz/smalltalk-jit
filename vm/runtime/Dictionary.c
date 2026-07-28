@@ -173,6 +173,69 @@ static Association *dictAtPut(Dictionary *dictionary, String *key, Value value,
 }
 
 
+// Remove a key, answering whether there was one.
+//
+// BACKWARD-SHIFT DELETION, and it has to be. Probing is linear and it STOPS at
+// the first empty slot, so simply emptying a slot cuts every chain that ran
+// through it: an unrelated key whose home index is before the hole and whose
+// entry is after it becomes unfindable, while still occupying a slot. The
+// symptom is not "removal is broken", it is one method of a class disappearing
+// when a DIFFERENT one is removed, which is why the test for this removes a
+// selector and then looks for the ones it did not remove.
+//
+// The rule below is Knuth's: after emptying slot `hole`, walk forward, and move
+// any entry whose HOME index is not cyclically inside `(hole, cursor]` down into
+// the hole -- those are exactly the entries that were displaced past it.
+//
+// NOTHING ALLOCATES HERE, so no handle is needed and no collection can move the
+// contents array mid-shift.
+static _Bool dictRemove(Dictionary *dictionary, String *key, _Bool byIdentity)
+{
+	KeyMatch match = byIdentity ? matchByIdentity : matchByContent;
+	RawArray *contents = (RawArray *) asObject(dictionary->raw->contents);
+	_Bool found;
+	size_t hole = probe(contents, key->raw, keyHash(key->raw, byIdentity), match,
+		&found);
+	if (!found) {
+		return 0;
+	}
+
+	size_t capacity = rawArraySize(contents);
+	size_t mask = capacity - 1;
+	Value empty = tagPtr(Handles.nil.raw); // nil, the spelling Smalltalk reads
+	contents->vars[hole] = empty; // immortal, so no write barrier
+	for (size_t cursor = (hole + 1) & mask; ; cursor = (cursor + 1) & mask) {
+		Value slot = contents->vars[cursor];
+		if (slotIsEmpty(slot)) {
+			break;
+		}
+		RawAssociation *association = (RawAssociation *) asObject(slot);
+		uint32_t hash = keyHash((RawString *) asObject(association->key), byIdentity);
+		size_t home = hash & mask;
+		// Is `home` cyclically within (hole, cursor]? If so the entry is on a
+		// chain that does not pass through the hole and must stay put.
+		_Bool wraps = cursor < hole;
+		_Bool stays = wraps ? (home > hole || home <= cursor)
+			: (home > hole && home <= cursor);
+		if (stays) {
+			continue;
+		}
+		rawObjectStorePtr((RawObject *) contents, &contents->vars[hole],
+			(RawObject *) association);
+		contents->vars[cursor] = empty;
+		hole = cursor;
+	}
+	dictionary->raw->tally = tagInt((intptr_t) (dictSize(dictionary) - 1));
+	return 1;
+}
+
+
+_Bool symbolDictRemove(Dictionary *dictionary, String *key)
+{
+	return dictRemove(dictionary, key, 1);
+}
+
+
 static Association *dictAssocAt(Dictionary *dictionary, String *key, _Bool byIdentity)
 {
 	KeyMatch match = byIdentity ? matchByIdentity : matchByContent;

@@ -37,6 +37,7 @@
 #include "runtime/Closure.h"
 #include "runtime/Primitive.h"
 #include "runtime/String.h"
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -84,6 +85,30 @@ static void checkFloat(const char *what, Value got, double expected)
 		printValue(got);
 		printf("\n");
 	}
+}
+
+
+// The double behind a float answer, in EITHER representation.
+//
+// checkFloat above accepts only the immediate one, which is right for every
+// everyday value and wrong for the three the divide-by-zero checks are about:
+// an infinity and a NaN do not fit the SmallFloat64 window, so they arrive as
+// BoxedFloat64 -- which is exactly what tests/SmallFloat64BoundaryTest.st
+// asserts about `Float infinity`. A check that demanded the immediate form
+// would be asking for a representation the kernel says is impossible.
+static _Bool floatOf(Value value, double *answer)
+{
+	if (valueTypeOf(value, VALUE_FLOAT)) {
+		*answer = floatValueOf(value);
+		return 1;
+	}
+	if (valueTypeOf(value, VALUE_POINTER) && Handles.BoxedFloat64.raw != NULL
+			&& rawObjectClassIndex(asObject(value))
+				== classIndexOf(&Handles.BoxedFloat64)) {
+		*answer = ((RawFloat *) asObject(value))->value;
+		return 1;
+	}
+	return 0;
 }
 
 
@@ -446,8 +471,40 @@ int main(void)
 	checkFloat("7 / 2 as floats answers 3.5, where the integers fell back",
 		sendBinary(divide, tagFloat(7.0), tagInt(2)), 3.5);
 	checkFloat("1 / 4 with a float receiver", sendBinary(divide, tagFloat(1.0), tagInt(4)), 0.25);
-	checkInt("float division by zero falls back rather than answering an infinity",
-		sendBinary(divide, tagFloat(1.0), tagFloat(0.0)), FALLBACK_MARK);
+	// A ZERO DIVISOR IS NOT A FAILURE WHEN A FLOAT IS INVOLVED, and this check
+	// used to assert the opposite: "float division by zero falls back rather
+	// than answering an infinity".
+	//
+	// THE KERNEL REFUTED IT. packages/Core/src/Magnitudes/Float.st defines the
+	// two constants as
+	//
+	//     class infinity [ ^1.0 / 0.0 ]
+	//     class nan      [ ^0.0 / 0.0 ]
+	//
+	// so a primitive that fails on a zero divisor leaves `Float infinity` with
+	// nothing to compute it from -- the Smalltalk fallback raised ZeroDivide, so
+	// the ONE expression in the kernel whose whole job is to produce an infinity
+	// produced an exception instead. tests/FloatEdgeTest.st then asks for
+	// 1.0/0.0, -1.0/0.0 and 0.0/0.0 by name, and five other test files reach the
+	// same divide through Json and the cross-representation paths.
+	//
+	// The rule that stands is the one in runtime/Primitive.h, unchanged: fail
+	// rather than GUESS. An infinity is not a guess, it is what IEEE 754
+	// division answers, and IEEE 754 division is the operation this primitive
+	// implements. What still fails is INTEGER division by zero, checked above,
+	// because there the answer really does not exist.
+	{
+		double quotient = 0.0;
+		check("1.0 / 0.0 answers +inf, which is what Float class infinity is",
+			floatOf(sendBinary(divide, tagFloat(1.0), tagFloat(0.0)), &quotient)
+				&& isinf(quotient) && quotient > 0.0);
+		check("-1.0 / 0.0 answers -inf, so the SIGN is the dividend's",
+			floatOf(sendBinary(divide, tagFloat(-1.0), tagFloat(0.0)), &quotient)
+				&& isinf(quotient) && quotient < 0.0);
+		check("0.0 / 0.0 answers a NaN, which is what Float class nan is",
+			floatOf(sendBinary(divide, tagFloat(0.0), tagFloat(0.0)), &quotient)
+				&& isnan(quotient));
+	}
 
 	// A BoxedFloat64: the same arithmetic reaching through a heap object.
 	Float *boxed = newObject(boxedFloat, 0);

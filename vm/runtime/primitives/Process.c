@@ -109,6 +109,81 @@ Value primProcessResume(Value *args, uint64_t argc)
 }
 
 
+// ---------------------------------------------------------------------------
+// The sync monitor
+// ---------------------------------------------------------------------------
+//
+// Four primitives over three scheduler calls. The reasoning about why there is
+// ONE monitor rather than a striped set, and why each answers rather than
+// asserting when the caller is out of protocol, is at their declarations in
+// concurrency/Scheduler.h.
+//
+// A FAILURE HERE IS THE POINT. All four kernel methods have empty bodies, so a
+// failed attempt becomes `self primitiveFailed: #MonitorEnterPrimitive` and
+// names itself. Entering twice, exiting without holding and parking without
+// holding are all program errors in the Smalltalk, and they say so.
+
+// ProcessorScheduler>>monitorEnter
+Value primMonitorEnter(Value *args, uint64_t argc)
+{
+	if (argc != 0) {
+		return PRIMITIVE_FAILED;
+	}
+	// Entering can YIELD when another fiber holds the monitor, and a yield runs
+	// other fibers, which allocate. So the frame is anchored exactly as the
+	// other switching primitives above anchor theirs.
+	PRIMITIVE_ALLOCATES(args);
+	_Bool taken = schedulerMonitorEnter();
+	PRIMITIVE_DONE_ALLOCATING();
+	return taken ? primitiveReceiver(args) : PRIMITIVE_FAILED;
+}
+
+
+// ProcessorScheduler>>monitorEnterOn: anObject
+//
+// THE OBJECT IS ACCEPTED AND IGNORED, and that is not a shortcut. It names the
+// stripe in a striped monitor, and there is one monitor here because there is no
+// parallelism to stripe (Scheduler.h). The kernel keeps sending it because the
+// day workers arrive it is the argument that makes striping possible again
+// without touching a single caller.
+Value primMonitorEnterOn(Value *args, uint64_t argc)
+{
+	if (argc != 1) {
+		return PRIMITIVE_FAILED;
+	}
+	PRIMITIVE_ALLOCATES(args);
+	_Bool taken = schedulerMonitorEnter();
+	PRIMITIVE_DONE_ALLOCATING();
+	return taken ? primitiveReceiver(args) : PRIMITIVE_FAILED;
+}
+
+
+// ProcessorScheduler>>monitorExit
+Value primMonitorExit(Value *args, uint64_t argc)
+{
+	if (argc != 0) {
+		return PRIMITIVE_FAILED;
+	}
+	// Releasing switches nothing and allocates nothing.
+	return schedulerMonitorExit() ? primitiveReceiver(args) : PRIMITIVE_FAILED;
+}
+
+
+// ProcessorScheduler>>parkOnMonitor
+Value primMonitorPark(Value *args, uint64_t argc)
+{
+	if (argc != 0) {
+		return PRIMITIVE_FAILED;
+	}
+	PRIMITIVE_ALLOCATES(args);
+	_Bool parked = schedulerMonitorPark();
+	PRIMITIVE_DONE_ALLOCATING();
+	// The receiver is re-read AFTER the park: other fibers ran while this one
+	// was off the queue, and any of them may have collected.
+	return parked ? primitiveReceiver(args) : PRIMITIVE_FAILED;
+}
+
+
 Value primProcessTerminate(Value *args, uint64_t argc)
 {
 	if (argc != 1) {

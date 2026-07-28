@@ -132,6 +132,30 @@ void rootsVisitCompiledCode(RootVisitor visit, void *ctx)
 // with it.
 
 
+// Forget every resolved target at every send site.
+//
+// A cell's way holds the NativeCode a class dispatched to LAST TIME, so a site
+// that has already run keeps calling a method that has just been removed or
+// replaced. That is a wrong ANSWER and not a crash, and it appears only at sites
+// warm enough to have a way, which is the worst possible distribution for
+// noticing it.
+//
+// The COUNTS ARE KEPT, and so is `megamorphic`. What a removal invalidates is
+// "which code does this class dispatch to", not "which classes has this site
+// seen": the profile is what the optimizer learns from, and throwing it away
+// would make a dev-time reload cost the tier its accumulated knowledge for no
+// correctness reason. wayCount going to zero is enough, because a way is
+// rebuilt by the next send through the ordinary lookup.
+void jitFlushSendCaches(void)
+{
+	for (NativeCode *code = gCompiledCode; code != NULL; code = code->nextCompiled) {
+		for (uint16_t i = 0; i < code->unit->instructionCount; i++) {
+			code->cells[i].wayCount = 0;
+		}
+	}
+}
+
+
 NativeCode *jitCodeContaining(const void *address)
 {
 	const uint8_t *pointer = address;
@@ -442,37 +466,36 @@ static Value dispatchFrom(IcCell *cell, Value *receiverSlot, uint64_t packed,
 	// this is what keeps that from being a requirement.
 	receiver = *receiverSlot;
 	Value answer;
-	switch (argc) {
-	case 0:
-		answer = jitCall0(code, receiver);
-		break;
-	case 1:
-		answer = jitCall1(code, receiver, receiverSlot[-1]);
-		break;
-	case 2:
-		answer = jitCall2(code, receiver, receiverSlot[-1], receiverSlot[-2]);
-		break;
-	case 3:
-		answer = jitCall3(code, receiver, receiverSlot[-1], receiverSlot[-2],
-			receiverSlot[-3]);
-		break;
-	case 4:
-		answer = jitCall4(code, receiver, receiverSlot[-1], receiverSlot[-2],
-			receiverSlot[-3], receiverSlot[-4]);
-		break;
-	case 5:
-		answer = jitCall5(code, receiver, receiverSlot[-1], receiverSlot[-2],
-			receiverSlot[-3], receiverSlot[-4], receiverSlot[-5]);
-		break;
-	default:
-		// Past the ABI's register set. Saying so beats calling with arguments the
-		// callee will read out of registers nobody wrote.
-		fprintf(stderr, "jit: a send of ");
-		fprintRawString(stderr, (RawString *) cell->selector);
-		fprintf(stderr, " has %llu arguments, and this tier passes at most %d\n",
-			(unsigned long long) argc, JIT_MAX_REGISTER_ARGS);
-		fflush(NULL);
-		abort();
+	if (code->wide) {
+		// The arguments are ALREADY laid out the way a wide callee reads them:
+		// this frame's receiver slot with the arguments descending from it. So
+		// the wide path is the cheap one here, and it is the narrow cases below
+		// that pay to take frame slots apart into positional C arguments.
+		answer = jitCallWide(code, receiverSlot);
+	} else {
+		switch (argc) {
+		case 0:
+			answer = jitCall0(code, receiver);
+			break;
+		case 1:
+			answer = jitCall1(code, receiver, receiverSlot[-1]);
+			break;
+		case 2:
+			answer = jitCall2(code, receiver, receiverSlot[-1], receiverSlot[-2]);
+			break;
+		case 3:
+			answer = jitCall3(code, receiver, receiverSlot[-1], receiverSlot[-2],
+				receiverSlot[-3]);
+			break;
+		case 4:
+			answer = jitCall4(code, receiver, receiverSlot[-1], receiverSlot[-2],
+				receiverSlot[-3], receiverSlot[-4]);
+			break;
+		default:
+			answer = jitCall5(code, receiver, receiverSlot[-1], receiverSlot[-2],
+				receiverSlot[-3], receiverSlot[-4], receiverSlot[-5]);
+			break;
+		}
 	}
 	compiledFrameLeave(&guard);
 	return answer;
@@ -665,6 +688,33 @@ void unwindPushCleanup(UnwindRecord *record, Value cleanupBlock)
 }
 
 
+// The bottom of one fiber's Smalltalk execution, and the one place terminating
+// that fiber can land.
+//
+// IT DOES NOT GO THROUGH unwindPushCommon, and the difference is the four
+// tagged fields: they are the allocator's ZERO here rather than nil. An exit
+// record holds no block and answers no value, so absent is the truth about them
+// and the root visitor skips them; and it is pushed BEFORE anything a fiber
+// runs, which for the main process is before an image may be loaded. An image
+// load rewrites every well-known handle, so a nil written here at startup would
+// leave this record rooting the PREVIOUS kernel's nil for the whole run.
+void unwindPushExit(UnwindRecord *record)
+{
+	record->kind = UNWIND_EXIT;
+	record->disabled = 0;
+	record->token = 0;
+	record->exceptionClass = tagInt(0);
+	record->handlerBlock = tagInt(0);
+	record->cleanupBlock = tagInt(0);
+	record->answer = tagInt(0);
+	record->savedFrames = CurrentThread.compiledFrames;
+	record->savedScopes = CurrentThread.handleScopes;
+	record->savedHomeToken = CurrentThread.homeToken;
+	record->previous = CurrentThread.unwinds;
+	CurrentThread.unwinds = record;
+}
+
+
 void unwindPop(UnwindRecord *record)
 {
 	ASSERT(CurrentThread.unwinds == record);
@@ -728,6 +778,38 @@ static void unwindRunCleanupsTo(UnwindRecord *target)
 		_Bool understood = 0;
 		jitSendUnary(record->cleanupBlock, "value", &understood);
 	}
+}
+
+
+// Terminate the running fiber. Never returns.
+//
+// THE CLEANUPS RUN BEFORE THE JUMP AND ON THIS STACK, and that is the whole
+// difference between terminating a fiber and abandoning one. An `ensure:` block
+// belongs to an activation, and the only stack that activation exists on is the
+// one running right now; a terminate that reclaimed the stack first would have
+// nowhere left to run them. It is the third client of unwindRunCleanupsTo, and
+// the other two are the non-local return and the exception unwind.
+//
+// WHERE IT LANDS is the only difference between the main process and any other
+// fiber, and it is not decided here: main() ends the program, the spawn
+// trampoline marks the fiber DONE and hands the CPU on. Both are just the frame
+// that pushed the exit record.
+void unwindToExit(void)
+{
+	UnwindRecord *bottom = CurrentThread.unwinds;
+	while (bottom != NULL && bottom->kind != UNWIND_EXIT) {
+		bottom = bottom->previous;
+	}
+	if (bottom == NULL) {
+		// A fiber whose bottom was never marked. Every entry into Smalltalk
+		// pushes one, so this is a VM bug and not a program error, and jumping
+		// nowhere or answering would be silence in the middle of a terminate.
+		fprintf(stderr, "terminate: this fiber has no exit point\n");
+		fflush(NULL);
+		abort();
+	}
+	unwindRunCleanupsTo(bottom);
+	longjmp(bottom->destination, 1);
 }
 
 
@@ -820,10 +902,34 @@ static Value jitReturnOuter(void *unused, Value *valueSlot, uint64_t packed)
 	// than jumping anywhere, and the token scheme is what makes it detectable at
 	// all: no live record can ever carry a retired token.
 	//
-	// PENDING: this is BlockCannotReturn once exceptions exist in v2. Aborting is
-	// the same thing doesNotUnderstand does today, and for the same reason:
-	// answering something would turn a broken program into a wrong answer.
+	// AN ORDINARY EXCEPTION, now that there are exceptions. `[^1]` kept and sent
+	// `value` after its method returned is a program error a program can want to
+	// catch, and until this was wired it killed the process instead: exactly the
+	// state doesNotUnderstand was in before its bridge existed, and fixed the same
+	// way. The abort below stays for the window where it is still the only
+	// option, which is the BUILT-IN kernel, where Error does not exist.
+	Class *errorClass = getClass("Error");
+	if (errorClass != NULL) {
+		HandleScope scope;
+		openHandleScope(&scope);
+		Value text = objectTagged(stringFromC(
+			"non-local return from a method that has already returned"));
+		_Bool understood = 0;
+		// The scope stays OPEN across the send: `text` is a heap String and
+		// jitSend allocates (it interns the selector) before it uses it.
+		Value raised = jitSend(objectTagged(errorClass), "signal:", 1, &text,
+			&understood);
+		closeHandleScope(&scope, NULL);
+		// `signal:` on an unhandled Error does not come back: its default action
+		// terminates the process. Arriving here means a handler RESUMED it, and
+		// the value it resumed with is the only sensible thing for the abandoned
+		// `^` to answer.
+		if (understood) {
+			return raised;
+		}
+	}
 	fprintf(stderr, "non-local return from a method that has already returned\n");
+	fflush(NULL);
 	abort();
 }
 
@@ -1253,6 +1359,10 @@ NativeCode *jitCompileFor(const MacroAssemblerOps *ops, CodeUnit *unit,
 	ASSERT(code != NULL);
 	code->unit = unit;
 	code->frameSlots = unit->registerCount;
+	// RECORDED, not re-derived. The prologue above asked the same question of
+	// the same assembler to decide what to emit; asking it again anywhere else
+	// is how the two ends of a call come to disagree.
+	code->wide = maUsesWideArguments(jit.assembler);
 	code->machineOffsetAt = jit.machineOffsetAt;
 	code->cells = jit.cells;
 	if (ops == maHostBackend()) {
@@ -1289,6 +1399,10 @@ typedef Value (*Entry2)(Value, Value, Value);
 typedef Value (*Entry3)(Value, Value, Value, Value);
 typedef Value (*Entry4)(Value, Value, Value, Value, Value);
 typedef Value (*Entry5)(Value, Value, Value, Value, Value, Value);
+// The WIDE entry, and there is only ONE of it however many arguments there are.
+// That is the point of the convention: the arguments never become C arguments,
+// so no per-arity variant and no ceiling (jit/Jit.h).
+typedef Value (*EntryWide)(Value *);
 
 
 // Entering compiled code, and the ONE place a non-local return can land.
@@ -1314,9 +1428,17 @@ typedef Value (*Entry5)(Value, Value, Value, Value, Value, Value);
 	unwindPop(&record); \
 	return answer;
 
+// Every positional entry asserts the code is NARROW. Handing a wide method its
+// receiver in argument register 0 would have the prologue treat that Value as
+// the address of an argument block and dereference it, which is a wild read
+// from a tagged integer rather than a wrong answer -- but only sometimes, and
+// only for the methods whose arity happens to cross the ABI's register set.
+#define NARROW_ONLY() ASSERT(!code->wide)
+
 
 Value jitCall0(NativeCode *code, Value receiver)
 {
+	NARROW_ONLY();
 	Entry0 entry;
 	memcpy(&entry, &code->entry, sizeof(entry));
 	ENTER_COMPILED(entry(receiver))
@@ -1325,6 +1447,7 @@ Value jitCall0(NativeCode *code, Value receiver)
 
 Value jitCall1(NativeCode *code, Value receiver, Value a)
 {
+	NARROW_ONLY();
 	Entry1 entry;
 	memcpy(&entry, &code->entry, sizeof(entry));
 	ENTER_COMPILED(entry(receiver, a))
@@ -1333,6 +1456,7 @@ Value jitCall1(NativeCode *code, Value receiver, Value a)
 
 Value jitCall2(NativeCode *code, Value receiver, Value a, Value b)
 {
+	NARROW_ONLY();
 	Entry2 entry;
 	memcpy(&entry, &code->entry, sizeof(entry));
 	ENTER_COMPILED(entry(receiver, a, b))
@@ -1345,6 +1469,7 @@ Value jitCall2(NativeCode *code, Value receiver, Value a, Value b)
 // does not have yet and says so about rather than guesses at.
 Value jitCall3(NativeCode *code, Value receiver, Value a, Value b, Value c)
 {
+	NARROW_ONLY();
 	Entry3 entry;
 	memcpy(&entry, &code->entry, sizeof(entry));
 	ENTER_COMPILED(entry(receiver, a, b, c))
@@ -1353,6 +1478,7 @@ Value jitCall3(NativeCode *code, Value receiver, Value a, Value b, Value c)
 
 Value jitCall4(NativeCode *code, Value receiver, Value a, Value b, Value c, Value d)
 {
+	NARROW_ONLY();
 	Entry4 entry;
 	memcpy(&entry, &code->entry, sizeof(entry));
 	ENTER_COMPILED(entry(receiver, a, b, c, d))
@@ -1362,9 +1488,26 @@ Value jitCall4(NativeCode *code, Value receiver, Value a, Value b, Value c, Valu
 Value jitCall5(NativeCode *code, Value receiver, Value a, Value b, Value c, Value d,
 	Value e)
 {
+	NARROW_ONLY();
 	Entry5 entry;
 	memcpy(&entry, &code->entry, sizeof(entry));
 	ENTER_COMPILED(entry(receiver, a, b, c, d, e))
+}
+
+
+// The wide entry. `receiverSlot` points at the receiver, with the arguments at
+// DESCENDING addresses from it; the prologue copies them straight into its own
+// slots, so they must still be there and still be right at the moment of the
+// call. For a send that is the caller's own frame and nothing has to be built;
+// for a C caller it is a block laid out on purpose, and nothing may allocate
+// between laying it out and calling, because the collector does not know about
+// it.
+Value jitCallWide(NativeCode *code, Value *receiverSlot)
+{
+	ASSERT(code->wide);
+	EntryWide entry;
+	memcpy(&entry, &code->entry, sizeof(entry));
+	ENTER_COMPILED(entry(receiverSlot))
 }
 
 

@@ -6,6 +6,7 @@
 #include "core/Smalltalk.h"
 #include "core/Thread.h"
 #include "jit/CompiledMethod.h"
+#include "jit/Jit.h"
 #include "memory/Heap.h"
 #include "runtime/Collection.h"
 #include "runtime/Dictionary.h"
@@ -66,6 +67,18 @@ static void fail(ClassBuildError *error, const char *message, String *what)
 	if (error->message == NULL) {
 		error->message = message;
 		error->what = what;
+	}
+}
+
+
+// The same, naming the kernel exception class the image should raise. Plain
+// `fail` leaves it NULL, which the reflective primitive reads as Error.
+static void failAs(ClassBuildError *error, const char *errorClass,
+	const char *message, String *what)
+{
+	if (error->message == NULL) {
+		fail(error, message, what);
+		error->errorClass = errorClass;
 	}
 }
 
@@ -200,7 +213,16 @@ static void shapesResolve(void)
 
 
 // The `<shape: X>` pragma of a class node, or NULL when it has none.
-static String *shapePragmaOf(ClassNode *node)
+// The name in `<shape: Something>`, or NULL when there is no shape pragma.
+//
+// THE ARGUMENT HAS TO BE AN IDENTIFIER, and that is checked rather than
+// assumed. The parser answers a VariableNode for `BytesShape`, a StringNode for
+// `'hi'` and a CharacterNode for `$a`, and only the first holds a String: a
+// CharacterNode holds a Character IMMEDIATE, so reading it as a String went
+// through asObject on an immediate and ABORTED THE VM while compiling. That is
+// the tag-check-before-asObject rule, and a malformed pragma in someone's source
+// is exactly the input that must not crash a compiler.
+static String *shapePragmaOf(ClassNode *node, ClassBuildError *error)
 {
 	OrderedCollection *pragmas = classNodeGetPragmas(node);
 	size_t count = pragmas == NULL ? 0 : ordCollSize(pragmas);
@@ -211,10 +233,20 @@ static String *shapePragmaOf(ClassNode *node)
 		}
 		OrderedCollection *arguments = messageExpressionNodeGetArgs(pragma);
 		if (arguments == NULL || ordCollSize(arguments) != 1) {
-			continue;
+			failAs(error, "InvalidPragmaError",
+				"shape: takes exactly one argument", classNodeGetName(node) == NULL
+					? NULL : literalNodeGetStringValue(classNodeGetName(node)));
+			return NULL;
 		}
-		LiteralNode *named = scopeHandle(asObject(ordCollAt(arguments, 0)));
-		return literalNodeGetStringValue(named);
+		Object *argument = scopeHandle(asObject(ordCollAt(arguments, 0)));
+		if (Handles.VariableNode.raw == NULL
+				|| rawObjectClassIndex(argument->raw)
+					!= classIndexOf(&Handles.VariableNode)) {
+			failAs(error, "InvalidPragmaError",
+				"shape: takes a shape NAME, not a literal", NULL);
+			return NULL;
+		}
+		return literalNodeGetStringValue((LiteralNode *) argument);
 	}
 	return NULL;
 }
@@ -247,6 +279,40 @@ CompiledMethod *classCompileMethodInto(MethodNode *node, Class *target,
 	CompiledMethod *method = compiledMethodCreate(unit, selector, target);
 	symbolDictAtPutObject(methodsOf(target), selector, (Object *) method);
 	return method;
+}
+
+
+// Does this extension redefine a selector the class defines ITSELF?
+//
+// OWN DICTIONARY ONLY, on whichever side the method is written for. An
+// INHERITED selector is a legal override -- `ExtChild extend [ probe [ ... ] ]`
+// over `ExtParent>>probe` is the ordinary thing extensions are for -- and only a
+// selector already in this class's own dictionary is a redefinition. Asking the
+// full lookup chain instead would refuse every override, which is the same
+// mistake in the other direction and just as silent.
+static void checkNoOwnSelectorCollision(Class *class, ClassNode *node,
+	ClassBuildError *error)
+{
+	OrderedCollection *methods = classNodeGetMethods(node);
+	size_t count = methods == NULL ? 0 : ordCollSize(methods);
+	for (size_t i = 0; i < count; i++) {
+		HandleScope scope;
+		openHandleScope(&scope);
+		MethodNode *methodNode = scopeHandle(asObject(ordCollAt(methods, i)));
+		String *side = methodNodeGetClassName(methodNode);
+		Class *target = side != NULL && stringEqualsC(side, "class")
+			? classMetaclassOf(class) : class;
+		String *selector = methodNodeGetSelector(methodNode);
+		Value existing = selector == NULL ? 0
+			: symbolDictAt(methodsOf(target), asSymbol(selector));
+		if (valueTypeOf(existing, VALUE_POINTER)) {
+			failAs(error, "RedefinitionError",
+				"extension redefines a selector the class defines itself", selector);
+			closeHandleScope(&scope, NULL);
+			return;
+		}
+		closeHandleScope(&scope, NULL);
+	}
 }
 
 
@@ -361,6 +427,134 @@ static uint16_t inheritedSlots(Class *super)
 }
 
 
+// ---------------------------------------------------------------------------
+// `Name := Namespace [ ... ]`
+// ---------------------------------------------------------------------------
+//
+// EVERYTHING THIS NEEDS IS ALREADY IN packages/Core, and none of it is rebuilt
+// here. `Namespace named:imports:` makes one, the `Namespaces` global is the
+// registry, and `PackageLoader>>loadPackage:` is this exact sequence for a
+// package: make the namespace, register it, build the sources into it, then
+// initialize what was built. A Namespace assembled in C would be a second
+// encoding of a shape Namespace.st owns.
+//
+// IT LIVES IN C rather than in Compiler.st because a class definition reaches
+// this builder three ways -- the reflective compiler, `st -f`, and the package
+// bootstrap -- and only the first goes through Smalltalk. One implementation,
+// every path.
+
+// The registry, or NULL before packages/Core has been loaded. Before that there
+// is no Namespace class either, so a declaration cannot be built and says so.
+static Dictionary *namespaceRegistry(void)
+{
+	Object *registry = getGlobalObject("Namespaces");
+	if (registry == NULL || registry->raw == Handles.nil.raw) {
+		return NULL;
+	}
+	return (Dictionary *) registry;
+}
+
+
+// Declare, or REOPEN. Reopening is the same object: the test that separates a
+// right implementation from a plausible one is that a second declaration adds
+// members and keeps the ones already there, which a fresh Namespace would not.
+static Namespace *declareNamespace(String *name, Namespace *declarant,
+	ClassBuildError *error)
+{
+	HandleScope scope;
+	openHandleScope(&scope);
+	Dictionary *registry = namespaceRegistry();
+	Class *namespaceClass = getClass("Namespace");
+	if (registry == NULL || namespaceClass == NULL) {
+		fail(error, "namespaces need packages/Core loaded", name);
+		return closeHandleScope(&scope, NULL);
+	}
+
+	String *symbol = asSymbol(name);
+	Value existing = symbolDictAt(registry, symbol);
+	if (valueTypeOf(existing, VALUE_POINTER) && asObject(existing) != Handles.nil.raw) {
+		return closeHandleScope(&scope, scopeHandle(asObject(existing)));
+	}
+
+	// A namespace declared inside another one IMPORTS its declarant, so its
+	// members see the declarant's classes unqualified. Core is never in imports:
+	// it is the fallback by construction (core/Namespace.h), so a top-level
+	// declaration imports nothing.
+	Array *imports = newArray(declarant == NULL ? 0 : 1);
+	if (declarant != NULL) {
+		arrayAtPutObject(imports, 0, (Object *) declarant);
+	}
+	Value arguments[2] = { tagPtr(symbol->raw), tagPtr(imports->raw) };
+	_Bool understood = 0;
+	Value made = jitSend(objectTagged(namespaceClass), "named:imports:", 2,
+		arguments, &understood);
+	if (!understood || !valueTypeOf(made, VALUE_POINTER)) {
+		fail(error, "Namespace class did not answer named:imports:", name);
+		return closeHandleScope(&scope, NULL);
+	}
+	Namespace *declared = scopeHandle(asObject(made));
+
+	symbolDictAtPutObject(namespaceRegistry(), symbol, (Object *) declared);
+	// Bound in the DECLARING namespace and not in core, which is what makes a
+	// namespace declared inside a package invisible from outside it.
+	namespaceAtPutObject(declarant, symbol, (Object *) declared);
+	return closeHandleScope(&scope, declared);
+}
+
+
+// Build the members into the declared namespace and initialize them.
+//
+// THE INITIALIZE RULE IS THE ONE THE BOOTSTRAP ALREADY USES, and it is not
+// optional: only the class that DEFINES `initialize` runs it. Sending it to
+// every member would run an inherited one once per subclass, with a different
+// `self` each time, which is how Transcript once became a Socket
+// (docs/jit-v2/01-gate.md). An extension or a nested declaration is skipped for
+// the same reason the image skips it: neither defines a class to initialize.
+static void buildMembersOf(ClassNode *node, Namespace *declared,
+	ClassBuildError *error)
+{
+	HandleScope scope;
+	openHandleScope(&scope);
+	OrderedCollection *members = classNodeGetMembers(node);
+	size_t count = members == NULL ? 0 : ordCollSize(members);
+	OrderedCollection *built = newOrdColl(count == 0 ? 1 : count);
+	for (size_t i = 0; i < count && error->message == NULL; i++) {
+		ClassNode *member = scopeHandle(asObject(ordCollAt(members, i)));
+		Class *class = classBuildIn(member, declared, error);
+		if (class != NULL && !classNodeIsExtension(member)
+				&& !classNodeIsNamespace(member)) {
+			ordCollAddObject(built, (Object *) class);
+		}
+	}
+	if (error->message != NULL) {
+		closeHandleScope(&scope, NULL);
+		return;
+	}
+
+	// AFTER every member exists, not as each one is built: an initializer
+	// routinely names a sibling declared further down the body, and the forward
+	// reference that made it compile is only filled in when that sibling is
+	// built.
+	String *initialize = asSymbol(stringFromC("initialize"));
+	size_t builtCount = ordCollSize(built);
+	for (size_t i = 0; i < builtCount; i++) {
+		HandleScope each;
+		openHandleScope(&each);
+		Object *class = ordCollObjectAt(built, i);
+		RawClass *metaclass = classOf(objectTagged(class));
+		Value methods = metaclass == NULL ? 0 : metaclass->methodDictionary;
+		if (valueTypeOf(methods, VALUE_POINTER)
+				&& valueTypeOf(symbolDictAt(scopeHandle(asObject(methods)), initialize),
+					VALUE_POINTER)) {
+			_Bool understood = 0;
+			jitSendUnary(objectTagged(class), "initialize", &understood);
+		}
+		closeHandleScope(&each, NULL);
+	}
+	closeHandleScope(&scope, NULL);
+}
+
+
 Class *classBuildIn(ClassNode *node, Namespace *namespace,
 	ClassBuildError *error)
 {
@@ -374,17 +568,18 @@ Class *classBuildIn(ClassNode *node, Namespace *namespace,
 
 	String *name = literalNodeGetStringValue(classNodeGetName(node));
 
-	// A NAMESPACE declaration is a container of class definitions. The container
-	// itself is not built yet, so its members are built into the system
-	// dictionary; that is wrong for a namespace and right for getting the
-	// classes to exist, and it is called out here rather than hidden.
+	// `Name := Namespace [ ... ]`: a container of class definitions. It answers
+	// NO CLASS, because there is no single one to answer; the image is written
+	// for that (PackageLoader>>loadPackage: and Compiler>>compileStream: both
+	// skip the answer when `node isNamespace`), and runtime/primitives/Reflect.c
+	// turns it into nil.
 	if (classNodeIsNamespace(node)) {
-		OrderedCollection *members = classNodeGetMembers(node);
-		size_t count = members == NULL ? 0 : ordCollSize(members);
-		for (size_t i = 0; i < count && error->message == NULL; i++) {
-			ClassNode *member = scopeHandle(asObject(ordCollAt(members, i)));
-			classBuildIn(member, namespace, error);
+		Namespace *declared = declareNamespace(name, namespace, error);
+		if (declared == NULL) {
+			closeHandleScope(&scope, NULL);
+			return NULL;
 		}
+		buildMembersOf(node, declared, error);
 		closeHandleScope(&scope, NULL);
 		return NULL;
 	}
@@ -398,6 +593,18 @@ Class *classBuildIn(ClassNode *node, Namespace *namespace,
 		Class *class = resolvedClassNamed(namespace, name);
 		if (class == NULL) {
 			fail(error, "extending a class that does not exist", name);
+			closeHandleScope(&scope, NULL);
+			return NULL;
+		}
+		// EVERY SELECTOR IS CHECKED BEFORE ANY IS INSTALLED, and that ordering is
+		// the whole guarantee. An extension is ADDITIVE: it may override an
+		// INHERITED selector, which is an ordinary subclass-style override, but
+		// it may not quietly replace one the class defines ITSELF. Checking as
+		// each method was installed would leave the ones before the collision in
+		// place, so a failed extension would half-apply -- and half of an
+		// extension is a class nobody wrote.
+		checkNoOwnSelectorCollision(class, node, error);
+		if (error->message != NULL) {
 			closeHandleScope(&scope, NULL);
 			return NULL;
 		}
@@ -427,7 +634,11 @@ Class *classBuildIn(ClassNode *node, Namespace *namespace,
 	// carries. Defaulting to named-slots instead was wrong in exactly those
 	// places, and wrong in the expensive direction: the collector would have
 	// walked an Array's elements as if they were named fields.
-	String *shapeName = shapePragmaOf(node);
+	String *shapeName = shapePragmaOf(node, error);
+	if (error->message != NULL) {
+		closeHandleScope(&scope, NULL);
+		return NULL;
+	}
 	const ShapeMapping *mapping = NULL;
 	if (shapeName == NULL) {
 		for (size_t i = 0; i < sizeof(gShapes) / sizeof(gShapes[0]); i++) {
@@ -453,7 +664,7 @@ Class *classBuildIn(ClassNode *node, Namespace *namespace,
 			// lays out (a context, a compiled method, an exception handler), and
 			// those are decisions for the layer that owns them, not defaults to
 			// be guessed here.
-			fail(error, "unknown instance shape", shapeName);
+			failAs(error, "InvalidPragmaError", "unknown instance shape", shapeName);
 			closeHandleScope(&scope, NULL);
 			return NULL;
 		}
@@ -516,6 +727,19 @@ Class *classBuildIn(ClassNode *node, Namespace *namespace,
 	// The built-in classes were made during bootstrap, before there was a nil to
 	// put in them, and this is the pass that reaches every one of them.
 	classFillAbsentSmalltalkFields(class);
+	// THE HOME NAMESPACE, which nothing wrote until now: every class in the
+	// system answered nil there, so `Class>>qualifiedName` answered the plain
+	// name for a package class as readily as for a kernel one, and the only
+	// thing that reads the field could never tell the two apart.
+	//
+	// Core stays NIL rather than holding the Core namespace, because that is
+	// what qualifiedName already treats as "no prefix" and what every class made
+	// before namespaces existed already has. Two spellings of the same answer,
+	// and the one already in the image is the one to keep.
+	if (namespace != NULL) {
+		rawObjectStorePtr((RawObject *) class->raw, &class->raw->namespace,
+			(RawObject *) namespace->raw);
+	}
 	declareClassVariables(class, node);
 	methodsOf(class);
 	classMetaclassOf(class); // established here so the chain is never partial

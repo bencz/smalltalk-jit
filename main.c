@@ -27,6 +27,7 @@
 #include "tools/Cli.h"
 #include "tools/Project.h"
 #include "tools/Snapshot.h"
+#include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -56,10 +57,19 @@ static int evalToInt(const char *code);
 //
 // A status that is already non-zero is kept: it is more specific than "one of
 // the processes died".
+//
+// AND IT IS CLAMPED, because an exit status is EIGHT BITS and a failure count
+// is not. `runFile` answers what the file's last statement did, and a test file
+// that counts failures in BIT FLAGS routinely answers a multiple of 256:
+// SmallFloat64BoundaryTest answered 30720, the shell saw 0, and the file
+// reported success while none of its checks had run. That is precisely the
+// silent false pass this function exists to prevent, so a non-zero count is
+// never allowed to become a zero status.
 static int foldUnhandledErrors(int status)
 {
 	if (status != 0) {
-		return status;
+		int truncated = (int) ((unsigned) status & 0xFFu);
+		return truncated != 0 ? truncated : 1;
 	}
 	return primitiveUnhandledErrorCount() > 0 ? 1 : 0;
 }
@@ -461,6 +471,35 @@ int main(int argc, char **argv)
 	initThread(&CurrentThread);
 	initHandles();
 	bootstrapBuiltinKernel();
+
+	// THE PROCESS'S EXIT POINT.
+	//
+	// `Processor thisProcess terminate` on the main process means the program is
+	// over, and a program that is over has to have somewhere to end. For every
+	// other fiber that place is its spawn trampoline; for this one it is main,
+	// because main IS the frame that owns the process. It is pushed here, before
+	// any image is read and before any Smalltalk runs, so that EVERY entry into
+	// Smalltalk below is covered: the package builder's class initializers, the
+	// `ProjectTool` bridges, -f and -e alike.
+	//
+	// Arriving here means an unwind ran every pending ensure:/ifCurtailed: on
+	// the way (jit/Jit.h, unwindToExit) and then jumped past whatever C frames
+	// were in between. Those frames leak what they were holding -- a FILE*, a
+	// Parser, the handle scopes of runFile -- and that is accepted rather than
+	// hidden: it happens at most once, and what it happens to is a process that
+	// is exiting.
+	//
+	// THE STATUS IS THE UNHANDLED-ERROR COUNT and nothing else. The common way
+	// to get here is Exception>>defaultAction, which prints, counts the death
+	// and then terminates, so the count is what says whether this was a program
+	// ending or a program dying. An explicit terminate with no error is an
+	// ordinary exit 0.
+	UnwindRecord processExit;
+	unwindPushExit(&processExit);
+	if (setjmp(processExit.destination) != 0) {
+		unwindAnswer(&processExit);
+		return foldUnhandledErrors(0);
+	}
 
 	// The project subcommands.
 	//

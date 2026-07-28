@@ -85,10 +85,31 @@ void x64Prologue(MacroAssembler *assembler, Value nilValue)
 	asmSubRegImm32(buffer, RSP, frameBytes);
 
 	uint16_t incoming = (uint16_t) (maArgumentCount(assembler) + 1);
-	ASSERT(incoming <= abi->argumentRegisterCount);
-	for (uint16_t i = 0; i < incoming; i++) {
-		asmMovMemReg(buffer, X64_FRAME, slotOffset(i),
-			(Register) abi->argumentRegisters[i]);
+	if (!maUsesWideArguments(assembler)) {
+		for (uint16_t i = 0; i < incoming; i++) {
+			asmMovMemReg(buffer, X64_FRAME, slotOffset(i),
+				(Register) abi->argumentRegisters[i]);
+		}
+	} else {
+		// THE WIDE CONVENTION (jit/Jit.h): argument register 0 holds a pointer
+		// to the caller's receiver slot, and the arguments are at descending
+		// addresses from it -- the same order this frame wants them in, so it is
+		// a straight copy down rather than the ABI's stack-argument area being
+		// staged by the caller and read back here.
+		//
+		// The accumulator is the only scratch used, and the one way this goes
+		// wrong is it BEING the register the block pointer arrived in, which
+		// would clobber the pointer on the first copy. That is exactly the
+		// mistake abiUsesAsArgument exists for, and it is checked rather than
+		// reasoned about: RAX is not an argument register under SysV or Win64,
+		// but that is a fact about two tables, not about this code.
+		Register block = (Register) abi->argumentRegisters[0];
+		ASSERT(!abiUsesAsArgument(abi, X64_ACCUMULATOR));
+		for (uint16_t i = 0; i < incoming; i++) {
+			asmMovRegMem(buffer, X64_ACCUMULATOR, block,
+				-(int32_t) ((uint32_t) i * sizeof(Value)));
+			asmMovMemReg(buffer, X64_FRAME, slotOffset(i), X64_ACCUMULATOR);
+		}
 	}
 
 	// Every remaining slot starts as nil. Not tidiness: a slot written on only

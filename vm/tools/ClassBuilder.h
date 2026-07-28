@@ -26,7 +26,21 @@ typedef struct {
 	String *what;          // the name involved, when there is one
 	String *inMethod;      // the method being compiled, when it was one
 	CompileStatus status;  // when the failure came from compiling a method
+	// Which kernel exception class the reflective compiler should raise, or NULL
+	// for plain Error. It is a NAME and not a Handle because the classes it can
+	// name live in packages/Core and this header is compiled long before any of
+	// them exists; the reflective primitive looks it up when it needs it.
+	//
+	// It exists because `on: RedefinitionError do: [...]` in the image cannot
+	// work if every build failure arrives as Error. A caller that wants to
+	// distinguish "you redefined something" from "the shape pragma is wrong"
+	// needs the class, and a message string is not one.
+	const char *errorClass;
 } ClassBuildError;
+
+// A zeroed one. Every field means "not set", so one initializer, and adding a
+// field does not make four call sites list one fewer than the struct has.
+#define CLASS_BUILD_ERROR_NONE ((ClassBuildError) { NULL, NULL, NULL, COMPILE_OK, NULL })
 
 // Build or REOPEN the class this node describes. Reopening matters: the
 // built-in kernel already defines Object, Array, SmallInteger and the rest, and

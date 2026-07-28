@@ -108,6 +108,11 @@ typedef struct Fiber {
 	FiberState state;
 	ParkIntent parkIntent;
 	_Bool parkPending; // a wake raced in while this fiber was still PARKING
+	// Condemned: this fiber has been terminated by SOMEBODY ELSE and dies the
+	// next time it has the CPU. It is a bit here rather than something done to
+	// the fiber from outside because its pending `ensure:` cleanups belong to
+	// activations on THIS stack, and this stack is the only place they can run.
+	_Bool terminating;
 	int homeWorker;    // the ONE worker this fiber runs on; fibers do not migrate
 
 	FiberRoots roots;

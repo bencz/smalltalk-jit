@@ -19,17 +19,45 @@
 // variation. A deopt map can therefore say "register 4 is live and holds a
 // pointer" and mean one address.
 //
-// CALLING CONVENTION: the SysV integer argument registers, so a compiled method
-// is callable from C as an ordinary function of Values, and the self-test calls
-// one directly. Receiver in RDI, arguments in RSI, RDX, RCX, R8, R9; result in
-// RAX.
+// CALLING CONVENTION, and there are exactly TWO of them.
+//
+// NARROW, which is nearly every method: the receiver and the arguments go in
+// the ABI's integer argument registers, so a compiled method is callable from C
+// as an ordinary function of Values and the self-test calls one directly. Under
+// SysV that is the receiver in RDI and arguments in RSI, RDX, RCX, R8, R9;
+// result in RAX.
+//
+// WIDE, when the receiver plus the arguments do not FIT that register set:
+// ONE pointer, to the CALLER's receiver slot, with the arguments at DESCENDING
+// addresses from it. That is already the layout the caller has -- consecutive
+// bytecode registers are consecutive frame slots and slots grow down -- and it
+// is the layout the callee wants, so the prologue copies straight down instead
+// of the ABI's stack-argument area being staged and then read back.
+//
+// `DateTime year:month:day:hour:minute:second:millisecond:` is why this exists:
+// seven arguments plus a receiver is eight, SysV has six registers, and the
+// prologue used to ASSERT and abort while compiling it.
+//
+// WHICH CONVENTION A METHOD USES IS A PROPERTY OF ITS ARITY AND ITS ABI, so
+// both ends agree with nothing passed between them: the prologue decides from
+// CodeUnit.argumentCount against the Abi it is emitting for, and records the
+// answer in NativeCode.wide for every caller to read. Nobody derives it a
+// second time, because the two derivations could disagree and the disagreement
+// would be a callee reading its arguments out of registers nobody wrote.
 
 #include "compiler/Bytecode.h"
 #include "core/Object.h"
 #include <setjmp.h>
 #include <stddef.h>
 
-#define JIT_MAX_REGISTER_ARGS 5 // receiver plus five, the SysV integer set
+// How many arguments the NARROW convention can carry, and it is a fact about
+// THIS FILE and not about any ABI: the narrow convention is entered from C
+// through positional entry points, and there are jitCall0 through jitCall5 and
+// no more. An ABI with fewer argument registers simply makes more methods wide;
+// an ABI with more cannot be exploited until there are entry points for it, and
+// compiling a method narrow that nothing here can call would be correct code
+// nobody can enter.
+#define JIT_MAX_NARROW_ARGS 5
 
 struct IcCell;
 
@@ -48,6 +76,10 @@ typedef struct NativeCode {
 	// what lets it be indexed rather than searched (docs/jit-v2/04-bytecode.md).
 	uint32_t *machineOffsetAt;
 	uint16_t frameSlots;
+	// Which of the two calling conventions the prologue emitted, decided by the
+	// arity against the Abi being compiled for. Written once, here, and read by
+	// every caller: see the header comment.
+	_Bool wide;
 	// Every compiled unit, chained, so the collector can reach the heap
 	// references this structure holds outside the heap: the unit's literal
 	// frame and each cell's selector (memory/Roots.h, rootsVisitCompiledCode).
@@ -73,7 +105,9 @@ void jitFreeNativeCode(NativeCode *code);
 void jitRegisterUnit(CodeUnit *unit);
 
 // Call compiled code. The variants exist because the argument registers are
-// positional; anything wider goes through jitCallN.
+// positional. Every one of them ASSERTS that the code is NARROW, because
+// calling a wide method this way would put the receiver where the callee
+// expects a pointer to an argument block and then dereference it.
 Value jitCall0(NativeCode *code, Value receiver);
 Value jitCall1(NativeCode *code, Value receiver, Value a);
 Value jitCall2(NativeCode *code, Value receiver, Value a, Value b);
@@ -81,6 +115,12 @@ Value jitCall3(NativeCode *code, Value receiver, Value a, Value b, Value c);
 Value jitCall4(NativeCode *code, Value receiver, Value a, Value b, Value c, Value d);
 Value jitCall5(NativeCode *code, Value receiver, Value a, Value b, Value c, Value d,
 	Value e);
+// The WIDE entry. `receiverSlot` is the address of the receiver, with the
+// arguments at DESCENDING addresses from it, which is exactly what a compiled
+// caller's frame already holds and what a C caller has to lay out on purpose.
+// There is no arity ceiling on this path and no per-arity variant of it: the
+// arguments never become C arguments.
+Value jitCallWide(NativeCode *code, Value *receiverSlot);
 
 // Send a message from C, compiling the target on the way in if it has not run
 // yet. `understood` says whether anything answered; a caller that wants to know
@@ -91,11 +131,11 @@ Value jitSend(Value receiver, const char *selector, uint64_t argc,
 Value jitSendUnary(Value receiver, const char *selector, _Bool *understood);
 
 
-// ---- unwinding: non-local return, on:do: and ensure: ------------------------
+// ---- unwinding: non-local return, on:do:, ensure: and terminate -------------
 //
-// ONE CHAIN, three kinds of entry, and that is the whole design. All three are
+// ONE CHAIN, four kinds of entry, and that is the whole design. All four are
 // "a point on the C stack, ordered by nesting, that leaving through has to
-// notice", and keeping them apart would mean three chains that have to be
+// notice", and keeping them apart would mean four chains that have to be
 // interleaved correctly by every walk anyway.
 //
 // What each kind is for:
@@ -107,8 +147,19 @@ Value jitSendUnary(Value receiver, const char *selector, _Bool *understood);
 //            frames, and only then unwinds, which is what makes `resume:`
 //            possible at all: at decision time nothing has been popped yet;
 //   CLEANUP  an `ensure:`/`ifCurtailed:` registration. It runs when an unwind of
-//            EITHER other kind passes through it, innermost first, and the
-//            kernel's `ensure:` runs it itself on the normal path.
+//            ANY other kind passes through it, innermost first, and the
+//            kernel's `ensure:` runs it itself on the normal path;
+//   EXIT     the BOTTOM of one fiber's Smalltalk execution: the C frame that
+//            entered it, and the one place terminating that fiber can land.
+//            Exactly one per fiber, pushed by whoever owns that frame -- main()
+//            for the main process, the spawn trampoline for every other fiber.
+//
+// EXIT is on this chain rather than in a jmp_buf of its own for the reason the
+// other three share one: terminating a fiber has to run every pending cleanup
+// between here and the bottom, innermost first, restoring the bookkeeping of
+// every frame the jump skips. That is unwindRunCleanupsTo plus unwindAnswer,
+// which already exist and already do it for the other two jumping kinds. A
+// second mechanism would have to be interleaved with this one anyway.
 //
 // The Values in here are GC ROOTS and are visited through
 // rootsVisitUnwindRecords (memory/Roots.h). A handler block is held across the
@@ -119,6 +170,7 @@ typedef enum {
 	UNWIND_HOME,
 	UNWIND_HANDLER,
 	UNWIND_CLEANUP,
+	UNWIND_EXIT,
 } UnwindKind;
 
 typedef struct UnwindRecord {
@@ -132,7 +184,7 @@ typedef struct UnwindRecord {
 	Value exceptionClass; // UNWIND_HANDLER
 	Value handlerBlock;   // UNWIND_HANDLER
 	Value cleanupBlock;   // UNWIND_CLEANUP
-	jmp_buf destination;  // UNWIND_HOME and UNWIND_HANDLER
+	jmp_buf destination;  // UNWIND_HOME, UNWIND_HANDLER and UNWIND_EXIT
 	Value answer;
 	// Thread state to put back, because the jump skips every frame in between
 	// and each of them would otherwise leave its bookkeeping on these chains.
@@ -146,10 +198,17 @@ typedef struct UnwindRecord {
 void unwindPushHandler(UnwindRecord *record, Value exceptionClass,
 	Value handlerBlock);
 void unwindPushCleanup(UnwindRecord *record, Value cleanupBlock);
+// Mark the bottom of this fiber's Smalltalk execution. Same contract as the two
+// above: the caller owns the record and takes the setjmp in its own frame.
+void unwindPushExit(UnwindRecord *record);
 void unwindPop(UnwindRecord *record);
 // Arrived by a jump: put back the thread state the skipped frames would have
 // restored on the way out, and answer what the unwinder left.
 Value unwindAnswer(UnwindRecord *record);
+
+// Terminate the RUNNING fiber: run every pending cleanup on its own stack,
+// innermost first, then jump to its exit record. Never returns.
+void unwindToExit(void);
 
 // Find a handler for `exception` and act on its decision. Answers the value the
 // signal expression should have, or PRIMITIVE_FAILED when no handler matched,
@@ -207,6 +266,11 @@ void compiledFrameLeave(const CompiledFrameGuard *guard);
 // How the walk decides whether a return address belongs to a compiled frame or
 // to the C code that entered one.
 NativeCode *jitCodeContaining(const void *address);
+
+// Forget every RESOLVED TARGET at every send site, keeping the profile. What
+// any change to a method dictionary has to do, or a warm site keeps calling the
+// method that was there before. Details at the definition.
+void jitFlushSendCaches(void);
 
 // The unconditional send path, called by compiled code. `receiverSlot` points
 // at the receiver's frame slot; arguments are at DESCENDING addresses from it,

@@ -185,6 +185,36 @@ t0=$(now_ms)
 [ $? -ne 0 ]; rc=$?
 report_result "$rc" "UNCAUGHT_ERROR_EXITS_NONZERO" $(( $(now_ms) - t0 ))
 
+# And it must STOP. Exception>>defaultAction ends in `Processor thisProcess
+# terminate`, and for the main process that means the program is over: the
+# statement after the error must not run. Exiting nonzero is not enough on its
+# own -- the count made the status nonzero while execution carried on, so the
+# signal expression answered the Error object and every send after it went to
+# the wrong receiver. That is the doesNotUnderstand cascade this checks against.
+#
+# It CANNOT be an ordinary test file: the process it is about is the one running
+# the test, and a file that proves this dies before it can report.
+t0=$(now_ms)
+out="$("$BUILD/st" -s "$SNAP" -e "nil zork. 'REACHED' printNl" </dev/null 2>&1)"
+case "$out" in *REACHED*) rc=1 ;; *) rc=0 ;; esac
+report_result "$rc" "TERMINATE_STOPS_THE_PROCESS" $(( $(now_ms) - t0 ))
+
+# And the pending cleanups on the way out must run, because
+# Block>>valueUnwindProtected: promises they do when "Process terminate" cuts
+# through the frame.
+#
+# ifCurtailed: AND NOT ensure:, and the difference is the whole check. ensure:
+# runs its block itself on the NORMAL path, so it prints either way and proves
+# nothing -- measured against the pre-fix VM, which printed it. ifCurtailed:
+# runs ONLY during an unwind, so it prints exactly when a terminate really
+# unwound through here. Same reason as above for it not being a test file: the
+# process being unwound is this one.
+t0=$(now_ms)
+out="$("$BUILD/st" -s "$SNAP" -e "[nil zork] ifCurtailed: ['CURTAILED' printNl]" \
+	</dev/null 2>&1)"
+case "$out" in *CURTAILED*) rc=0 ;; *) rc=1 ;; esac
+report_result "$rc" "TERMINATE_RUNS_PENDING_CLEANUPS" $(( $(now_ms) - t0 ))
+
 # Project tooling e2e gate: the whole st new/build/run/test flow against the
 # fresh image. Covers scaffold, build, the up-to-date fast path, staleness on
 # a touched source, entry-point exit-code propagation, requires-by-name
