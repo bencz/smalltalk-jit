@@ -1,54 +1,59 @@
 #ifndef SNAPSHOT_H
 #define SNAPSHOT_H
 
-#include "core/Object.h"
-#include <stdio.h>
-#include <stdint.h>
-
-// Image format v2. The file opens with an 8-byte self-describing header:
+// The image: the object graph of a running heap, written out and read back.
+//
+// WHAT AN IMAGE HAS TO CARRY IN JIT-V2, and each of these is a difference from
+// the format this file replaces:
+//
+//   * the CLASS TABLE, restored index for index. An object header names its
+//     class by a 22-bit INDEX (ADR 0005), a guard in generated code compares
+//     that index, and the class's own trailer repeats it. Renumbering on load
+//     would be silent and total;
+//   * CODE UNITS, which are malloc'd C structs and not heap objects. A
+//     CompiledMethod reaches its bytecode through a raw word the collector never
+//     follows (jit/CompiledMethod.h), so nothing about a unit is in the object
+//     graph and all of it has to be written explicitly;
+//   * NOTHING about native code. A loaded method has `native == NULL` and is
+//     compiled again on its first send. That is not a shortcut: generated code
+//     BAKES the addresses of nil, true and false as immediates, and those
+//     addresses are different in the process that loads the image.
+//
+// THE STREAM IS NATIVE-ENDIAN and the header says which. An image is a
+// per-build artifact, regenerated from packages/Core in seconds, and heap
+// Values punned out of C structs make true cross-endian portability a claim
+// this format cannot honestly make. So instead of byte-swapping, the loader
+// REFUSES a foreign-endian, foreign-word-size or foreign-version image with a
+// message that says how to regenerate it. See PORTING.md "endianness".
 //
 //   bytes 0-3  magic "STIM"
 //   byte  4    format version (SNAPSHOT_FORMAT_VERSION)
 //   byte  5    byte order (1 = little-endian, 2 = big-endian)
 //   byte  6    word size in bytes (8)
 //   byte  7    reserved (0)
-//
-// The object stream that follows stays NATIVE-endian: images are per-build
-// artifacts (re-bootstrapping takes seconds) and heap Values that were punned
-// from C structs make true cross-endian portability a lie — so instead of
-// byte-swapping, the loader REFUSES a foreign-endian or legacy image with an
-// actionable message. See PORTING.md "endianness".
+
+#include "core/Object.h"
+#include <stdint.h>
+#include <stdio.h>
+
 #define SNAPSHOT_MAGIC "STIM"
-// v3: SmalltalkHandles grew the namespace roots (Namespace, CoreNamespace,
-// Namespaces, DefaultNamespace) appended at the end of the struct.
-// v4: RawClass gained the `namespace` ivar and RawBlockScope the `namespace`
-// slot, so v3 class objects no longer match the C layout.
-// v5: RawClassNode gained `isExtension` and `members` (extend syntax and
-// namespace declarations).
-#define SNAPSHOT_FORMAT_VERSION 5
+// v6: the jit-v2 object model. One-word object headers with a class INDEX, a
+// restored class table, and code units written explicitly. Nothing before this
+// version shares a single record with it.
+#define SNAPSHOT_FORMAT_VERSION 6
 #define SNAPSHOT_BYTE_ORDER_LITTLE 1
 #define SNAPSHOT_BYTE_ORDER_BIG 2
 
-void snapshotWrite(FILE *file);
-void snapshotRead(FILE *file);
-
-// ---- format primitives (unit-testable without a heap: ST_SNAPSHOT_FORMAT_TEST) --
-
-// InstanceShape <-> a DEFINED uint64 layout (byte i = field i, size in bytes
-// 6-7 low-first): pure shift arithmetic, so the encoding is independent of
-// struct padding, field order changes and host endianness — unlike the old
-// *(int64_t *)&shape reinterpret it replaces.
-uint64_t snapshotEncodeShape(InstanceShape shape);
-InstanceShape snapshotDecodeShape(uint64_t bits);
-
-// Persisted object header: identity hash + payload/vars sizes packed
-// explicitly (tags are never persisted; the loader starts every object clean).
-uint64_t snapshotEncodeObjectHeader(uint32_t hash, uint8_t payloadSize, uint8_t varsSize);
-void snapshotDecodeObjectHeader(uint64_t bits, uint32_t *hash, uint8_t *payloadSize, uint8_t *varsSize);
+// Both answer 0 on success. They REPORT rather than abort: writing an image is
+// something a command line asked for, and a failed write has to become an exit
+// code and not a core dump.
+int snapshotWrite(FILE *file);
+int snapshotRead(FILE *file);
 
 void snapshotWriteHeader(FILE *file);
-// 0 = valid v2 image for this host; nonzero = invalid, with an actionable
-// message in err (legacy/corrupt image, foreign endianness, wrong word size).
+// 0 = an image this build can read; nonzero = refused, with an actionable
+// message in `err` (legacy or corrupt image, foreign endianness, wrong word
+// size).
 int snapshotCheckHeader(FILE *file, char *err, size_t errSize);
 
 #endif

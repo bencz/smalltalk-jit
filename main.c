@@ -23,7 +23,9 @@
 #include "memory/Heap.h"
 #include "runtime/Primitive.h"
 #include "tools/Bootstrap.h"
+#include "tools/ClassBuilder.h"
 #include "tools/Cli.h"
+#include "tools/Snapshot.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -34,6 +36,173 @@ static int notPortedYet(const char *what, const char *needs)
 {
 	fprintf(stderr, "st: %s is not ported to jit-v2 yet (it needs %s)\n", what, needs);
 	return 3;
+}
+
+
+// ---- the image --------------------------------------------------------------
+
+static int writeImage(const char *path)
+{
+	FILE *file = fopen(path, "wb");
+	if (file == NULL) {
+		fprintf(stderr, "st: cannot write the image '%s'\n", path);
+		return 4;
+	}
+	int status = snapshotWrite(file);
+	if (fclose(file) != 0 || status != 0) {
+		fprintf(stderr, "st: writing the image '%s' failed\n", path);
+		return 4;
+	}
+	return 0;
+}
+
+
+// Answers 1 when the image was loaded, 0 when it was passed over, and exits on
+// a failure that leaves the heap unusable.
+//
+// The three outcomes are deliberately different. An image the caller NAMED with
+// -s and that this build cannot read is REFUSED, because ignoring it would run
+// the built-in kernel while the caller believed their image was loaded. One the
+// SEARCH merely found is passed over with a note: every checkout of this project
+// has a stale `snapshot` next to it that nobody asked for. And a file that
+// passed the header check and then ran out is neither: the heap has already been
+// replaced by then, so there is nothing left to fall back to.
+static int readImage(const char *path, _Bool explicitlyNamed)
+{
+	FILE *file = fopen(path, "rb");
+	if (file == NULL) {
+		return 0; // no image there: what every run looks like before one is made
+	}
+	char err[256];
+	if (snapshotCheckHeader(file, err, sizeof err) != 0) {
+		fclose(file);
+		if (explicitlyNamed) {
+			fprintf(stderr, "st: %s\n", err);
+			exit(3);
+		}
+		fprintf(stderr, "st: ignoring the image at '%s' and running the built-in "
+			"kernel (%s)\n", path, err);
+		return 0;
+	}
+	rewind(file);
+	int status = snapshotRead(file);
+	fclose(file);
+	if (status != 0) {
+		fprintf(stderr, "st: the image '%s' could not be loaded\n", path);
+		exit(3);
+	}
+	return 1;
+}
+
+
+// Run one parsed body with nil as the receiver, answering what it returned.
+//
+// A METHOD and not something special: the front end compiles methods, the tier
+// compiles CodeUnits, and a body with no arguments is what both an expression on
+// the command line and a top-level block in a file already are. Anything else
+// would be a second path through the compiler that nothing else exercises.
+static Value runBody(BlockNode *body, const char *what, int *failed)
+{
+	MethodNode *node = newObject(&Handles.MethodNode, 0);
+	methodNodeSetSelector(node, stringFromC("doIt"));
+	methodNodeSetBody(node, body);
+
+	// No owner class: a top-level body has no instance variables to resolve
+	// against, and every name in it is either its own temporary or a global.
+	CompileContext context = { NULL, smalltalkGlobals(), NULL };
+	CompileError error;
+	CodeUnit *unit = compileMethod(node, &context, &error);
+	if (unit == NULL) {
+		fprintf(stderr, "st: %s: %s", what, compileStatusName(error.status));
+		if (error.what != NULL) {
+			fprintf(stderr, ": ");
+			fprintRawString(stderr, error.what->raw);
+		}
+		fprintf(stderr, "\n");
+		*failed = 1;
+		return tagPtr(Handles.nil.raw);
+	}
+
+	Opcode unsupported = OP_COUNT;
+	NativeCode *code = jitCompile(unit, &unsupported);
+	if (code == NULL) {
+		fprintf(stderr, "st: %s: the tier does not implement %s yet\n", what,
+			opcodeName(unsupported));
+		*failed = 1;
+		return tagPtr(Handles.nil.raw);
+	}
+	return jitCall0(code, tagPtr(Handles.nil.raw));
+}
+
+
+// -f: a source file, run top to bottom.
+//
+// A file holds two kinds of thing and they are told apart by ONE token. `[`
+// opens a top-level block, which is evaluated; anything else begins a class
+// definition, which is built. That is the whole grammar of a file in this
+// dialect, and it is what every file in tests/ is made of: a run of blocks, the
+// last of which answers the failure count.
+//
+// THE LAST VALUE ANSWERED BECOMES THE EXIT CODE when it is an integer. The test
+// suite reads it that way -- a file ends with `[ ^SomeRun report ]` and a
+// nonzero count has to make the process fail, or every assertion-style test in
+// the suite can pass while its checks do not.
+static int runFile(const char *path)
+{
+	FILE *file = fopen(path, "rb");
+	if (file == NULL) {
+		fprintf(stderr, "st: cannot read '%s'\n", path);
+		return 1;
+	}
+
+	HandleScope scope;
+	openHandleScope(&scope);
+	Parser parser;
+	initFileParser(&parser, file, stringFromC(path));
+
+	int failed = 0;
+	int exitCode = 0;
+	while (!parserAtEnd(&parser) && !failed) {
+		HandleScope each;
+		openHandleScope(&each);
+		if (currentToken(&parser.tokenizer)->type == TOKEN_OPEN_SQUARE_BRACKET) {
+			BlockNode *body = parseBlock(&parser);
+			if (body == NULL) {
+				printParseError(&parser, (char *) path);
+				failed = 1;
+			} else {
+				Value answer = runBody(body, path, &failed);
+				if (valueTypeOf(answer, VALUE_INT)) {
+					exitCode = (int) asCInt(answer);
+				}
+			}
+		} else {
+			ClassNode *node = parseClass(&parser);
+			if (node == NULL) {
+				printParseError(&parser, (char *) path);
+				failed = 1;
+			} else {
+				ClassBuildError error;
+				classBuild(node, &error);
+				if (error.message != NULL) {
+					fprintf(stderr, "st: %s: %s", path, error.message);
+					if (error.what != NULL) {
+						fprintf(stderr, " '");
+						fprintRawString(stderr, error.what->raw);
+						fprintf(stderr, "'");
+					}
+					fprintf(stderr, "\n");
+					failed = 1;
+				}
+			}
+		}
+		closeHandleScope(&each, NULL);
+	}
+
+	closeHandleScope(&scope, NULL);
+	freeParser(&parser);
+	fclose(file);
+	return failed ? 1 : exitCode;
 }
 
 
@@ -157,46 +326,48 @@ int main(int argc, char **argv)
 				report.errorDetail, report.errorFile);
 			return 4;
 		}
-		// The classes are LIVE now, in this process. Writing them out needs the
-		// image writer, but RUNNING against them needs nothing else, and that is
-		// what makes `-b DIR -e CODE` the cheapest way to find out what the real
-		// kernel does when it actually executes.
+		// SAVING NEEDS -s, and only -s. `-b DIR` on its own builds the classes and
+		// reports, which is what makes `-b DIR -e CODE` the cheapest way to find
+		// out what the real kernel does when it executes; writing to the resolved
+		// default would have it clobber whatever image is next to the checkout
+		// without anyone asking.
+		if (cliArgs.snapshotExplicit) {
+			int status = writeImage(cliArgs.snapshotFileName);
+			if (status != 0) {
+				return status;
+			}
+		}
+		// The image is written BEFORE the expression runs, so it holds the package
+		// as built and not as some probe left it.
 		if (cliArgs.eval != NULL) {
 			return evaluate(cliArgs.eval);
 		}
-		fprintf(stderr, "st: writing an image is not ported to jit-v2 yet, so "
-			"nothing was saved\n");
-		return 3;
-	}
-	if (cliArgs.fileName != NULL) {
-		return notPortedYet("running a source file", "the class builder");
+		if (!cliArgs.snapshotExplicit) {
+			fprintf(stderr, "st: nothing was saved; name an image with -s to write "
+				"one\n");
+		}
+		return 0;
 	}
 
-	// An image the caller NAMED with -s and that exists is refused rather than
-	// ignored: ignoring it would run the built-in kernel while the caller
-	// believed their image was loaded.
-	//
-	// One the SEARCH merely found is a different matter. Every checkout of this
-	// project has a `snapshot` left over from before the cut, nobody asked for
-	// it, and refusing would make `st -e` unusable in the source tree. It is
-	// passed over, with one line on stderr so that which kernel is running is
-	// never a guess. A path that does not exist is not an error at all: that is
-	// what every run looks like until there is a writer.
 	if (cliArgs.snapshotFileName != NULL) {
-		FILE *existing = fopen(cliArgs.snapshotFileName, "rb");
-		if (existing != NULL) {
-			fclose(existing);
-			if (cliArgs.snapshotExplicit) {
-				fprintf(stderr, "st: reading an image is not ported to jit-v2 yet "
-					"(would have read '%s')\n", cliArgs.snapshotFileName);
-				return 3;
-			}
-			fprintf(stderr, "st: ignoring the image at '%s' and running the "
-				"built-in kernel; reading an image is not ported to jit-v2 yet\n",
-				cliArgs.snapshotFileName);
+		readImage(cliArgs.snapshotFileName, cliArgs.snapshotExplicit);
+	}
+
+	// ST_RESAVE: load an image and write it straight back out. It exists for
+	// scripts/check-image-idempotence.sh, which is the only check that can catch
+	// a field the writer persists and the reader drops -- the image still loads
+	// and still runs, and the difference shows up nowhere else.
+	const char *resave = getenv("ST_RESAVE");
+	if (resave != NULL) {
+		int status = writeImage(resave);
+		if (status != 0) {
+			return status;
 		}
 	}
 
+	if (cliArgs.fileName != NULL) {
+		return runFile(cliArgs.fileName);
+	}
 	if (cliArgs.eval != NULL) {
 		return evaluate(cliArgs.eval);
 	}

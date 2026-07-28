@@ -108,7 +108,8 @@ static uint8_t *allocateOld(Heap *heap, size_t bytes)
 {
 	osMutexLock(&heap->oldLock);
 	uint8_t *address = pageSpaceAllocate(&heap->oldSpace, bytes);
-	_Bool overThreshold = heap->oldSpace.allocated > heap->oldGcThreshold;
+	_Bool overThreshold = heap->oldSpace.allocated > heap->oldGcThreshold
+		&& !heap->gcInhibited;
 	osMutexUnlock(&heap->oldLock);
 	if (address == NULL) {
 		fprintf(stderr, "out of memory: old space refused %zu bytes\n", bytes);
@@ -312,7 +313,32 @@ RawObject *allocateObject(Heap *heap, RawObject *class, size_t elements)
 
 void collectGarbage(Heap *heap)
 {
+	// Not "skip it", an ASSERT. While an image is loading, the objects already
+	// read are reachable ONLY from the loader's id-to-address table, which is a C
+	// array the collector does not scan, so a collection here would sweep a
+	// half-built image and the damage would surface far from the cause.
+	ASSERT(!heap->gcInhibited);
 	collectorMarkSweep(heap);
+}
+
+
+// Raw old-space bytes for the image loader, with no collection triggered.
+//
+// The OLD space and not the nursery, and that is correctness rather than
+// convenience: the old space does not move (ADR 0005), so the loader's
+// id-to-address table stays valid for the whole load. In the nursery a
+// collection partway through would relocate everything already read and leave
+// every entry stale.
+uint8_t *heapAllocateImageBytes(Heap *heap, size_t bytes)
+{
+	ASSERT(heap->gcInhibited);
+	return allocateOld(heap, bytes);
+}
+
+
+void heapInhibitGc(Heap *heap, _Bool inhibited)
+{
+	heap->gcInhibited = inhibited;
 }
 
 

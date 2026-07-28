@@ -228,7 +228,24 @@ level9() {
 }
 
 level10() { "$BUILD/st" -s "$BUILD/gate.img" -e '(3 + 4) printNl' </dev/null | grep -qx 7; }
-level11() { "$BUILD/st" -s "$SCRATCH/gate.img" -b packages/Core </dev/null >/dev/null; }
+# Writing an image is only half the level: the criterion is that it RELOADS.
+# Three checks, because each one fails for a different reason.
+#
+#   1. the bootstrap writes an image at all;
+#   2. the image loads and the kernel in it RUNS. `printNl` and not `3 + 4`,
+#      because a loaded method has no native code and is compiled again on its
+#      first send, so printing is what proves the reload reached the JIT;
+#   3. save-load-save is a FIXPOINT, byte for byte. This is the only check that
+#      catches a field the writer persists and the reader drops: the image still
+#      loads and still runs, and the loss shows up nowhere else.
+level11() {
+	"$BUILD/st" -s "$SCRATCH/gate.img" -b packages/Core </dev/null >/dev/null || return 1
+	"$BUILD/st" -s "$SCRATCH/gate.img" -e '(3 + 4) printNl' </dev/null \
+		| grep -qx 7 || return 1
+	ST_RESAVE="$SCRATCH/gate2.img" "$BUILD/st" -s "$SCRATCH/gate.img" \
+		</dev/null >/dev/null || return 1
+	cmp -s "$SCRATCH/gate.img" "$SCRATCH/gate2.img"
+}
 level12() { echo "level 12 (pacotes) has no runner yet"; return 1; }
 level13() { ./run_tests.sh --no-build 2>&1 | grep -q "ALL PASSED"; }
 level14() { echo "level 14 (deopt-stress) has no runner yet"; return 1; }

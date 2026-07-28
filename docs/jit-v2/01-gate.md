@@ -176,6 +176,7 @@ Apendar, nunca reescrever. Data, commit, o que destravou.
 | 2026-07-28 | 10 | (nao commitado) | o Core EXECUTA: 158 inicializadores, metaclasses eager, sends ate 5 argumentos |
 | 2026-07-28 | 8 | (nao commitado) | metodo que e SO primitiva falha em voz alta: 93 de 93, e a varredura achou 77 |
 | 2026-07-28 | 10 | (nao commitado) | `printNl` contra o Core DE VERDADE: 5 bugs, nenhum na pilha de streams, 98 de 98 |
+| 2026-07-28 | **11** | (nao commitado) | imagem: 1,1 MB, recarrega e RODA, e salvar-carregar-salvar e byte-identico |
 
 ## O que o nivel 7 encontrou, e por que so ele podia encontrar
 
@@ -875,11 +876,92 @@ O que ainda nao: `3.5 printNl` (`FloatAsStringPrimitive`) e `100 factorial`
 aparecem na varredura acima, e os dois agora DIZEM qual primitiva falta em vez de
 responder o receptor.
 
-E compilar nao e rodar. Entre isto e `run_tests.sh` verde estao, em ordem:
-a IMAGEM (Snapshot le e escreve o modelo novo), as EXCECOES (`signal`, `on:do:`,
-`ensure:`, que e o segundo cliente do unwind que o retorno nao local ja
-construiu), e as PRIMITIVAS: 40 das 175 estao implementadas, e os testes usam
-muito mais que isso. Um metodo que declara uma primitiva ausente E NAO TEM corpo
+## Nivel 11: a imagem, e as tres coisas que ela tem que carregar
+
+`Snapshot.c` foi reescrito. O grafo continua sendo escrito por descoberta a
+partir das raizes, com ids e referencias, que era o desenho certo do v1; o que
+mudou por completo foi o que um registro contem, porque tres coisas do v2 nao
+existem no modelo antigo:
+
+- **a TABELA DE CLASSES, restaurada indice por indice.** O cabecalho de um objeto
+  nomeia a classe por INDICE de 22 bits (ADR 0005), um guard em codigo gerado
+  compara esse indice, e o trailer da propria classe o repete. Renumerar na carga
+  seria silencioso e total. `classTableSet` ja existia para isso;
+- **as CODE UNITS**, que sao structs C de `malloc` e nao objetos de heap. Um
+  CompiledMethod alcanca o bytecode dele por uma palavra CRUA que o coletor nunca
+  segue, entao nada de uma unit esta no grafo de objetos e tudo dela e escrito a
+  parte. Toda unit e alcancavel: a de um bloco mora num CompiledMethod dentro do
+  `blocks` da unit que a contem;
+- **NADA de codigo nativo.** Um metodo carregado tem `native == NULL` e compila
+  de novo no primeiro send. Nao e atalho: codigo gerado BAKEIA os enderecos de
+  nil, true e false como imediatos, e no processo que carrega a imagem esses
+  enderecos sao outros.
+
+Tres decisoes que valem registro:
+
+**A imagem carrega na OLD SPACE, e isso e corretude e nao arrumacao.** A old
+space nao move (ADR 0005), entao a tabela id-para-endereco do carregador continua
+valida do primeiro registro ao ultimo. Na nursery, uma coleta no meio realocaria
+tudo o que ja foi lido e deixaria a tabela inteira apontando para onde as coisas
+estavam.
+
+**Coleta durante a carga e ASSERT, nao "pula".** Entre o primeiro registro e o
+fim da correcao de ponteiros, os objetos lidos sao alcancaveis SO pela tabela do
+carregador, que e um array C que nenhum provedor de raiz conhece. `collectGarbage`
+falha alto se for chamado ali.
+
+**Um valor codificado guarda os dois bits de tag**, entao ele se descreve
+sozinho: tag de ponteiro significa "o resto e `id + 1`", e os outros tres tags
+sao imediatos escritos como estao. Nada pode ser confundido com referencia, e um
+slot com o ZERO do alocador (o "ausente" do VM) atravessa como ele mesmo.
+
+### O criterio do nivel 11 e RECARREGAR, e o gate agora mede isso
+
+O runner antigo so escrevia a imagem. Sao tres checagens, cada uma falhando por
+um motivo diferente: a imagem e escrita; ela carrega e o kernel dentro dela RODA
+(`printNl`, nao `3 + 4`, porque um metodo carregado nao tem codigo nativo e
+imprimir e o que prova que a recarga chegou ate o JIT); e salvar-carregar-salvar
+e um PONTO FIXO byte a byte.
+
+O ponto fixo e a unica checagem que pega um campo que o escritor persiste e o
+leitor descarta: a imagem continua carregando e continua rodando, e a perda nao
+aparece em lugar nenhum. Medido: **a imagem do bootstrap ja e um ponto fixo**,
+`img1 == img2`, 1.149.776 bytes. As 24 checagens de `printNl` com valor esperado
+respondem identicamente contra a imagem carregada e contra o pacote vivo.
+
+## `st -f`, e o censo dos 141
+
+`-f` roda um arquivo de cima a baixo, e o arquivo tem duas coisas separadas por
+UM token: `[` abre um bloco de topo, que e avaliado, e qualquer outra coisa
+comeca uma definicao de classe, que e construida. **O ultimo valor respondido
+vira o codigo de saida** quando for inteiro, que e como a suite le um arquivo
+terminado em `[ ^AlgumRun report ]`.
+
+Um bug caiu junto: `methodNodeGetPragmas` derreferenciava o zero de um campo nao
+setado. Nenhum no vindo do PARSER deixa esse campo vazio; um no construido a mao
+deixa, e `-f` e o primeiro que constroi um.
+
+**O censo, rodando os 141 arquivos de `tests/` contra a imagem:**
+
+| | |
+|---|---|
+| **99** | `BlockOnExceptionPrimitive`, ou seja `on:do:` |
+| 5 | assert em C |
+| 4 cada | `ProcessSpawnPrimitive`, `WorkerParallelPrimitive`, `MonotonicNanoTimePrimitive`, aritmetica de LargeInteger |
+| 3 | JA PASSAM |
+| o resto | 1 ou 2 cada: `ParseClass`, `MonitorEnterOn`, `BlockUnwind`, `FloatAsString`, `thisContext`, e outros |
+
+**70% dos arquivos param na MESMA coisa**, e e o proximo item da ordem aprovada:
+`TestRun check:` envolve cada checagem em `on:do:`, entao excecoes nao sao um
+item entre outros, sao o que destranca a suite. O unwind que o retorno nao local
+ja construiu e a metade que existe.
+
+E compilar nao e rodar. A IMAGEM esta feita (nivel 11, acima). O que resta entre
+isto e `run_tests.sh` verde, em ordem e agora com numero: as EXCECOES (`signal`,
+`on:do:`, `ensure:`, o segundo cliente do unwind que o retorno nao local ja
+construiu), que sozinhas destrancam **99 dos 141** arquivos de teste; e as
+PRIMITIVAS, 40 das 175, com a lista do que falta saindo do censo acima em vez de
+de um palpite. Um metodo que declara uma primitiva ausente E NAO TEM corpo
 de fallback agora falha nomeando-a, em vez de responder o receptor: sao 65 assim
 no Core, contados na varredura acima.
 

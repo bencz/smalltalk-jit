@@ -319,7 +319,12 @@ static void methodNodeSetPragmas(MethodNode *method, OrderedCollection *pragmas)
 
 static OrderedCollection *methodNodeGetPragmas(MethodNode *method)
 {
-	return (OrderedCollection *) scopeHandle(asObject(method->raw->pragmas));
+	// A node the PARSER built always has one, even empty; a node built by hand
+	// does not. `st -f` makes one to wrap a top-level block, which is the first
+	// caller that ever left it unset, and dereferencing the zero aborted before
+	// the file's first statement ran.
+	return valueTypeOf(method->raw->pragmas, VALUE_POINTER)
+		? (OrderedCollection *) scopeHandle(asObject(method->raw->pragmas)) : NULL;
 }
 
 

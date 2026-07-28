@@ -149,7 +149,7 @@ endif()
 # core/{CompiledCode,Entry,Exception,Lookup,Namespace,StackFrame}.c,
 # compiler/{Compiler,Scope}.c, concurrency/Scheduler.c, runtime/{Base64,
 # FileSystem,Iterator,Json,Message,Primitives,Socket,Stream}.c and
-# tools/{Repl,Snapshot}.c. None of them compiles against the new object model,
+# tools/Repl.c. None of them compiles against the new object model,
 # and each comes back when its layer does.
 set(vmSources
 	vm/compiler/Compile.c
@@ -188,6 +188,7 @@ set(vmSources
 	vm/thirdparty/cityhash/city.c
 	vm/tools/Bootstrap.c
 	vm/tools/ClassBuilder.c
+	vm/tools/Snapshot.c
 	${vmArchSources}
 	${vmAbiSources}
 	${vmOsSources}

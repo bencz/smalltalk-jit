@@ -61,6 +61,10 @@ typedef struct Heap {
 	// collection may have invalidated.
 	size_t gcEpoch;
 
+	// Set only while an image is being LOADED, when the objects read so far are
+	// reachable from nothing the collector scans (tools/Snapshot.c).
+	_Bool gcInhibited;
+
 	// Guards carving TLABs out of the shared young space. The per-mutator bump
 	// INSIDE a TLAB stays lock-free; only the (rare) refill takes this.
 	OsMutex youngLock;
@@ -118,6 +122,13 @@ RawObject *allocateObject(Heap *heap, RawObject *class, size_t elements);
 RawObject *allocateImmortalObject(Heap *heap, RawObject *class, size_t elements);
 
 void collectGarbage(Heap *heap);
+
+// Raw old-space bytes for the image loader, with no collection triggered. See
+// the note at the definition for why the old space and not the nursery.
+uint8_t *heapAllocateImageBytes(Heap *heap, size_t bytes);
+// While set, no collection may run: `collectGarbage` asserts on it rather than
+// skipping, because a collection during a load is corruption and not a slowdown.
+void heapInhibitGc(Heap *heap, _Bool inhibited);
 void printHeap(Heap *heap);
 void resetGcStats(void);
 void printGcStats(void);
