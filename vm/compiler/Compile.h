@@ -10,13 +10,19 @@
 // SSA construction and for deoptimization rather than for direct interpretation
 // (docs/jit-v2/04-bytecode.md).
 //
-// Two phases, in one translation unit because the second consumes the first
+// Three phases, in one translation unit because each consumes the one before it
 // name by name and a header between them would only describe the join:
 //
+//   CAPTURE      which names each non-inlined block closes over, and which
+//                declarations need a heap CELL because they are captured AND
+//                assigned (ADR 0008). It runs over the whole method first,
+//                because a cell changes every read and write of a variable,
+//                including the ones emitted before the closure exists;
 //   RESOLUTION   every identifier becomes a place: self, an argument register,
-//                a temporary register, an instance-variable slot, or a global
-//                Association. Registers are FLAT, so a resolved local IS an SSA
-//                value later, with nothing to interpret first;
+//                a temporary register, a cell, a capture slot, an
+//                instance-variable slot, or a global Association. Registers are
+//                FLAT, so a resolved local IS an SSA value later, with nothing
+//                to interpret first;
 //   EMISSION     the tree becomes fixed-width instructions.
 //
 // WHAT IS DELIBERATELY NOT DONE HERE (ADR 0006, and it is the discipline the
@@ -37,6 +43,7 @@ typedef enum {
 	COMPILE_TOO_MANY_REGISTERS,
 	COMPILE_TOO_MANY_LITERALS,
 	COMPILE_TOO_MANY_INSTRUCTIONS,
+	COMPILE_TOO_MANY_CAPTURES,  // a block closing over more than a CLOSURE can name
 	COMPILE_BAD_INLINE_BLOCK,   // a block where the shape required one
 	COMPILE_UNKNOWN_PRIMITIVE,  // <primitive: Foo> naming nothing the VM knows
 	COMPILE_UNSUPPORTED,        // reached a construct this stage does not do yet

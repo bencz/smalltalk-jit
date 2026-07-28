@@ -236,21 +236,45 @@ static uint32_t birthHash(void *address)
 // Shared by the ordinary and the immortal allocator: everything except WHERE
 // the bytes come from is identical, and a second copy of the header stamping is
 // how the two would drift.
-static RawObject *initializeObject(RawObject *object, RawClass *raw, size_t bytes,
-	size_t elements)
+//
+// EVERY BODY WORD IS WRITTEN HERE, and that is load-bearing rather than tidy.
+// The semispaces are not re-zeroed when they flip and a swept old-space chunk
+// keeps whatever it held, so from the second cycle onward an allocation lands on
+// a DEAD OBJECT'S BYTES. A slot the allocator leaves alone therefore holds a
+// value from that dead object, and the collector scans it: a garbage class index
+// at best, a plausible pointer into the evacuated semispace at worst. The
+// ALIGNMENT PADDING is covered for the same reason, because the pointer range
+// comes from the object's SIZE and no caller ever writes padding.
+//
+// ZERO and not nil, which is tagInt(0) and therefore a legal Value the collector
+// steps over. That is deliberate: throughout the VM an unset slot answers
+// `valueTypeOf(slot, VALUE_POINTER)` as false and means ABSENT (a class with no
+// superclass, a method with no owner), and nil is an object, so filling with it
+// here would turn every one of those into "present, and it is nil". What
+// Smalltalk requires instead, that `Object new` answers an instance whose
+// variables are nil, belongs to the primitive that serves `new` and is done
+// there (runtime/Primitive.c), where nil is guaranteed to exist.
+// The class is passed as its SHAPE and its INDEX rather than as a pointer,
+// because the allocation that precedes this can collect and move the class
+// object: everything needed out of it is read before the bytes are asked for.
+static RawObject *initializeObject(Heap *heap, RawObject *object,
+	InstanceShape shape, uint32_t classIndex, size_t bytes, size_t elements)
 {
-	InstanceShape shape = raw->instanceShape;
-	object->header = makeObjectHeader(raw->classIndex, birthHash(object),
+	object->header = makeObjectHeader(classIndex, birthHash(object),
 		(ObjectFormat) shape.format, bytes / sizeof(uint64_t));
+	memset(object->body, 0, bytes - HEADER_SIZE);
 	switch ((ObjectFormat) shape.format) {
 	case FORMAT_INDEXED_POINTERS:
 	case FORMAT_BYTES:
 	case FORMAT_DOUBLES:
+		// After the zeroing, and before the pointer range is computed: an object
+		// too large for the header's size field answers its size FROM this count.
 		rawObjectSetElementCount(object, elements);
 		break;
 	default:
 		break;
 	}
+	(void) heap;
 	return object;
 }
 
@@ -264,7 +288,8 @@ RawObject *allocateImmortalObject(Heap *heap, RawObject *class, size_t elements)
 	// must never do is change address.
 	RawObject *object = (RawObject *) allocateOld(heap, bytes);
 	ASSERT(object != NULL);
-	initializeObject(object, raw, bytes, elements);
+	initializeObject(heap, object, raw->instanceShape, raw->classIndex, bytes,
+		elements);
 	ASSERT(isOldObject(object)); // the whole point: bit 3 says non-moving
 	return object;
 }
@@ -273,27 +298,15 @@ RawObject *allocateImmortalObject(Heap *heap, RawObject *class, size_t elements)
 RawObject *allocateObject(Heap *heap, RawObject *class, size_t elements)
 {
 	RawClass *raw = (RawClass *) class;
+	// Read out of the class BEFORE allocating: the allocation can collect, and a
+	// collection moves the class.
 	InstanceShape shape = raw->instanceShape;
+	uint32_t classIndex = raw->classIndex;
 	size_t bytes = objectSizeForShape(shape, elements);
 
 	uint8_t *address = allocate(heap, bytes);
-	RawObject *object = (RawObject *) address;
-	object->header = makeObjectHeader(raw->classIndex, birthHash(address),
-		(ObjectFormat) shape.format, bytes / sizeof(uint64_t));
-
-	// osPageAlloc promises zeroed pages and the collector never hands back a
-	// dirty chunk, so a fresh object's body is already zero. Only the element
-	// count and the nil-filling of pointer slots have to be written.
-	switch ((ObjectFormat) shape.format) {
-	case FORMAT_INDEXED_POINTERS:
-	case FORMAT_BYTES:
-	case FORMAT_DOUBLES:
-		rawObjectSetElementCount(object, elements);
-		break;
-	default:
-		break;
-	}
-	return object;
+	return initializeObject(heap, (RawObject *) address, shape, classIndex, bytes,
+		elements);
 }
 
 

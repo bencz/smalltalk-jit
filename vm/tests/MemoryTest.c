@@ -170,6 +170,76 @@ int main(void)
 	check("and that survivor kept its contents",
 		((Value *) tailAfter->body)[0] == tagInt(4321));
 
+	// ---- an INDEXED object that ALSO has a named slot ----------------------
+	//
+	// A Closure is one: element count, then the method, then the captures. Its
+	// size cannot be derived from the element count, because the count says
+	// nothing about the named slot, and deriving it that way answered ONE WORD
+	// SHORT: the walk strode into the middle of the object and the pointer range
+	// it computed stopped before the named slot, so nothing ever updated it.
+	//
+	// The worst case is zero elements, which is a block that captures nothing,
+	// and it is the case used here.
+	//
+	// THE GENERATION IS THE CHECK, and the contents are not. The target left
+	// behind in the evacuated semispace still reads 4242, so "is the field
+	// intact" answers YES with the bug present. Only a collector that FOUND it
+	// twice could have promoted it.
+	uint32_t namedIndexed = makeClass(&heap, FORMAT_INDEXED_POINTERS, 1, 0, 9);
+	{
+		RawObject *withNamed = allocateObject(&heap, classAt(&heap, namedIndexed), 0);
+		RawObject *namedTarget = allocateObject(&heap, classOfPairs, 0);
+		((Value *) namedTarget->body)[0] = tagInt(4242);
+		// Body word 0 is the element count; word 1 is the named slot.
+		((Value *) withNamed->body)[1] = tagPtr(namedTarget);
+		roots[3] = tagPtr(withNamed);
+
+		collectorScavenge(&heap);
+		collectorScavenge(&heap);
+
+		Value slot = ((Value *) asObject(roots[3])->body)[1];
+		check("the named slot of an indexed object is scanned, so its target was "
+			"promoted rather than abandoned in the dead semispace",
+			valueTypeOf(slot, VALUE_POINTER) && isOldObject(asObject(slot)));
+		check("and that target kept its contents",
+			valueTypeOf(slot, VALUE_POINTER)
+			&& ((Value *) asObject(slot)->body)[0] == tagInt(4242));
+		roots[3] = 0;
+	}
+
+	// ---- a fresh object lands on RECYCLED memory ---------------------------
+	//
+	// The semispaces are never re-zeroed when they flip, so from the second
+	// cycle onward an allocation lands on the bytes of a dead object. Every word
+	// the collector will scan therefore has to be written by the ALLOCATOR: one
+	// left alone holds whatever the corpse held, and a slot that used to be a
+	// pointer is followed by the next collection.
+	//
+	// The padding is the part that is easy to miss. A two-slot object occupies
+	// three body words after alignment, and the pointer range comes from the
+	// SIZE, so that third word is scanned and no caller ever writes it.
+	{
+		// Dirty both semispaces first, with values that are plausible pointers.
+		for (int round = 0; round < 2; round++) {
+			for (int i = 0; i < 20000; i++) {
+				RawObject *garbage = allocateObject(&heap, classOfPairs, 0);
+				((Value *) garbage->body)[0] = tagPtr(liveNow);
+				((Value *) garbage->body)[1] = tagPtr(liveNow);
+				((Value *) garbage->body)[2] = tagPtr(liveNow); // the padding word
+			}
+			collectorScavenge(&heap);
+		}
+		RawObject *fresh = allocateObject(&heap, classOfPairs, 0);
+		size_t count;
+		Value *slots = objectPointerSlots(&heap.classes, fresh, &count);
+		_Bool clean = count == 3;
+		for (size_t i = 0; i < count; i++) {
+			clean = clean && slots[i] == 0; // nil does not exist yet in this test
+		}
+		check("every scanned word of a fresh object is written by the allocator, "
+			"padding included, so recycled memory carries nothing forward", clean);
+	}
+
 	// ---- 6: raw bodies are never scanned -----------------------------------
 	// A double whose bits are exactly a plausible tagged pointer. If the
 	// collector ever scanned a FORMAT_DOUBLES body it would follow this and

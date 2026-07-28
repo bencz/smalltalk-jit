@@ -165,6 +165,8 @@ Apendar, nunca reescrever. Data, commit, o que destravou.
 | 2026-07-27 | 8 | (nao commitado) | frames compilados viraram raizes: alocar de codigo compilado ficou seguro |
 | 2026-07-27 | 7 | (nao commitado) | closures planas com celulas (ADR 0008) em bytecode: 104 de 104 |
 | 2026-07-27 | 7 | (nao commitado) | nomes de primitiva alinhados a packages/ (173 declaradas, 31 implementadas): 109 de 109 |
+| 2026-07-28 | 8 | (nao commitado) | closures no FRONT END: analise de captura e emissao de CLOSURE, 69 de 69 |
+| 2026-07-28 | 0 | (nao commitado) | as closures acharam DOIS bugs de memoria pre-existentes, ver abaixo: 27 de 27 |
 
 ## O que o nivel 7 encontrou, e por que so ele podia encontrar
 
@@ -258,31 +260,114 @@ passava com o walk inteiro removido. O que nao acontece por sorte e estar na OLD
 space, porque so um coletor que ACHOU o objeto duas vezes poderia te-lo
 promovido.
 
-## Closures: metade feita, e qual metade
+## Closures: FEITAS, e o que decidiu o desenho
 
-O ADR 0008 esta implementado **em bytecode** e verificado no nivel 7:
-`CLOSURE`, `GETUP`, `NEWCELL`, `GETCELL`, `SETCELL`, mais `value`/`value:` como
-primitivas (que sao SENDs, entao um sitio de chamada de bloco carrega cache
-inline como qualquer outro). Objeto `Closure` = contagem, metodo, capturas, tudo
-tagueado (`FORMAT_INDEXED_POINTERS`), entao o coletor nao tem caso especial.
+O ADR 0008 esta implementado dos dois lados. **Em bytecode**, verificado no
+nivel 7: `CLOSURE`, `GETUP`, `NEWCELL`, `GETCELL`, `SETCELL`, mais
+`value`/`value:` como primitivas (que sao SENDs, entao um sitio de chamada de
+bloco carrega cache inline como qualquer outro). Objeto `Closure` = contagem,
+metodo, capturas, tudo tagueado (`FORMAT_INDEXED_POINTERS`), entao o coletor nao
+tem caso especial.
 
 Provado com bytecode escrito a mao, de proposito, pelo mesmo motivo dos niveis
-abaixo: o mecanismo erra de jeitos que o nivel de fonte esconde. O teste cobre
-captura por valor, celula mutada DEPOIS da captura (captura por valor
-responderia 1 em vez de 99), bloco com argumento proprio junto das capturas,
-aridade errada caindo no fallback, e sobrevivencia a coleta completa.
+abaixo: o mecanismo erra de jeitos que o nivel de fonte esconde.
 
-**O que falta e a metade do FRONT END**: analise de captura (quais nomes sao
-capturados, quais sao mutados, logo quais precisam de celula) e emissao de
-`CLOSURE`. Ate la o compilador RECUSA um bloco nao inlinado, com erro nomeado,
-em vez de emitir algo que parece funcionar.
+**E no FRONT END**, verificado no nivel 8: analise de captura mais emissao de
+`CLOSURE`. Tres coisas decidiram o desenho.
 
-Tambem faltam, e pelo mesmo motivo:
+**UM predicado de inlining, lido pelos dois lados.** A analise e o emissor
+chamam a MESMA funcao para decidir se um bloco vira controle de fluxo ou
+closure. Se discordassem, a discordancia seria silenciosa e cara: um
+`sum := sum + i` dentro de um `to:do:` cujo bloco a analise achasse ser closure
+poria `sum` numa celula de heap, e o resultado e um programa correto com o laco
+morto, que e exatamente o laco que este projeto existe para otimizar. O nivel 8
+le o bytecode de volta e conta: o laco inlinado tem ZERO instrucoes de celula e
+ZERO `CLOSURE`, e o mesmo laco com uma closure lendo o acumulador tem as duas
+coisas. Um numero so nao provaria nada; sao os dois que provam.
+
+**A analise roda ANTES de existir uma instrucao.** Celula ou registrador muda
+toda leitura e toda escrita da variavel, inclusive as emitidas antes da closure
+que a captura. Decidir no sitio da closure exigiria reescrever o que ja foi
+emitido.
+
+**As tabelas da analise sao colecoes de HEAP, nao arrays C de `RawObject *`.**
+A emissao aloca, entao um array C de ponteiros para nos da AST seria um conjunto
+de enderecos que a primeira coleta invalida. Essa e a familia de bug que este
+repositorio ja pagou tres vezes; nao vai pagar a quarta dentro do compilador.
+
+Onde a celula e criada e onde o registrador e inicializado, e isso da de graca
+as duas semanticas que importam: temporario de bloco inlinado ganha celula NOVA
+por iteracao (closures feitas num laco capturam variaveis diferentes) e
+temporario de metodo ganha UMA para a ativacao inteira (closures irmas
+compartilham).
+
+Tres guardas sao ASSERT e nao teste, porque o modo de falha e silencio: um bloco
+que a analise nao viu, uma escrita em captura por valor, e "todo bloco preparado
+foi emitido exatamente uma vez", que e a unica maneira de tornar barulhenta a
+divergencia na direcao contraria.
+
+Faltam ainda, e sao o proximo item:
 
 - **`super`**: o emissor gera `SENDSUPER` e o tier 1 ainda nao o implementa, e
   reporta o opcode pelo nome;
-- **retorno nao local** (`^` dentro de bloco), que depende do token de frame
-  home do ADR 0008.
+- **retorno nao local** (`^` dentro de bloco nao inlinado), que depende do token
+  de frame home do ADR 0008. Ate la e **recusa nomeada**, nunca um `RET` que
+  retornaria do bloco em vez do metodo.
+
+## O que as closures encontraram no subsistema de memoria
+
+Dois bugs pre-existentes, os dois no nivel 0, os dois invisiveis para tudo o que
+rodou antes. Ficam registrados porque a CAUSA de terem escapado importa mais que
+os bugs.
+
+**1. Objeto INDEXADO com slot NOMEADO era medido pela contagem de elementos.**
+Um `Closure` e exatamente isso: contagem, depois o metodo, depois as capturas. A
+contagem de elementos nao sabe do slot nomeado, entao `objectSizeInBytes`
+respondia UMA PALAVRA A MENOS: o walk entrava no meio do objeto, e a faixa de
+ponteiros calculada parava ANTES do campo `method`. Ninguem atualizava esse
+campo, e o primeiro scavenge que movesse o `CompiledMethod` deixava a closure
+apontando para um cadaver.
+
+Por que o nivel 7 nao viu: closure la so passou por `collectorMarkSweep`, que
+**nao move**. O ponteiro obsoleto continuava certo por acidente.
+
+Conserto: o CABECALHO responde primeiro. `sizeWords` e o tamanho TOTAL e foi
+escrito por `objectSizeForShape`, entao ja contempla o que vem antes dos
+elementos. A derivacao pela contagem fica so para o objeto grande demais para o
+campo, e um `ASSERT` em `objectSizeForShape` mantem slot nomeado fora desse
+caminho. O teto que sai dai e `CLOSURE_MAX_CAPTURES`, com **erro limpo** de
+compilacao.
+
+**2. O alocador nao escrevia o corpo, e as semispaces nao sao rezeradas.** O
+comentario dizia "o corpo ja esta zerado", e isso e verdade so no primeiro ciclo:
+a partir da segunda troca de semispace uma alocacao cai sobre os BYTES DE UM
+OBJETO MORTO. Todo slot que o alocador nao escrevesse guardava o valor do
+cadaver, e o coletor varre esse slot. O PADDING de alinhamento e o caso facil de
+perder: um objeto de dois slots ocupa tres palavras de corpo, a faixa de
+ponteiros sai do TAMANHO, e ninguem escreve a terceira.
+
+Conserto: `initializeObject` escreve o corpo inteiro. Com ZERO, que e
+`tagInt(0)`, e nao com nil: no VM inteiro um slot nao setado responde falso a
+`valueTypeOf(slot, VALUE_POINTER)` e significa AUSENTE (classe sem superclasse,
+metodo sem dono), e nil e um objeto. O que o Smalltalk exige, `Object new` com
+variaveis em nil, passou a ser feito na primitiva que serve `new`, que e onde a
+regra do Smalltalk comeca a valer.
+
+**Os dois testes checam GERACAO, nao conteudo**, e os dois foram verificados
+DESLIGANDO o conserto: o primeiro vira FAIL limpo, o segundo tambem, e a
+ausencia do registro de unidades (abaixo) vira SEGV dentro do coletor.
+
+## Um quarto baked pointer, e por que a unidade de bloco e diferente
+
+A unidade de um bloco e construida quando o metodo que a contem compila, e nao
+roda ate alguem mandar `value` para a closure. Nesse intervalo o frame de
+literais dela nao era alcancavel de lugar nenhum: uma `CodeUnit` e um struct C
+de `malloc`, e o `CompiledMethod` que a segura a segura como PALAVRA CRUA que o
+coletor nao segue.
+
+`jitRegisterUnit` passou a registrar a unidade quando ela e CONSTRUIDA e nao
+quando e compilada. Com o registro desligado, o nivel 8 nao falha: ele SEGFATA
+dentro do `markSlot`, seguindo o ponteiro obsoleto.
 
 ## Um baked pointer que o coletor movia
 

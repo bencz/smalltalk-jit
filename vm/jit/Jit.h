@@ -64,6 +64,13 @@ NativeCode *jitCompileFor(const struct MacroAssemblerOps *ops, CodeUnit *unit,
 	Opcode *unsupported);
 void jitFreeNativeCode(NativeCode *code);
 
+// Make a unit's tagged fields (its literal frame, its blocks, its selector and
+// its owner class) reachable by the collector. Idempotent, and called by
+// jitCompileFor, so hand-written units need nothing; what has to call it
+// explicitly is whatever BUILDS a unit that will not run immediately, which is
+// exactly a block's unit.
+void jitRegisterUnit(CodeUnit *unit);
+
 // Call compiled code. The variants exist because the argument registers are
 // positional; anything wider goes through jitCallN.
 Value jitCall0(NativeCode *code, Value receiver);

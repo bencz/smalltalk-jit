@@ -49,6 +49,13 @@ static inline size_t objectSizeForShape(InstanceShape shape, size_t elements)
 	case FORMAT_INDEXED_POINTERS:
 		bytes += sizeof(uint64_t)                                  // element count
 			+ ((size_t) shape.fixedSlots + elements) * sizeof(Value);
+		// An indexed shape with NAMED SLOTS (a Closure, which holds its method
+		// that way) has to stay small enough for the header to carry its size,
+		// because the derivation used when it cannot is the element count, and
+		// an element count knows nothing about named slots. The front end caps
+		// captures well below this, so what remains here is the guard.
+		ASSERT(shape.fixedSlots == 0
+			|| objectAlignSize(bytes) / sizeof(uint64_t) < SIZE_WORDS_BIG);
 		break;
 	case FORMAT_BYTES:
 		bytes += sizeof(uint64_t) + elements;
@@ -76,6 +83,26 @@ static inline size_t objectSizeForShape(InstanceShape shape, size_t elements)
 // Total size in bytes, header included. The collector strides on this.
 static inline size_t objectSizeInBytes(ClassTable *classes, RawObject *object)
 {
+	// THE HEADER ANSWERS FIRST, and for everything that fits in the field it is
+	// the whole answer: sizeWords is the TOTAL size and it was written by
+	// objectSizeForShape, so it already accounts for anything a format puts
+	// BEFORE its elements.
+	//
+	// Asking the element count first was wrong exactly there. An indexed object
+	// may also carry named slots, which is what a Closure is (element count,
+	// then the method, then the captures), and the element count knows nothing
+	// about them: the answer came out one word short, so the walk strode into
+	// the middle of the object AND the pointer range stopped before the method
+	// field. Nothing updated that field, and a block whose method had moved
+	// entered a corpse on the first scavenge after it was built.
+	size_t words = rawObjectInlineSizeWords(object);
+	if (words != SIZE_WORDS_BIG) {
+		return words * sizeof(uint64_t);
+	}
+	// Too large for the field. An indexed object answers from its element count,
+	// with no access to its class, which is the point (ADR 0003, R6); the
+	// assertion in objectSizeForShape is what keeps a named slot out of this
+	// path.
 	ObjectFormat format = rawObjectFormat(object);
 	switch (format) {
 	case FORMAT_INDEXED_POINTERS:
@@ -89,10 +116,6 @@ static inline size_t objectSizeInBytes(ClassTable *classes, RawObject *object)
 			+ rawObjectElementCount(object) * sizeof(double));
 	default:
 		break;
-	}
-	size_t words = rawObjectInlineSizeWords(object);
-	if (words != SIZE_WORDS_BIG) {
-		return words * sizeof(uint64_t);
 	}
 	// Too large for the field and not indexed by a count readable from here:
 	// the class knows the shape. Rare by construction, because the fixed

@@ -5,6 +5,7 @@
 #include "core/Handle.h"
 #include "core/Thread.h"
 #include "memory/Heap.h"
+#include "memory/ObjectWalk.h"
 #include "jit/CompiledMethod.h"
 #include "runtime/Closure.h"
 #include <string.h>
@@ -604,6 +605,23 @@ static Value allocateInstance(Value *args, uint64_t elements)
 		return PRIMITIVE_FAILED;
 	}
 	Object *instance = newObject(class, elements);
+	// NIL, not the zero the allocator leaves. Smalltalk says a fresh instance
+	// variable answers nil, and zero is the SmallInteger 0; the allocator
+	// deliberately does not do this, because inside the VM an unset slot means
+	// ABSENT and nil is an object (memory/Heap.c). This is the boundary where
+	// the Smalltalk rule starts applying.
+	//
+	// The range comes from objectPointerSlots, so it is by construction the same
+	// range the collector scans: raw words and byte bodies are left alone.
+	// nil is IMMORTAL, so storing it needs no write barrier.
+	if (formatHasPointers(rawObjectFormat(instance->raw))) {
+		size_t count;
+		Value *slots = objectPointerSlots(&CurrentThread.heap->classes,
+			instance->raw, &count);
+		for (size_t i = 0; i < count; i++) {
+			slots[i] = tagPtr(Handles.nil.raw);
+		}
+	}
 	Value answer = objectTagged(instance);
 	closeHandleScope(&scope, NULL);
 	// Read out BEFORE returning and with nothing allocating in between: the

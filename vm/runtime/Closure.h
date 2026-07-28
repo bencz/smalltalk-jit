@@ -51,6 +51,20 @@ OBJECT_HANDLE(Closure);
 #define CLOSURE_CAPTURE_FIELD(i) ((uint16_t) (2 + (i)))
 #define CLOSURE_METHOD_FIELD 1
 
+// The most a closure may capture, and the tighter of two ceilings wins.
+//
+// The CLOSURE instruction counts captures in one byte, which allows 255. The
+// real limit is smaller and comes from the object model: a closure is an INDEXED
+// object that ALSO has a named slot, and the collector sizes such an object from
+// the header alone (memory/ObjectWalk.h), so it has to fit the header's size
+// field. Worst case a closure occupies 4 + captures words after alignment.
+//
+// The front end reports going past this as a clean compile error, which is what
+// this bytecode does with every ceiling.
+#define CLOSURE_MAX_CAPTURES 250
+_Static_assert(CLOSURE_MAX_CAPTURES + 4 < SIZE_WORDS_BIG,
+	"a closure has to stay sizeable from its header alone");
+
 // A box for a variable that is captured and then assigned. One slot, so the
 // value can change without the closures that captured it having to agree on
 // anything but the box's address.

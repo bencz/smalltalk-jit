@@ -136,6 +136,16 @@ typedef struct CodeUnit {
 	uint8_t *declaredTypes;
 	uint16_t *declaredClass;  // class index when declaredTypes[i] == DECL_CLASS
 	uint8_t returnType;
+
+	// The unit registry (jit/Jit.h, jitRegisterUnit). A unit is a malloc'd C
+	// struct holding TAGGED VALUES, so nothing else in the system can find them
+	// and a young collection moves precisely what they name. Chaining the units
+	// themselves is what makes the literal frame a root from the moment it
+	// exists rather than from the first call, which is what a block unit needs:
+	// it is built when its enclosing method compiles and does not run until
+	// someone sends it `value`, and a collection in between is ordinary.
+	struct CodeUnit *nextUnit;
+	_Bool registered;
 } CodeUnit;
 
 

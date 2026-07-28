@@ -71,27 +71,47 @@ void codeSpacePublish(uint8_t *destination, const uint8_t *bytes, size_t size)
 // first collection and never before it.
 
 static NativeCode *gCompiledCode;
+static CodeUnit *gRegisteredUnits;
+
+
+// A unit is registered when it is BUILT, not when it is compiled, and the
+// difference is a block: the front end builds a block's unit while compiling the
+// enclosing method, and that unit does not run until somebody sends the closure
+// `value`. Everything in between is ordinary program execution, collections
+// included, and the block's literal frame is reachable from nowhere else.
+void jitRegisterUnit(CodeUnit *unit)
+{
+	if (unit == NULL || unit->registered) {
+		return;
+	}
+	unit->registered = 1;
+	unit->nextUnit = gRegisteredUnits;
+	gRegisteredUnits = unit;
+}
+
+
+static void visitUnitField(RootVisitor visit, void *ctx, Value *field)
+{
+	// A zeroed field is tagInt(0), not a pointer, so a unit registered before it
+	// is fully populated is walkable at every moment in between.
+	if (valueTypeOf(*field, VALUE_POINTER)) {
+		visit(ctx, field);
+	}
+}
 
 
 void rootsVisitCompiledCode(RootVisitor visit, void *ctx)
 {
+	for (CodeUnit *unit = gRegisteredUnits; unit != NULL; unit = unit->nextUnit) {
+		visitUnitField(visit, ctx, &unit->literals);
+		visitUnitField(visit, ctx, &unit->blocks);
+		visitUnitField(visit, ctx, &unit->selector);
+		visitUnitField(visit, ctx, &unit->ownerClass);
+	}
 	for (NativeCode *code = gCompiledCode; code != NULL; code = code->nextCompiled) {
-		CodeUnit *unit = code->unit;
-		if (valueTypeOf(unit->literals, VALUE_POINTER)) {
-			visit(ctx, &unit->literals);
-		}
-		if (valueTypeOf(unit->blocks, VALUE_POINTER)) {
-			visit(ctx, &unit->blocks);
-		}
-		if (valueTypeOf(unit->selector, VALUE_POINTER)) {
-			visit(ctx, &unit->selector);
-		}
-		if (valueTypeOf(unit->ownerClass, VALUE_POINTER)) {
-			visit(ctx, &unit->ownerClass);
-		}
 		// The cells' selectors are UNTAGGED, so they are tagged for the visit
 		// and written back, exactly as the class table does for its entries.
-		for (uint16_t i = 0; i < unit->instructionCount; i++) {
+		for (uint16_t i = 0; i < code->unit->instructionCount; i++) {
 			if (code->cells[i].selector == NULL) {
 				continue;
 			}
@@ -103,13 +123,10 @@ void rootsVisitCompiledCode(RootVisitor visit, void *ctx)
 }
 
 
-// PENDING: a CodeUnit that has been built but never COMPILED is not on this
-// list, so its literal frame is unrooted until its first call. It cannot bite
-// yet, because the only units that exist are made and compiled together, and
-// the front end (which is what will create them in quantity) should reach the
-// literal frame through a tagged field of the CompiledMethod rather than
-// through a raw word into a C struct. Noted here so that decision is made on
-// purpose rather than discovered.
+// PENDING: nothing ever LEAVES either list. Methods are never discarded today,
+// so a unit is live for as long as the process is; when redefinition arrives,
+// retiring a method has to unregister its unit, and the block units it owns
+// with it.
 
 
 NativeCode *jitCodeContaining(const void *address)
@@ -619,6 +636,9 @@ NativeCode *jitCompileFor(const MacroAssemblerOps *ops, CodeUnit *unit,
 	Opcode *unsupported)
 {
 	assertSingletonsAreImmortal();
+	// Idempotent: a unit built by the front end registered itself when it was
+	// built, and one written by hand in a test registers here.
+	jitRegisterUnit(unit);
 	JitContext jit;
 	jit.unit = unit;
 	jit.assembler = maCreate(ops, unit->registerCount, unit->argumentCount);

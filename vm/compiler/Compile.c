@@ -2,6 +2,9 @@
 #include "core/Assert.h"
 #include "core/Class.h"
 #include "core/Smalltalk.h"
+#include "jit/CompiledMethod.h"
+#include "jit/Jit.h"
+#include "runtime/Closure.h"
 #include "runtime/Collection.h"
 #include "runtime/Primitive.h"
 #include "runtime/String.h"
@@ -10,16 +13,532 @@
 #include <string.h>
 
 // ---------------------------------------------------------------------------
-// Phase 1: resolution
+// Small shared helpers
+// ---------------------------------------------------------------------------
+
+// The Symbol a name interns to. A RAW pointer, valid until the next allocation,
+// so every caller uses it immediately and none of them stores it.
+static RawObject *symbolOf(String *name)
+{
+	return (RawObject *) asSymbol(name)->raw;
+}
+
+
+static _Bool nameIs(RawObject *symbol, const char *text)
+{
+	return rawStringEqualsBytes((RawString *) symbol, text, strlen(text));
+}
+
+
+// Position of `symbol` in a collection of interned Symbols, or -1. Identity, so
+// no string compare happens anywhere in resolution.
+static int indexOfSymbol(OrderedCollection *symbols, RawObject *symbol)
+{
+	size_t size = ordCollSize(symbols);
+	for (size_t i = 0; i < size; i++) {
+		if (asObject(ordCollAt(symbols, i)) == symbol) {
+			return (int) i;
+		}
+	}
+	return -1;
+}
+
+
+static int indexOfObject(OrderedCollection *objects, Object *object)
+{
+	return indexOfSymbol(objects, (RawObject *) object->raw);
+}
+
+
+// ---------------------------------------------------------------------------
+// Phase 0: which messages become control flow
+// ---------------------------------------------------------------------------
+//
+// ONE predicate, read by BOTH the capture analysis and the emitter, and that is
+// not tidiness. If the two ever disagreed about whether a block is inlined, the
+// disagreement would be silent: a `sum := sum + i` inside a to:do: whose block
+// the analysis believed was a real closure would turn `sum` into a heap cell,
+// and the result is a correct program with a dead loop, which is precisely the
+// loop this project exists to optimize.
+//
+// The Boolean check is a JUMPTRUE/JUMPFALSE pair rather than the GUARDCLASS that
+// docs/jit-v2/04-bytecode.md names, and the difference is worth stating: true
+// and false are SINGLETONS, so testing identity against them is one compare
+// against an immediate, while a class guard is a load, a mask and a compare, and
+// it would take TWO of them to establish "Boolean" rather than "True".
+
+typedef enum {
+	INLINE_NONE = 0,
+	INLINE_IF,     // ifTrue:, ifFalse:, ifTrue:ifFalse:, ifFalse:ifTrue:
+	INLINE_AND,    // and:
+	INLINE_OR,     // or:
+	INLINE_WHILE,  // whileTrue:, whileFalse:, and the argumentless forms
+	INLINE_TO_DO,  // to:do:
+} InlineForm;
+
+typedef struct {
+	InlineForm form;
+	_Bool sense;       // INLINE_WHILE: keep looping while the test answers this
+	BlockNode *test;   // INLINE_WHILE: the receiver block
+	BlockNode *first;  // the true arm, the right-hand side, or the loop body
+	BlockNode *second; // the false arm
+	Object *limit;     // INLINE_TO_DO
+} Inline;
+
+
+static _Bool isBlockOfArity(Object *node, size_t arity)
+{
+	if (node == NULL || !isInstanceOf(node->raw, &Handles.BlockNode)) {
+		return 0;
+	}
+	OrderedCollection *args = blockNodeGetArgs((BlockNode *) node);
+	return args != NULL && ordCollSize(args) == arity;
+}
+
+
+// `receiverNode` non-NULL means the receiver has NOT been evaluated yet, which
+// is the only difference between the two places this is asked: the loop forms
+// take a BLOCK as receiver and have to be recognised before it is built, since
+// building it is exactly the closure allocation they exist to avoid. A caller
+// holding an already-evaluated receiver passes NULL and acts only on the forms
+// that do not need it.
+static Inline inlineFormOf(Object *receiverNode, String *selector,
+	OrderedCollection *args)
+{
+	Inline decision;
+	memset(&decision, 0, sizeof decision);
+
+	size_t argc = args == NULL ? 0 : ordCollSize(args);
+	Object *arg0 = argc > 0 ? scopeHandle(asObject(ordCollAt(args, 0))) : NULL;
+	Object *arg1 = argc > 1 ? scopeHandle(asObject(ordCollAt(args, 1))) : NULL;
+
+	if (receiverNode != NULL && isInstanceOf(receiverNode->raw, &Handles.BlockNode)) {
+		if (!isBlockOfArity(receiverNode, 0)) {
+			return decision;
+		}
+		if (argc == 0 && (stringEqualsC(selector, "whileTrue")
+				|| stringEqualsC(selector, "whileFalse"))) {
+			decision.form = INLINE_WHILE;
+			decision.sense = stringEqualsC(selector, "whileTrue");
+			decision.test = (BlockNode *) receiverNode;
+			return decision;
+		}
+		if (argc == 1 && isBlockOfArity(arg0, 0)
+				&& (stringEqualsC(selector, "whileTrue:")
+					|| stringEqualsC(selector, "whileFalse:"))) {
+			decision.form = INLINE_WHILE;
+			decision.sense = stringEqualsC(selector, "whileTrue:");
+			decision.test = (BlockNode *) receiverNode;
+			decision.first = (BlockNode *) arg0;
+			return decision;
+		}
+		// Any other message to a block literal wants a real closure.
+		return decision;
+	}
+
+	// to:do: needs its RECEIVER node too, so that the counter can be the block's
+	// argument register rather than a copy of it.
+	if (receiverNode != NULL && argc == 2 && stringEqualsC(selector, "to:do:")
+			&& isBlockOfArity(arg1, 1)) {
+		decision.form = INLINE_TO_DO;
+		decision.limit = arg0;
+		decision.first = (BlockNode *) arg1;
+		return decision;
+	}
+
+	if (argc == 1 && isBlockOfArity(arg0, 0)) {
+		if (stringEqualsC(selector, "ifTrue:")) {
+			decision.form = INLINE_IF;
+			decision.first = (BlockNode *) arg0;
+		} else if (stringEqualsC(selector, "ifFalse:")) {
+			decision.form = INLINE_IF;
+			decision.second = (BlockNode *) arg0;
+		} else if (stringEqualsC(selector, "and:")) {
+			decision.form = INLINE_AND;
+			decision.first = (BlockNode *) arg0;
+		} else if (stringEqualsC(selector, "or:")) {
+			decision.form = INLINE_OR;
+			decision.first = (BlockNode *) arg0;
+		}
+		return decision;
+	}
+	if (argc == 2 && isBlockOfArity(arg0, 0) && isBlockOfArity(arg1, 0)) {
+		if (stringEqualsC(selector, "ifTrue:ifFalse:")) {
+			decision.form = INLINE_IF;
+			decision.first = (BlockNode *) arg0;
+			decision.second = (BlockNode *) arg1;
+		} else if (stringEqualsC(selector, "ifFalse:ifTrue:")) {
+			decision.form = INLINE_IF;
+			decision.first = (BlockNode *) arg1;
+			decision.second = (BlockNode *) arg0;
+		}
+	}
+	return decision;
+}
+
+
+// ---------------------------------------------------------------------------
+// Phase 1: capture analysis
+// ---------------------------------------------------------------------------
+//
+// What a closure needs decided BEFORE a single instruction is emitted:
+//
+//   * which outer names each non-inlined block reads, in an order that becomes
+//     the closure's capture slots;
+//   * which declarations need a heap CELL, which is exactly those that are
+//     captured AND assigned. Everything else is captured by VALUE and touches no
+//     heap at all (ADR 0008).
+//
+// It has to be decided first because a cell changes how the variable is read and
+// written EVERYWHERE, including before the closure that captures it exists. A
+// decision taken at the closure site would have to rewrite instructions already
+// emitted.
+//
+// The tables are keyed by AST NODE IDENTITY and they are HEAP collections, not C
+// arrays of RawObject*. Emission allocates, so a C array of node pointers would
+// be a set of addresses the first collection invalidates. That is the mistake
+// this project has already paid for three times (IcCell.selector,
+// CodeUnit.literals, and nil/true/false), and it is not going to be paid a
+// fourth time in the compiler.
+
+enum {
+	DECL_ASSIGNED = 1,
+	DECL_CAPTURED = 2,
+};
+
+typedef struct {
+	OrderedCollection *declarations;   // the VariableNode that declares a local
+	OrderedCollection *flags;          // parallel, tagged DECL_* bits
+	OrderedCollection *blockNodes;     // BlockNodes that become real closures
+	OrderedCollection *blockCaptures;  // parallel, an OrderedCollection of Symbols
+	OrderedCollection *blockUses;      // parallel, times the emitter used it
+	OrderedCollection *instanceVariables;
+} Analysis;
+
+// One lexical level for the analysis. `block` is NULL for the method and for
+// every INLINED block, because an inlined block shares the enclosing frame and
+// therefore captures nothing. A non-NULL `block` is a real closure boundary, and
+// crossing one outward is what makes a name a capture.
+typedef struct AnalysisScope {
+	struct AnalysisScope *parent;
+	OrderedCollection *names;         // interned Symbols
+	OrderedCollection *declarations;  // parallel, the declaring VariableNodes
+	BlockNode *block;
+	uint16_t blockIndex;
+} AnalysisScope;
+
+
+static void analysisDeclare(Analysis *a, AnalysisScope *scope, LiteralNode *declaration)
+{
+	String *name = literalNodeGetStringValue(declaration);
+	ordCollAdd(scope->names, objectTagged(asSymbol(name)));
+	ordCollAddObject(scope->declarations, (Object *) declaration);
+	if (indexOfObject(a->declarations, (Object *) declaration) < 0) {
+		ordCollAddObject(a->declarations, (Object *) declaration);
+		ordCollAdd(a->flags, tagInt(0));
+	}
+}
+
+
+static void analysisSetFlag(Analysis *a, Object *declaration, int flag)
+{
+	int index = indexOfObject(a->declarations, declaration);
+	ASSERT(index >= 0); // every declaration passed here was declared above
+	Value flags = ordCollAt(a->flags, (size_t) index);
+	ordCollAtPut(a->flags, (size_t) index, tagInt(asCInt(flags) | flag));
+}
+
+
+static _Bool declarationNeedsCell(Analysis *a, LiteralNode *declaration)
+{
+	int index = indexOfObject(a->declarations, (Object *) declaration);
+	if (index < 0) {
+		return 0;
+	}
+	intptr_t flags = asCInt(ordCollAt(a->flags, (size_t) index));
+	// Captured AND assigned. Captured alone is a copy into the closure and costs
+	// nothing; assigned alone is an ordinary register.
+	return (flags & DECL_ASSIGNED) != 0 && (flags & DECL_CAPTURED) != 0;
+}
+
+
+// Give `block` a capture list, or find the one it already has.
+static uint16_t analysisRegisterBlock(Analysis *a, BlockNode *block)
+{
+	int index = indexOfObject(a->blockNodes, (Object *) block);
+	if (index >= 0) {
+		return (uint16_t) index;
+	}
+	index = (int) ordCollSize(a->blockNodes);
+	ordCollAddObject(a->blockNodes, (Object *) block);
+	ordCollAddObject(a->blockCaptures, (Object *) newOrdColl(4));
+	ordCollAdd(a->blockUses, tagInt(0));
+	return (uint16_t) index;
+}
+
+
+static OrderedCollection *analysisCapturesOf(Analysis *a, uint16_t blockIndex)
+{
+	return (OrderedCollection *) ordCollObjectAt(a->blockCaptures, blockIndex);
+}
+
+
+static void analysisAddCapture(Analysis *a, uint16_t blockIndex, RawObject *symbol)
+{
+	OrderedCollection *captures = analysisCapturesOf(a, blockIndex);
+	if (indexOfSymbol(captures, symbol) < 0) {
+		ordCollAdd(captures, tagPtr(symbol));
+	}
+}
+
+
+// `self` lives in register 0 of the METHOD, so every block between here and the
+// method has to carry it. An instance variable inside a block needs it too:
+// GETIVAR takes an object register, and in a block that register can only come
+// from a capture.
+static void analysisCaptureSelf(Analysis *a, AnalysisScope *scope)
+{
+	String *name = stringFromC("self");
+	for (AnalysisScope *s = scope; s != NULL; s = s->parent) {
+		if (s->block != NULL) {
+			analysisAddCapture(a, s->blockIndex, symbolOf(name));
+		}
+	}
+}
+
+
+static _Bool isInstanceVariable(Analysis *a, RawObject *symbol)
+{
+	return a->instanceVariables != NULL
+		&& indexOfSymbol(a->instanceVariables, symbol) >= 0;
+}
+
+
+// One reference to a name. `assigned` says whether this is the target of an
+// assignment rather than a read.
+static void analysisUse(Analysis *a, AnalysisScope *scope, String *name,
+	_Bool assigned)
+{
+	RawObject *symbol = symbolOf(name);
+	if (nameIs(symbol, "self") || nameIs(symbol, "super")) {
+		analysisCaptureSelf(a, scope);
+		return;
+	}
+
+	for (AnalysisScope *s = scope; s != NULL; s = s->parent) {
+		// BACKWARD, so a later declaration of a name shadows an earlier one,
+		// which is what a block argument reusing an outer temporary's name does.
+		int found = -1;
+		for (size_t i = ordCollSize(s->names); i > 0 && found < 0; i--) {
+			if (asObject(ordCollAt(s->names, i - 1)) == symbol) {
+				found = (int) (i - 1);
+			}
+		}
+		if (found < 0) {
+			continue;
+		}
+		Object *declaration = ordCollObjectAt(s->declarations, (size_t) found);
+		if (assigned) {
+			analysisSetFlag(a, declaration, DECL_ASSIGNED);
+		}
+		// Every closure boundary strictly INSIDE the declaring scope has to
+		// carry the name, including the intermediate ones: a doubly nested block
+		// reaches a method temporary by way of its parent's capture, not by
+		// walking anything (ADR 0008).
+		for (AnalysisScope *t = scope; t != s; t = t->parent) {
+			if (t->block == NULL) {
+				continue;
+			}
+			analysisAddCapture(a, t->blockIndex, symbolOf(name));
+			analysisSetFlag(a, declaration, DECL_CAPTURED);
+		}
+		return;
+	}
+
+	// Not a local. An instance variable needs self; a global is reached through
+	// this unit's own literal frame and needs nothing.
+	if (isInstanceVariable(a, symbol)) {
+		analysisCaptureSelf(a, scope);
+	}
+}
+
+
+static void analyzeExpression(Analysis *a, AnalysisScope *scope, ExpressionNode *node);
+static void analyzeValue(Analysis *a, AnalysisScope *scope, Object *node);
+
+
+static void analyzeStatements(Analysis *a, AnalysisScope *scope,
+	OrderedCollection *statements)
+{
+	size_t count = statements == NULL ? 0 : ordCollSize(statements);
+	for (size_t i = 0; i < count; i++) {
+		HandleScope handles;
+		openHandleScope(&handles);
+		analyzeExpression(a, scope,
+			(ExpressionNode *) scopeHandle(asObject(ordCollAt(statements, i))));
+		closeHandleScope(&handles, NULL);
+	}
+}
+
+
+// A block that is compiled INTO the enclosing frame. Its temporaries are
+// ordinary registers of the same method, so its scope is not a boundary.
+static void analyzeInlineBlock(Analysis *a, AnalysisScope *parent, BlockNode *block,
+	LiteralNode *boundArgument)
+{
+	if (block == NULL) {
+		return;
+	}
+	AnalysisScope scope;
+	scope.parent = parent;
+	scope.block = NULL;
+	scope.blockIndex = 0;
+	scope.names = newOrdColl(4);
+	scope.declarations = newOrdColl(4);
+
+	if (boundArgument != NULL) {
+		analysisDeclare(a, &scope, boundArgument);
+	}
+	OrderedCollection *temps = blockNodeGetTempVars(block);
+	size_t tempCount = temps == NULL ? 0 : ordCollSize(temps);
+	for (size_t i = 0; i < tempCount; i++) {
+		analysisDeclare(a, &scope,
+			(LiteralNode *) scopeHandle(asObject(ordCollAt(temps, i))));
+	}
+	analyzeStatements(a, &scope, blockNodeGetExpressions(block));
+}
+
+
+// A block that becomes a real closure. Its scope IS a boundary, so every name it
+// reads from outside becomes a capture.
+static void analyzeClosureBlock(Analysis *a, AnalysisScope *parent, BlockNode *block)
+{
+	AnalysisScope scope;
+	scope.parent = parent;
+	scope.block = block;
+	scope.blockIndex = analysisRegisterBlock(a, block);
+	scope.names = newOrdColl(4);
+	scope.declarations = newOrdColl(4);
+
+	OrderedCollection *args = blockNodeGetArgs(block);
+	size_t argCount = args == NULL ? 0 : ordCollSize(args);
+	for (size_t i = 0; i < argCount; i++) {
+		analysisDeclare(a, &scope,
+			(LiteralNode *) scopeHandle(asObject(ordCollAt(args, i))));
+	}
+	OrderedCollection *temps = blockNodeGetTempVars(block);
+	size_t tempCount = temps == NULL ? 0 : ordCollSize(temps);
+	for (size_t i = 0; i < tempCount; i++) {
+		analysisDeclare(a, &scope,
+			(LiteralNode *) scopeHandle(asObject(ordCollAt(temps, i))));
+	}
+	analyzeStatements(a, &scope, blockNodeGetExpressions(block));
+}
+
+
+// `toSuper` is passed rather than rediscovered, because the emitter does not
+// inline anything sent to super (the whole point of super is where the lookup
+// starts) and the two have to reach the same verdict. Without it, the analysis
+// would treat the arms of a `super ifTrue: [...]` as inlined while the emitter
+// built closures for them, and the emitter would then look for capture lists
+// that were never made.
+static void analyzeMessage(Analysis *a, AnalysisScope *scope,
+	MessageExpressionNode *message, _Bool toSuper)
+{
+	String *selector = messageExpressionNodeGetSelector(message);
+	OrderedCollection *args = messageExpressionNodeGetArgs(message);
+	Inline decision = toSuper ? (Inline) { INLINE_NONE, 0, NULL, NULL, NULL, NULL }
+		: inlineFormOf(NULL, selector, args);
+
+	if (decision.form == INLINE_IF || decision.form == INLINE_AND
+			|| decision.form == INLINE_OR) {
+		analyzeInlineBlock(a, scope, decision.first, NULL);
+		analyzeInlineBlock(a, scope, decision.second, NULL);
+		return;
+	}
+	size_t argc = args == NULL ? 0 : ordCollSize(args);
+	for (size_t i = 0; i < argc; i++) {
+		analyzeValue(a, scope, scopeHandle(asObject(ordCollAt(args, i))));
+	}
+}
+
+
+static void analyzeValue(Analysis *a, AnalysisScope *scope, Object *node)
+{
+	if (isInstanceOf(node->raw, &Handles.VariableNode)) {
+		analysisUse(a, scope, literalNodeGetStringValue((LiteralNode *) node), 0);
+	} else if (isInstanceOf(node->raw, &Handles.ExpressionNode)) {
+		analyzeExpression(a, scope, (ExpressionNode *) node);
+	} else if (isInstanceOf(node->raw, &Handles.BlockNode)) {
+		analyzeClosureBlock(a, scope, (BlockNode *) node);
+	}
+	// Literals and nil/true/false name nothing.
+}
+
+
+static void analyzeExpression(Analysis *a, AnalysisScope *scope, ExpressionNode *node)
+{
+	Object *receiverNode = (Object *) expressionNodeGetReceiver(node);
+	OrderedCollection *messages = expressionNodeGetMessageExpressions(node);
+	size_t messageCount = messages == NULL ? 0 : ordCollSize(messages);
+	_Bool handled = 0;
+
+	// The same two shapes the emitter recognises with the receiver still
+	// unevaluated, recognised here through the same predicate.
+	if (messageCount == 1) {
+		MessageExpressionNode *only = scopeHandle(asObject(ordCollAt(messages, 0)));
+		Inline decision = inlineFormOf(receiverNode,
+			messageExpressionNodeGetSelector(only),
+			messageExpressionNodeGetArgs(only));
+		if (decision.form == INLINE_WHILE) {
+			analyzeInlineBlock(a, scope, decision.test, NULL);
+			analyzeInlineBlock(a, scope, decision.first, NULL);
+			handled = 1;
+		} else if (decision.form == INLINE_TO_DO) {
+			analyzeValue(a, scope, receiverNode);
+			analyzeValue(a, scope, decision.limit);
+			OrderedCollection *args = blockNodeGetArgs(decision.first);
+			analyzeInlineBlock(a, scope, decision.first,
+				(LiteralNode *) scopeHandle(asObject(ordCollAt(args, 0))));
+			handled = 1;
+		}
+	}
+
+	if (!handled) {
+		_Bool toSuper = isInstanceOf(receiverNode->raw, &Handles.VariableNode)
+			&& stringEqualsC(literalNodeGetStringValue((LiteralNode *) receiverNode),
+				"super");
+		analyzeValue(a, scope, receiverNode);
+		for (size_t i = 0; i < messageCount; i++) {
+			analyzeMessage(a, scope,
+				(MessageExpressionNode *) scopeHandle(asObject(ordCollAt(messages, i))),
+				toSuper);
+		}
+	}
+
+	OrderedCollection *targets = expressionNodeGetAssigments(node);
+	size_t targetCount = targets == NULL ? 0 : ordCollSize(targets);
+	for (size_t i = 0; i < targetCount; i++) {
+		LiteralNode *target = scopeHandle(asObject(ordCollAt(targets, i)));
+		analysisUse(a, scope, literalNodeGetStringValue(target), 1);
+	}
+}
+
+
+// ---------------------------------------------------------------------------
+// Phase 2: resolution
 // ---------------------------------------------------------------------------
 
 typedef enum {
 	PLACE_NONE,
 	PLACE_SELF,
-	PLACE_SUPER,        // self, but a send through it starts lookup one level up
-	PLACE_REGISTER,     // an argument or a temporary: index IS the frame slot
+	PLACE_SUPER,          // self, but a send through it starts lookup one level up
+	PLACE_REGISTER,       // an argument or a temporary: index IS the frame slot
+	PLACE_CELL_REGISTER,  // that slot holds a Cell, so reads and writes go through it
+	PLACE_CAPTURE,        // captured by the running closure, by value
+	PLACE_CELL_CAPTURE,   // captured by the running closure, and it is a Cell
 	PLACE_INSTANCE_VAR,
-	PLACE_GLOBAL,       // index is a literal slot holding the Association
+	PLACE_GLOBAL,         // index is a literal slot holding the Association
 } PlaceKind;
 
 typedef struct {
@@ -27,17 +546,20 @@ typedef struct {
 	uint16_t index;
 } Place;
 
-// One lexical level: a method, or a block that has been INLINED into it.
+// One lexical level of the emitter: a method, or a block INLINED into it.
 //
 // An inlined block shares the enclosing frame, so its arguments and temporaries
-// are ordinary registers of the same method and resolution just walks out
-// through `parent`. That is the whole reason inlined control flow costs nothing
-// here: there is no capture, no cell and no closure, because there is no
-// separate activation.
+// are ordinary registers of the same unit and resolution just walks out through
+// `parent`. That is the whole reason inlined control flow costs nothing here.
+//
+// The names are a HEAP collection and not a C array of RawObject*, because
+// emission allocates (symbols, literal frames, block methods) and a raw name
+// pointer held across that is a dangling pointer as soon as anything collects.
 typedef struct Scope {
 	struct Scope *parent;
-	RawObject **names;   // interned Symbols, one per local, in register order
+	OrderedCollection *names;
 	uint16_t *registers;
+	uint8_t *isCell;
 	uint16_t count;
 	uint16_t capacity;
 } Scope;
@@ -48,6 +570,7 @@ typedef struct {
 	uint16_t count;
 	uint16_t capacity;
 	OrderedCollection *literals;
+	OrderedCollection *blocks;  // CompiledMethods, one per non-inlined block
 
 	// -- frame
 	uint16_t registerCount; // high-water mark: the frame is this wide
@@ -57,7 +580,13 @@ typedef struct {
 	Scope *scope;
 	const CompileContext *context;
 	OrderedCollection *instanceVariables; // Symbols, in slot order
+	Analysis *analysis;
 	CompileError *error;
+
+	// -- only when this unit is a BLOCK
+	_Bool isBlock;
+	OrderedCollection *captureNames; // Symbols, in capture-slot order
+	const uint8_t *captureIsCell;
 } Emitter;
 
 
@@ -102,8 +631,9 @@ static void releaseTo(Emitter *e, uint16_t mark)
 static void scopePush(Emitter *e, Scope *scope)
 {
 	scope->parent = e->scope;
-	scope->names = NULL;
+	scope->names = newOrdColl(4);
 	scope->registers = NULL;
+	scope->isCell = NULL;
 	scope->count = 0;
 	scope->capacity = 0;
 	e->scope = scope;
@@ -114,35 +644,38 @@ static void scopePop(Emitter *e, Scope *scope)
 {
 	ASSERT(e->scope == scope);
 	e->scope = scope->parent;
-	free(scope->names);
 	free(scope->registers);
+	free(scope->isCell);
+}
+
+
+static void scopeBind(Emitter *e, Scope *scope, String *name, uint16_t reg,
+	_Bool isCell)
+{
+	(void) e;
+	if (scope->count == scope->capacity) {
+		scope->capacity = scope->capacity == 0 ? 8 : scope->capacity * 2;
+		scope->registers = realloc(scope->registers, scope->capacity * sizeof(uint16_t));
+		scope->isCell = realloc(scope->isCell, scope->capacity * sizeof(uint8_t));
+		ASSERT(scope->registers != NULL && scope->isCell != NULL);
+	}
+	// The Symbol is INTERNED, so identity is the comparison and no string
+	// compare happens during resolution.
+	ordCollAdd(scope->names, objectTagged(asSymbol(name)));
+	scope->registers[scope->count] = reg;
+	scope->isCell[scope->count] = isCell != 0;
+	scope->count++;
 }
 
 
 // Declare a local and give it a register. The register is permanent for the
 // scope's lifetime, which is why locals are allocated before any expression of
 // the body: the expression stack has to start above them.
-static uint16_t scopeDeclare(Emitter *e, Scope *scope, String *name)
+static uint16_t scopeDeclare(Emitter *e, Scope *scope, String *name, _Bool isCell)
 {
-	if (scope->count == scope->capacity) {
-		scope->capacity = scope->capacity == 0 ? 8 : scope->capacity * 2;
-		scope->names = realloc(scope->names, scope->capacity * sizeof(RawObject *));
-		scope->registers = realloc(scope->registers, scope->capacity * sizeof(uint16_t));
-		ASSERT(scope->names != NULL && scope->registers != NULL);
-	}
 	uint16_t reg = allocRegister(e);
-	// The Symbol is INTERNED, so identity is the comparison and no string
-	// compare happens during resolution.
-	scope->names[scope->count] = (RawObject *) asSymbol(name)->raw;
-	scope->registers[scope->count] = reg;
-	scope->count++;
+	scopeBind(e, scope, name, reg, isCell);
 	return reg;
-}
-
-
-static _Bool nameIs(RawObject *symbol, const char *text)
-{
-	return rawStringEqualsBytes((RawString *) symbol, text, strlen(text));
 }
 
 
@@ -172,12 +705,38 @@ static uint16_t selectorIndex(Emitter *e, String *selector)
 }
 
 
-// Where does this identifier live? Innermost scope outward, then instance
-// variables, then globals. The order IS Smalltalk's shadowing rule.
+// Where does this identifier live? Innermost scope outward, then the captures of
+// the running closure, then instance variables, then globals. The order IS
+// Smalltalk's shadowing rule, with the captures sitting exactly where an
+// enclosing scope would be if a block shared its frame.
 static Place resolveName(Emitter *e, String *name)
 {
 	Place place = { PLACE_NONE, 0 };
-	RawObject *symbol = (RawObject *) asSymbol(name)->raw;
+	RawObject *symbol = symbolOf(name);
+
+	for (Scope *scope = e->scope; scope != NULL; scope = scope->parent) {
+		// BACKWARD, so a later declaration of the same name shadows an earlier
+		// one within a scope, which is what a block argument reusing an outer
+		// temporary's name has to do.
+		for (uint16_t i = scope->count; i > 0; i--) {
+			if (asObject(ordCollAt(scope->names, i - 1)) == symbol) {
+				place.kind = scope->isCell[i - 1]
+					? PLACE_CELL_REGISTER : PLACE_REGISTER;
+				place.index = scope->registers[i - 1];
+				return place;
+			}
+		}
+	}
+
+	if (e->captureNames != NULL) {
+		int index = indexOfSymbol(e->captureNames, symbol);
+		if (index >= 0) {
+			place.kind = e->captureIsCell[index]
+				? PLACE_CELL_CAPTURE : PLACE_CAPTURE;
+			place.index = (uint16_t) index;
+			return place;
+		}
+	}
 
 	if (nameIs(symbol, "self")) {
 		place.kind = PLACE_SELF;
@@ -188,27 +747,12 @@ static Place resolveName(Emitter *e, String *name)
 		return place;
 	}
 
-	for (Scope *scope = e->scope; scope != NULL; scope = scope->parent) {
-		// BACKWARD, so a later declaration of the same name shadows an earlier
-		// one within a scope, which is what a block argument reusing an outer
-		// temporary's name has to do.
-		for (uint16_t i = scope->count; i > 0; i--) {
-			if (scope->names[i - 1] == symbol) {
-				place.kind = PLACE_REGISTER;
-				place.index = scope->registers[i - 1];
-				return place;
-			}
-		}
-	}
-
 	if (e->instanceVariables != NULL) {
-		size_t size = ordCollSize(e->instanceVariables);
-		for (size_t i = 0; i < size; i++) {
-			if (asObject(ordCollAt(e->instanceVariables, i)) == symbol) {
-				place.kind = PLACE_INSTANCE_VAR;
-				place.index = (uint16_t) i;
-				return place;
-			}
+		int index = indexOfSymbol(e->instanceVariables, symbol);
+		if (index >= 0) {
+			place.kind = PLACE_INSTANCE_VAR;
+			place.index = (uint16_t) index;
+			return place;
 		}
 	}
 
@@ -263,7 +807,7 @@ static OrderedCollection *collectInstanceVariables(Class *class)
 
 
 // ---------------------------------------------------------------------------
-// Phase 2: emission
+// Phase 3: emission
 // ---------------------------------------------------------------------------
 
 static uint16_t emit(Emitter *e, Opcode op, uint8_t n, uint16_t a, uint16_t b,
@@ -322,20 +866,74 @@ static void emitStatements(Emitter *e, OrderedCollection *statements,
 	uint16_t dest, _Bool wantValue);
 
 
+// Load `self` into `dest`. In a method it is register 0; in a block register 0
+// is the CLOSURE, so self is an ordinary capture and reaching it is one GETUP.
+//
+// The failure below is loud on purpose. If a block reached this with no `self`
+// capture, the silent answer would be register 0, which is the closure, and
+// every send to "self" would go to the block object instead. That is a wrong
+// answer with no crash, so the analysis and the emitter disagreeing about it has
+// to stop the compile rather than be discovered later.
+static void emitSelfLoad(Emitter *e, uint16_t dest)
+{
+	if (!e->isBlock) {
+		emit(e, OP_MOVE, 0, dest, 0, 0); // register 0 IS self
+		return;
+	}
+	int index = e->captureNames == NULL
+		? -1 : indexOfSymbol(e->captureNames, symbolOf(stringFromC("self")));
+	if (index < 0) {
+		ASSERT(index >= 0);
+		fail(e, COMPILE_UNSUPPORTED, stringFromC("self inside a block that did "
+			"not capture it"));
+		return;
+	}
+	emit(e, OP_GETUP, 0, dest, (uint16_t) index, 0);
+}
+
+
+// The register holding self, for GETIVAR and SETIVAR. In a block that costs one
+// instruction and a scratch register; in a method it is free.
+static uint16_t selfRegister(Emitter *e, uint16_t scratch)
+{
+	if (!e->isBlock) {
+		return 0;
+	}
+	emitSelfLoad(e, scratch);
+	return scratch;
+}
+
+
 // Load whatever `place` names into `dest`.
 static void emitLoad(Emitter *e, Place place, String *name, uint16_t dest)
 {
 	switch (place.kind) {
 	case PLACE_SELF:
 	case PLACE_SUPER:
-		emit(e, OP_MOVE, 0, dest, 0, 0); // register 0 IS self
+		emitSelfLoad(e, dest);
 		break;
 	case PLACE_REGISTER:
 		emit(e, OP_MOVE, 0, dest, place.index, 0);
 		break;
-	case PLACE_INSTANCE_VAR:
-		emit(e, OP_GETIVAR, 0, dest, 0, place.index);
+	case PLACE_CELL_REGISTER:
+		emit(e, OP_GETCELL, 0, dest, place.index, 0);
 		break;
+	case PLACE_CAPTURE:
+		emit(e, OP_GETUP, 0, dest, place.index, 0);
+		break;
+	case PLACE_CELL_CAPTURE:
+		// The capture slot holds the cell, so the value is one more load. `dest`
+		// doubles as the scratch: GETCELL reads its source before writing.
+		emit(e, OP_GETUP, 0, dest, place.index, 0);
+		emit(e, OP_GETCELL, 0, dest, dest, 0);
+		break;
+	case PLACE_INSTANCE_VAR: {
+		uint16_t mark = e->top;
+		uint16_t object = selfRegister(e, dest);
+		emit(e, OP_GETIVAR, 0, dest, object, place.index);
+		releaseTo(e, mark);
+		break;
+	}
 	case PLACE_GLOBAL:
 		emit(e, OP_GETGLOBAL, 0, dest, place.index, 0);
 		break;
@@ -352,15 +950,66 @@ static void emitStore(Emitter *e, Place place, String *name, uint16_t source)
 	case PLACE_REGISTER:
 		emit(e, OP_MOVE, 0, place.index, source, 0);
 		break;
-	case PLACE_INSTANCE_VAR:
-		emit(e, OP_SETIVAR, 0, 0, place.index, source);
+	case PLACE_CELL_REGISTER:
+		emit(e, OP_SETCELL, 0, place.index, source, 0);
 		break;
+	case PLACE_CELL_CAPTURE: {
+		uint16_t mark = e->top;
+		uint16_t cell = allocRegister(e);
+		emit(e, OP_GETUP, 0, cell, place.index, 0);
+		emit(e, OP_SETCELL, 0, cell, source, 0);
+		releaseTo(e, mark);
+		break;
+	}
+	case PLACE_CAPTURE:
+		// A capture that is written is captured AND assigned, so the analysis
+		// gave it a cell and this place kind cannot be reached. Loud, because a
+		// store into a by-value capture would be silently lost.
+		ASSERT(place.kind != PLACE_CAPTURE);
+		fail(e, COMPILE_UNSUPPORTED, stringFromC("an assignment to a captured "
+			"value with no cell"));
+		break;
+	case PLACE_INSTANCE_VAR: {
+		uint16_t mark = e->top;
+		// A scratch register only when there is something to put in it: in a
+		// method self is register 0 and this costs nothing.
+		uint16_t object = e->isBlock ? selfRegister(e, allocRegister(e)) : 0;
+		emit(e, OP_SETIVAR, 0, object, place.index, source);
+		releaseTo(e, mark);
+		break;
+	}
 	case PLACE_GLOBAL:
 		emit(e, OP_SETGLOBAL, 0, place.index, source, 0);
 		break;
 	default:
 		// Assigning to self, to super, or to a name that resolves nowhere.
 		fail(e, COMPILE_UNDECLARED_NAME, name);
+		break;
+	}
+}
+
+
+// What a closure captures is the CELL and not the value in it: that is the whole
+// point of the cell, and dereferencing here would capture by value and lose
+// every later assignment.
+static void emitCaptureLoad(Emitter *e, Place place, String *name, uint16_t dest)
+{
+	switch (place.kind) {
+	case PLACE_SELF:
+		emitSelfLoad(e, dest);
+		break;
+	case PLACE_REGISTER:
+	case PLACE_CELL_REGISTER:
+		emit(e, OP_MOVE, 0, dest, place.index, 0);
+		break;
+	case PLACE_CAPTURE:
+	case PLACE_CELL_CAPTURE:
+		emit(e, OP_GETUP, 0, dest, place.index, 0);
+		break;
+	default:
+		// The analysis only ever puts locals and self in a capture list.
+		ASSERT(0);
+		fail(e, COMPILE_UNSUPPORTED, name);
 		break;
 	}
 }
@@ -400,30 +1049,34 @@ static void emitLiteral(Emitter *e, LiteralNode *node, uint16_t dest)
 }
 
 
+// A local that is captured and assigned lives in a CELL, and the cell is made
+// exactly where the register is initialised. That placement is what gives an
+// inlined loop body a FRESH cell per iteration, which is what makes closures
+// made in a loop capture different variables, and a method temporary ONE cell
+// for the whole activation, which is what makes them share.
+static void emitCellIfNeeded(Emitter *e, LiteralNode *declaration, uint16_t reg)
+{
+	if (declarationNeedsCell(e->analysis, declaration)) {
+		// NEWCELL reads its source slot before writing its destination, so a
+		// register can be replaced by a cell over itself.
+		emit(e, OP_NEWCELL, 0, reg, reg, 0);
+	}
+}
+
+
+static uint16_t declareLocal(Emitter *e, Scope *scope, LiteralNode *declaration)
+{
+	_Bool cell = declarationNeedsCell(e->analysis, declaration);
+	return scopeDeclare(e, scope, literalNodeGetStringValue(declaration), cell);
+}
+
+
 // ---- inlined control flow ---------------------------------------------------
 //
 // ifTrue:, and:, whileTrue: and to:do: are compiled INTO the method, with their
 // block arguments becoming ordinary statements of the same frame. Without this
-// there is no loop for the optimizer to work on: every iteration would be a
-// send and a block activation, and the phase-6 target could not exist.
-//
-// The Boolean check is a JUMPTRUE/JUMPFALSE pair rather than a GUARDCLASS, and
-// the difference is worth stating because docs/jit-v2/04-bytecode.md names
-// GUARDCLASS: true and false are SINGLETONS, so testing identity against them is
-// one compare against an immediate, while a class guard is a load, a mask and a
-// compare, and it would take TWO of them to establish "Boolean" rather than
-// "True". The pair is both cheaper and more precise. GUARDCLASS keeps its other
-// documented use, which is the tier's own class speculation.
-
-static _Bool isBlockOfArity(Object *node, size_t arity)
-{
-	if (!isInstanceOf(node->raw, &Handles.BlockNode)) {
-		return 0;
-	}
-	OrderedCollection *args = blockNodeGetArgs((BlockNode *) node);
-	return args != NULL && ordCollSize(args) == arity;
-}
-
+// there is no loop for the optimizer to work on: every iteration would be a send
+// and a block activation, and the phase-6 target could not exist.
 
 // Emit an inlined block's body into the current frame, answering its value in
 // `dest`. Its temporaries become registers of this method.
@@ -439,9 +1092,9 @@ static void emitInlineBlock(Emitter *e, BlockNode *block, uint16_t dest,
 			// A temporary is a VariableNode, not a String: the parser records
 			// declarations with the same node it records uses with.
 			LiteralNode *declaration = scopeHandle(asObject(ordCollAt(temps, i)));
-			uint16_t reg = scopeDeclare(e, &scope,
-				literalNodeGetStringValue(declaration));
+			uint16_t reg = declareLocal(e, &scope, declaration);
 			emit(e, OP_LOADNIL, 0, reg, 0, 0);
+			emitCellIfNeeded(e, declaration, reg);
 		}
 	}
 	emitStatements(e, blockNodeGetExpressions(block), dest, wantValue);
@@ -522,10 +1175,9 @@ static void emitSendTo(Emitter *e, uint16_t dest, String *selector,
 // `+` are exactly the sites ADR 0006 says must carry a profile, and a loop
 // counter is the hottest instance of both in the system. What is inlined is the
 // CONTROL FLOW, not the arithmetic.
-static void emitToDo(Emitter *e, ExpressionNode *receiverExpression,
-	Object *receiverNode, Object *limitNode, BlockNode *body, uint16_t dest)
+static void emitToDo(Emitter *e, Object *receiverNode, Object *limitNode,
+	BlockNode *body, uint16_t dest)
 {
-	(void) receiverExpression;
 	uint16_t counter = allocRegister(e);
 	uint16_t limit = allocRegister(e);
 	emitValue(e, receiverNode, counter);
@@ -548,21 +1200,21 @@ static void emitToDo(Emitter *e, ExpressionNode *receiverExpression,
 	releaseTo(e, mark);
 
 	// The block's argument IS the counter register. No copy, and no separate
-	// activation: that is what inlining to:do: buys.
+	// activation: that is what inlining to:do: buys. It also means the counter
+	// cannot be a cell, because the loop reads and writes it as a number; a
+	// captured counter is captured BY VALUE, once per iteration, which is what
+	// a fresh activation per iteration would have given anyway.
 	Scope scope;
 	scopePush(e, &scope);
 	OrderedCollection *args = blockNodeGetArgs(body);
 	LiteralNode *declaration = scopeHandle(asObject(ordCollAt(args, 0)));
-	String *name = literalNodeGetStringValue(declaration);
-	if (scope.count == scope.capacity) {
-		scope.capacity = 8;
-		scope.names = realloc(scope.names, scope.capacity * sizeof(RawObject *));
-		scope.registers = realloc(scope.registers, scope.capacity * sizeof(uint16_t));
-		ASSERT(scope.names != NULL && scope.registers != NULL);
+	if (declarationNeedsCell(e->analysis, declaration)) {
+		fail(e, COMPILE_UNSUPPORTED,
+			stringFromC("an assignment to the argument of an inlined block"));
+		scopePop(e, &scope);
+		return;
 	}
-	scope.names[scope.count] = (RawObject *) asSymbol(name)->raw;
-	scope.registers[scope.count] = counter;
-	scope.count++;
+	scopeBind(e, &scope, literalNodeGetStringValue(declaration), counter, 0);
 
 	uint16_t discard = allocRegister(e);
 	emitInlineBlock(e, body, discard, 0);
@@ -606,71 +1258,102 @@ static void emitWhile(Emitter *e, BlockNode *condition, BlockNode *body,
 }
 
 
-// Try to compile `receiver selector: args` as inlined control flow. Answers
-// whether it did; when it did not, nothing was emitted and the caller falls
-// back to an ordinary send.
-static _Bool emitInlinedMessage(Emitter *e, Object *receiverNode,
-	String *selector, OrderedCollection *args, uint16_t receiverReg,
-	_Bool receiverEmitted, uint16_t dest)
+// ---- closures ---------------------------------------------------------------
+
+static CodeUnit *compileUnit(Emitter *parent, BlockNode *body, uint16_t arity,
+	OrderedCollection *captureNames, const uint8_t *captureIsCell,
+	String *selector, uint16_t primitive, _Bool isBlock);
+
+
+// `[ :x | ... ]` where the block is NOT inlined: a real closure (ADR 0008).
+//
+// Three things happen here and their order matters. The capture list comes from
+// the analysis, so it is already final, including the names an inner block needs
+// only in order to forward them outward. The block's own unit is compiled first,
+// because it has to exist before anything can point at it. Only then is the
+// capture run emitted into THIS frame, into consecutive registers, for the same
+// reason a send's arguments are consecutive: one address describes the whole run.
+static void emitBlockClosure(Emitter *e, BlockNode *block, uint16_t dest)
 {
-	size_t argc = args == NULL ? 0 : ordCollSize(args);
-	Object *arg0 = argc > 0 ? scopeHandle(asObject(ordCollAt(args, 0))) : NULL;
-	Object *arg1 = argc > 1 ? scopeHandle(asObject(ordCollAt(args, 1))) : NULL;
-
-	// The receiverless loop forms take a BLOCK receiver and must be caught
-	// before the receiver has been evaluated, because evaluating it would
-	// allocate the closure this exists to avoid.
-	if (!receiverEmitted && isInstanceOf(receiverNode->raw, &Handles.BlockNode)) {
-		BlockNode *conditionBlock = (BlockNode *) receiverNode;
-		if (!isBlockOfArity(receiverNode, 0)) {
-			return 0;
-		}
-		if (argc == 0 && (stringEqualsC(selector, "whileTrue")
-				|| stringEqualsC(selector, "whileFalse"))) {
-			emitWhile(e, conditionBlock, NULL, stringEqualsC(selector, "whileTrue"), dest);
-			return 1;
-		}
-		if (argc == 1 && isBlockOfArity(arg0, 0)
-				&& (stringEqualsC(selector, "whileTrue:")
-					|| stringEqualsC(selector, "whileFalse:"))) {
-			emitWhile(e, conditionBlock, (BlockNode *) arg0,
-				stringEqualsC(selector, "whileTrue:"), dest);
-			return 1;
-		}
-		return 0;
+	Analysis *analysis = e->analysis;
+	int found = indexOfObject(analysis->blockNodes, (Object *) block);
+	if (found < 0) {
+		// The analysis decided this block was inlined and emission did not. The
+		// two share one predicate precisely so this cannot happen, so it is a
+		// compiler bug and not a program error.
+		ASSERT(found >= 0);
+		fail(e, COMPILE_UNSUPPORTED, stringFromC("a block the analysis and the "
+			"emitter disagree about"));
+		return;
+	}
+	uint16_t blockIndex = (uint16_t) found;
+	OrderedCollection *captures = analysisCapturesOf(analysis, blockIndex);
+	size_t captureCount = ordCollSize(captures);
+	if (captureCount > CLOSURE_MAX_CAPTURES) {
+		// A ceiling in this bytecode fails LOUDLY rather than truncating
+		// (docs/jit-v2/04-bytecode.md). What sets this one is the object model
+		// rather than the instruction, see runtime/Closure.h.
+		fail(e, COMPILE_TOO_MANY_CAPTURES, NULL);
+		return;
 	}
 
-	if (argc == 1 && isBlockOfArity(arg0, 0)) {
-		if (stringEqualsC(selector, "ifTrue:")) {
-			emitConditional(e, receiverReg, (BlockNode *) arg0, NULL, dest);
-			return 1;
-		}
-		if (stringEqualsC(selector, "ifFalse:")) {
-			emitConditional(e, receiverReg, NULL, (BlockNode *) arg0, dest);
-			return 1;
-		}
-		if (stringEqualsC(selector, "and:")) {
-			emitShortCircuit(e, receiverReg, (BlockNode *) arg0, 1, dest);
-			return 1;
-		}
-		if (stringEqualsC(selector, "or:")) {
-			emitShortCircuit(e, receiverReg, (BlockNode *) arg0, 0, dest);
-			return 1;
-		}
+	// Resolve every capture ONCE before compiling the block, because whether a
+	// captured name is a cell is part of the block's own contract: it decides
+	// whether the block dereferences the capture slot or uses it directly.
+	uint8_t *isCell = captureCount > 0 ? calloc(captureCount, 1) : NULL;
+	ASSERT(captureCount == 0 || isCell != NULL);
+	for (size_t i = 0; i < captureCount; i++) {
+		String *name = scopeHandle(asObject(ordCollAt(captures, i)));
+		Place place = resolveName(e, name);
+		isCell[i] = place.kind == PLACE_CELL_REGISTER
+			|| place.kind == PLACE_CELL_CAPTURE;
 	}
-	if (argc == 2 && isBlockOfArity(arg0, 0) && isBlockOfArity(arg1, 0)) {
-		if (stringEqualsC(selector, "ifTrue:ifFalse:")) {
-			emitConditional(e, receiverReg, (BlockNode *) arg0, (BlockNode *) arg1, dest);
-			return 1;
-		}
-		if (stringEqualsC(selector, "ifFalse:ifTrue:")) {
-			emitConditional(e, receiverReg, (BlockNode *) arg1, (BlockNode *) arg0, dest);
-			return 1;
-		}
+
+	OrderedCollection *args = blockNodeGetArgs(block);
+	size_t arity = args == NULL ? 0 : ordCollSize(args);
+	// PENDING: a block's unit is named "aBlock" rather than after the method it
+	// was written in, which is what a backtrace will want once there is one.
+	String *selector = asSymbol(stringFromC("aBlock"));
+	CodeUnit *unit = compileUnit(e, block, (uint16_t) arity, captures, isCell,
+		selector, PRIM_NONE, 1);
+	if (unit == NULL) {
+		free(isCell);
+		return;
 	}
-	return 0;
+
+	// The unit is reached through a HEAP OBJECT and not through a raw C pointer,
+	// which is what keeps a block's code and its literal frame alive for as long
+	// as any closure over it: the alternative is a word the collector cannot
+	// follow.
+	Class *owner = e->context->ownerClass;
+	CompiledMethod *method = compiledMethodCreate(unit, selector, owner);
+	uint16_t slot = (uint16_t) ordCollSize(e->blocks);
+	ordCollAddObject(e->blocks, (Object *) method);
+
+	// The base register is allocated even when there is nothing to capture. The
+	// instruction names it either way, and the runtime turns the address of that
+	// slot back into the frame pointer in order to walk the compiled frames
+	// underneath the allocation, so it has to be a slot this frame really has.
+	uint16_t mark = e->top;
+	uint16_t base = allocRegister(e);
+	for (size_t i = 0; i < captureCount; i++) {
+		uint16_t reg = i == 0 ? base : allocRegister(e);
+		String *name = scopeHandle(asObject(ordCollAt(captures, i)));
+		emitCaptureLoad(e, resolveName(e, name), name, reg);
+	}
+	emit(e, OP_CLOSURE, (uint8_t) captureCount, dest, slot, base);
+	releaseTo(e, mark);
+	free(isCell);
+
+	// Used exactly once, and checked at the end of the compile: a block the
+	// analysis prepared and emission never reached would mean the two walks
+	// diverged in the other direction, which is silent by nature.
+	Value uses = ordCollAt(analysis->blockUses, blockIndex);
+	ordCollAtPut(analysis->blockUses, blockIndex, tagInt(asCInt(uses) + 1));
 }
 
+
+// ---- expressions -------------------------------------------------------------
 
 // One message of an expression, sent to a receiver already in `receiverReg`.
 static void emitMessage(Emitter *e, MessageExpressionNode *message,
@@ -680,8 +1363,21 @@ static void emitMessage(Emitter *e, MessageExpressionNode *message,
 	OrderedCollection *args = messageExpressionNodeGetArgs(message);
 	size_t argc = args == NULL ? 0 : ordCollSize(args);
 
-	if (!toSuper && emitInlinedMessage(e, NULL, selector, args, receiverReg, 1, dest)) {
-		return;
+	if (!toSuper) {
+		Inline decision = inlineFormOf(NULL, selector, args);
+		switch (decision.form) {
+		case INLINE_IF:
+			emitConditional(e, receiverReg, decision.first, decision.second, dest);
+			return;
+		case INLINE_AND:
+			emitShortCircuit(e, receiverReg, decision.first, 1, dest);
+			return;
+		case INLINE_OR:
+			emitShortCircuit(e, receiverReg, decision.first, 0, dest);
+			return;
+		default:
+			break;
+		}
 	}
 	if (argc > 255) {
 		fail(e, COMPILE_UNSUPPORTED, selector);
@@ -725,10 +1421,7 @@ static void emitValue(Emitter *e, Object *node, uint16_t dest)
 	} else if (isInstance(node, &Handles.ExpressionNode)) {
 		emitExpression(e, (ExpressionNode *) node, dest);
 	} else if (isInstance(node, &Handles.BlockNode)) {
-		// A block that was NOT inlined needs a real closure, which is the next
-		// milestone (ADR 0008: flat closures with cells). Failing cleanly here
-		// beats emitting something that looks like it works.
-		fail(e, COMPILE_UNSUPPORTED, stringFromC("a non-inlined block"));
+		emitBlockClosure(e, (BlockNode *) node, dest);
 	} else {
 		fail(e, COMPILE_UNSUPPORTED, stringFromC("an unknown node"));
 	}
@@ -745,26 +1438,20 @@ static void emitExpression(Emitter *e, ExpressionNode *node, uint16_t dest)
 	size_t messageCount = messages == NULL ? 0 : ordCollSize(messages);
 
 	// A single message whose receiver has not been evaluated yet: the only shape
-	// where the receiverless loop forms can be inlined, because inlining them
-	// depends on NOT building the receiver block.
+	// where the loop forms can be inlined, because inlining them depends on NOT
+	// building the receiver block.
 	if (messageCount == 1) {
 		MessageExpressionNode *only = scopeHandle(asObject(ordCollAt(messages, 0)));
-		String *selector = messageExpressionNodeGetSelector(only);
-		OrderedCollection *args = messageExpressionNodeGetArgs(only);
-		if (isInstanceOf(receiverNode->raw, &Handles.BlockNode)
-				&& emitInlinedMessage(e, receiverNode, selector, args, 0, 0, dest)) {
+		Inline decision = inlineFormOf(receiverNode,
+			messageExpressionNodeGetSelector(only),
+			messageExpressionNodeGetArgs(only));
+		if (decision.form == INLINE_WHILE) {
+			emitWhile(e, decision.test, decision.first, decision.sense, dest);
 			goto assignments;
 		}
-		// to:do: needs its receiver node UNevaluated too, so the counter can be
-		// the block's argument register rather than a copy of it.
-		if (args != NULL && ordCollSize(args) == 2
-				&& stringEqualsC(selector, "to:do:")) {
-			Object *limit = scopeHandle(asObject(ordCollAt(args, 0)));
-			Object *body = scopeHandle(asObject(ordCollAt(args, 1)));
-			if (isBlockOfArity(body, 1)) {
-				emitToDo(e, node, receiverNode, limit, (BlockNode *) body, dest);
-				goto assignments;
-			}
+		if (decision.form == INLINE_TO_DO) {
+			emitToDo(e, receiverNode, decision.limit, decision.first, dest);
+			goto assignments;
 		}
 	}
 
@@ -828,7 +1515,15 @@ static void emitStatements(Emitter *e, OrderedCollection *statements,
 		uint16_t into = last ? dest : allocRegister(e);
 		emitExpression(e, statement, into);
 		if (expressionNodeReturns(statement)) {
-			emit(e, OP_RET, 0, into, 0, 0);
+			if (e->isBlock) {
+				// `^` inside a non-inlined block returns from the HOME METHOD,
+				// which is RETOUTER and the frame token of ADR 0008. Emitting a
+				// plain RET here would return from the block instead, quietly.
+				fail(e, COMPILE_UNSUPPORTED,
+					stringFromC("a non-local return from a block"));
+			} else {
+				emit(e, OP_RET, 0, into, 0, 0);
+			}
 			releaseTo(e, mark);
 			closeHandleScope(&scope, NULL);
 			return; // everything after an explicit return is unreachable
@@ -836,6 +1531,107 @@ static void emitStatements(Emitter *e, OrderedCollection *statements,
 		releaseTo(e, mark);
 		closeHandleScope(&scope, NULL);
 	}
+}
+
+
+// ---------------------------------------------------------------------------
+// One unit: a method, or a block
+// ---------------------------------------------------------------------------
+//
+// Both have the same shape, which is the point of the CodeUnit being one type:
+// the tier-1 frame and the deopt map need only one layout. The two differences
+// are what register 0 holds (self for a method, the CLOSURE for a block) and
+// what falling off the end answers (self for a method, the last statement's
+// value for a block).
+
+static CodeUnit *compileUnit(Emitter *parent, BlockNode *body, uint16_t arity,
+	OrderedCollection *captureNames, const uint8_t *captureIsCell,
+	String *selector, uint16_t primitive, _Bool isBlock)
+{
+	Emitter e;
+	memset(&e, 0, sizeof e);
+	e.context = parent->context;
+	e.error = parent->error;
+	e.analysis = parent->analysis;
+	e.instanceVariables = parent->instanceVariables;
+	e.literals = newOrdColl(8);
+	e.blocks = newOrdColl(2);
+	e.isBlock = isBlock;
+	e.captureNames = captureNames;
+	e.captureIsCell = captureIsCell;
+
+	Scope scope;
+	scopePush(&e, &scope);
+
+	// Register 0 is self in a method and the CLOSURE in a block, ALWAYS, in
+	// every unit. That is the frame contract the tier-1 template and the deopt
+	// map both read (jit/Jit.h), and it is what makes GETUP one load.
+	allocRegister(&e);
+
+	OrderedCollection *args = blockNodeGetArgs(body);
+	size_t argumentCount = args == NULL ? 0 : ordCollSize(args);
+	ASSERT(argumentCount == arity);
+	for (size_t i = 0; i < argumentCount; i++) {
+		LiteralNode *declaration = scopeHandle(asObject(ordCollAt(args, i)));
+		uint16_t reg = declareLocal(&e, &scope, declaration);
+		// An argument arrives in its register, so the cell wraps what is already
+		// there rather than nil.
+		emitCellIfNeeded(&e, declaration, reg);
+	}
+
+	OrderedCollection *temps = blockNodeGetTempVars(body);
+	size_t tempCount = temps == NULL ? 0 : ordCollSize(temps);
+	for (size_t i = 0; i < tempCount; i++) {
+		LiteralNode *declaration = scopeHandle(asObject(ordCollAt(temps, i)));
+		uint16_t reg = declareLocal(&e, &scope, declaration);
+		emit(&e, OP_LOADNIL, 0, reg, 0, 0);
+		emitCellIfNeeded(&e, declaration, reg);
+	}
+
+	uint16_t result = allocRegister(&e);
+	emitStatements(&e, blockNodeGetExpressions(body), result, 1);
+	if (!isBlock) {
+		// A method with no explicit return answers self. A block answers its
+		// last statement, which is already in `result`.
+		emit(&e, OP_MOVE, 0, result, 0, 0);
+	}
+	// The trailing RET is unconditional: falling off the end of generated code
+	// has no defined meaning, so there is always one here even when the body
+	// ended in one.
+	emit(&e, OP_RET, 0, result, 0, 0);
+
+	scopePop(&e, &scope);
+
+	if (e.error->status != COMPILE_OK) {
+		free(e.code);
+		return NULL;
+	}
+
+	Array *literalArray = ordCollAsArray(e.literals);
+	Array *blockArray = ordCollAsArray(e.blocks);
+	String *selectorSymbol = selector == NULL ? NULL : asSymbol(selector);
+
+	CodeUnit *unit = calloc(1, sizeof(CodeUnit));
+	ASSERT(unit != NULL);
+	unit->code = e.code;
+	unit->instructionCount = e.count;
+	unit->registerCount = e.registerCount;
+	unit->argumentCount = arity;
+	unit->captureCount = captureNames == NULL
+		? 0 : (uint16_t) ordCollSize(captureNames);
+	unit->primitive = primitive;
+	// No allocation between here and jitRegisterUnit: until the unit is on the
+	// registry these four words are reachable from nowhere the collector looks.
+	unit->literals = objectTagged(literalArray);
+	unit->blocks = objectTagged(blockArray);
+	if (selectorSymbol != NULL) {
+		unit->selector = objectTagged(selectorSymbol);
+	}
+	if (e.context->ownerClass != NULL) {
+		unit->ownerClass = objectTagged(e.context->ownerClass);
+	}
+	jitRegisterUnit(unit);
+	return unit;
 }
 
 
@@ -851,15 +1647,6 @@ CodeUnit *compileMethod(MethodNode *method, const CompileContext *context,
 
 	error->status = COMPILE_OK;
 	error->what = NULL;
-
-	Emitter e;
-	memset(&e, 0, sizeof(e));
-	e.context = context;
-	e.error = error;
-	e.literals = newOrdColl(8);
-	e.instanceVariables = collectInstanceVariables(context->ownerClass);
-
-	BlockNode *body = methodNodeGetBody(method);
 
 	// <primitive: IntAddPrimitive>
 	//
@@ -894,57 +1681,76 @@ CodeUnit *compileMethod(MethodNode *method, const CompileContext *context,
 		primitive = (uint16_t) number;
 	}
 
-	Scope scope;
-	scopePush(&e, &scope);
+	BlockNode *body = methodNodeGetBody(method);
 
-	// Register 0 is self, ALWAYS, in every unit. That is the frame contract the
-	// tier-1 template and the deopt map both read (jit/Jit.h).
-	allocRegister(&e);
+	Analysis analysis;
+	analysis.declarations = newOrdColl(8);
+	analysis.flags = newOrdColl(8);
+	analysis.blockNodes = newOrdColl(4);
+	analysis.blockCaptures = newOrdColl(4);
+	analysis.blockUses = newOrdColl(4);
+	analysis.instanceVariables = collectInstanceVariables(context->ownerClass);
 
-	OrderedCollection *args = blockNodeGetArgs(body);
-	size_t argumentCount = args == NULL ? 0 : ordCollSize(args);
-	for (size_t i = 0; i < argumentCount; i++) {
-		LiteralNode *arg = scopeHandle(asObject(ordCollAt(args, i)));
-		scopeDeclare(&e, &scope, literalNodeGetStringValue(arg));
+	// The capture analysis runs over the WHOLE method before a single
+	// instruction exists, because whether a variable lives in a register or in a
+	// cell changes every read and every write of it, including the ones emitted
+	// before the closure that captures it.
+	{
+		AnalysisScope scope;
+		scope.parent = NULL;
+		scope.block = NULL;
+		scope.blockIndex = 0;
+		scope.names = newOrdColl(8);
+		scope.declarations = newOrdColl(8);
+
+		OrderedCollection *args = blockNodeGetArgs(body);
+		size_t argumentCount = args == NULL ? 0 : ordCollSize(args);
+		for (size_t i = 0; i < argumentCount; i++) {
+			analysisDeclare(&analysis, &scope,
+				(LiteralNode *) scopeHandle(asObject(ordCollAt(args, i))));
+		}
+		OrderedCollection *temps = blockNodeGetTempVars(body);
+		size_t tempCount = temps == NULL ? 0 : ordCollSize(temps);
+		for (size_t i = 0; i < tempCount; i++) {
+			analysisDeclare(&analysis, &scope,
+				(LiteralNode *) scopeHandle(asObject(ordCollAt(temps, i))));
+		}
+		analyzeStatements(&analysis, &scope, blockNodeGetExpressions(body));
 	}
-
-	OrderedCollection *temps = blockNodeGetTempVars(body);
-	size_t tempCount = temps == NULL ? 0 : ordCollSize(temps);
-	for (size_t i = 0; i < tempCount; i++) {
-		LiteralNode *declaration = scopeHandle(asObject(ordCollAt(temps, i)));
-		uint16_t reg = scopeDeclare(&e, &scope,
-			literalNodeGetStringValue(declaration));
-		emit(&e, OP_LOADNIL, 0, reg, 0, 0);
-	}
-
-	uint16_t result = allocRegister(&e);
-	emitStatements(&e, blockNodeGetExpressions(body), result, 1);
-	// A method with no explicit return answers self, and the trailing RET is
-	// unconditional: falling off the end of generated code has no defined
-	// meaning, so there is always one here even when the body ended in one.
-	emit(&e, OP_MOVE, 0, result, 0, 0);
-	emit(&e, OP_RET, 0, result, 0, 0);
-
-	scopePop(&e, &scope);
-
-	if (failed(&e)) {
-		free(e.code);
+	if (error->status != COMPILE_OK) {
 		closeHandleScope(&outer, NULL);
 		return NULL;
 	}
 
-	CodeUnit *unit = calloc(1, sizeof(CodeUnit));
-	ASSERT(unit != NULL);
-	unit->code = e.code;
-	unit->instructionCount = e.count;
-	unit->registerCount = e.registerCount;
-	unit->argumentCount = (uint16_t) argumentCount;
-	unit->primitive = primitive;
-	unit->literals = objectTagged(ordCollAsArray(e.literals));
-	unit->selector = objectTagged(asSymbol(methodNodeGetSelector(method)));
-	if (context->ownerClass != NULL) {
-		unit->ownerClass = objectTagged(context->ownerClass);
+	// A stand-in emitter, holding only what a unit inherits from the context it
+	// is compiled in. The method's own unit is compiled through the same
+	// function a block's is.
+	Emitter root;
+	memset(&root, 0, sizeof root);
+	root.context = context;
+	root.error = error;
+	root.analysis = &analysis;
+	root.instanceVariables = analysis.instanceVariables;
+
+	OrderedCollection *args = blockNodeGetArgs(body);
+	uint16_t argumentCount = (uint16_t) (args == NULL ? 0 : ordCollSize(args));
+	CodeUnit *unit = compileUnit(&root, body, argumentCount, NULL, NULL,
+		methodNodeGetSelector(method), primitive, 0);
+	if (unit == NULL) {
+		closeHandleScope(&outer, NULL);
+		return NULL;
 	}
+
+	// Every block the analysis prepared was emitted exactly once. The other
+	// direction of a disagreement between the two walks (a block the emitter
+	// inlined and the analysis did not) leaves an unused capture list and a
+	// variable needlessly in a cell, which is correct and silent, and this is
+	// what makes it loud.
+	size_t blockCount = ordCollSize(analysis.blockNodes);
+	for (size_t i = 0; i < blockCount; i++) {
+		ASSERT(asCInt(ordCollAt(analysis.blockUses, i)) == 1);
+	}
+
 	closeHandleScope(&outer, NULL);
 	return unit;
 }
@@ -958,6 +1764,7 @@ const char *compileStatusName(CompileStatus status)
 	case COMPILE_TOO_MANY_REGISTERS: return "too many registers";
 	case COMPILE_TOO_MANY_LITERALS: return "too many literals";
 	case COMPILE_TOO_MANY_INSTRUCTIONS: return "too many instructions";
+	case COMPILE_TOO_MANY_CAPTURES: return "too many captured variables";
 	case COMPILE_BAD_INLINE_BLOCK: return "block of the wrong shape";
 	case COMPILE_UNKNOWN_PRIMITIVE: return "unknown primitive name";
 	default: return "unsupported construct";

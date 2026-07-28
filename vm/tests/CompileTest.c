@@ -33,6 +33,7 @@
 #include "memory/Collector.h"
 #include "memory/Heap.h"
 #include "memory/ObjectWalk.h"
+#include "runtime/Closure.h"
 #include "runtime/Collection.h"
 #include "runtime/Dictionary.h"
 #include "runtime/Primitive.h"
@@ -134,6 +135,11 @@ static void bootstrapKernel(Heap *heap)
 	Handles.BoxedFloat64.raw = classCreate(object, NULL, (InstanceShape)
 		DEFINE_SHAPE(FORMAT_NO_POINTERS, 0, 0, 1))->raw;
 	Handles.Character.raw = fixedClass(object, 0)->raw;
+	// A block is an ordinary object of an ordinary class, which is the point of
+	// ADR 0008: the collector needs no case for it, and `value` is a send like
+	// any other, so the site carries an inline cache like any other.
+	Handles.Closure.raw = classCreate(object, NULL, CLOSURE_SHAPE)->raw;
+	Handles.Cell.raw = classCreate(object, NULL, CELL_SHAPE)->raw;
 
 	// The syntax tree's classes. Field counts come from the structs in Ast.h;
 	// one too few and the parser would write past the object.
@@ -177,6 +183,7 @@ static void bootstrapKernel(Heap *heap)
 	withMethods(&Handles.BoxedFloat64);
 	withMethods(&Handles.Array);
 	withMethods(&Handles.String);
+	withMethods(&Handles.Closure);
 }
 
 
@@ -234,6 +241,11 @@ static void installPrimitives(void)
 	// its instances are the classes themselves.
 	definePrimitive(&Handles.ClassClass, "new", PRIM_BehaviorNew, 0);
 	definePrimitive(&Handles.ClassClass, "new:", PRIM_BehaviorNewSize, 1);
+	// Entering a block is a primitive on Closure, so `aBlock value` is an
+	// ordinary send that happens to land on one.
+	definePrimitive(&Handles.Closure, "value", PRIM_BlockValue, 0);
+	definePrimitive(&Handles.Closure, "value:", PRIM_BlockValue1, 1);
+	definePrimitive(&Handles.Closure, "value:value:", PRIM_BlockValue2, 2);
 }
 
 
@@ -306,6 +318,33 @@ static Value call1(NativeCode *code, Value receiver, Value a)
 static Value call2(NativeCode *code, Value receiver, Value a, Value b)
 {
 	return code == NULL ? PRIMITIVE_FAILED : jitCall2(code, receiver, a, b);
+}
+
+
+// Reading the emitted bytecode back, which is how a claim about what a program
+// does NOT allocate can be checked at all.
+static int countCellOps(const CodeUnit *unit)
+{
+	int count = 0;
+	for (uint16_t i = 0; i < unit->instructionCount; i++) {
+		Opcode op = (Opcode) unit->code[i].op;
+		if (op == OP_NEWCELL || op == OP_GETCELL || op == OP_SETCELL) {
+			count++;
+		}
+	}
+	return count;
+}
+
+
+static int countClosureOps(const CodeUnit *unit)
+{
+	int count = 0;
+	for (uint16_t i = 0; i < unit->instructionCount; i++) {
+		if ((Opcode) unit->code[i].op == OP_CLOSURE) {
+			count++;
+		}
+	}
+	return count;
 }
 
 
@@ -476,6 +515,225 @@ int main(void)
 	checkInt("and writing one updates that same Association",
 		bound->raw->value, 99);
 
+	// ---- closures ----------------------------------------------------------------
+	//
+	// A block that is NOT inlined becomes a real closure (ADR 0008): it captures
+	// what it reads BY VALUE, into itself, and a variable that is captured AND
+	// ASSIGNED gets a heap cell instead. Level 7 proved the mechanism on
+	// hand-written bytecode; what is proved here is the half that decides, which
+	// is the front end's, and its two halves have to agree: the capture analysis
+	// and the emitter share ONE inlining predicate, because if they disagreed the
+	// disagreement would be silent.
+	printf("\n  -- closures, which is what a block that is not inlined becomes\n");
+	defineGlobal("Object", objectTagged(&Handles.ObjectClass));
+	defineGlobal("Array", objectTagged(&Handles.Array));
+
+	// Sending `value` from C, through compiled code, so the site is an ordinary
+	// send with an ordinary inline cache.
+	NativeCode *evaluate = define(counter, "eval: b [ ^b value ]");
+	NativeCode *evaluateWith = define(counter, "eval: b with: x [ ^b value: x ]");
+
+	checkInt("a block that captures nothing",
+		call0(define(counter, "constant [ ^[ 42 ] value ]"), objectTagged(instance)), 42);
+	checkInt("a block reads a captured argument",
+		call1(define(counter, "captured: x [ ^[ x + 1 ] value ]"),
+			objectTagged(instance), tagInt(41)), 42);
+	checkInt("two captures, in the order the analysis found them",
+		call2(define(counter, "sum: a and: b [ ^[ a + b ] value ]"),
+			objectTagged(instance), tagInt(30), tagInt(12)), 42);
+	checkInt("a block's OWN argument sits alongside its captures",
+		call1(define(counter, "bump: n [ ^[ :d | n + d ] value: 5 ]"),
+			objectTagged(instance), tagInt(37)), 42);
+
+	// The closure OUTLIVES the frame that made it, which is the whole point of
+	// capturing by value into the object rather than pointing at a frame.
+	Value escaped = call1(define(counter, "adder: n [ ^[ :d | n + d ] ]"),
+		objectTagged(instance), tagInt(40));
+	Object *escapedBlock = valueTypeOf(escaped, VALUE_POINTER)
+		? scopeHandle(asObject(escaped)) : NULL;
+	check("a block survives the method that built it",
+		escapedBlock != NULL
+		&& rawObjectClassIndex(escapedBlock->raw) == classIndexOf(&Handles.Closure));
+	checkInt("and answers with its capture long after that frame is gone",
+		call2(evaluateWith, objectTagged(instance), objectTagged(escapedBlock), tagInt(2)),
+		42);
+
+	// A CELL, and the two directions it has to work in.
+	checkInt("a variable assigned AFTER the capture is seen through a cell, so "
+		"this answers 99 and not 1",
+		call0(define(counter,
+			"mutated [ | n b | n := 1. b := [ n ]. n := 99. ^b value ]"),
+			objectTagged(instance)), 99);
+	checkInt("and an assignment INSIDE the block is seen by the method",
+		call0(define(counter, "writeBack [ | n | n := 0. [ n := 7 ] value. ^n ]"),
+			objectTagged(instance)), 7);
+
+	// self is captured BY NAME, because register 0 of a block's frame is the
+	// closure and not the receiver. An instance variable inside a block needs it.
+	call1(define(counter, "setCount: n [ count := n ]"), objectTagged(instance),
+		tagInt(17));
+	checkInt("an instance variable read inside a block",
+		call0(define(counter, "ivarInBlock [ ^[ count ] value ]"),
+			objectTagged(instance)), 17);
+	call1(define(counter, "ivarWriteInBlock: v [ [ count := v ] value ]"),
+		objectTagged(instance), tagInt(23));
+	checkInt("and written inside one, through the captured self",
+		call0(getCount, objectTagged(instance)), 23);
+	checkInt("a send to self inside a block",
+		call0(define(counter, "selfInBlock [ ^[ self add: 20 to: 22 ] value ]"),
+			objectTagged(instance)), 42);
+
+	// Nested blocks: the inner one reaches a name two levels out THROUGH the
+	// intermediate block's capture list, with nothing walked at runtime.
+	checkInt("a doubly nested block reaches an outer name by forwarding",
+		call1(define(counter, "nestedCapture: x [ ^[ [ x + 1 ] value ] value ]"),
+			objectTagged(instance), tagInt(41)), 42);
+	checkInt("and the intermediate block carries it even though it never reads it",
+		call2(define(counter,
+			"deep: a and: b [ ^[ :p | [ a + b + p ] value ] value: 2 ]"),
+			objectTagged(instance), tagInt(30), tagInt(10)), 42);
+
+	// One closure per ITERATION, capturing the counter by value. If the loop
+	// counter were shared, all three would answer the same thing.
+	checkInt("a closure made in a loop captures that iteration's counter",
+		call0(define(counter,
+			"perIteration [ | a | a := Array new: 3. "
+			"1 to: 3 do: [ :i | a at: i put: [ i ] ]. "
+			"^(a at: 1) value + ((a at: 2) value * 10) + ((a at: 3) value * 100) ]"),
+			objectTagged(instance)), 321);
+	// And a FRESH cell per iteration, for a temporary that is captured and then
+	// assigned. A single shared cell would answer 2121.
+	checkInt("and a temporary needing a cell gets a fresh one each time round",
+		call0(define(counter,
+			"cellPerIteration [ | a | a := Array new: 2. "
+			"1 to: 2 do: [ :i | | t | t := i * 10. a at: i put: [ t ]. t := t + 1 ]. "
+			"^(a at: 1) value + ((a at: 2) value * 100) ]"),
+			objectTagged(instance)), 2111);
+
+	// THE PREDICATE, which is the reason the analysis and the emitter share one
+	// function. An accumulator assigned inside an INLINED block is not captured
+	// by anything, so it stays a register; if the analysis thought that block
+	// were a closure, the accumulator would become a heap cell and the loop this
+	// whole project exists to optimize would allocate on every iteration.
+	NativeCode *accumulate = define(counter,
+		"accumulate [ | s | s := 0. 1 to: 10 do: [ :i | s := s + i ]. ^s ]");
+	checkInt("an inlined loop still answers 55", call0(accumulate,
+		objectTagged(instance)), 55);
+	// The same accumulator, once a real closure does read it: now it must be a
+	// cell, and the loop still has to be right.
+	NativeCode *accumulateCaptured = define(counter,
+		"accumulateCaptured [ | s b | s := 0. b := [ s ]. "
+		"1 to: 10 do: [ :i | s := s + i ]. ^b value ]");
+	checkInt("an accumulator a closure reads becomes a cell and still sums",
+		call0(accumulateCaptured, objectTagged(instance)), 55);
+	{
+		// The two programs differ only in whether a closure reads the
+		// accumulator, so the same count answering differently on them is what
+		// makes the zero on the left meaningful.
+		int plainCells = countCellOps(accumulate->unit);
+		int capturedCells = countCellOps(accumulateCaptured->unit);
+		check("the inlined loop allocates NOTHING: no closure, and the "
+			"accumulator is a register rather than a cell",
+			plainCells == 0 && countClosureOps(accumulate->unit) == 0);
+		check("while the one a closure reads does use a cell, which is what "
+			"makes the zero above a measurement and not a tautology",
+			capturedCells > 0 && countClosureOps(accumulateCaptured->unit) == 1);
+	}
+
+	{
+		// A message sent to SUPER is never inlined, because where the lookup
+		// starts is the entire point of writing super. The analysis has to reach
+		// the same verdict: if it thought the arms were inlined it would prepare
+		// no capture lists for them, and the emitter would then be building
+		// closures out of blocks it knows nothing about.
+		CompileError error;
+		CodeUnit *unit = compileSource(
+			"viaSuper [ ^super ifTrue: [ 1 ] ifFalse: [ 2 ] ]", counter, &error);
+		check("a conditional sent to super compiles as a real send with real "
+			"blocks, and both halves of the front end agree that it does",
+			unit != NULL && countClosureOps(unit) == 2 && countCellOps(unit) == 0);
+	}
+
+	// A block with two arguments, and one containing inlined control flow of its
+	// own: a block unit is an ordinary unit, so everything the method level does
+	// has to work inside one.
+	checkInt("a two-argument block",
+		call2(define(counter, "pair: a with: b [ ^[ :p :q | p + q ] value: a value: b ]"),
+			objectTagged(instance), tagInt(30), tagInt(12)), 42);
+	checkInt("inlined control flow INSIDE a block",
+		call1(define(counter,
+			"clamp: x [ ^[ :v | (v < 10) ifTrue: [ v ] ifFalse: [ 10 ] ] value: x ]"),
+			objectTagged(instance), tagInt(70)), 10);
+	checkInt("and a loop inside a block, over a cell the block also writes",
+		call0(define(counter,
+			"loopInBlock [ ^[ | t | t := 0. 1 to: 5 do: [ :i | t := t + i ]. t ] value ]"),
+			objectTagged(instance)), 15);
+
+	// A block called repeatedly that WRITES its captured variable: every call
+	// goes through the same cell, and the method sees the result.
+	checkInt("a block called three times writes through one cell",
+		call0(define(counter,
+			"increment [ | n b | n := 0. b := [ n := n + 1 ]. "
+			"1 to: 3 do: [ :i | b value ]. ^n ]"),
+			objectTagged(instance)), 3);
+	// self reaching a doubly nested block, which is the forwarding path again
+	// but for the receiver rather than for a temporary.
+	call1(define(counter, "setCount: n [ count := n ]"), objectTagged(instance),
+		tagInt(9));
+	checkInt("an instance variable read from a doubly nested block",
+		call0(define(counter, "deepIvar [ ^[ [ count ] value ] value ]"),
+			objectTagged(instance)), 9);
+
+	// ---- closures and the collector ----------------------------------------------
+	//
+	// A block's CodeUnit is built while its enclosing method compiles and does
+	// not run until somebody sends the closure `value`, so its literal frame has
+	// to be a root for that whole interval. It is reachable from nowhere else: a
+	// unit is a malloc'd C struct, and the CompiledMethod holding it holds it as
+	// a RAW word the collector does not follow.
+	printf("\n  -- a block's literal frame, which nothing else can reach\n");
+	NativeCode *wide = define(counter, "wideBlock [ ^[ 1000000000 ] ]");
+	Value wideClosure = call0(wide, objectTagged(instance));
+	Object *heldClosure = valueTypeOf(wideClosure, VALUE_POINTER)
+		? scopeHandle(asObject(wideClosure)) : NULL;
+	collectorScavenge(&heap);
+	collectorScavenge(&heap);
+	{
+		RawArray *blocks = (RawArray *) asObject(wide->unit->blocks);
+		RawCompiledMethod *blockMethod =
+			(RawCompiledMethod *) asObject(rawArrayAt(blocks, 0));
+		Value literals = blockMethod->unit->literals;
+		// THE GENERATION IS THE CHECK, and the contents are not. An object the
+		// collector never saw is abandoned in the evacuated semispace with its
+		// bytes intact, so reading the literal back answers correctly even with
+		// the root missing. Being in the OLD space cannot happen by luck: only a
+		// collector that FOUND this Array twice could have promoted it.
+		check("the block's literal frame was PROMOTED, so the collector reached "
+			"it before the block had ever run",
+			valueTypeOf(literals, VALUE_POINTER) && isOldObject(asObject(literals)));
+	}
+	checkInt("and the block answers its literal after those collections",
+		heldClosure == NULL ? PRIMITIVE_FAILED
+			: call1(evaluate, objectTagged(instance), objectTagged(heldClosure)),
+		1000000000);
+
+	// Allocating INSIDE a block, hard enough to collect, with the block's own
+	// frame live underneath. A block frame is a compiled frame like any other:
+	// register 0 holds the closure and every slot holds a tagged Value.
+	{
+		size_t before = LastGCStats.scavengeCount;
+		Value kept = call0(define(counter,
+			"churnInBlock [ ^[ | keep | keep := Array new: 3. "
+			"keep at: 1 put: 111. "
+			"1 to: 40000 do: [ :i | Array new: 200 ]. keep ] value ]"),
+			objectTagged(instance));
+		check("a block that allocates really collected",
+			LastGCStats.scavengeCount >= before + 2);
+		check("and an Array reachable only from the BLOCK's frame was promoted",
+			valueTypeOf(kept, VALUE_POINTER) && isOldObject(asObject(kept))
+			&& rawArrayAt((RawArray *) asObject(kept), 0) == tagInt(111));
+	}
+
 	// ---- failing cleanly --------------------------------------------------------
 	printf("\n  -- what it refuses to compile, and how\n");
 	{
@@ -485,10 +743,14 @@ int main(void)
 			unit == NULL && error.status == COMPILE_UNDECLARED_NAME);
 	}
 	{
+		// The non-local return needs RETOUTER and the home-frame token of ADR
+		// 0008, which is the next milestone. A plain RET here would return from
+		// the BLOCK, quietly answering the wrong thing.
 		CompileError error;
-		CodeUnit *unit = compileSource("bad [ ^[ :x | x ] ]", counter, &error);
-		check("a block that cannot be inlined is refused BY NAME, not emitted wrong",
-			unit == NULL && error.status == COMPILE_UNSUPPORTED);
+		CodeUnit *unit = compileSource(
+			"bad [ ^[ :x | ^x ] ]", counter, &error);
+		check("a non-local return is refused BY NAME rather than emitted as a "
+			"return from the block", unit == NULL && error.status == COMPILE_UNSUPPORTED);
 	}
 
 	// ---- the profile, which is why arithmetic is a send ------------------------
@@ -540,8 +802,6 @@ int main(void)
 	// frame holds a tagged Value, so the map is "all of them" and there is no
 	// per-site table to get wrong.
 	printf("\n  -- a collection with COMPILED FRAMES LIVE underneath it\n");
-	defineGlobal("Object", objectTagged(&Handles.ObjectClass));
-	defineGlobal("Array", objectTagged(&Handles.Array));
 
 	// The garbage is allocated as ARRAYS, not as bare Objects: the nursery is
 	// sixteen megabytes a side, so filling it with sixteen-byte instances would
