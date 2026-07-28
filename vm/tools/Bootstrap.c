@@ -450,7 +450,8 @@ static size_t manifestFiles(const char *text, char ***files)
 
 
 // One source file: a sequence of class definitions.
-static _Bool loadFile(const char *path, BootstrapReport *report)
+static _Bool loadFile(const char *path, BootstrapReport *report,
+	OrderedCollection *built)
 {
 	size_t size = 0;
 	char *text = readWholeFile(path, &size);
@@ -505,6 +506,9 @@ static _Bool loadFile(const char *path, BootstrapReport *report)
 			continue;
 		}
 		if (class != NULL) {
+			if (built != NULL) {
+				ordCollAddObject(built, (Object *) class);
+			}
 			report->classesBuilt++;
 			OrderedCollection *methods = classNodeGetMethods(node);
 			report->methodsBuilt += methods == NULL ? 0 : ordCollSize(methods);
@@ -542,13 +546,36 @@ void bootstrapLoadPackage(const char *directory, BootstrapReport *report)
 		return;
 	}
 
+	HandleScope scope;
+	openHandleScope(&scope);
+	OrderedCollection *built = newOrdColl(64);
+
 	for (size_t i = 0; i < count; i++) {
 		char path[512];
 		snprintf(path, sizeof(path), "%s/%s", directory, files[i]);
-		if (!loadFile(path, report)) {
+		if (!loadFile(path, report, built)) {
 			break;
 		}
 	}
+
+	// CLASS-SIDE `initialize`, in the order the classes were built.
+	//
+	// A class that has one is not optional scaffolding: `ExternalStream class
+	// initialize` is what makes Transcript a stream on descriptor 1, and until it
+	// runs the kernel's own printNl sends nextPutAll: to nil. The order is the
+	// manifest's, which is the same order the classes were defined in, because
+	// one initializer routinely uses a class defined earlier.
+	size_t built_count = ordCollSize(built);
+	for (size_t i = 0; i < built_count; i++) {
+		HandleScope each;
+		openHandleScope(&each);
+		Object *class = ordCollObjectAt(built, i);
+		_Bool understood = 0;
+		jitSendUnary(objectTagged(class), "initialize", &understood);
+		report->initializersRun += understood ? 1 : 0;
+		closeHandleScope(&each, NULL);
+	}
+	closeHandleScope(&scope, NULL);
 	for (size_t i = 0; i < count; i++) {
 		free(files[i]);
 	}

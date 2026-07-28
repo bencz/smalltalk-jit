@@ -62,8 +62,8 @@ PRIMITIVE(BlockWhileTrue2, "BlockWhileTrue2Primitive", NULL)  // Block>>whileTru
 PRIMITIVE(BlockWhileTrue, "BlockWhileTruePrimitive", NULL)  // Block>>whileTrue
 PRIMITIVE(BuildClassIn, "BuildClassInPrimitive", NULL)  // Compiler>>basicBuildClass: aClassNode in: aNamespace
 PRIMITIVE(BuildClass, "BuildClassPrimitive", NULL)  // Compiler>>basicBuildClass: aClassNode
-PRIMITIVE(CharacterCode, "CharacterCodePrimitive", NULL)  // Character>>codePoint
-PRIMITIVE(CharacterNew, "CharacterNewPrimitive", NULL)  // Character>>class codePoint: anInteger
+PRIMITIVE(CharacterCode, "CharacterCodePrimitive", primCharacterCode)  // Character>>codePoint
+PRIMITIVE(CharacterNew, "CharacterNewPrimitive", primCharacterNew)  // Character>>class codePoint: anInteger
 PRIMITIVE(Class, "ClassPrimitive", primClass)  // Object>>class
 PRIMITIVE(ClassRemoveSelector, "ClassRemoveSelectorPrimitive", NULL)  // Behavior>>removeSelector: aSymbol
 PRIMITIVE(CommandLine, "CommandLinePrimitive", NULL)  // System>>class primitiveCommandLine
@@ -129,7 +129,7 @@ PRIMITIVE(InstVarAtPut, "InstVarAtPutPrimitive", NULL)  // Object>>instVarAt: an
 PRIMITIVE(IntAdd, "IntAddPrimitive", primAdd)  // SmallInteger>>+ aNumber
 PRIMITIVE(IntAnd, "IntAndPrimitive", primBitAnd)  // SmallInteger>>bitAnd: anInteger
 PRIMITIVE(IntAsFloat, "IntAsFloatPrimitive", primAsFloat)  // SmallInteger>>asFloat
-PRIMITIVE(IntAsStringBase, "IntAsStringBasePrimitive", NULL)  // SmallInteger>>printStringBase: base
+PRIMITIVE(IntAsStringBase, "IntAsStringBasePrimitive", primIntAsStringBase)  // SmallInteger>>printStringBase: base
 PRIMITIVE(IntFloorDiv, "IntFloorDivPrimitive", primFloorDivide)  // SmallInteger>>// aNumber
 PRIMITIVE(IntLessThan, "IntLessThanPrimitive", primLess)  // SmallInteger>>< aNumber
 PRIMITIVE(IntMod, "IntModPrimitive", primFloorModulo)  // SmallInteger>>\\ aNumber
@@ -185,13 +185,13 @@ PRIMITIVE(SocketRead, "SocketReadPrimitive", NULL)  // Socket>>class read: descr
 PRIMITIVE(SocketSetNoDelay, "SocketSetNoDelayPrimitive", NULL)  // Socket>>class setNoDelay: descriptor
 PRIMITIVE(SocketWrite, "SocketWritePrimitive", NULL)  // Socket>>class write: descriptor from: aString size: anInteger
 PRIMITIVE(StreamAvailable, "StreamAvailablePrimitive", NULL)  // ExternalStream>>class available: descriptor
-PRIMITIVE(StreamClose, "StreamClosePrimitive", NULL)  // ExternalStream>>class close: descriptor
-PRIMITIVE(StreamFlush, "StreamFlushPrimitive", NULL)  // ExternalStream>>class flush: descriptor
+PRIMITIVE(StreamClose, "StreamClosePrimitive", primStreamClose)  // ExternalStream>>class close: descriptor
+PRIMITIVE(StreamFlush, "StreamFlushPrimitive", primStreamFlush)  // ExternalStream>>class flush: descriptor
 PRIMITIVE(StreamGetPosition, "StreamGetPositionPrimitive", NULL)  // ExternalStream>>class position: descriptor
 PRIMITIVE(StreamOpen, "StreamOpenPrimitive", NULL)  // FileStream>>class open: aString mode: anInteger
-PRIMITIVE(StreamRead, "StreamReadPrimitive", NULL)  // ExternalStream>>class read: descriptor next: anInteger into: aString startingAt: start
+PRIMITIVE(StreamRead, "StreamReadPrimitive", primStreamRead)  // ExternalStream>>class read: descriptor next: anInteger into: aString startingAt: start
 PRIMITIVE(StreamSetPosition, "StreamSetPositionPrimitive", NULL)  // ExternalStream>>class position: descriptor to: anInteger
-PRIMITIVE(StreamWrite, "StreamWritePrimitive", NULL)  // ExternalStream>>class write: descriptor next: anInteger from: aString
+PRIMITIVE(StreamWrite, "StreamWritePrimitive", primStreamWrite)  // ExternalStream>>class write: descriptor next: anInteger from: aString
 PRIMITIVE(StringAsSymbol, "StringAsSymbolPrimitive", NULL)  // String>>asSymbol
 PRIMITIVE(StringAsciiCaseEquals, "StringAsciiCaseEqualsPrimitive", NULL)  // String>>sameAsciiCaseAs: aString
 PRIMITIVE(StringAsciiLowercase, "StringAsciiLowercasePrimitive", NULL)  // String>>asLowercase

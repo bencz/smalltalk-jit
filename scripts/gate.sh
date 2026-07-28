@@ -72,6 +72,7 @@ level0() {
 		vm/tests/MemoryTest.c vm/memory/Heap.c vm/memory/Collector.c \
 		vm/memory/PageSpace.c vm/memory/Nursery.c vm/memory/RememberedSet.c \
 		vm/memory/Roots.c vm/core/ClassTable.c vm/core/Handle.c \
+		vm/os/linux/OsFile.c \
 		vm/os/linux/OsMemory.c vm/os/linux/OsThread.c vm/os/linux/OsTime.c \
 		-o "$SCRATCH/memtest" -lpthread || return 1
 	"$SCRATCH/memtest"
@@ -103,6 +104,7 @@ level2() {
 		vm/runtime/String.c vm/runtime/Collection.c \
 		vm/memory/Heap.c vm/memory/Collector.c vm/memory/PageSpace.c \
 		vm/memory/Nursery.c vm/memory/RememberedSet.c vm/memory/Roots.c \
+		vm/os/linux/OsFile.c \
 		vm/os/linux/OsMemory.c vm/os/linux/OsThread.c vm/os/linux/OsTime.c \
 		-o "$SCRATCH/objtest" -lpthread || return 1
 	"$SCRATCH/objtest"
@@ -124,6 +126,7 @@ level3() {
 		vm/runtime/String.c vm/runtime/Collection.c vm/runtime/Dictionary.c \
 		vm/memory/Heap.c vm/memory/Collector.c vm/memory/PageSpace.c \
 		vm/memory/Nursery.c vm/memory/RememberedSet.c vm/memory/Roots.c \
+		vm/os/linux/OsFile.c \
 		vm/os/linux/OsMemory.c vm/os/linux/OsThread.c vm/os/linux/OsTime.c \
 		-o "$SCRATCH/jittest" -lpthread || return 1
 	"$SCRATCH/jittest"
@@ -160,6 +163,7 @@ level6() {
 		vm/runtime/String.c vm/runtime/Collection.c \
 		vm/memory/Heap.c vm/memory/Collector.c vm/memory/PageSpace.c \
 		vm/memory/Nursery.c vm/memory/RememberedSet.c vm/memory/Roots.c \
+		vm/os/linux/OsFile.c \
 		vm/os/linux/OsMemory.c vm/os/linux/OsThread.c vm/os/linux/OsTime.c \
 		-o "$SCRATCH/deopttest" -lpthread || return 1
 	"$SCRATCH/deopttest" >/dev/null
@@ -186,6 +190,7 @@ level7() {
 		vm/runtime/String.c vm/runtime/Collection.c vm/runtime/Dictionary.c \
 		vm/memory/Heap.c vm/memory/Collector.c vm/memory/PageSpace.c \
 		vm/memory/Nursery.c vm/memory/RememberedSet.c vm/memory/Roots.c \
+		vm/os/linux/OsFile.c \
 		vm/os/linux/OsMemory.c vm/os/linux/OsThread.c vm/os/linux/OsTime.c \
 		-o "$SCRATCH/primtest" -lpthread || return 1
 	"$SCRATCH/primtest"
@@ -210,6 +215,7 @@ level8() {
 		vm/runtime/String.c vm/runtime/Collection.c vm/runtime/Dictionary.c \
 		vm/memory/Heap.c vm/memory/Collector.c vm/memory/PageSpace.c \
 		vm/memory/Nursery.c vm/memory/RememberedSet.c vm/memory/Roots.c \
+		vm/os/linux/OsFile.c \
 		vm/os/linux/OsMemory.c vm/os/linux/OsThread.c vm/os/linux/OsTime.c \
 		-o "$SCRATCH/compiletest" -lpthread || return 1
 	"$SCRATCH/compiletest"

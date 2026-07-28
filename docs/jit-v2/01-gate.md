@@ -172,7 +172,8 @@ Apendar, nunca reescrever. Data, commit, o que destravou.
 | 2026-07-28 | **9** | (nao commitado) | CMakeLists reescrito para o conjunto v2; `cmake --build` limpo com -Werror |
 | 2026-07-28 | **10** | (nao commitado) | kernel EMBUTIDO em C + `st -e`: `(3 + 4) printNl` imprime 7 |
 | 2026-07-28 | 10 | `c4ef859` | construtor de classes: 142 arquivos do Core, 1567 metodos, 16 falhas nomeadas |
-| 2026-07-28 | 10 | (nao commitado) | formas reconciliadas e os 5 arquivos v1 reescritos: **o Core inteiro constroi, 158 classes, 1727 metodos, zero falhas** |
+| 2026-07-28 | 10 | `e77a111` | formas reconciliadas e os 5 arquivos v1 reescritos: o Core inteiro constroi |
+| 2026-07-28 | 10 | (nao commitado) | o Core EXECUTA: 158 inicializadores, metaclasses eager, sends ate 5 argumentos |
 
 ## O que o nivel 7 encontrou, e por que so ele podia encontrar
 
@@ -646,6 +647,58 @@ Smalltalk chega nela por primitiva e nao por campo.
 Onde um metodo perdeu o campo que lia, ele passou a `self notYetImplemented`, que
 LEVANTA. Responder nil seria resposta plausivel vinda de um metodo que nao tem
 como computar nada, e isso e resposta errada em outro lugar.
+
+### O Core agora EXECUTA, e onde ele para
+
+`st -b DIR -e CODE` constroi as classes do pacote e roda codigo contra elas no
+mesmo processo. Nao precisa de imagem: e a maneira mais barata de descobrir o que
+o kernel de verdade faz quando executa, e foi ela que achou tudo o que segue.
+
+```
+142 files, 158 classes, 1727 methods, 158 initializers
+```
+
+Quatro coisas que so apareceram ao RODAR, cada uma um erro de desenho e nao um
+detalhe:
+
+- **`initialize` de classe tinha que rodar.** Nada e opcional ali: e
+  `ExternalStream class initialize` que faz Transcript ser um stream no descritor
+  1, e sem ele o proprio `printNl` do kernel manda `nextPutAll:` para nil. O
+  carregador roda os 158 na ordem do manifesto, que e a ordem em que as classes
+  foram definidas, porque um inicializador rotineiramente usa uma classe
+  definida antes;
+- **metaclasse preguicosa quebra HERANCA de metodo de classe.** Criar a
+  metaclasse so para quem declara metodo de classe parecia economia e era bug: a
+  cadeia de metaclasses e o que faz metodo de classe ser herdado, entao `Array`,
+  que nao declara nenhum, continuava instancia da classe-das-classes e a busca de
+  `with:with:` nunca chegava na metaclasse de ArrayedCollection. Agora TODA classe
+  tem a sua;
+- **"e uma classe?" mudou de pergunta.** Era "e instancia da classe-das-classes",
+  e isso deixou de ser verdade no instante em que metaclasses existiram: uma
+  classe e instancia da SUA metaclasse. O teste desceu um nivel e aceita os dois,
+  que e o certo, porque `Array new` e `Array class new` sao os dois sends a uma
+  classe;
+- **send de 3 a 5 argumentos** era `FAIL()` com um PENDING. O teto agora e o da
+  ABI (receptor mais cinco, o conjunto de registradores inteiros do SysV), e
+  passar disso DIZ isso em vez de chamar com argumentos que ninguem escreveu.
+
+Onde para hoje: `3 + 4` roda contra o kernel de verdade, `7 printStringBase: 10`
+tambem, e os bytes JA SAEM do processo (`ExternalStream write:next:from:` escreve
+no descritor). `printNl` ainda morre acima disso, dentro da pilha de streams. Sao
+**38 das 175 primitivas implementadas**, e os testes usam muito mais.
+
+Duas armadilhas achadas ali, as duas da mesma familia:
+
+- **`flush` chamando o SO era erro.** `fsync` num terminal ou num pipe responde
+  EINVAL, entao `Transcript flush` falhava, o fallback levantava um IoError, e
+  reportar esse IoError precisava do Transcript. Recursao infinita, medida. Nada
+  e bufferizado do lado C; o buffer que existe e o do proprio kernel, em
+  Smalltalk, e ja foi escrito quando esse send chega. E no-op de proposito;
+- **metodo com primitiva e SEM corpo de fallback responde SELF.** `IoError class
+  last` era exatamente isso, entao respondia a CLASSE IoError, e
+  `IoError last signal` saia procurando um signal de classe. Vale como regra
+  geral: primitiva nao implementada mais corpo vazio e um metodo que responde o
+  receptor, silenciosamente.
 
 E compilar nao e rodar. Entre isto e `run_tests.sh` verde estao, em ordem:
 a IMAGEM (Snapshot le e escreve o modelo novo), as EXCECOES (`signal`, `on:do:`,

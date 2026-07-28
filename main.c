@@ -148,13 +148,21 @@ int main(int argc, char **argv)
 	if (cliArgs.bootstrapDir != NULL) {
 		BootstrapReport report;
 		bootstrapLoadPackage(cliArgs.bootstrapDir, &report);
-		printf("%zu files, %zu classes, %zu methods\n",
-			report.filesRead, report.classesBuilt, report.methodsBuilt);
+		printf("%zu files, %zu classes, %zu methods, %zu initializers\n",
+			report.filesRead, report.classesBuilt, report.methodsBuilt,
+			report.initializersRun);
 		if (report.error != NULL) {
 			fprintf(stderr, "st: %zu class(es) did not build; the first was\n"
 				"    %s%s\n    in %s\n", report.classesFailed, report.error,
 				report.errorDetail, report.errorFile);
 			return 4;
+		}
+		// The classes are LIVE now, in this process. Writing them out needs the
+		// image writer, but RUNNING against them needs nothing else, and that is
+		// what makes `-b DIR -e CODE` the cheapest way to find out what the real
+		// kernel does when it actually executes.
+		if (cliArgs.eval != NULL) {
+			return evaluate(cliArgs.eval);
 		}
 		fprintf(stderr, "st: writing an image is not ported to jit-v2 yet, so "
 			"nothing was saved\n");

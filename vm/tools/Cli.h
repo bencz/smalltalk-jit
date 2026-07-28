@@ -124,6 +124,9 @@ static void parseCliArgs(CliArgs *cliArgs, int argc, char **args)
 			&& (cliArgs->eval != NULL || cliArgs->fileName != NULL || cliArgs->bootstrapDir != NULL)) {
 		cliArgs->error = "Cannot combine a subcommand with -e, -f or -b";
 	}
+	// -b with -e is ALLOWED: build the package's classes, then run code against
+	// them in the same process. It is how the kernel gets exercised before there
+	// is an image to save it in.
 }
 
 

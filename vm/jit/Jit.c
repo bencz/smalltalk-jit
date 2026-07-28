@@ -349,8 +349,27 @@ static Value dispatchFrom(IcCell *cell, Value *receiverSlot, uint64_t packed,
 	case 2:
 		answer = jitCall2(code, receiver, receiverSlot[-1], receiverSlot[-2]);
 		break;
+	case 3:
+		answer = jitCall3(code, receiver, receiverSlot[-1], receiverSlot[-2],
+			receiverSlot[-3]);
+		break;
+	case 4:
+		answer = jitCall4(code, receiver, receiverSlot[-1], receiverSlot[-2],
+			receiverSlot[-3], receiverSlot[-4]);
+		break;
+	case 5:
+		answer = jitCall5(code, receiver, receiverSlot[-1], receiverSlot[-2],
+			receiverSlot[-3], receiverSlot[-4], receiverSlot[-5]);
+		break;
 	default:
-		FAIL(); // PENDING: arities past two
+		// Past the ABI's register set. Saying so beats calling with arguments the
+		// callee will read out of registers nobody wrote.
+		fprintf(stderr, "jit: a send of ");
+		fprintRawString(stderr, (RawString *) cell->selector);
+		fprintf(stderr, " has %llu arguments, and this tier passes at most %d\n",
+			(unsigned long long) argc, JIT_MAX_REGISTER_ARGS);
+		fflush(NULL);
+		abort();
 	}
 	compiledFrameLeave(&guard);
 	return answer;
@@ -394,6 +413,51 @@ Value jitDispatchSuper(void *cellPointer, Value *receiverSlot, uint64_t packed)
 #define PACKED_LOW(packed) ((uint16_t) ((packed) & 0xFFFF))
 #define PACKED_MID(packed) ((uint16_t) (((packed) >> 16) & 0xFFFF))
 #define PACKED_SLOT(packed) ((uint16_t) (((packed) >> 32) & 0xFFFF))
+
+
+// Send a unary message from C.
+//
+// It exists for the bootstrap: a class-side `initialize` has to run before
+// anything the class touches works, and until an image exists there is no
+// Smalltalk-level place to run it from. It goes through the same lookup and the
+// same entry as every other send, so a method reached this way is compiled,
+// cached and profiled exactly like one reached from bytecode.
+Value jitSendUnary(Value receiver, const char *selector, _Bool *understood)
+{
+	HandleScope scope;
+	openHandleScope(&scope);
+	Object *held = valueTypeOf(receiver, VALUE_POINTER)
+		? (Object *) scopeHandle(asObject(receiver)) : NULL;
+	String *name = asSymbol(stringFromC(selector));
+
+	RawCompiledMethod *method = lookupMethod(classOf(
+		held != NULL ? tagPtr(held->raw) : receiver), (RawObject *) name->raw);
+	if (method == NULL) {
+		if (understood != NULL) {
+			*understood = 0;
+		}
+		closeHandleScope(&scope, NULL);
+		return tagPtr(Handles.nil.raw);
+	}
+	if (understood != NULL) {
+		*understood = 1;
+	}
+	if (method->native == NULL) {
+		Opcode unsupported;
+		method->native = jitCompile(method->unit, &unsupported);
+		if (method->native == NULL) {
+			fprintf(stderr, "jit: %s uses %s, which the tier does not implement\n",
+				selector, opcodeName(unsupported));
+			fflush(NULL);
+			closeHandleScope(&scope, NULL);
+			return tagPtr(Handles.nil.raw);
+		}
+	}
+	Value answer = jitCall0(method->native,
+		held != NULL ? tagPtr(held->raw) : receiver);
+	closeHandleScope(&scope, NULL);
+	return answer;
+}
 
 
 // ---------------------------------------------------------------------------
@@ -960,6 +1024,95 @@ NativeCode *jitCompileFor(const MacroAssemblerOps *ops, CodeUnit *unit,
 }
 
 
+// ---------------------------------------------------------------------------
+// Calling in
+// ---------------------------------------------------------------------------
+
+typedef Value (*Entry0)(Value);
+typedef Value (*Entry1)(Value, Value);
+typedef Value (*Entry2)(Value, Value, Value);
+typedef Value (*Entry3)(Value, Value, Value, Value);
+typedef Value (*Entry4)(Value, Value, Value, Value, Value);
+typedef Value (*Entry5)(Value, Value, Value, Value, Value, Value);
+
+
+// Entering compiled code, and the ONE place a non-local return can land.
+//
+// The record has to be made in THIS frame rather than inside a helper, because a
+// jump resumes in the frame that took the destination: taking it one call deeper
+// would resume in a frame that no longer exists. That is what the macro is for,
+// and why it expands into each entry point instead of being a function of its
+// own.
+//
+// The test is a field of the unit the compiler already filled, so a method with
+// no `^` inside a block enters exactly as it did before.
+#define ENTER_COMPILED(call) \
+	if (!code->unit->couldBeHome) { \
+		return (call); \
+	} \
+	UnwindRecord record; \
+	unwindPush(&record); \
+	if (setjmp(record.destination) != 0) { \
+		return unwindAnswer(&record); \
+	} \
+	Value answer = (call); \
+	unwindPop(&record); \
+	return answer;
+
+
+Value jitCall0(NativeCode *code, Value receiver)
+{
+	Entry0 entry;
+	memcpy(&entry, &code->entry, sizeof(entry));
+	ENTER_COMPILED(entry(receiver))
+}
+
+
+Value jitCall1(NativeCode *code, Value receiver, Value a)
+{
+	Entry1 entry;
+	memcpy(&entry, &code->entry, sizeof(entry));
+	ENTER_COMPILED(entry(receiver, a))
+}
+
+
+Value jitCall2(NativeCode *code, Value receiver, Value a, Value b)
+{
+	Entry2 entry;
+	memcpy(&entry, &code->entry, sizeof(entry));
+	ENTER_COMPILED(entry(receiver, a, b))
+}
+
+
+// Three, four and five arguments. The ceiling is the ABI's: the receiver plus
+// five is the SysV integer argument set (JIT_MAX_REGISTER_ARGS), and a wider
+// send needs its arguments in memory, which is a calling convention this tier
+// does not have yet and says so about rather than guesses at.
+Value jitCall3(NativeCode *code, Value receiver, Value a, Value b, Value c)
+{
+	Entry3 entry;
+	memcpy(&entry, &code->entry, sizeof(entry));
+	ENTER_COMPILED(entry(receiver, a, b, c))
+}
+
+
+Value jitCall4(NativeCode *code, Value receiver, Value a, Value b, Value c, Value d)
+{
+	Entry4 entry;
+	memcpy(&entry, &code->entry, sizeof(entry));
+	ENTER_COMPILED(entry(receiver, a, b, c, d))
+}
+
+
+Value jitCall5(NativeCode *code, Value receiver, Value a, Value b, Value c, Value d,
+	Value e)
+{
+	Entry5 entry;
+	memcpy(&entry, &code->entry, sizeof(entry));
+	ENTER_COMPILED(entry(receiver, a, b, c, d, e))
+}
+
+
 void jitFreeNativeCode(NativeCode *code)
 {
 	for (NativeCode **link = &gCompiledCode; *link != NULL;
@@ -977,74 +1130,3 @@ void jitFreeNativeCode(NativeCode *code)
 }
 
 
-// ---------------------------------------------------------------------------
-// Calling in
-// ---------------------------------------------------------------------------
-
-typedef Value (*Entry0)(Value);
-typedef Value (*Entry1)(Value, Value);
-typedef Value (*Entry2)(Value, Value, Value);
-
-
-// Entering compiled code, and the ONE place a non-local return can land.
-//
-// The record has to be made here rather than inside a helper, because a jump
-// resumes in the frame that took the destination: taking it one call deeper
-// would resume in a frame that no longer exists. That is also why the three
-// functions repeat the shape instead of sharing it.
-//
-// The test is a field of the unit the compiler already filled, so a method with
-// no `^` inside a block enters exactly as it did before.
-
-Value jitCall0(NativeCode *code, Value receiver)
-{
-	Entry0 entry;
-	memcpy(&entry, &code->entry, sizeof(entry));
-	if (!code->unit->couldBeHome) {
-		return entry(receiver);
-	}
-	UnwindRecord record;
-	unwindPush(&record);
-	if (setjmp(record.destination) != 0) {
-		return unwindAnswer(&record);
-	}
-	Value answer = entry(receiver);
-	unwindPop(&record);
-	return answer;
-}
-
-
-Value jitCall1(NativeCode *code, Value receiver, Value a)
-{
-	Entry1 entry;
-	memcpy(&entry, &code->entry, sizeof(entry));
-	if (!code->unit->couldBeHome) {
-		return entry(receiver, a);
-	}
-	UnwindRecord record;
-	unwindPush(&record);
-	if (setjmp(record.destination) != 0) {
-		return unwindAnswer(&record);
-	}
-	Value answer = entry(receiver, a);
-	unwindPop(&record);
-	return answer;
-}
-
-
-Value jitCall2(NativeCode *code, Value receiver, Value a, Value b)
-{
-	Entry2 entry;
-	memcpy(&entry, &code->entry, sizeof(entry));
-	if (!code->unit->couldBeHome) {
-		return entry(receiver, a, b);
-	}
-	UnwindRecord record;
-	unwindPush(&record);
-	if (setjmp(record.destination) != 0) {
-		return unwindAnswer(&record);
-	}
-	Value answer = entry(receiver, a, b);
-	unwindPop(&record);
-	return answer;
-}

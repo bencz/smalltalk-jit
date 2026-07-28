@@ -61,9 +61,12 @@ static Dictionary *methodsOf(Class *class)
 // class-of-classes, and installing a class-side method there would put it on
 // EVERY class in the system.
 //
-// The metaclass is created on first use rather than for every class, because
-// most classes have no class-side methods and a metaclass each would double the
-// class table for nothing.
+// EVERY class gets one, and not lazily. Creating it only for classes that
+// declare a class-side method looked like a saving and was a bug: the metaclass
+// chain is what makes a class-side method INHERITED, so a class with none of its
+// own stayed an instance of the shared class-of-classes and the lookup for
+// `Array with: 1 with: 2` never reached ArrayedCollection's metaclass, where
+// with:with: is defined.
 
 Class *classMetaclassOf(Class *class)
 {
@@ -450,6 +453,7 @@ Class *classBuild(ClassNode *node, ClassBuildError *error)
 		(RawObject *) variables->raw);
 	declareClassVariables(class, node);
 	methodsOf(class);
+	classMetaclassOf(class); // established here so the chain is never partial
 
 	buildMethods(class, node, error);
 	return closeHandleScope(&scope, error->message == NULL ? class : NULL);

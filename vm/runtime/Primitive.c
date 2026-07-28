@@ -8,6 +8,7 @@
 #include "memory/ObjectWalk.h"
 #include "jit/CompiledMethod.h"
 #include "runtime/Closure.h"
+#include "os/OsFile.h"
 #include <string.h>
 
 // The implementations.
@@ -581,17 +582,32 @@ static Value primIdentityHash(Value *args, uint64_t argc)
 // The receiver has to be a class before its shape can be stamped onto anything.
 // A non-class receiver fails rather than reading instanceShape out of whatever
 // object happened to arrive, which would allocate a garbage size.
+// Is this receiver a CLASS?
+//
+// Not "is it an instance of the class-of-classes", which is what this used to
+// ask and what stopped being true the moment metaclasses arrived: a class is an
+// instance of ITS METACLASS, and a metaclass is an instance of the
+// class-of-classes. So the test is one level deeper, and it accepts both, which
+// is right: `Array new` and `Array class new` are both sends to a class.
+//
+// The shape is what decides rather than a name, because that is what the
+// allocator is about to use.
 static Class *receiverAsClass(Value receiver)
 {
-	if (!valueTypeOf(receiver, VALUE_POINTER)) {
+	if (!valueTypeOf(receiver, VALUE_POINTER) || Handles.ClassClass.raw == NULL) {
 		return NULL;
 	}
 	RawObject *object = asObject(receiver);
-	if (Handles.ClassClass.raw == NULL
-			|| rawObjectClassIndex(object) != classIndexOf(&Handles.ClassClass)) {
+	uint32_t classOfObject = rawObjectClassIndex(object);
+	if (classOfObject == classIndexOf(&Handles.ClassClass)) {
+		return (Class *) scopeHandle(object); // a metaclass, or a class before it has one
+	}
+	RawObject *itsClass = classTableAt(&CurrentThread.heap->classes, classOfObject);
+	if (itsClass == NULL
+			|| rawObjectClassIndex(itsClass) != classIndexOf(&Handles.ClassClass)) {
 		return NULL;
 	}
-	return (Class *) scopeHandle(object);
+	return (Class *) scopeHandle(object); // an instance of a metaclass: a class
 }
 
 
@@ -758,6 +774,221 @@ static Value primInstanceShape(Value *args, uint64_t argc)
 	uint64_t packed;
 	memcpy(&packed, &shape, sizeof(packed) < sizeof(shape) ? sizeof(packed) : sizeof(shape));
 	return tagInt((intptr_t) (packed & 0x3FFFFFFFFFFFFFFFull));
+}
+
+
+// The digits of an integer, as a String.
+//
+// It ALLOCATES, so it anchors the calling frame first. The Smalltalk fallback
+// beside it in the kernel is the definition of what this must agree with, and it
+// stays there: this answers only what it can answer exactly, which is a
+// SmallInteger in a base from 2 to 36.
+static Value primIntAsStringBase(Value *args, uint64_t argc)
+{
+	if (argc != 1) {
+		return PRIMITIVE_FAILED;
+	}
+	Value receiver = primitiveReceiver(args);
+	Value baseValue = primitiveArgument(args, 0);
+	if (!valueTypeOf(receiver, VALUE_INT) || !valueTypeOf(baseValue, VALUE_INT)) {
+		return PRIMITIVE_FAILED;
+	}
+	intptr_t base = asCInt(baseValue);
+	if (base < 2 || base > 36) {
+		return PRIMITIVE_FAILED; // the fallback signals; guessing here would not
+	}
+
+	// Built BACKWARDS into a C buffer first, so the String is allocated once at
+	// its exact size. 64 binary digits plus a sign is the widest a SmallInteger
+	// can be.
+	char digits[72];
+	size_t length = 0;
+	intptr_t value = asCInt(receiver);
+	_Bool negative = value < 0;
+	// Through uintptr_t, because negating the most negative value overflows.
+	uintptr_t magnitude = negative
+		? (uintptr_t) 0 - (uintptr_t) value : (uintptr_t) value;
+	if (magnitude == 0) {
+		digits[length++] = '0';
+	}
+	while (magnitude > 0) {
+		unsigned digit = (unsigned) (magnitude % (uintptr_t) base);
+		digits[length++] = (char) (digit < 10 ? '0' + digit : 'A' + digit - 10);
+		magnitude /= (uintptr_t) base;
+	}
+	if (negative) {
+		digits[length++] = '-';
+	}
+
+	PRIMITIVE_ALLOCATES(args);
+	String *string = newString(length);
+	for (size_t i = 0; i < length; i++) {
+		string->raw->contents[i] = digits[length - 1 - i];
+	}
+	Value answer = objectTagged(string);
+	PRIMITIVE_DONE_ALLOCATING();
+	return answer;
+}
+
+
+// ---------------------------------------------------------------------------
+// Streams: the bytes actually leaving the process
+// ---------------------------------------------------------------------------
+//
+// These are the bottom of the kernel's IO stack. `Transcript` is an
+// ExternalStream on descriptor 1, `printNl` fills its buffer, and the buffer
+// arrives here. Everything above them is Smalltalk.
+//
+// They are CLASS-SIDE methods, so the receiver is the class and the descriptor
+// is an ordinary argument. None of them allocates.
+//
+// A short write is not an error and not silently accepted either: the count
+// WRITTEN is answered, and the Smalltalk side loops. That is the contract a
+// caller can act on; answering "done" after a partial write is how data goes
+// missing without anybody noticing.
+
+static _Bool streamDescriptorOf(Value value, int *descriptor)
+{
+	if (!valueTypeOf(value, VALUE_INT)) {
+		return 0;
+	}
+	intptr_t number = asCInt(value);
+	if (number < 0 || number > 65535) {
+		return 0;
+	}
+	*descriptor = (int) number;
+	return 1;
+}
+
+
+static Value primStreamWrite(Value *args, uint64_t argc)
+{
+	if (argc != 3) {
+		return PRIMITIVE_FAILED;
+	}
+	int descriptor;
+	Value count = primitiveArgument(args, 1);
+	Value bytes = primitiveArgument(args, 2);
+	if (!streamDescriptorOf(primitiveArgument(args, 0), &descriptor)
+			|| !valueTypeOf(count, VALUE_INT) || !valueTypeOf(bytes, VALUE_POINTER)) {
+		return PRIMITIVE_FAILED;
+	}
+	RawObject *object = asObject(bytes);
+	if (rawObjectFormat(object) != FORMAT_BYTES) {
+		return PRIMITIVE_FAILED;
+	}
+	intptr_t wanted = asCInt(count);
+	if (wanted < 0 || (size_t) wanted > rawObjectElementCount(object)) {
+		return PRIMITIVE_FAILED; // out of range fails; the fallback signals
+	}
+	int64_t written = osFileWrite(descriptor, rawObjectBytes(object),
+		(size_t) wanted);
+	if (written < 0) {
+		return PRIMITIVE_FAILED; // the fallback reads the errno through IoError
+	}
+	return tagInt((intptr_t) written);
+}
+
+
+static Value primStreamRead(Value *args, uint64_t argc)
+{
+	if (argc != 4) {
+		return PRIMITIVE_FAILED;
+	}
+	int descriptor;
+	Value count = primitiveArgument(args, 1);
+	Value into = primitiveArgument(args, 2);
+	Value start = primitiveArgument(args, 3);
+	if (!streamDescriptorOf(primitiveArgument(args, 0), &descriptor)
+			|| !valueTypeOf(count, VALUE_INT) || !valueTypeOf(into, VALUE_POINTER)
+			|| !valueTypeOf(start, VALUE_INT)) {
+		return PRIMITIVE_FAILED;
+	}
+	RawObject *object = asObject(into);
+	if (rawObjectFormat(object) != FORMAT_BYTES) {
+		return PRIMITIVE_FAILED;
+	}
+	// One-based, like every index in Smalltalk.
+	intptr_t from = asCInt(start) - 1;
+	intptr_t wanted = asCInt(count);
+	size_t size = rawObjectElementCount(object);
+	if (from < 0 || wanted < 0 || (size_t) from + (size_t) wanted > size) {
+		return PRIMITIVE_FAILED;
+	}
+	int64_t got = osFileRead(descriptor, rawObjectBytes(object) + from,
+		(size_t) wanted);
+	if (got < 0) {
+		return PRIMITIVE_FAILED;
+	}
+	return tagInt((intptr_t) got);
+}
+
+
+static Value primStreamClose(Value *args, uint64_t argc)
+{
+	int descriptor;
+	if (argc != 1 || !streamDescriptorOf(primitiveArgument(args, 0), &descriptor)) {
+		return PRIMITIVE_FAILED;
+	}
+	return osFileClose(descriptor) ? primitiveReceiver(args) : PRIMITIVE_FAILED;
+}
+
+
+static Value primStreamFlush(Value *args, uint64_t argc)
+{
+	int descriptor;
+	if (argc != 1 || !streamDescriptorOf(primitiveArgument(args, 0), &descriptor)) {
+		return PRIMITIVE_FAILED;
+	}
+	// A NO-OP that answers the receiver, and deliberately so. Nothing is buffered
+	// on the C side; the buffering that exists is the kernel's own, in Smalltalk,
+	// and it has already been written out by the time this is sent.
+	//
+	// Calling through to the OS was the obvious version and it was wrong:
+	// fsync on a terminal or a pipe answers EINVAL, so `Transcript flush` failed,
+	// the Smalltalk fallback raised an IoError, and reporting THAT needed the
+	// Transcript. Measured as an infinite recursion on `last`.
+	(void) descriptor;
+	return primitiveReceiver(args);
+}
+
+
+// ---------------------------------------------------------------------------
+// Characters
+// ---------------------------------------------------------------------------
+//
+// A Character is an IMMEDIATE: the code point IS the payload, so both of these
+// are a tag operation and neither touches the heap.
+
+static Value primCharacterCode(Value *args, uint64_t argc)
+{
+	if (argc != 0) {
+		return PRIMITIVE_FAILED;
+	}
+	Value receiver = primitiveReceiver(args);
+	if (!valueTypeOf(receiver, VALUE_CHAR)) {
+		return PRIMITIVE_FAILED;
+	}
+	return tagInt((intptr_t) (unsigned char) asCChar(receiver));
+}
+
+
+static Value primCharacterNew(Value *args, uint64_t argc)
+{
+	if (argc != 1) {
+		return PRIMITIVE_FAILED;
+	}
+	Value code = primitiveArgument(args, 0);
+	if (!valueTypeOf(code, VALUE_INT)) {
+		return PRIMITIVE_FAILED;
+	}
+	intptr_t point = asCInt(code);
+	// Out of range FAILS rather than truncating: the Smalltalk fallback is what
+	// knows how to signal, and a truncated code point is a wrong character.
+	if (point < 0 || point > 255) {
+		return PRIMITIVE_FAILED;
+	}
+	return tagChar((char) point);
 }
 
 

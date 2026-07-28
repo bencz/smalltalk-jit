@@ -76,6 +76,16 @@ void jitRegisterUnit(CodeUnit *unit);
 Value jitCall0(NativeCode *code, Value receiver);
 Value jitCall1(NativeCode *code, Value receiver, Value a);
 Value jitCall2(NativeCode *code, Value receiver, Value a, Value b);
+Value jitCall3(NativeCode *code, Value receiver, Value a, Value b, Value c);
+Value jitCall4(NativeCode *code, Value receiver, Value a, Value b, Value c, Value d);
+Value jitCall5(NativeCode *code, Value receiver, Value a, Value b, Value c, Value d,
+	Value e);
+
+// Send a UNARY message from C, compiling the target on the way in if it has not
+// run yet. `understood` says whether anything answered; a caller that wants to
+// know rather than to crash passes it, because the bootstrap legitimately asks
+// classes a question most of them do not answer (a class-side `initialize`).
+Value jitSendUnary(Value receiver, const char *selector, _Bool *understood);
 
 // Executable memory. Never moved and never freed, exactly like the old exec
 // space: a frame still running inside superseded code has to stay valid, and

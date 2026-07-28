@@ -35,6 +35,7 @@ typedef struct {
 	size_t classesBuilt;
 	size_t methodsBuilt;
 	size_t classesFailed;
+	size_t initializersRun;
 	// A load KEEPS GOING past a class it cannot build, because the question this
 	// answers today is "what is still missing", and the first answer is worth far
 	// less than all of them. Each failure is printed as it happens; this is the
