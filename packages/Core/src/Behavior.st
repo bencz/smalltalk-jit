@@ -1,6 +1,17 @@
 Behavior := Object [
 
-	| superClass subClasses methodDictionary instanceShape instanceVariables |
+	"THE VM OWNS THIS LAYOUT. These five names mirror, in order, the tagged
+	 fields of RawClass in vm/core/Object.h, and the class builder refuses to
+	 build the mirror if the two stop agreeing.
+
+	 `instanceShape` is NOT among them any more. In jit-v2 the shape is a RAW
+	 word in the class's trailer rather than a tagged slot, precisely so the
+	 collector never walks it (ADR 0005), so Smalltalk reaches it through a
+	 primitive instead of through a field."
+
+	<shape: ClassShape>
+
+	| superClass subClasses methodDictionary instanceVariables |
 
 
 	"instance creation"
@@ -31,17 +42,20 @@ Behavior := Object [
 	"shape and size"
 
 	instanceSize [
-		^(instanceShape bitShift: -14) bitAnd: 16rFF
+		^(self instanceShape bitShift: -14) bitAnd: 16rFF
 	]
 
 
 	instanceShape [
-		^instanceShape
+		"The packed shape word out of the class's raw trailer. A primitive
+		 because it is not a tagged field: see the note at the top."
+		<primitive: BehaviorInstanceShapePrimitive>
+		^0
 	]
 
 
 	isIndexable [
-		^((instanceShape bitShift: -22) bitAnd: 16rFF) = 1
+		^((self instanceShape bitShift: -22) bitAnd: 16rFF) = 1
 	]
 
 

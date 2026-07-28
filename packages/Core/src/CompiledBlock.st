@@ -1,42 +1,43 @@
 CompiledBlock := CompiledCode [
 
-	| method sourceCode descriptors |
+	"A block's code is an ordinary CompiledMethod in jit-v2 (ADR 0008): a
+	 closure holds one, and entering the block enters it like any other. This
+	 class survives as the name the image uses for that role and declares no
+	 fields of its own, because the VM layout it would mirror no longer exists."
+
 
 
 	"accessing"
 
 	method [
-		^method
+		^self notYetImplemented
 	]
 
 
 	sourceCode [
-		^sourceCode
+		^self notYetImplemented
 	]
 
 
 	descriptors [
-		^descriptors
+		^self notYetImplemented
 	]
 
 
 	literals [
-		^method literals
+		^self notYetImplemented
 	]
 
 
 	ownerClass [
-		^method ownerClass
+		^self notYetImplemented
 	]
 
 
 	"printing"
 
 	printOn: aStream [
-		| index |
-
-		method printOn: aStream.
-		aStream nextPutAll: '[]'.
+		aStream nextPutAll: 'a block'.
 	]
 
 ]

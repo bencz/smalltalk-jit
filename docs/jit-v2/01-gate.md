@@ -171,7 +171,8 @@ Apendar, nunca reescrever. Data, commit, o que destravou.
 | 2026-07-28 | 8 | `fe9b5e8` | `super` no tier 1 e retorno nao local: 88 de 88 |
 | 2026-07-28 | **9** | (nao commitado) | CMakeLists reescrito para o conjunto v2; `cmake --build` limpo com -Werror |
 | 2026-07-28 | **10** | (nao commitado) | kernel EMBUTIDO em C + `st -e`: `(3 + 4) printNl` imprime 7 |
-| 2026-07-28 | 10 | (nao commitado) | construtor de classes: **142 de 144 arquivos do Core, 1567 metodos**, 16 falhas nomeadas |
+| 2026-07-28 | 10 | `c4ef859` | construtor de classes: 142 arquivos do Core, 1567 metodos, 16 falhas nomeadas |
+| 2026-07-28 | 10 | (nao commitado) | formas reconciliadas e os 5 arquivos v1 reescritos: **o Core inteiro constroi, 158 classes, 1727 metodos, zero falhas** |
 
 ## O que o nivel 7 encontrou, e por que so ele podia encontrar
 
@@ -582,23 +583,69 @@ vai definir.
 Os acessores que podem ser perguntados sobre campo que o parser nao escreve
 passaram a responder NULL.
 
-### O numero, que e a resposta para "quando"
+### O numero
 
 ```
 $ st -b packages/Core
-142 files, 142 classes, 1567 methods
-st: 16 class(es) did not build
+142 files, 158 classes, 1727 methods
 ```
 
-**142 dos 144 arquivos do Core, 1567 metodos compilados.** As 16 falhas nao sao
-uma nevoa, sao tres grupos com nome:
+**O Core inteiro constroi.** Zero falhas. O que faltava eram 16 classes em tres
+grupos, e cada grupo foi uma correcao de natureza diferente:
 
-| grupo | o que e | o que resolve |
+| grupo | o que era | o que resolveu |
 |---|---|---|
-| 5 formas que o VM POSSUI | `CompiledCodeShape`, `BlockShape`, `ContextShape`, `ExceptionHandlerShape`, `UnwindHandlerShape` | esses arquivos sao o DESENHO V1. Block virou closure plana e Context virou materializacao a partir do frame (ADR 0008): os .st mudam |
-| 5 subclasses em cascata | CompiledBlock, CompiledMethod, ContextCopy, MethodContext, BlockContext | somem junto com o grupo acima |
-| 5 formas em conflito | Class, BoxedFloat64, Character, Array, Symbol | a forma do kernel EMBUTIDO tem que concordar com a que `packages/` declara. Recusar e o certo: recarimbar em silencio deixaria instancia ja viva com um layout e instancia nova com outro |
-| 1 lacuna de linguagem | `thisContext` em `Exception.st` | o ADR 0008 ja disse o que ele vira, e ninguem escreveu ainda |
+| 5 formas em conflito | Class, BoxedFloat64, Character, Array, Symbol | **HERANCA DE FORMA** mais **variaveis de classe**, os dois abaixo |
+| 5 formas que o VM possui | `CompiledCodeShape`, `BlockShape`, `ContextShape`, `ExceptionHandlerShape`, `UnwindHandlerShape` | os `.st` eram o DESENHO V1 e foram reescritos, ver abaixo |
+| 5 subclasses em cascata | CompiledBlock, CompiledMethod, ContextCopy, MethodContext, BlockContext | sumiram junto |
+| 1 lacuna de linguagem | `thisContext` em `Exception.st` | recusa nomeada: o materializador do ADR 0008 nao existe ainda |
+
+**A FORMA E HERDADA** quando a classe nao declara uma. Era isso que quebrava
+`Array := ArrayedCollection [ ]` e `Symbol := String [ ]`, que nao repetem a
+pragma do pai. Errar aqui e caro na direcao pior: o coletor teria lido a
+CONTAGEM DE ELEMENTOS de um Array como se fosse a primeira variavel de instancia.
+
+**NOME MAIUSCULO NA SECAO DE VARIAVEIS E VARIAVEL DE CLASSE**, que e a convencao
+do proprio Smalltalk, e o kernel depende dela: `Character` declara `| Table |` e
+o preenche num metodo de classe, e as instancias de Character sao IMEDIATOS, sem
+slot nenhum onde uma variavel de instancia pudesse morar. Uma variavel de classe
+vira Association no dicionario da classe, que e exatamente o que uma global ja e,
+entao o compilador le e escreve com as instrucoes que ja tinha; o que muda e so
+onde a Association foi achada.
+
+**O ESPELHO TEM QUE CONCORDAR COM O STRUCT.** `Behavior + Class` declaram, em
+ordem, os 9 campos tagueados de `RawClass`, e `<shape: ClassShape>` e a classe
+dizendo em voz alta que e espelho de um struct em vez de o construtor inferir
+isso de uma lista de campos. O construtor CONFERE a contagem: acrescentar campo
+de um lado sem o outro apareceria como metodo lendo o slot errado, que e resposta
+errada e nao crash.
+
+Um campo saiu do espelho: **`instanceShape`**. No v2 a forma e palavra RAW no
+trailer da classe, justamente para o coletor nunca varre-la (ADR 0005), entao o
+Smalltalk chega nela por primitiva e nao por campo.
+
+### Os cinco arquivos v1, e o que cada um virou
+
+- **`Block.st`**: era o desenho de CONTEXTOS (`| compiledBlock receiver
+  outerContext homeContext |`). Virou closure plana do ADR 0008,
+  `<shape: ClosureShape>`, sem campo nenhum: `receiver` e uma captura como outra
+  qualquer, e os outros dois eram elos de uma cadeia que nao existe mais;
+- **`CompiledCode.st`**: a palavra `header` empacotava contagem de argumentos,
+  de temporarios e numero de primitiva. Isso mora na CodeUnit, que e struct C.
+  Junto foi o DESASSEMBLADOR em Smalltalk, que decodificava o bytecode do v1
+  instrucao por instrucao e nao descreve mais nenhuma instrucao que exista;
+- **`CompiledMethod.st`**: ficou com os dois campos tagueados que o v2 tem
+  (`selector`, `ownerClass`). `literals` foi para a CodeUnit e `descriptors`
+  virou array ao lado do codigo nativo;
+- **`Context.st`**: deixou de ter forma propria. Ativacao e frame nativo, e um
+  Context e MATERIALIZADO de um quando alguem pede;
+- **`ExceptionHandler.st` e `UnwindHandler.st`**: objetos comuns ate a maquinaria
+  de excecao existir. A cadeia que o VM percorre e a de registros de unwind que o
+  retorno nao local ja construiu, nao uma cadeia desses.
+
+Onde um metodo perdeu o campo que lia, ele passou a `self notYetImplemented`, que
+LEVANTA. Responder nil seria resposta plausivel vinda de um metodo que nao tem
+como computar nada, e isso e resposta errada em outro lugar.
 
 E compilar nao e rodar. Entre isto e `run_tests.sh` verde estao, em ordem:
 a IMAGEM (Snapshot le e escreve o modelo novo), as EXCECOES (`signal`, `on:do:`,

@@ -192,14 +192,15 @@ Exception := Object [
 
 
 	signalingContext [
-		| context |
+		"The activation that signalled, found by walking OUT of the Exception
+		 frames that got here.
 
-		context := thisContext.
-		[(context code ownerClass == Exception or: [context code ownerClass inheritsFrom: Exception])
-		or: [context code ownerClass == Exception class or: [context code ownerClass inheritsFrom: Exception class]]]
-			whileTrue: [context := context parent].
-
-		^context
+		 It starts from `thisContext`, and in jit-v2 that is not a field read: an
+		 activation is a native frame, and a Context is MATERIALISED from one on
+		 demand using the slot map deoptimization already carries (ADR 0008). The
+		 materialiser is not written yet, so this raises rather than answering an
+		 activation that would be a fiction."
+		^self notYetImplemented
 	]
 
 

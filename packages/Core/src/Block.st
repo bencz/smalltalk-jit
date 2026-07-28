@@ -1,29 +1,44 @@
 Block := Object [
 
-	<shape: BlockShape>
+	"A FLAT CLOSURE (ADR 0008), and the VM owns the layout: an element count,
+	 the CompiledMethod holding the block's code, the token of the activation a
+	 `^` inside it returns from, then the captured values.
 
-	| compiledBlock receiver outerContext homeContext |
+	 There is no chain of contexts any more. A block captures what it reads BY
+	 VALUE into itself, and a variable it also ASSIGNS gets a heap cell that the
+	 closure captures the pointer of; reaching a captured value is one load at a
+	 known offset rather than a walk up a chain of activations. That is what
+	 makes `receiver`, `outerContext` and `homeContext` disappear from here:
+	 the first is a capture like any other, and the other two named links in a
+	 chain that no longer exists.
+
+	 The price, accepted with open eyes in the ADR: reflection over an
+	 activation is no longer free. It MATERIALISES a Context from the native
+	 frame, which is a primitive rather than a field read."
+
+	<shape: ClosureShape>
 
 
 	"accessing"
 
 	compiledBlock [
-		^compiledBlock
+		^self notYetImplemented
 	]
 
 
 	receiver [
-		^receiver
+		"Captured by name when the block reads it, and not a field."
+		^self notYetImplemented
 	]
 
 
 	outerContext [
-		^outerContext
+		^self notYetImplemented
 	]
 
 
 	homeContext [
-		^homeContext
+		^self notYetImplemented
 	]
 
 

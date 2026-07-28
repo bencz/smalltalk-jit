@@ -75,6 +75,14 @@ Object := nil [
 	]
 
 
+	notYetImplemented [
+		"Reached something the port has not brought back yet. It RAISES rather
+		 than answering nil, because a plausible answer from a method that cannot
+		 compute one is a wrong answer somewhere else."
+		^NotYetImplementedError signal
+	]
+
+
 	"system primitives"
 
 	instVarAt: anInteger [

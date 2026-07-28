@@ -1,6 +1,10 @@
 Context := Object [
 
-	<shape: ContextShape>
+	"An ORDINARY OBJECT in jit-v2, and that is the change ADR 0008 accepted with
+	 its eyes open. There is no Context sitting in the heap for every activation
+	 any more: an activation is a native frame, and a Context is MATERIALISED
+	 from one on demand, using the same slot map deoptimization uses. So this
+	 class describes what a materialised context holds, not what the VM keeps."
 
 	| ic code parent outer home |
 

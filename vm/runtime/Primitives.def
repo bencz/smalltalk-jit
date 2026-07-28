@@ -48,6 +48,7 @@ PRIMITIVE(Base64Decode, "Base64DecodePrimitive", NULL)  // Base64>>class decode:
 PRIMITIVE(Base64Encode, "Base64EncodePrimitive", NULL)  // Base64>>class encode: aCollection
 PRIMITIVE(Become, "BecomePrimitive", NULL)  // Object>>become: otherObject
 PRIMITIVE(BehaviorLookupSelector, "BehaviorLookupSelectorPrimitive", NULL)  // Behavior>>lookupSelector: aSymbol
+PRIMITIVE(BehaviorInstanceShape, "BehaviorInstanceShapePrimitive", primInstanceShape)  // Behavior>>instanceShape
 PRIMITIVE(BehaviorNew, "BehaviorNewPrimitive", primBasicNew)  // Behavior>>new; Behavior>>basicNew
 PRIMITIVE(BehaviorNewSize, "BehaviorNewSizePrimitive", primBasicNewSized)  // Behavior>>new: anInteger; Behavior>>basicNew: anInteger
 PRIMITIVE(BlockOnException, "BlockOnExceptionPrimitive", NULL)  // Block>>basicOn: anException do: aBlock

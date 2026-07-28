@@ -10,6 +10,8 @@
 #include "runtime/Dictionary.h"
 #include "runtime/String.h"
 #include <string.h>
+#include "jit/CompiledMethod.h"
+#include "runtime/Closure.h"
 
 // A class the system ALREADY HAS under this name, or NULL.
 //
@@ -121,15 +123,46 @@ typedef struct {
 	const char *pragma;
 	uint8_t format;
 	_Bool countsFixedSlots; // does the instance variable count go in fixedSlots
+	// A layout the VM OWNS, used exactly as given. A class carrying one of these
+	// is a Smalltalk MIRROR of a C struct, and the pragma is how the mirror says
+	// so out loud instead of a builder inferring it from a field list.
+	_Bool exact;
+	InstanceShape shape;
 } ShapeMapping;
 
-static const ShapeMapping gShapes[] = {
-	{ "FixedShape", FORMAT_POINTERS, 1 },
-	{ "IndexedShape", FORMAT_INDEXED_POINTERS, 1 },
-	{ "BytesShape", FORMAT_BYTES, 0 },
-	{ "StringShape", FORMAT_BYTES, 0 },
-	{ "FloatShape", FORMAT_NO_POINTERS, 1 },
+#define SHAPE_FROM_FORMAT(f, counts) { NULL, (f), (counts), 0, { 0, 0, 0, 0 } }
+
+static ShapeMapping gShapes[] = {
+	{ "FixedShape", FORMAT_POINTERS, 1, 0, { 0, 0, 0, 0 } },
+	{ "IndexedShape", FORMAT_INDEXED_POINTERS, 1, 0, { 0, 0, 0, 0 } },
+	{ "BytesShape", FORMAT_BYTES, 0, 0, { 0, 0, 0, 0 } },
+	{ "StringShape", FORMAT_BYTES, 0, 0, { 0, 0, 0, 0 } },
+	// One raw word holding an IEEE double, and no pointers in it: getting this
+	// wrong would have the collector chase a mantissa as an address.
+	{ "FloatShape", FORMAT_NO_POINTERS, 0, 1,
+		{ FORMAT_NO_POINTERS, 0, 0, 1 } },
+	{ "ClassShape", FORMAT_MIXED_BYTES, 0, 1, { 0, 0, 0, 0 } },
+	{ "CompiledMethodShape", FORMAT_MIXED_BYTES, 0, 1, { 0, 0, 0, 0 } },
+	{ "ClosureShape", FORMAT_INDEXED_POINTERS, 0, 1, { 0, 0, 0, 0 } },
 };
+
+
+// The three shapes above whose layout comes from a C header are filled in here
+// rather than written twice: DEFINE_SHAPE is not a constant expression the
+// initialiser above can use, and a second copy of these numbers is exactly the
+// drift the mirror check exists to prevent.
+static void shapesResolve(void)
+{
+	for (size_t i = 0; i < sizeof(gShapes) / sizeof(gShapes[0]); i++) {
+		if (strcmp(gShapes[i].pragma, "ClassShape") == 0) {
+			gShapes[i].shape = CLASS_OF_CLASSES_SHAPE;
+		} else if (strcmp(gShapes[i].pragma, "CompiledMethodShape") == 0) {
+			gShapes[i].shape = COMPILED_METHOD_SHAPE;
+		} else if (strcmp(gShapes[i].pragma, "ClosureShape") == 0) {
+			gShapes[i].shape = CLOSURE_SHAPE;
+		}
+	}
+}
 
 
 // The `<shape: X>` pragma of a class node, or NULL when it has none.
@@ -196,6 +229,22 @@ static void buildMethods(Class *class, ClassNode *node, ClassBuildError *error)
 // own: the compiler walks the superclass chain to build the slot numbering
 // (vm/compiler/Compile.c), so repeating inherited ones here would number them
 // twice.
+// A name in the variable section that starts with a CAPITAL is a CLASS
+// VARIABLE, not an instance variable. That is Smalltalk's own convention and the
+// kernel depends on it: `Character` declares `| Table |` and fills it from a
+// class-side method, and Character's instances are IMMEDIATES with no slots at
+// all, so there is nowhere for an instance variable to live.
+//
+// It becomes an Association in the class's classVariables dictionary, which is
+// the same thing a global is, so the compiler reads and writes it with the
+// instructions it already has.
+static _Bool isClassVariableName(String *name)
+{
+	return rawStringSize(name->raw) > 0 && name->raw->contents[0] >= 'A'
+		&& name->raw->contents[0] <= 'Z';
+}
+
+
 static OrderedCollection *ownInstanceVariables(ClassNode *node)
 {
 	OrderedCollection *declared = classNodeGetVars(node);
@@ -203,9 +252,56 @@ static OrderedCollection *ownInstanceVariables(ClassNode *node)
 	OrderedCollection *names = newOrdColl(count == 0 ? 1 : count);
 	for (size_t i = 0; i < count; i++) {
 		LiteralNode *variable = scopeHandle(asObject(ordCollAt(declared, i)));
-		ordCollAdd(names, objectTagged(asSymbol(literalNodeGetStringValue(variable))));
+		String *name = literalNodeGetStringValue(variable);
+		if (!isClassVariableName(name)) {
+			ordCollAdd(names, objectTagged(asSymbol(name)));
+		}
 	}
 	return names;
+}
+
+
+// The class variables a class declares, into its own dictionary, each holding
+// nil until something assigns it.
+static void declareClassVariables(Class *class, ClassNode *node)
+{
+	OrderedCollection *declared = classNodeGetVars(node);
+	size_t count = declared == NULL ? 0 : ordCollSize(declared);
+	Dictionary *variables = NULL;
+	for (size_t i = 0; i < count; i++) {
+		LiteralNode *variable = scopeHandle(asObject(ordCollAt(declared, i)));
+		String *name = literalNodeGetStringValue(variable);
+		if (!isClassVariableName(name)) {
+			continue;
+		}
+		if (variables == NULL) {
+			Value existing = class->raw->classVariables;
+			variables = valueTypeOf(existing, VALUE_POINTER)
+				? scopeHandle(asObject(existing)) : newDictionary(8);
+			rawObjectStorePtr((RawObject *) class->raw, &class->raw->classVariables,
+				(RawObject *) variables->raw);
+		}
+		symbolDictAtPut(variables, asSymbol(name), tagPtr(Handles.nil.raw));
+	}
+}
+
+
+// How many instance variables a class and its superclasses DECLARE. The mirror
+// check needs the count the compiler will number against, and that comes from
+// the declarations rather than from the shape, because a mirror's shape is the
+// C struct's and says nothing about how many names Smalltalk gave it.
+static size_t declaredVariableCount(Class *class)
+{
+	size_t count = 0;
+	for (Class *level = class; level != NULL; ) {
+		Value declared = level->raw->instanceVariables;
+		if (valueTypeOf(declared, VALUE_POINTER)) {
+			count += ordCollSize(scopeHandle(asObject(declared)));
+		}
+		Value super = level->raw->superClass;
+		level = valueTypeOf(super, VALUE_POINTER) ? scopeHandle(asObject(super)) : NULL;
+	}
+	return count;
 }
 
 
@@ -217,6 +313,7 @@ static uint16_t inheritedSlots(Class *super)
 
 Class *classBuild(ClassNode *node, ClassBuildError *error)
 {
+	shapesResolve();
 	HandleScope scope;
 	openHandleScope(&scope);
 	error->message = NULL;
@@ -270,9 +367,25 @@ Class *classBuild(ClassNode *node, ClassBuildError *error)
 	OrderedCollection *variables = ownInstanceVariables(node);
 	uint16_t ownCount = (uint16_t) ordCollSize(variables);
 
-	// The shape. No pragma means the ordinary case: named slots, all tagged.
+	// THE SHAPE IS INHERITED unless the class declares one, which is what makes
+	// `Array := ArrayedCollection [ ]` an indexed class and `Symbol := String`
+	// a byte class without either of them repeating a pragma its parent already
+	// carries. Defaulting to named-slots instead was wrong in exactly those
+	// places, and wrong in the expensive direction: the collector would have
+	// walked an Array's elements as if they were named fields.
 	String *shapeName = shapePragmaOf(node);
-	const ShapeMapping *mapping = &gShapes[0];
+	const ShapeMapping *mapping = NULL;
+	if (shapeName == NULL) {
+		for (size_t i = 0; i < sizeof(gShapes) / sizeof(gShapes[0]); i++) {
+			if (super != NULL && gShapes[i].format == super->raw->instanceShape.format) {
+				mapping = &gShapes[i];
+				break;
+			}
+		}
+		if (mapping == NULL) {
+			mapping = &gShapes[0]; // no superclass: named slots, all tagged
+		}
+	}
 	if (shapeName != NULL) {
 		mapping = NULL;
 		for (size_t i = 0; i < sizeof(gShapes) / sizeof(gShapes[0]); i++) {
@@ -293,8 +406,23 @@ Class *classBuild(ClassNode *node, ClassBuildError *error)
 	}
 	uint16_t slots = mapping->countsFixedSlots
 		? (uint16_t) (inheritedSlots(super) + ownCount) : 0;
-	InstanceShape shape = (InstanceShape)
-		DEFINE_SHAPE(mapping->format, 0, 0, slots);
+	InstanceShape shape = mapping->exact
+		? mapping->shape : (InstanceShape) DEFINE_SHAPE(mapping->format, 0, 0, slots);
+
+	// A MIRROR of a C struct has to agree with the struct, field for field, and
+	// this is where that is checked rather than hoped for. The Smalltalk side
+	// declares the tagged fields in order and the C side lays them out; adding
+	// one to either without the other shows up as a method reading the wrong
+	// slot, which is a wrong answer and not a crash.
+	if (shapeName != NULL && stringEqualsC(shapeName, "ClassShape")) {
+		size_t declared = ownCount + declaredVariableCount(super);
+		if (declared > CLASS_TAGGED_FIELDS) {
+			fail(error, "the class mirror declares more fields than RawClass has",
+				name);
+			closeHandleScope(&scope, NULL);
+			return NULL;
+		}
+	}
 
 	// REOPENING, which is the common case for the kernel: the built-in classes
 	// already exist, and packages/Core defines them again with their real
@@ -320,6 +448,7 @@ Class *classBuild(ClassNode *node, ClassBuildError *error)
 	}
 	rawObjectStorePtr((RawObject *) class->raw, &class->raw->instanceVariables,
 		(RawObject *) variables->raw);
+	declareClassVariables(class, node);
 	methodsOf(class);
 
 	buildMethods(class, node, error);

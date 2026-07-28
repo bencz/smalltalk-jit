@@ -733,7 +733,7 @@ int main(void)
 		printf("        primitives: %zu of %zu declared by packages/ are implemented\n",
 			implemented, declared);
 		check("every name packages/ uses is declared here, plus the one the built-in "
-				"kernel needs and packages/ does not", declared == 174);
+				"kernel needs and packages/ does not", declared == 175);
 	}
 
 	// ---- closures, at the bytecode level ------------------------------------

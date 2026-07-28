@@ -760,6 +760,29 @@ static Place resolveName(Emitter *e, String *name)
 		}
 	}
 
+	// CLASS VARIABLES, which sit between instance variables and globals for the
+	// same reason they do in every Smalltalk: they are shared by a class and its
+	// subclasses, and they shadow a global of the same name.
+	//
+	// One is an Association, exactly like a global, so nothing new is emitted to
+	// read or write it: the difference is only where the Association was found.
+	for (Class *level = e->context->ownerClass; level != NULL; ) {
+		Value variables = level->raw->classVariables;
+		if (valueTypeOf(variables, VALUE_POINTER)) {
+			Dictionary *dictionary = scopeHandle(asObject(variables));
+			String *key = scopeHandle(symbol);
+			Association *association = symbolDictAssocAt(dictionary, key);
+			if (association != NULL) {
+				place.kind = PLACE_GLOBAL;
+				place.index = literalIndex(e, objectTagged(association));
+				return place;
+			}
+			symbol = symbolOf(key); // the lookup may have moved it
+		}
+		Value super = level->raw->superClass;
+		level = valueTypeOf(super, VALUE_POINTER) ? scopeHandle(asObject(super)) : NULL;
+	}
+
 	if (e->context->globals != NULL) {
 		String *key = scopeHandle(symbol);
 		Association *association = symbolDictAssocAt(e->context->globals, key);

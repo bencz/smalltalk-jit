@@ -1,5 +1,9 @@
 Class := ClassDescription [
 
+	"The last five tagged fields of RawClass. See the note in Behavior.st."
+
+	<shape: ClassShape>
+
 	| name comment category classVariables namespace |
 
 

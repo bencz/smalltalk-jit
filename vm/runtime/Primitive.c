@@ -742,6 +742,25 @@ static Value primClosureValue2(Value *args, uint64_t argc)
 }
 
 
+// The packed shape word of a class, which Smalltalk cannot read as a field:
+// jit-v2 keeps it in the class's RAW TRAILER so the collector never walks it
+// (ADR 0005), and that is exactly the kind of thing a primitive is for.
+static Value primInstanceShape(Value *args, uint64_t argc)
+{
+	if (argc != 0) {
+		return PRIMITIVE_FAILED;
+	}
+	Class *class = receiverAsClass(primitiveReceiver(args));
+	if (class == NULL) {
+		return PRIMITIVE_FAILED;
+	}
+	InstanceShape shape = class->raw->instanceShape;
+	uint64_t packed;
+	memcpy(&packed, &shape, sizeof(packed) < sizeof(shape) ? sizeof(packed) : sizeof(shape));
+	return tagInt((intptr_t) (packed & 0x3FFFFFFFFFFFFFFFull));
+}
+
+
 // ---------------------------------------------------------------------------
 // Showing a value, before there is a kernel that can
 // ---------------------------------------------------------------------------
