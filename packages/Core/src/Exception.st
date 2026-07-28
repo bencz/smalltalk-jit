@@ -159,8 +159,22 @@ Exception := Object [
 	 value of the signal expression and execution continues at the signal
 	 point."
 	defaultAction [
+		"THE LAST RESORT, so nothing in here may raise.
+
+		 defaultAction is what runs when NOBODY handled the exception, and an
+		 exception raised inside it has nowhere left to go but defaultAction
+		 again. Both statements below were exactly that: signalingContext answers
+		 `self notYetImplemented` until the ADR 0008 materialiser exists, and
+		 noteUnhandled was a primitive with an empty body, so each one raised and
+		 re-entered here. Every unhandled error in the system died of stack
+		 exhaustion instead of being reported, which is a SEGFAULT where the
+		 design says print-and-exit-non-zero.
+
+		 The backtrace is GUARDED rather than removed: it comes back for free the
+		 day a Context can be materialised, and until then a missing backtrace is
+		 worth strictly less than the message, which still prints."
 		Transcript nextPutAll: self messageText; lf.
-		self signalingContext printBacktrace.
+		[self signalingContext printBacktrace] on: Error do: [ :ignored | ].
 		"Count this death so main folds it into a nonzero process exit code
 		 (non-interactive runs): a test can no longer print a backtrace and
 		 still report success. Resumable defaults (Warning) never reach here."

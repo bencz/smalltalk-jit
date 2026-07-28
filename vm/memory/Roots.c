@@ -32,3 +32,13 @@ void rootsVisitUnwindRecords(struct Thread *thread, RootVisitor visit, void *ctx
 	(void) visit;
 	(void) ctx;
 }
+
+
+// No scheduler linked: there are no fibers besides the one this thread is
+// running, and its roots are the Thread's (memory/Roots.h).
+__attribute__((weak))
+void rootsVisitFibers(RootVisitor visit, void *ctx)
+{
+	(void) visit;
+	(void) ctx;
+}

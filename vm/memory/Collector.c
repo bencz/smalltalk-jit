@@ -49,6 +49,9 @@ void collectorVisitRoots(Heap *heap, RootVisitor visit, void *ctx)
 	// Literal frames and inline-cache selectors: heap references that compiled
 	// code holds outside the heap, so nothing else reaches them (memory/Roots.h).
 	rootsVisitCompiledCode(visit, ctx);
+	// Every fiber that is not running: its state moved into the Fiber when it
+	// switched off, so nothing else can reach it (memory/Roots.h).
+	rootsVisitFibers(visit, ctx);
 
 	for (size_t i = 0; i < gExtraRootCount; i++) {
 		if (valueTypeOf(gExtraRoots[i], VALUE_POINTER)) {

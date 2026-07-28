@@ -165,6 +165,7 @@ set(vmSources
 	vm/compiler/Tokenizer.c
 	vm/concurrency/Fiber.c
 	vm/concurrency/FiberSwitchX64.c
+	vm/concurrency/Scheduler.c
 	vm/core/Class.c
 	vm/core/ClassTable.c
 	vm/core/Handle.c
@@ -211,6 +212,7 @@ set(vmSources
 	vm/runtime/primitives/Indexed.c
 	vm/runtime/primitives/Method.c
 	vm/runtime/primitives/PrintValue.c
+	vm/runtime/primitives/Process.c
 	vm/runtime/primitives/Reflect.c
 	vm/runtime/primitives/Streams.c
 	vm/runtime/primitives/System.c

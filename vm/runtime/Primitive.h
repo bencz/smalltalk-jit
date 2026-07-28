@@ -124,4 +124,11 @@ void primitiveCoverage(size_t *implemented, size_t *declared);
 PrimitiveFunction primitiveFunctionAt(PrimitiveNumber number);
 const char *primitiveName(PrimitiveNumber number);
 
+// How many exceptions reached Exception>>defaultAction without a handler.
+//
+// Declared here because main.c is the only reader and the exit code is the only
+// use: a process whose Smalltalk died must not exit zero. Read-only; the
+// read-AND-CLEAR form is the kernel's takeUnhandledErrorCount.
+size_t primitiveUnhandledErrorCount(void);
+
 #endif

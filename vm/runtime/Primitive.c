@@ -55,8 +55,11 @@
 // state every absent primitive is in, and the method runs its Smalltalk
 // fallback.
 //
-// A front-end-dependent primitive added WITHOUT a default here is a link error
-// in levels 3 and 7, which is the loud failure and the intended one.
+// The SCHEDULER is the same shape: concurrency/Scheduler.c owns the fibers, and
+// levels 3 and 7 prove the JIT and the primitives with no scheduler at all.
+//
+// A dependent primitive added WITHOUT a default here is a link error in levels
+// 3 and 7, which is the loud failure and the intended one.
 #define WEAK_FRONTEND_PRIMITIVE(name) \
 	__attribute__((weak)) Value name(Value *args, uint64_t argc) \
 	{ \
@@ -74,6 +77,13 @@ WEAK_FRONTEND_PRIMITIVE(primDefaultNamespace)
 WEAK_FRONTEND_PRIMITIVE(primSetDefaultNamespace)
 WEAK_FRONTEND_PRIMITIVE(primBuildClassIn)
 WEAK_FRONTEND_PRIMITIVE(primCompileMethodIn)
+WEAK_FRONTEND_PRIMITIVE(primProcessSpawn)
+WEAK_FRONTEND_PRIMITIVE(primProcessCurrentId)
+WEAK_FRONTEND_PRIMITIVE(primProcessYield)
+WEAK_FRONTEND_PRIMITIVE(primProcessSuspend)
+WEAK_FRONTEND_PRIMITIVE(primProcessSleep)
+WEAK_FRONTEND_PRIMITIVE(primProcessResume)
+WEAK_FRONTEND_PRIMITIVE(primProcessTerminate)
 
 
 // Designated initialisers, so the array is indexed by the enum and a primitive

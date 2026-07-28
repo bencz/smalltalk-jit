@@ -178,6 +178,10 @@ Apendar, nunca reescrever. Data, commit, o que destravou.
 | 2026-07-28 | 10 | (nao commitado) | `printNl` contra o Core DE VERDADE: 5 bugs, nenhum na pilha de streams, 98 de 98 |
 | 2026-07-28 | **11** | (nao commitado) | imagem: 1,1 MB, recarrega e RODA, e salvar-carregar-salvar e byte-identico |
 | 2026-07-28 | 11 | (nao commitado) | `Primitive.c` quebrado em 14 dominios: 1730 -> 104 linhas, gate 0..11 verde, 66 de 175 e 109 de 109 |
+| 2026-07-28 | 11 | (nao commitado) | `-Wall -Wextra -Werror` de verdade nos dois builds: 93 erros, um deles `classVariableScope` implicito em main.c |
+| 2026-07-28 | 11 | (nao commitado) | filesystem + `StreamOpen` (10 prims) no seam de OS; `st build` ligado ao ProjectTool |
+| 2026-07-28 | 11 | (nao commitado) | compilador reflexivo (5 prims) + classes de AST NOMEADAS: o Core reabre as do bootstrap em vez de criar segundas |
+| 2026-07-28 | **12** | (nao commitado) | namespaces (cadeia propria -> imports -> Core), `Namespaces`/`Smalltalk`, `MethodSend`, `GetEnv`: os 4 pacotes E samples geram imagem, 88 de 175 |
 
 ## O que o nivel 7 encontrou, e por que so ele podia encontrar
 

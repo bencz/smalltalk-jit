@@ -136,7 +136,7 @@ ClassNode *parseClass(Parser *parser)
 	HandleScope scope;
 	openHandleScope(&scope);
 
-	ClassNode *class = newObject(&Handles.ClassNode, 0);
+	ClassNode *class = newAstNode(&Handles.ClassNode);
 	SourceCode *sourceCode = createSourceCode(parser, 0);
 	OrderedCollection *tmp;
 
@@ -234,8 +234,8 @@ MethodNode *parseMethod(Parser *parser)
 	HandleScope scope;
 	openHandleScope(&scope);
 
-	MethodNode *method = newObject(&Handles.MethodNode, 0);
-	BlockNode *block = newObject(&Handles.BlockNode, 0);
+	MethodNode *method = newAstNode(&Handles.MethodNode);
+	BlockNode *block = newAstNode(&Handles.BlockNode);
 	SourceCode *sourceCode = createSourceCode(parser, 0);
 	OrderedCollection *args = newOrdColl(16);
 	Object *tmp;
@@ -486,7 +486,7 @@ static ExpressionNode *parseExpression(Parser *parser)
 	HandleScope scope;
 	openHandleScope(&scope);
 
-	ExpressionNode *expression = newObject(&Handles.ExpressionNode, 0);
+	ExpressionNode *expression = newAstNode(&Handles.ExpressionNode);
 	SourceCode *sourceCode = createSourceCode(parser, 0);
 	Object *receiver;
 	OrderedCollection *messageExpressions;
@@ -599,7 +599,7 @@ static Object *parseUnaryObject(Parser *parser)
 
 static ExpressionNode *convertToExpression(LiteralNode *literal, MessageExpressionNode *messageExpression)
 {
-	ExpressionNode *expression = newObject(&Handles.ExpressionNode, 0);
+	ExpressionNode *expression = newAstNode(&Handles.ExpressionNode);
 	OrderedCollection *messageExpressions = newOrdColl(8);
 
 	expressionNodeSetSourceCode(expression, literalNodeGetSourceCode(literal));
@@ -675,7 +675,7 @@ BlockNode *parseBlock(Parser *parser)
 	HandleScope scope;
 	openHandleScope(&scope);
 
-	BlockNode *block = newObject(&Handles.BlockNode, 0);
+	BlockNode *block = newAstNode(&Handles.BlockNode);
 	SourceCode *sourceCode = createSourceCode(parser, 0);
 	Object *tmp;
 
@@ -943,7 +943,7 @@ static Value buildScaledDecimalLiteral(const char *str, _Bool negative)
 
 static LiteralNode *parseNumber(Parser *parser, int8_t sign)
 {
-	LiteralNode *literal = newObject(&Handles.IntegerNode, 0);
+	LiteralNode *literal = newAstNode(&Handles.IntegerNode);
 	literalNodeSetSourceCode(literal, createSourceCode(parser, 1));
 
 	Token *token = currentToken(&parser->tokenizer);
@@ -1013,7 +1013,7 @@ static SignedValue parseInteger(Parser *parser)
  */
 static LiteralNode *parseSymbol(Parser *parser)
 {
-	LiteralNode *literal = newObject(&Handles.SymbolNode, 0);
+	LiteralNode *literal = newAstNode(&Handles.SymbolNode);
 	Token *token;
 
 	NEXT_EXPECT_TOKEN(token, TOKEN_IDENTIFIER | TOKEN_KEYWORD | SPECIAL_CHARS_TOKENS | TOKEN_STRING, NULL);
@@ -1046,7 +1046,7 @@ static LiteralNode *parseSymbol(Parser *parser)
  */
 static LiteralNode *parseString(Parser *parser)
 {
-	LiteralNode *literal = newObject(&Handles.StringNode, 0);
+	LiteralNode *literal = newAstNode(&Handles.StringNode);
 	literalNodeSetValue(literal, (Object *) stringFromC(currentToken(&parser->tokenizer)->content));
 	literalNodeSetSourceCode(literal, createSourceCode(parser, 1));
 	nextToken(&parser->tokenizer);
@@ -1060,7 +1060,7 @@ static LiteralNode *parseString(Parser *parser)
 static LiteralNode *parseChar(Parser *parser)
 {
 	Token *token = currentToken(&parser->tokenizer);
-	LiteralNode *literal = newObject(&Handles.CharacterNode, 0);
+	LiteralNode *literal = newAstNode(&Handles.CharacterNode);
 	literalNodeSetSourceCode(literal, createSourceCode(parser, 1));
 	if (strcmp("$<", token->content) == 0 && peekToken(&parser->tokenizer)->type == TOKEN_DIGIT) {
 		nextToken(&parser->tokenizer);
@@ -1084,7 +1084,7 @@ static LiteralNode *parseArray(Parser *parser)
 	HandleScope scope;
 	openHandleScope(&scope);
 
-	LiteralNode *arrayLiteral = newObject(&Handles.ArrayNode, 0);
+	LiteralNode *arrayLiteral = newAstNode(&Handles.ArrayNode);
 	SourceCode *sourceCode = createSourceCode(parser, 0);
 	OrderedCollection *array = newOrdColl(16);
 
@@ -1264,7 +1264,7 @@ static MessageExpressionNode *parseKeywordExpression(Parser *parser)
 
 static MessageExpressionNode *createMessageExpressionNode(String *selector, OrderedCollection *args, SourceCode *source)
 {
-	MessageExpressionNode *node = newObject(&Handles.MessageExpressionNode, 0);
+	MessageExpressionNode *node = newAstNode(&Handles.MessageExpressionNode);
 	messageExpressionNodeSetSelector(node, selector);
 	messageExpressionNodeSetArgs(node, args);
 	messageExpressionNodeSetSourceCode(node, source);

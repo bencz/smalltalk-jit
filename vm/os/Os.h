@@ -48,6 +48,14 @@ int64_t osMonotonicNanos(void);
 // instant. Takes the instant because the answer is DST-dependent.
 int64_t osLocalUtcOffsetSeconds(int64_t epochSeconds);
 
+// Block this OS THREAD for at least `nanos`. Interrupted sleeps are resumed
+// inside the layer, so a signal does not cut a sleep short.
+//
+// It blocks the thread, not a fiber: the scheduler calls it only when there is
+// no other fiber that could run, because with one there is always something
+// better to do than wait (concurrency/Scheduler.c).
+void osSleepNanos(int64_t nanos);
+
 // ---- entropy ----------------------------------------------------------------
 
 // Fill buffer with `size` cryptographically strong random bytes (blocking

@@ -51,12 +51,35 @@ typedef enum {
 // The slice of VM execution state that belongs to a fiber rather than to the
 // OS thread. These hold the live values while the fiber runs and the saved ones
 // while it is suspended, and they are roots in BOTH cases.
+struct CompiledFrameGuard;
+struct UnwindRecord;
+
 typedef struct FiberRoots {
 	struct EntryStackFrame *stackFramesTail; // native frame chain, the deep root set
 	struct HandleScope *handleScopes;
 	Value context;
 	Value exceptionHandler;
 	Value unwindHandler;
+
+	// The three chains core/Thread.h marked PENDING(fibers), moved here when the
+	// scheduler arrived. Every one of them is a list whose entries live on THIS
+	// fiber's C stack, so leaving them in the Thread across a switch would have
+	// the next fiber walking, popping and asserting on records that belong to a
+	// stack it is not standing on.
+	//
+	// It is not theoretical: the first version of the scheduler saved the five
+	// fields above and not these, and the compiled-frame guard's own
+	// `ASSERT(CurrentThread.compiledFrames == guard)` fired on the first fork.
+	struct CompiledFrameGuard *compiledFrames;
+	struct UnwindRecord *unwinds;
+	uint64_t homeToken;
+
+	// nextHomeToken is DELIBERATELY NOT HERE and stays in the Thread. It is a
+	// MINTER, and a token has to be unique across every fiber: two fibers each
+	// minting from their own counter would hand out the same number twice, and a
+	// non-local return carrying one would then match an activation in the wrong
+	// fiber. That is the "an address is reused, a counter is not" argument that
+	// put a token here in the first place (docs/jit-v2/01-gate.md).
 } FiberRoots;
 
 typedef void (*FiberEntry)(void *arg);

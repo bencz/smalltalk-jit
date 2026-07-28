@@ -46,6 +46,25 @@ static _Bool evalValue(const char *source, const char *what, Value *answer);
 static int evalToInt(const char *code);
 
 
+// Fold the VM's unhandled-error count into an exit status.
+//
+// A Smalltalk process that died of an exception nobody handled has already
+// printed it and been killed, and NOTHING ELSE makes the process exit non-zero:
+// the file still ran to its end and answered whatever its last statement did.
+// Without this an assertion-style test can print a backtrace and still report
+// success, which makes every green run in the suite meaningless.
+//
+// A status that is already non-zero is kept: it is more specific than "one of
+// the processes died".
+static int foldUnhandledErrors(int status)
+{
+	if (status != 0) {
+		return status;
+	}
+	return primitiveUnhandledErrorCount() > 0 ? 1 : 0;
+}
+
+
 static int notPortedYet(const char *what, const char *needs)
 {
 	fprintf(stderr, "st: %s is not ported to jit-v2 yet (it needs %s)\n", what, needs);
@@ -181,7 +200,7 @@ static int readImage(const char *path, _Bool explicitlyNamed)
 // would be a second path through the compiler that nothing else exercises.
 static Value runBody(BlockNode *body, const char *what, int *failed)
 {
-	MethodNode *node = newObject(&Handles.MethodNode, 0);
+	MethodNode *node = newAstNode(&Handles.MethodNode);
 	methodNodeSetSelector(node, stringFromC("doIt"));
 	methodNodeSetBody(node, body);
 
@@ -519,10 +538,10 @@ int main(int argc, char **argv)
 			return evalToInt("^ProjectTool scaffold");
 		}
 		if (strcmp(name, "run") == 0) {
-			return evalToInt("^ProjectTool run");
+			return foldUnhandledErrors(evalToInt("^ProjectTool run"));
 		}
 		if (strcmp(name, "test") == 0) {
-			return runProjectTests();
+			return foldUnhandledErrors(runProjectTests());
 		}
 		fprintf(stderr, "st: unknown subcommand '%s'\n", name);
 		return EXIT_FAILURE;
@@ -557,7 +576,7 @@ int main(int argc, char **argv)
 		// The image is written BEFORE the expression runs, so it holds the package
 		// as built and not as some probe left it.
 		if (cliArgs.eval != NULL) {
-			return evaluate(cliArgs.eval);
+			return foldUnhandledErrors(evaluate(cliArgs.eval));
 		}
 		if (!cliArgs.snapshotExplicit) {
 			fprintf(stderr, "st: nothing was saved; name an image with -s to write "
@@ -583,10 +602,10 @@ int main(int argc, char **argv)
 	}
 
 	if (cliArgs.fileName != NULL) {
-		return runFile(cliArgs.fileName);
+		return foldUnhandledErrors(runFile(cliArgs.fileName));
 	}
 	if (cliArgs.eval != NULL) {
-		return evaluate(cliArgs.eval);
+		return foldUnhandledErrors(evaluate(cliArgs.eval));
 	}
 	printCliHelp();
 	return 0;

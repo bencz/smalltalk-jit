@@ -327,6 +327,18 @@ static int countCellOps(const CodeUnit *unit)
 }
 
 
+static int countOpcode(const CodeUnit *unit, Opcode wanted)
+{
+	int count = 0;
+	for (uint16_t i = 0; i < unit->instructionCount; i++) {
+		if ((Opcode) unit->code[i].op == wanted) {
+			count++;
+		}
+	}
+	return count;
+}
+
+
 static int countClosureOps(const CodeUnit *unit)
 {
 	int count = 0;
@@ -507,6 +519,68 @@ int main(void)
 	checkInt("to:do: answers its receiver",
 		call0(define(counter, "toDoValue [ ^1 to: 3 do: [ :i | i ] ]"),
 			objectTagged(instance)), 1);
+	// ---- THE BOOLEAN GUARD ON EVERY INLINED FORM ----------------------------
+	//
+	// Inlined control flow tests a value that the compiler has NOT proved is a
+	// Boolean, so every one of these forms has to handle three cases: true,
+	// false, and neither. The third is a `mustBeBoolean` send.
+	//
+	// THIS SECTION EXISTS BECAUSE THE LOOPS WERE MISSING IT. `emitWhile` emitted
+	// ONE jump -- leave when false -- so nil, an integer, anything not false
+	// FELL INTO THE BODY, and `[] whileTrue` spun forever. The conditionals had
+	// the pair from the start, which is exactly why the asymmetry survived: the
+	// forms were never checked against each other.
+	//
+	// It is checked on the BYTECODE and not by running it, and that is the
+	// point rather than convenience: a conditional that gets this wrong answers
+	// the wrong arm once, and a LOOP that gets it wrong never returns. A
+	// behavioural check for the loop case would not fail, it would HANG, and a
+	// gate that hangs reports nothing at all.
+	printf("\n  -- the boolean guard, on every inlined form\n");
+	{
+		static const struct { const char *what; const char *source; } forms[] = {
+			{ "ifTrue:", "gIfTrue [ ^self ifTrue: [ 1 ] ]" },
+			{ "ifFalse:", "gIfFalse [ ^self ifFalse: [ 1 ] ]" },
+			{ "ifTrue:ifFalse:", "gIfBoth [ ^self ifTrue: [ 1 ] ifFalse: [ 2 ] ]" },
+			{ "and:", "gAnd [ ^self and: [ true ] ]" },
+			{ "or:", "gOr [ ^self or: [ true ] ]" },
+			{ "whileTrue:", "gWhileT [ | b | b := 0. [ self ] whileTrue: [ b := 1 ]. ^b ]" },
+			{ "whileFalse:", "gWhileF [ | b | b := 0. [ self ] whileFalse: [ b := 1 ]. ^b ]" },
+			{ "whileTrue", "gWhileT0 [ [ self ] whileTrue. ^1 ]" },
+			{ "whileFalse", "gWhileF0 [ [ self ] whileFalse. ^1 ]" },
+		};
+		for (size_t i = 0; i < sizeof forms / sizeof forms[0]; i++) {
+			NativeCode *code = define(counter, forms[i].source);
+			const CodeUnit *unit = code->unit;
+			int jumpTrue = countOpcode(unit, OP_JUMPTRUE);
+			int jumpFalse = countOpcode(unit, OP_JUMPFALSE);
+			char message[160];
+			snprintf(message, sizeof message,
+				"%s tests BOTH senses and sends mustBeBoolean for neither",
+				forms[i].what);
+			// BOTH jumps AND the send. Either one alone is satisfiable by an
+			// emitter that still falls through on a non-Boolean.
+			check(message, jumpTrue >= 1 && jumpFalse >= 1
+				&& sendsSelector(unit, "mustBeBoolean"));
+		}
+	}
+
+	// The guard must not have cost the ordinary paths anything, so the same
+	// forms are run for their VALUES too. Without this the section above is
+	// satisfiable by an emitter that guards correctly and loops wrongly.
+	checkInt("a guarded whileTrue: still counts up",
+		call0(define(counter,
+			"guardedSum [ | i s | i := 1. s := 0. "
+			"[ i <= 10 ] whileTrue: [ s := s + i. i := i + 1 ]. ^s ]"),
+			objectTagged(instance)), 55);
+	// `<` and not `>=`: this level compiles against a minimal class that defines
+	// only what it needs, and the derived comparisons live in Magnitude, which
+	// is packages/Core and is not here.
+	checkInt("a guarded whileFalse: still terminates",
+		call0(define(counter,
+			"guardedFalse [ | i | i := 0. [ 3 < i ] whileFalse: [ i := i + 1 ]. ^i ]"),
+			objectTagged(instance)), 4);
+
 	checkInt("a nested loop, so the register stack has to unwind correctly",
 		call0(define(counter,
 			"nested [ | n | n := 0. 1 to: 4 do: [ :i | 1 to: 5 do: [ :j | n := n + 1 ] ]. ^n ]"),

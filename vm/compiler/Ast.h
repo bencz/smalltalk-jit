@@ -9,6 +9,41 @@
 #include "runtime/Dictionary.h"
 #include "core/Handle.h"
 #include "core/Smalltalk.h"
+#include "memory/ObjectWalk.h"
+
+// A syntax-tree node, with every slot the parser does not fill set to NIL.
+//
+// THIS IS THE BOUNDARY WHERE THE SMALLTALK RULE STARTS APPLYING, the same one
+// `Object new` crosses in runtime/primitives/Allocation.c. Inside the VM an
+// unset slot holds the allocator's ZERO and means ABSENT; in Smalltalk there is
+// no zero, only nil. An AST node used to be C-side only, so zero was fine.
+//
+// It stopped being fine the moment the node classes were NAMED and packages/Core
+// reopened them (tools/Bootstrap.c), because the image now reads these slots.
+// It cost exactly one bug, and a wide one: ClassNode>>isNamespace answers
+// `members notNil`, the parser leaves `members` unset for an ordinary class, and
+// zero is not nil -- so EVERY class node answered "I am a namespace", and
+// PackageLoader skips `classes add:` for a namespace. The result was that no
+// class-side `initialize` of any package ever ran, which is a wrong answer with
+// no error anywhere.
+//
+// The C accessors in this file already answer NULL for an unset slot, so they
+// are unaffected either way; this is for the reader that is not C.
+//
+// nil is IMMORTAL, so storing it needs no write barrier.
+// `void *`, exactly like newObject, so a caller keeps assigning to its own node
+// type without a cast at each of the thirteen call sites.
+static inline void *newAstNode(Class *class)
+{
+	Object *node = newObject(class, 0);
+	size_t count;
+	Value *slots = objectPointerSlots(&CurrentThread.heap->classes, node->raw,
+		&count);
+	for (size_t i = 0; i < count; i++) {
+		slots[i] = tagPtr(Handles.nil.raw);
+	}
+	return node;
+}
 
 typedef struct
 {

@@ -1275,12 +1275,29 @@ static void emitConditional(Emitter *e, uint16_t testReg, BlockNode *whenTrue,
 static void emitShortCircuit(Emitter *e, uint16_t testReg, BlockNode *rest,
 	_Bool isAnd, uint16_t dest)
 {
-	uint16_t skip = emitJumpForward(e, isAnd ? OP_JUMPFALSE : OP_JUMPTRUE, testReg);
+	// BOTH senses, then mustBeBoolean, exactly as emitConditional and emitWhile
+	// do. With one jump, anything that is not false FELL THROUGH into the rest,
+	// so `nil and: [true]` answered TRUE -- a wrong answer with no error, which
+	// is worse than the loop that hung on the same mistake.
+	uint16_t toRest = emitJumpForward(e, isAnd ? OP_JUMPTRUE : OP_JUMPFALSE, testReg);
+	uint16_t toShort = emitJumpForward(e, isAnd ? OP_JUMPFALSE : OP_JUMPTRUE, testReg);
+
+	uint16_t mark = e->top;
+	uint16_t base = allocRegister(e);
+	emit(e, OP_MOVE, 0, base, testReg, 0);
+	emit(e, OP_SEND, 0, dest, selectorIndex(e, stringFromC("mustBeBoolean")), base);
+	releaseTo(e, mark);
+	uint16_t overNonBoolean = emitJumpForward(e, OP_JUMP, 0);
+
+	patchHere(e, toRest);
 	emitInlineBlock(e, rest, dest, 1);
 	uint16_t done = emitJumpForward(e, OP_JUMP, 0);
-	patchHere(e, skip);
+
+	patchHere(e, toShort);
 	emit(e, isAnd ? OP_LOADFALSE : OP_LOADTRUE, 0, dest, 0, 0);
+
 	patchHere(e, done);
+	patchHere(e, overNonBoolean);
 }
 
 
@@ -1375,7 +1392,29 @@ static void emitWhile(Emitter *e, BlockNode *condition, BlockNode *body,
 	uint16_t mark = e->top;
 	uint16_t test = allocRegister(e);
 	emitInlineBlock(e, condition, test, 1);
-	uint16_t exit = emitJumpForward(e, whileTrue ? OP_JUMPFALSE : OP_JUMPTRUE, test);
+
+	// BOTH senses are tested, exactly as emitConditional does, and the third
+	// case is a message rather than a branch.
+	//
+	// One jump is not enough and the difference is not cosmetic: with only
+	// "leave when false", anything that is not false FALLS INTO THE BODY, so
+	// `[] whileTrue` and `[1] whileTrue` spun forever instead of raising. A
+	// conditional that got this wrong answers the wrong arm once; a loop that
+	// gets it wrong never comes back, which is why it showed up as a test that
+	// hung rather than one that failed.
+	uint16_t toBody = emitJumpForward(e, whileTrue ? OP_JUMPTRUE : OP_JUMPFALSE, test);
+	uint16_t toExit = emitJumpForward(e, whileTrue ? OP_JUMPFALSE : OP_JUMPTRUE, test);
+
+	// Neither true nor false: tell the receiver so, by the only means Smalltalk
+	// has. `test` is still live here, so the register is released after.
+	uint16_t nonBooleanMark = e->top;
+	uint16_t base = allocRegister(e);
+	emit(e, OP_MOVE, 0, base, test, 0);
+	emit(e, OP_SEND, 0, dest, selectorIndex(e, stringFromC("mustBeBoolean")), base);
+	releaseTo(e, nonBooleanMark);
+	uint16_t overNonBoolean = emitJumpForward(e, OP_JUMP, 0);
+
+	patchHere(e, toBody);
 	releaseTo(e, mark);
 
 	if (body != NULL) {
@@ -1385,7 +1424,8 @@ static void emitWhile(Emitter *e, BlockNode *condition, BlockNode *body,
 		releaseTo(e, mark);
 	}
 	emit(e, OP_JUMP, 0, loop, 0, 0);
-	patchHere(e, exit);
+	patchHere(e, toExit);
+	patchHere(e, overNonBoolean);
 	emitNil(e, dest); // whileTrue: answers nil
 }
 

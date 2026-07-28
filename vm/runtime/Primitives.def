@@ -74,8 +74,8 @@ PRIMITIVE(BlockValue, "BlockValuePrimitive", primClosureValue)  // Block>>value
 PRIMITIVE(BlockValue1, "BlockValuePrimitive1", primClosureValue1)  // Block>>value: arg
 PRIMITIVE(BlockValue2, "BlockValuePrimitive2", primClosureValue2)  // Block>>value: arg1 value: arg2
 PRIMITIVE_ABSENT(BlockValue3, "BlockValuePrimitive3")  // Block>>value: arg1 value: arg2 value: arg3
-PRIMITIVE_ABSENT(BlockWhileTrue2, "BlockWhileTrue2Primitive")  // Block>>whileTrue: aBlock
-PRIMITIVE_ABSENT(BlockWhileTrue, "BlockWhileTruePrimitive")  // Block>>whileTrue
+PRIMITIVE(BlockWhileTrue2, "BlockWhileTrue2Primitive", primBlockWhileTrue2)  // Block>>whileTrue: aBlock
+PRIMITIVE(BlockWhileTrue, "BlockWhileTruePrimitive", primBlockWhileTrue)  // Block>>whileTrue
 PRIMITIVE(BuildClassIn, "BuildClassInPrimitive", primBuildClassIn)  // Compiler>>basicBuildClass: aClassNode in: aNamespace
 PRIMITIVE(BuildClass, "BuildClassPrimitive", primBuildClass)  // Compiler>>basicBuildClass: aClassNode
 PRIMITIVE(CharacterCode, "CharacterCodePrimitive", primCharacterCode)  // Character>>codePoint
@@ -182,13 +182,13 @@ PRIMITIVE(ParseMethodOrBlock, "ParseMethodOrBlockPrimitive", primParseMethodOrBl
 PRIMITIVE(ParseMethod, "ParseMethodPrimitive", primParseMethod)  // Parser>>basicParseMethod
 PRIMITIVE(PrintHeap, "PrintHeapPrimitive", primPrintHeap)  // GarbageCollector>>class printHeap
 PRIMITIVE(PrintValue, "PrintValuePrimitive", primPrintValue)  // the BUILT-IN kernel's Object>>printNl, see the note at the top
-PRIMITIVE_ABSENT(ProcessCurrentId, "ProcessCurrentIdPrimitive")  // ProcessorScheduler>>currentId
-PRIMITIVE_ABSENT(ProcessResume, "ProcessResumePrimitive")  // ProcessorScheduler>>resumeId: anId
-PRIMITIVE_ABSENT(ProcessSleep, "ProcessSleepPrimitive")  // ProcessorScheduler>>sleepMicroseconds: micros
-PRIMITIVE_ABSENT(ProcessSpawn, "ProcessSpawnPrimitive")  // Block>>basicSpawn
-PRIMITIVE_ABSENT(ProcessSuspend, "ProcessSuspendPrimitive")  // ProcessorScheduler>>suspendCurrent
-PRIMITIVE_ABSENT(ProcessTerminate, "ProcessTerminatePrimitive")  // ProcessorScheduler>>terminateId: anId
-PRIMITIVE_ABSENT(ProcessYield, "ProcessYieldPrimitive")  // ProcessorScheduler>>yield
+PRIMITIVE(ProcessCurrentId, "ProcessCurrentIdPrimitive", primProcessCurrentId)  // ProcessorScheduler>>currentId
+PRIMITIVE(ProcessResume, "ProcessResumePrimitive", primProcessResume)  // ProcessorScheduler>>resumeId: anId
+PRIMITIVE(ProcessSleep, "ProcessSleepPrimitive", primProcessSleep)  // ProcessorScheduler>>sleepMicroseconds: micros
+PRIMITIVE(ProcessSpawn, "ProcessSpawnPrimitive", primProcessSpawn)  // Block>>basicSpawn
+PRIMITIVE(ProcessSuspend, "ProcessSuspendPrimitive", primProcessSuspend)  // ProcessorScheduler>>suspendCurrent
+PRIMITIVE(ProcessTerminate, "ProcessTerminatePrimitive", primProcessTerminate)  // ProcessorScheduler>>terminateId: anId
+PRIMITIVE(ProcessYield, "ProcessYieldPrimitive", primProcessYield)  // ProcessorScheduler>>yield
 PRIMITIVE_ABSENT(RandomBytes, "RandomBytesPrimitive")  // Random>>primitiveRandomBytes: aByteArray; System>>class primitiveRandomBytes: aByteArray
 PRIMITIVE_ABSENT(ReplaceBytes, "ReplaceBytesPrimitive")
 PRIMITIVE(SetDefaultNamespace, "SetDefaultNamespacePrimitive", primSetDefaultNamespace)  // Namespace>>class default: aNamespace
@@ -218,6 +218,6 @@ PRIMITIVE_ABSENT(StringSplitBy, "StringSplitByPrimitive")  // SequenceableCollec
 PRIMITIVE_ABSENT(StringStartsWithAsciiCase, "StringStartsWithAsciiCasePrimitive")  // String>>startsWithAsciiCase: aPrefix
 PRIMITIVE_ABSENT(StringToInteger, "StringToIntegerPrimitive")  // String>>asNumber
 PRIMITIVE_ABSENT(StringTrimSeparators, "StringTrimSeparatorsPrimitive")  // String>>trimSeparators
-PRIMITIVE_ABSENT(UnhandledErrorNote, "UnhandledErrorNotePrimitive")  // Exception>>noteUnhandled
-PRIMITIVE_ABSENT(UnhandledErrorTake, "UnhandledErrorTakePrimitive")  // ProcessorScheduler>>takeUnhandledErrorCount
+PRIMITIVE(UnhandledErrorNote, "UnhandledErrorNotePrimitive", primUnhandledErrorNote)  // Exception>>noteUnhandled
+PRIMITIVE(UnhandledErrorTake, "UnhandledErrorTakePrimitive", primUnhandledErrorTake)  // ProcessorScheduler>>takeUnhandledErrorCount
 PRIMITIVE_ABSENT(WorkerParallel, "WorkerParallelPrimitive")  // Worker>>class parallel: anArrayOfBlocks

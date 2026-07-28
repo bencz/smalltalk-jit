@@ -87,3 +87,56 @@ Value primBlockUnwindProtected(Value *args, uint64_t argc)
 	PRIMITIVE_DONE_ALLOCATING();
 	return answer;
 }
+
+
+// ---------------------------------------------------------------------------
+// Unhandled-error accounting
+// ---------------------------------------------------------------------------
+//
+// An exception nobody handled runs Exception>>defaultAction, which prints it
+// and kills the signalling process. The PROCESS dies; the process's exit code
+// must not stay zero, or a test that printed a backtrace still reports success
+// and the whole suite can be green while failing.
+//
+// So defaultAction bumps a counter here and main.c folds it into the exit code.
+// A counter and not a flag, because the number is worth having: "3 processes
+// died" and "1 process died" are different reports.
+//
+// THESE TWO EXIST BECAUSE THEIR ABSENCE WAS AN INFINITE RECURSION, not for
+// tidiness. `noteUnhandled` was a primitive with an EMPTY body, so it compiled
+// to `self primitiveFailed:`, which raises, which runs defaultAction, which
+// calls noteUnhandled. Every unhandled error in the system died of stack
+// exhaustion instead of being reported -- a SEGFAULT where the design says
+// "print and exit non-zero".
+static size_t gUnhandledErrors;
+
+
+Value primUnhandledErrorNote(Value *args, uint64_t argc)
+{
+	if (argc != 0) {
+		return PRIMITIVE_FAILED;
+	}
+	gUnhandledErrors++;
+	return primitiveReceiver(args);
+}
+
+
+// Read AND CLEAR, which is what the kernel's name says. A test harness that
+// deliberately provokes an unhandled error takes the count to acknowledge it
+// and keep its own run green; leaving it set would poison every later reading.
+Value primUnhandledErrorTake(Value *args, uint64_t argc)
+{
+	(void) args;
+	if (argc != 0) {
+		return PRIMITIVE_FAILED;
+	}
+	size_t count = gUnhandledErrors;
+	gUnhandledErrors = 0;
+	return tagInt((intptr_t) count);
+}
+
+
+size_t primitiveUnhandledErrorCount(void)
+{
+	return gUnhandledErrors;
+}

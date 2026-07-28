@@ -80,7 +80,7 @@ PRIMITIVE_SOURCES="vm/runtime/Primitive.c vm/runtime/primitives/*.c"
 #
 # Named rather than silently dropped, and the levels still GLOB, so a new domain
 # file is picked up everywhere by existing.
-PRIMITIVE_SOURCES_NEEDING_FRONTEND="Reflect.c"
+PRIMITIVE_SOURCES_NEEDING_FRONTEND="Reflect.c Process.c"
 
 # The primitives minus the ones above, for the standalone levels.
 standalonePrimitiveSources() {
@@ -309,7 +309,40 @@ level11() {
 		</dev/null >/dev/null || return 1
 	cmp -s "$SCRATCH/gate.img" "$SCRATCH/gate2.img"
 }
-level12() { echo "level 12 (pacotes) has no runner yet"; return 1; }
+# ---- level 12: the packages build and the project image is generated --------
+# The criterion from docs/jit-v2/01-gate.md: the four packages compile and the
+# project image is generated. It goes through `st build`, which is the real
+# path -- the manifest is evaluated IN the image, the sources are parsed by the
+# reflective compiler, and the classes are built into the package's own
+# namespace -- so this level exercises the whole of that or none of it.
+#
+# EVERY .stbuild IS REMOVED FIRST. `st build` answers "up to date" when the
+# image is newer than its deps, so a stale image left over from a previous run
+# would make this level pass by not building anything, which is the one way a
+# build gate can lie.
+#
+# samples/ is built last and is not one of the four: it REQUIRES the Std.*
+# packages by name, so it only builds when the package path resolves and the
+# graph loads, which is the end-to-end of the whole arrangement.
+level12() {
+	rm -rf packages/*/.stbuild samples/.stbuild
+	"$BUILD/st" -s "$SCRATCH/core.img" -b packages/Core </dev/null >/dev/null 2>&1 \
+		|| return 1
+	local project out
+	for project in packages/Core packages/Std.Uuid packages/Std.Http \
+			packages/Std.Actors samples; do
+		out="$( (cd "$project" \
+			&& ST_PACKAGE_PATH="$ROOT/packages" ST_IMAGE="$SCRATCH/core.img" \
+				"$ROOT/$BUILD/st" build) </dev/null 2>&1 )" || {
+			echo "$project: $out"; return 1; }
+		case "$out" in
+			built\ *) ;;
+			*) echo "$project did not build: $out"; return 1 ;;
+		esac
+		[ -f "$project/.stbuild/program.img" ] \
+			|| { echo "$project: no program.img was written"; return 1; }
+	done
+}
 level13() { ./run_tests.sh --no-build 2>&1 | grep -q "ALL PASSED"; }
 level14() { echo "level 14 (deopt-stress) has no runner yet"; return 1; }
 level15() { echo "level 15 (performance) has no runner yet"; return 1; }

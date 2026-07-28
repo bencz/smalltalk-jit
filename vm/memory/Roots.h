@@ -112,4 +112,22 @@ void rootsVisitCompiledCode(RootVisitor visit, void *ctx);
 // appears when the protected block allocated enough to collect.
 void rootsVisitUnwindRecords(struct Thread *thread, RootVisitor visit, void *ctx);
 
+// The roots of every fiber that is NOT running.
+//
+// A parked fiber's VM state is not in any Thread: its handle scopes, its frame
+// chain, its handler chains and its entry block were moved into the Fiber when
+// it switched off (concurrency/Fiber.h, FiberRoots), and its native frames are
+// on a stack no mutator scan reaches. So a collection triggered by one fiber
+// would collect everything every other fiber is holding.
+//
+// The RUNNING fiber is deliberately excluded and must be: its live state is in
+// CurrentThread, which the per-mutator loop above already scans, and the copy
+// left in its Fiber is whatever was there when it last parked. Visiting the
+// stale copy would have the collector update a slot nobody reads while the live
+// one goes unvisited -- the exact shape of a root that looks scanned and is not.
+//
+// Weak no-op in memory/Roots.c, so a build with no scheduler links and collects
+// exactly as before, which is what keeps gate levels 0 and 2 standalone.
+void rootsVisitFibers(RootVisitor visit, void *ctx);
+
 #endif
