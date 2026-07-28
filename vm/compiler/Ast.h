@@ -200,13 +200,25 @@ static void classNodeSetMembers(ClassNode *class, OrderedCollection *members)
 
 static OrderedCollection *classNodeGetMembers(ClassNode *class)
 {
-	return (OrderedCollection *) scopeHandle(asObject(class->raw->members));
+	// Unset for every class that is not a namespace declaration.
+	return valueTypeOf(class->raw->members, VALUE_POINTER)
+		? (OrderedCollection *) scopeHandle(asObject(class->raw->members)) : NULL;
 }
 
 
+// A field NOBODY SET reads as 0, which is tagInt(0) and therefore not a pointer.
+// That is what ABSENT looks like in this object model (memory/Heap.c: the
+// allocator writes zero, deliberately, and nil is an object rather than the
+// absence of one). Every accessor here that can be asked about a field the
+// parser leaves alone says so by answering NULL instead of dereferencing zero.
+//
+// It mattered the first time the class builder ran: `members` is set only for a
+// namespace, the old test read "is it not nil", and EVERY ordinary class in
+// packages/Core came back claiming to be one.
 static _Bool classNodeIsNamespace(ClassNode *class)
 {
-	return !isTaggedNil(class->raw->members);
+	return valueTypeOf(class->raw->members, VALUE_POINTER)
+		&& !isTaggedNil(class->raw->members);
 }
 
 
@@ -218,7 +230,9 @@ static void classNodeSetSuperName(ClassNode *class, LiteralNode *superName)
 
 static LiteralNode *classNodeGetSuperName(ClassNode *class)
 {
-	return (LiteralNode *) scopeHandle(asObject(class->raw->superName));
+	// Unset for `Name extend [ ... ]`, which names no superclass at all.
+	return valueTypeOf(class->raw->superName, VALUE_POINTER)
+		? (LiteralNode *) scopeHandle(asObject(class->raw->superName)) : NULL;
 }
 
 
@@ -278,7 +292,10 @@ static void methodNodeSetClassName(MethodNode *method, String *className)
 
 static String *methodNodeGetClassName(MethodNode *method)
 {
-	return (String *) scopeHandle(asObject(method->raw->className));
+	// Set only for a CLASS-SIDE method, written `class foo [ ... ]`, so an
+	// instance-side method leaves it unset and this is how that is asked.
+	return valueTypeOf(method->raw->className, VALUE_POINTER)
+		? (String *) scopeHandle(asObject(method->raw->className)) : NULL;
 }
 
 
@@ -374,7 +391,10 @@ static void blockNodeSetScope(BlockNode *block, union BlockScope *scope)
 
 static union BlockScope *blockNodeGetScope(BlockNode *block)
 {
-	return scopeHandle(asObject(block->raw->scope));
+	// Never set in v2: the front end keeps its capture analysis in its own
+	// tables rather than on the tree (vm/compiler/Compile.c).
+	return valueTypeOf(block->raw->scope, VALUE_POINTER)
+		? scopeHandle(asObject(block->raw->scope)) : NULL;
 }
 
 

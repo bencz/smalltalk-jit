@@ -142,9 +142,23 @@ int main(int argc, char **argv)
 		}
 	}
 
+	// -b: build the classes of a package directory on top of the built-in
+	// kernel. What is missing to make it an IMAGE is the writer, so this reports
+	// what it managed to build and does not pretend to have saved anything.
 	if (cliArgs.bootstrapDir != NULL) {
-		return notPortedYet("bootstrapping an image from a package directory",
-			"the class builder and the image writer");
+		BootstrapReport report;
+		bootstrapLoadPackage(cliArgs.bootstrapDir, &report);
+		printf("%zu files, %zu classes, %zu methods\n",
+			report.filesRead, report.classesBuilt, report.methodsBuilt);
+		if (report.error != NULL) {
+			fprintf(stderr, "st: %zu class(es) did not build; the first was\n"
+				"    %s%s\n    in %s\n", report.classesFailed, report.error,
+				report.errorDetail, report.errorFile);
+			return 4;
+		}
+		fprintf(stderr, "st: writing an image is not ported to jit-v2 yet, so "
+			"nothing was saved\n");
+		return 3;
 	}
 	if (cliArgs.fileName != NULL) {
 		return notPortedYet("running a source file", "the class builder");

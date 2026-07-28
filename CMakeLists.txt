@@ -187,6 +187,7 @@ set(vmSources
 	vm/runtime/String.c
 	vm/thirdparty/cityhash/city.c
 	vm/tools/Bootstrap.c
+	vm/tools/ClassBuilder.c
 	${vmArchSources}
 	${vmAbiSources}
 	${vmOsSources}

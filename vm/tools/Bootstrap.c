@@ -1,4 +1,5 @@
 #include "tools/Bootstrap.h"
+#include "tools/ClassBuilder.h"
 #include "compiler/Compile.h"
 #include "compiler/Parser.h"
 #include "core/Assert.h"
@@ -337,4 +338,220 @@ void bootstrapBuiltinKernel(void)
 	nameClasses();
 	bootstrapMethods();
 	closeHandleScope(&scope, NULL);
+}
+
+
+// ---------------------------------------------------------------------------
+// Loading a package
+// ---------------------------------------------------------------------------
+
+static char *readWholeFile(const char *path, size_t *size)
+{
+	FILE *file = fopen(path, "rb");
+	if (file == NULL) {
+		return NULL;
+	}
+	fseek(file, 0, SEEK_END);
+	long length = ftell(file);
+	fseek(file, 0, SEEK_SET);
+	if (length < 0) {
+		fclose(file);
+		return NULL;
+	}
+	char *text = malloc((size_t) length + 1);
+	if (text == NULL) {
+		fclose(file);
+		return NULL;
+	}
+	size_t read = fread(text, 1, (size_t) length, file);
+	fclose(file);
+	text[read] = '\0';
+	if (size != NULL) {
+		*size = read;
+	}
+	return text;
+}
+
+
+// Step over a Smalltalk comment, which is double-quoted. Comments are the whole
+// reason this is a state machine and not two calls to strstr: the Core manifest
+// OPENS with a comment that explains this reader, and that comment contains the
+// word `files:` and a parenthesis. Reading it as code found an empty list and
+// said the manifest listed no files, which was true of the comment and false of
+// the manifest.
+static const char *skipComment(const char *cursor)
+{
+	if (*cursor != '"') {
+		return cursor;
+	}
+	const char *end = strchr(cursor + 1, '"');
+	return end == NULL ? cursor + strlen(cursor) : end + 1;
+}
+
+
+// The file list out of a manifest, with a scanner and not with the DSL: find
+// `files:` in CODE, then take every single-quoted string up to the closing
+// paren, comments and all.
+static size_t manifestFiles(const char *text, char ***files)
+{
+	const char *cursor = text;
+	while (*cursor != '\0') {
+		if (*cursor == '"') {
+			cursor = skipComment(cursor);
+			continue;
+		}
+		if (strncmp(cursor, "files:", 6) == 0) {
+			break;
+		}
+		cursor++;
+	}
+	if (*cursor == '\0') {
+		return 0;
+	}
+	while (*cursor != '\0' && *cursor != '(') {
+		cursor = *cursor == '"' ? skipComment(cursor) : cursor + 1;
+	}
+	if (*cursor != '(') {
+		return 0;
+	}
+	size_t capacity = 32;
+	size_t count = 0;
+	char **names = malloc(capacity * sizeof(char *));
+	ASSERT(names != NULL);
+	for (const char *end = cursor; *end != '\0' && *end != ')'; end++) {
+		if (*end == '"') {
+			end = skipComment(end) - 1; // a comment inside the array
+			continue;
+		}
+		if (*end != '\'') {
+			continue;
+		}
+		const char *start = end + 1;
+		const char *stop = strchr(start, '\'');
+		if (stop == NULL) {
+			break;
+		}
+		if (count == capacity) {
+			capacity *= 2;
+			names = realloc(names, capacity * sizeof(char *));
+			ASSERT(names != NULL);
+		}
+		size_t length = (size_t) (stop - start);
+		names[count] = malloc(length + 1);
+		ASSERT(names[count] != NULL);
+		memcpy(names[count], start, length);
+		names[count][length] = '\0';
+		count++;
+		end = stop;
+	}
+	*files = names;
+	return count;
+}
+
+
+// One source file: a sequence of class definitions.
+static _Bool loadFile(const char *path, BootstrapReport *report)
+{
+	size_t size = 0;
+	char *text = readWholeFile(path, &size);
+	if (text == NULL) {
+		report->error = "cannot read";
+		snprintf(report->errorFile, sizeof(report->errorFile), "%s", path);
+		return 0;
+	}
+
+	HandleScope scope;
+	openHandleScope(&scope);
+	Parser parser;
+	initParser(&parser, stringFromC(text));
+
+	while (!parserAtEnd(&parser)) {
+		HandleScope each;
+		openHandleScope(&each);
+		ClassNode *node = parseClass(&parser);
+		if (node == NULL) {
+			report->error = "cannot parse";
+			snprintf(report->errorFile, sizeof(report->errorFile), "%s", path);
+			printParseError(&parser, (char *) path);
+			closeHandleScope(&each, NULL);
+			closeHandleScope(&scope, NULL);
+			freeParser(&parser);
+			free(text);
+			return 0;
+		}
+		ClassBuildError error;
+		Class *class = classBuild(node, &error);
+		if (error.message != NULL) {
+			report->classesFailed++;
+			char detail[256] = "";
+			if (error.what != NULL) {
+				snprintf(detail, sizeof(detail), " '%.*s'",
+					(int) rawStringSize(error.what->raw), error.what->raw->contents);
+			}
+			char method[128] = "";
+			if (error.inMethod != NULL) {
+				snprintf(method, sizeof(method), " in method '%.*s'",
+					(int) rawStringSize(error.inMethod->raw),
+					error.inMethod->raw->contents);
+			}
+			fprintf(stderr, "  %s: %s%s%s\n", path, error.message, detail, method);
+			if (report->error == NULL) {
+				report->error = error.message;
+				snprintf(report->errorFile, sizeof(report->errorFile), "%s", path);
+				snprintf(report->errorDetail, sizeof(report->errorDetail), "%s%s",
+					detail, method);
+			}
+			closeHandleScope(&each, NULL);
+			continue;
+		}
+		if (class != NULL) {
+			report->classesBuilt++;
+			OrderedCollection *methods = classNodeGetMethods(node);
+			report->methodsBuilt += methods == NULL ? 0 : ordCollSize(methods);
+		}
+		closeHandleScope(&each, NULL);
+	}
+
+	closeHandleScope(&scope, NULL);
+	freeParser(&parser);
+	free(text);
+	report->filesRead++;
+	return 1;
+}
+
+
+void bootstrapLoadPackage(const char *directory, BootstrapReport *report)
+{
+	memset(report, 0, sizeof(*report));
+
+	char manifestPath[512];
+	snprintf(manifestPath, sizeof(manifestPath), "%s/package.st", directory);
+	char *manifest = readWholeFile(manifestPath, NULL);
+	if (manifest == NULL) {
+		report->error = "cannot read the manifest";
+		snprintf(report->errorFile, sizeof(report->errorFile), "%s", manifestPath);
+		return;
+	}
+
+	char **files = NULL;
+	size_t count = manifestFiles(manifest, &files);
+	if (count == 0) {
+		report->error = "the manifest lists no files";
+		snprintf(report->errorFile, sizeof(report->errorFile), "%s", manifestPath);
+		free(manifest);
+		return;
+	}
+
+	for (size_t i = 0; i < count; i++) {
+		char path[512];
+		snprintf(path, sizeof(path), "%s/%s", directory, files[i]);
+		if (!loadFile(path, report)) {
+			break;
+		}
+	}
+	for (size_t i = 0; i < count; i++) {
+		free(files[i]);
+	}
+	free(files);
+	free(manifest);
 }

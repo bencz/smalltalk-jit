@@ -763,6 +763,26 @@ static Place resolveName(Emitter *e, String *name)
 	if (e->context->globals != NULL) {
 		String *key = scopeHandle(symbol);
 		Association *association = symbolDictAssocAt(e->context->globals, key);
+		if (association == NULL && rawStringSize((RawString *) symbol) > 0
+				&& ((RawString *) symbol)->contents[0] >= 'A'
+				&& ((RawString *) symbol)->contents[0] <= 'Z') {
+			// A GLOBAL THAT DOES NOT EXIST YET gets its Association now, holding
+			// nil, and the definition fills that same Association in later
+			// (runtime/Dictionary.c reuses an existing entry).
+			//
+			// The kernel needs this and cannot be reordered out of it: its files
+			// refer to each other in both directions, so `Object>>at:` raises an
+			// OutOfRangeError that is defined thirty files further down. Without
+			// forward reference, the load order would have to be a total order
+			// that does not exist.
+			//
+			// The rule is the CAPITAL, which is Smalltalk's own convention for a
+			// global. A lowercase name that resolves nowhere is still an error,
+			// because that is a misspelled variable and there is nothing later
+			// that could define it.
+			association = symbolDictAtPut(e->context->globals, key,
+				tagPtr(Handles.nil.raw));
+		}
 		if (association != NULL) {
 			place.kind = PLACE_GLOBAL;
 			place.index = literalIndex(e, objectTagged(association));

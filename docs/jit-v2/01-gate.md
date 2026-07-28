@@ -171,6 +171,7 @@ Apendar, nunca reescrever. Data, commit, o que destravou.
 | 2026-07-28 | 8 | `fe9b5e8` | `super` no tier 1 e retorno nao local: 88 de 88 |
 | 2026-07-28 | **9** | (nao commitado) | CMakeLists reescrito para o conjunto v2; `cmake --build` limpo com -Werror |
 | 2026-07-28 | **10** | (nao commitado) | kernel EMBUTIDO em C + `st -e`: `(3 + 4) printNl` imprime 7 |
+| 2026-07-28 | 10 | (nao commitado) | construtor de classes: **142 de 144 arquivos do Core, 1567 metodos**, 16 falhas nomeadas |
 
 ## O que o nivel 7 encontrou, e por que so ele podia encontrar
 
@@ -556,6 +557,54 @@ classes, o laco do REPL), e cada um DIZ qual e a peca que falta e sai com codigo
 nao-zero. Comando que finge trabalhar e pior que comando que recusa. Imagem
 achada pela BUSCA e passada por cima com um aviso; imagem pedida com `-s` e
 recusada, porque ai o chamador pediu aquela imagem.
+
+## O construtor de classes, e a MEDICAO do que falta para packages/
+
+`ClassNode` vira classe de verdade: forma, superclasse, variaveis de instancia e
+cada metodo compilado dentro dela. Metaclasse criada no primeiro uso, com a
+cadeia de metaclasses PARALELA a de classes, que e o que faz metodo de classe ser
+herdado; sao 294 metodos de classe so no Core, entao nao era opcional.
+
+Duas decisoes que o Core forcou, as duas de desenho e nao de conveniencia:
+
+**Referencia adiantada a global.** Um nome com INICIAL MAIUSCULA que ainda nao
+existe ganha a Association agora, com nil, e a definicao preenche a MESMA
+Association depois. O kernel precisa disso e nao da para reordenar em volta:
+`Object>>at:` levanta um `OutOfRangeError` definido trinta arquivos abaixo, entao
+a ordem de carga teria que ser uma ordem total que nao existe. A regra e a
+MAIUSCULA, que e a convencao do proprio Smalltalk; nome minusculo que nao resolve
+continua sendo ERRO, porque aquilo e variavel escrita errada e nada la na frente
+vai definir.
+
+**Campo nao setado do AST e ZERO, nao nil.** Os acessores de `Ast.h` testavam
+"nao e nil", e no v2 o alocador escreve ZERO de proposito (ausente e diferente de
+"setado como nil"). Resultado: TODA classe do Core respondia que era um namespace.
+Os acessores que podem ser perguntados sobre campo que o parser nao escreve
+passaram a responder NULL.
+
+### O numero, que e a resposta para "quando"
+
+```
+$ st -b packages/Core
+142 files, 142 classes, 1567 methods
+st: 16 class(es) did not build
+```
+
+**142 dos 144 arquivos do Core, 1567 metodos compilados.** As 16 falhas nao sao
+uma nevoa, sao tres grupos com nome:
+
+| grupo | o que e | o que resolve |
+|---|---|---|
+| 5 formas que o VM POSSUI | `CompiledCodeShape`, `BlockShape`, `ContextShape`, `ExceptionHandlerShape`, `UnwindHandlerShape` | esses arquivos sao o DESENHO V1. Block virou closure plana e Context virou materializacao a partir do frame (ADR 0008): os .st mudam |
+| 5 subclasses em cascata | CompiledBlock, CompiledMethod, ContextCopy, MethodContext, BlockContext | somem junto com o grupo acima |
+| 5 formas em conflito | Class, BoxedFloat64, Character, Array, Symbol | a forma do kernel EMBUTIDO tem que concordar com a que `packages/` declara. Recusar e o certo: recarimbar em silencio deixaria instancia ja viva com um layout e instancia nova com outro |
+| 1 lacuna de linguagem | `thisContext` em `Exception.st` | o ADR 0008 ja disse o que ele vira, e ninguem escreveu ainda |
+
+E compilar nao e rodar. Entre isto e `run_tests.sh` verde estao, em ordem:
+a IMAGEM (Snapshot le e escreve o modelo novo), as EXCECOES (`signal`, `on:do:`,
+`ensure:`, que e o segundo cliente do unwind que o retorno nao local ja
+construiu), e as PRIMITIVAS: 31 das 174 estao implementadas, e os testes usam
+muito mais que isso.
 
 ## O que o gate NAO cobre, e como cobrimos
 
