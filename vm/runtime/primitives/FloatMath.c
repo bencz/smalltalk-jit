@@ -20,24 +20,20 @@
 #include <stdlib.h>
 #include <string.h>
 
-typedef double (*UnaryMath)(double);
-
-static Value floatUnary(Value *args, uint64_t argc, UnaryMath fn)
-{
-	if (argc != 0) {
-		return PRIMITIVE_FAILED;
-	}
-	Number self = numberOf(primitiveReceiver(args));
-	if (self.kind == NUM_NOT) {
-		return PRIMITIVE_FAILED;
-	}
-	return floatResult(fn(self.asFloat));
-}
-
+// Written out per primitive rather than through a shared helper, because
+// FLOAT_RESULT anchors the frame with __builtin_return_address(0) and that has
+// to be taken in the primitive itself (runtime/Primitive.h).
 #define FLOAT_UNARY(name, fn) \
 	Value name(Value *args, uint64_t argc) \
 	{ \
-		return floatUnary(args, argc, fn); \
+		if (argc != 0) { \
+			return PRIMITIVE_FAILED; \
+		} \
+		Number self = numberOf(primitiveReceiver(args)); \
+		if (self.kind == NUM_NOT) { \
+			return PRIMITIVE_FAILED; \
+		} \
+		FLOAT_RESULT(args, fn(self.asFloat)); \
 	}
 
 FLOAT_UNARY(primFloatSqrt, sqrt)
@@ -61,7 +57,7 @@ Value primFloatArcTan2(Value *args, uint64_t argc)
 	if (self.kind == NUM_NOT || other.kind == NUM_NOT) {
 		return PRIMITIVE_FAILED;
 	}
-	return floatResult(atan2(self.asFloat, other.asFloat));
+	FLOAT_RESULT(args, atan2(self.asFloat, other.asFloat));
 }
 
 
@@ -132,7 +128,7 @@ Value primFloatTimesTwoPower(Value *args, uint64_t argc)
 	if (n < INT_MIN || n > INT_MAX) {
 		return PRIMITIVE_FAILED;
 	}
-	return floatResult(ldexp(self.asFloat, (int) n));
+	FLOAT_RESULT(args, ldexp(self.asFloat, (int) n));
 }
 
 

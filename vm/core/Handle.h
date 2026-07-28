@@ -64,6 +64,11 @@ typedef struct SmalltalkHandles {
 	Class SmallInteger;
 	Class LargeInteger;
 	Class Character;
+	// Float is the class the built-in kernel hangs float arithmetic on, and it
+	// exists for one reason: packages/Core declares `Float := Number` with the
+	// real `+`, `/` and the rest, and a scaffold method has to go where the real
+	// one goes or it shadows it forever (tools/Bootstrap.c).
+	Class Float;
 	Class SmallFloat64;
 	Class BoxedFloat64;
 	Class String;

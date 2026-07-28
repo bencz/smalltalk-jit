@@ -31,24 +31,89 @@ Float := Number [
 
 	+ aNumber [
 		<primitive: FloatAddPrimitive>
+		"SAME-GENERALITY FAILURE, and it must be caught HERE.
+
+		 Number>>retry:coercing: says so in capitals: on equal generality it
+		 re-sends the same selector to the same representation, and it is only
+		 not an infinite loop because every concrete class short-circuits its own
+		 type first. Float did not, so `1.0 / 0.0` recursed until the stack ran
+		 out -- a SEGFAULT, and one that was hidden for as long as a scaffold
+		 method shadowed these (tools/Bootstrap.c).
+
+		 A result outside the immediate window is NOT one of those cases: the
+		 primitive boxes it into a BoxedFloat64 and answers normally, which is
+		 why `1.0e300 * 10.0` is an ordinary Float and not an error. What is left
+		 is a zero divisor, which is ZeroDivide, and anything unforeseen, which
+		 stops with a name instead of recursing."
+		(aNumber isKindOf: Float) ifTrue: [
+			^self error: 'float ', self class name, ' operation failed on a Float'].
 		^self retry: #+ coercing: aNumber
 	]
 
 
 	- aNumber [
 		<primitive: FloatSubPrimitive>
+		"SAME-GENERALITY FAILURE, and it must be caught HERE.
+
+		 Number>>retry:coercing: says so in capitals: on equal generality it
+		 re-sends the same selector to the same representation, and it is only
+		 not an infinite loop because every concrete class short-circuits its own
+		 type first. Float did not, so `1.0 / 0.0` recursed until the stack ran
+		 out -- a SEGFAULT, and one that was hidden for as long as a scaffold
+		 method shadowed these (tools/Bootstrap.c).
+
+		 A result outside the immediate window is NOT one of those cases: the
+		 primitive boxes it into a BoxedFloat64 and answers normally, which is
+		 why `1.0e300 * 10.0` is an ordinary Float and not an error. What is left
+		 is a zero divisor, which is ZeroDivide, and anything unforeseen, which
+		 stops with a name instead of recursing."
+		(aNumber isKindOf: Float) ifTrue: [
+			^self error: 'float ', self class name, ' operation failed on a Float'].
 		^self retry: #- coercing: aNumber
 	]
 
 
 	* aNumber [
 		<primitive: FloatMulPrimitive>
+		"SAME-GENERALITY FAILURE, and it must be caught HERE.
+
+		 Number>>retry:coercing: says so in capitals: on equal generality it
+		 re-sends the same selector to the same representation, and it is only
+		 not an infinite loop because every concrete class short-circuits its own
+		 type first. Float did not, so `1.0 / 0.0` recursed until the stack ran
+		 out -- a SEGFAULT, and one that was hidden for as long as a scaffold
+		 method shadowed these (tools/Bootstrap.c).
+
+		 A result outside the immediate window is NOT one of those cases: the
+		 primitive boxes it into a BoxedFloat64 and answers normally, which is
+		 why `1.0e300 * 10.0` is an ordinary Float and not an error. What is left
+		 is a zero divisor, which is ZeroDivide, and anything unforeseen, which
+		 stops with a name instead of recursing."
+		(aNumber isKindOf: Float) ifTrue: [
+			^self error: 'float ', self class name, ' operation failed on a Float'].
 		^self retry: #* coercing: aNumber
 	]
 
 
 	/ aNumber [
 		<primitive: FloatDivPrimitive>
+		"SAME-GENERALITY FAILURE, and it must be caught HERE.
+
+		 Number>>retry:coercing: says so in capitals: on equal generality it
+		 re-sends the same selector to the same representation, and it is only
+		 not an infinite loop because every concrete class short-circuits its own
+		 type first. Float did not, so `1.0 / 0.0` recursed until the stack ran
+		 out -- a SEGFAULT, and one that was hidden for as long as a scaffold
+		 method shadowed these (tools/Bootstrap.c).
+
+		 A result outside the immediate window is NOT one of those cases: the
+		 primitive boxes it into a BoxedFloat64 and answers normally, which is
+		 why `1.0e300 * 10.0` is an ordinary Float and not an error. What is left
+		 is a zero divisor, which is ZeroDivide, and anything unforeseen, which
+		 stops with a name instead of recursing."
+		(aNumber isKindOf: Float) ifTrue: [
+			aNumber = 0.0 ifTrue: [^ZeroDivide new signal: 'division by zero'].
+			^self error: 'float ', self class name, ' operation failed on a Float'].
 		^self retry: #/ coercing: aNumber
 	]
 

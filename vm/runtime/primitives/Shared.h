@@ -145,16 +145,54 @@ static inline Number numberOf(Value value)
 }
 
 
-// A double result, as an immediate or not at all.
+// A double as a BoxedFloat64 on the heap.
 //
-// The SmallFloat64 window is wide (magnitude in 2^[-255, 256]), so ordinary
-// arithmetic lands inside it; a subnormal, an infinity, a NaN or an overflow
-// does not, and boxing one would allocate. Failing hands those to the method's
-// own code, which is where the general case belongs anyway.
-static inline Value floatResult(double value)
+// This is the SLOW half of a float result and it is the only reason any
+// arithmetic primitive allocates. `Float` is abstract in this kernel exactly as
+// it is in Spur: SmallFloat64 holds the doubles whose exponent fits the tagged
+// word, BoxedFloat64 holds the rest, and which one an operation answers is not
+// the program's business.
+static inline Value boxedFloat(double value)
 {
-	return smallFloatFits(value) ? tagFloat(value) : PRIMITIVE_FAILED;
+	// Before the bootstrap has the class there is nowhere to put it, and failing
+	// is right: that window is the built-in kernel, which has no float literals.
+	if (Handles.BoxedFloat64.raw == NULL) {
+		return PRIMITIVE_FAILED;
+	}
+	Object *box = newObject(&Handles.BoxedFloat64, 0);
+	((RawFloat *) box->raw)->value = value;
+	return objectTagged(box);
 }
+
+
+// Answer a double, immediate when it fits and BOXED when it does not.
+//
+// A MACRO, and it has to be: PRIMITIVE_ALLOCATES takes
+// __builtin_return_address(0), which names the enclosing function, so inside a
+// helper it would anchor the helper's frame instead of the compiled method's.
+//
+// THE FAST PATH STILL DOES NOT ALLOCATE, which is the property runtime/
+// Primitive.h claims for arithmetic: an ordinary sum lands inside the
+// SmallFloat64 window and leaves through one compare and a tag, with no anchor
+// and no heap traffic. Only a subnormal, an infinity, a NaN or an overflow
+// reaches the second half.
+//
+// It used to FAIL there instead, on the stated grounds that "the method's own
+// code" would build the box. It could not: BoxedFloat64.st declares no methods
+// and no constructor, so nothing in Smalltalk can make one. That left
+// `1.0e300 + 1.0` with no correct answer available anywhere, which is why this
+// moved into C.
+#define FLOAT_RESULT(args, expression) \
+	do { \
+		double floatValue_ = (expression); \
+		if (smallFloatFits(floatValue_)) { \
+			return tagFloat(floatValue_); \
+		} \
+		PRIMITIVE_ALLOCATES(args); \
+		Value floatBoxed_ = boxedFloat(floatValue_); \
+		PRIMITIVE_DONE_ALLOCATING(); \
+		return floatBoxed_; \
+	} while (0)
 
 
 static inline Value booleanResult(_Bool value)

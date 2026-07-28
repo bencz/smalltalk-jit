@@ -179,7 +179,7 @@ level2() {
 level3() {
 	gcc $GATE_CFLAGS \
 		-Ivm -I. -Ivm/os/linux \
-		vm/tests/JitTest.c vm/jit/Jit.c vm/jit/CompiledMethod.c \
+		vm/tests/JitTest.c vm/jit/Jit.c vm/jit/CompiledMethod.c vm/core/Smalltalk.c \
 		vm/jit/MacroAssembler.c vm/jit/Backends.c vm/jit/InlineCache.c \
 		$(standalonePrimitiveSources) vm/runtime/Closure.c \
 		vm/jit/x64/MacroAssemblerX64.c \
@@ -244,6 +244,7 @@ level7() {
 	gcc $GATE_CFLAGS \
 		-Ivm -I. -Ivm/os/linux \
 		vm/tests/PrimitiveTest.c $(standalonePrimitiveSources) vm/runtime/Closure.c \
+		vm/core/Smalltalk.c \
 		vm/jit/Jit.c vm/jit/CompiledMethod.c \
 		vm/jit/MacroAssembler.c vm/jit/Backends.c vm/jit/InlineCache.c \
 		vm/jit/x64/MacroAssemblerX64.c \

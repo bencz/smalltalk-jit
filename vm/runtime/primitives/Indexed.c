@@ -95,7 +95,7 @@ Value primAt(Value *args, uint64_t argc)
 	case FORMAT_INDEXED_POINTERS:
 		return indexedPointerBase(object)[index];
 	case FORMAT_DOUBLES:
-		return floatResult(rawObjectDoubles(object)[index]);
+		FLOAT_RESULT(args, rawObjectDoubles(object)[index]);
 	default:
 		return receiverIsString(object)
 			? tagChar((char) rawObjectBytes(object)[index])

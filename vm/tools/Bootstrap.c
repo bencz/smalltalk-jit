@@ -86,8 +86,17 @@ static void bootstrapClasses(Heap *heap)
 	Handles.True.raw = fixedClass(object, 0)->raw;
 	Handles.False.raw = fixedClass(object, 0)->raw;
 	Handles.SmallInteger.raw = fixedClass(object, 0)->raw;
-	Handles.SmallFloat64.raw = fixedClass(object, 0)->raw;
-	Handles.BoxedFloat64.raw = classCreate(object, NULL, rawDouble)->raw;
+	// THE FLOAT HIERARCHY MIRRORS packages/Core's, and that is not tidiness.
+	// Core declares `Float := Number`, `SmallFloat64 := Float` and
+	// `BoxedFloat64 := Float`, and the arithmetic lives on FLOAT. The scaffold
+	// used to be installed directly on the two concrete classes, which are more
+	// specific, so it won every lookup and Core's Float methods never ran again.
+	// Invisible while the primitive SUCCEEDS -- float+float works either way --
+	// and only the FAILURE path diverged: `3.0 + (1/2)` reported a failed
+	// IntAddPrimitive instead of coercing.
+	Handles.Float.raw = fixedClass(object, 0)->raw;
+	Handles.SmallFloat64.raw = fixedClass(&Handles.Float, 0)->raw;
+	Handles.BoxedFloat64.raw = classCreate(&Handles.Float, NULL, rawDouble)->raw;
 	Handles.Character.raw = fixedClass(object, 0)->raw;
 	Handles.Closure.raw = classCreate(object, NULL, CLOSURE_SHAPE)->raw;
 	Handles.Cell.raw = classCreate(object, NULL, CELL_SHAPE)->raw;
@@ -134,6 +143,7 @@ static void bootstrapClasses(Heap *heap)
 	withMethods(&Handles.ClassClass);
 	withMethods(&Handles.ObjectClass);
 	withMethods(&Handles.SmallInteger);
+	withMethods(&Handles.Float);
 	withMethods(&Handles.SmallFloat64);
 	withMethods(&Handles.BoxedFloat64);
 	withMethods(&Handles.Character);
@@ -164,6 +174,7 @@ static void nameClasses(void)
 	nameClass(&Handles.True, "True");
 	nameClass(&Handles.False, "False");
 	nameClass(&Handles.SmallInteger, "SmallInteger");
+	nameClass(&Handles.Float, "Float");
 	nameClass(&Handles.SmallFloat64, "SmallFloat64");
 	nameClass(&Handles.BoxedFloat64, "BoxedFloat64");
 	nameClass(&Handles.Character, "Character");
@@ -353,9 +364,12 @@ static void bootstrapMethods(void)
 	definePrimitiveMethod(&Handles.ClassClass, "new", PRIM_BehaviorNew, 0);
 	definePrimitiveMethod(&Handles.ClassClass, "new:", PRIM_BehaviorNewSize, 1);
 
+	// SmallInteger gets its own because packages/Core also puts SmallInteger's
+	// arithmetic on SmallInteger: same class, so the real definition OVERWRITES
+	// the scaffold. The floats get theirs on Float for exactly that reason --
+	// see the hierarchy note above.
 	defineNumberMethods(&Handles.SmallInteger);
-	defineNumberMethods(&Handles.SmallFloat64);
-	defineNumberMethods(&Handles.BoxedFloat64);
+	defineNumberMethods(&Handles.Float);
 
 	// ON OBJECT, and this is scaffolding's ONE placement rule: a scaffold method
 	// goes where packages/Core puts the real one, or it SHADOWS it forever.

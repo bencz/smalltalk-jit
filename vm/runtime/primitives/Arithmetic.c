@@ -35,7 +35,7 @@ Value primAdd(Value *args, uint64_t argc)
 	if (a.kind == NUM_NOT || b.kind == NUM_NOT) {
 		return PRIMITIVE_FAILED;
 	}
-	return floatResult(a.asFloat + b.asFloat);
+	FLOAT_RESULT(args, a.asFloat + b.asFloat);
 }
 
 
@@ -61,7 +61,7 @@ Value primSubtract(Value *args, uint64_t argc)
 	if (a.kind == NUM_NOT || b.kind == NUM_NOT) {
 		return PRIMITIVE_FAILED;
 	}
-	return floatResult(a.asFloat - b.asFloat);
+	FLOAT_RESULT(args, a.asFloat - b.asFloat);
 }
 
 
@@ -87,7 +87,7 @@ Value primMultiply(Value *args, uint64_t argc)
 	if (a.kind == NUM_NOT || b.kind == NUM_NOT) {
 		return PRIMITIVE_FAILED;
 	}
-	return floatResult(a.asFloat * b.asFloat);
+	FLOAT_RESULT(args, a.asFloat * b.asFloat);
 }
 
 
@@ -128,7 +128,7 @@ Value primDivide(Value *args, uint64_t argc)
 		// accident.
 		return PRIMITIVE_FAILED;
 	}
-	return floatResult(a.asFloat / b.asFloat);
+	FLOAT_RESULT(args, a.asFloat / b.asFloat);
 }
 
 
@@ -246,5 +246,5 @@ Value primAsFloat(Value *args, uint64_t argc)
 	if (!valueTypeOf(receiver, VALUE_INT)) {
 		return PRIMITIVE_FAILED;
 	}
-	return floatResult((double) asCInt(receiver));
+	FLOAT_RESULT(args, (double) asCInt(receiver));
 }

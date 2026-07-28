@@ -9,6 +9,8 @@
 #include "runtime/Primitive.h"
 #include "runtime/String.h"
 #include "core/Handle.h"
+#include "core/Smalltalk.h"
+#include "runtime/Collection.h"
 #include "memory/Heap.h"
 #include "os/Os.h"
 #include <setjmp.h>
@@ -261,6 +263,77 @@ static RawCompiledMethod *lookupMethod(RawClass *class, RawObject *selector)
 }
 
 
+// Message, as packages/Core/src/Message.st declares it: `| selector arguments |`
+// and nothing else. Named here so the two slots this file writes are written
+// down where they are used rather than being indices 0 and 1.
+typedef struct {
+	OBJECT_HEADER;
+	Value selector;
+	Value arguments;
+} RawMessageObject;
+
+
+// The message nobody understood, handed BACK TO SMALLTALK.
+//
+// `Object>>doesNotUnderstand:` exists in the kernel and signals a
+// MessageNotUnderstood, which is an ordinary exception an `on:do:` can catch.
+// Until this was wired, the VM printed the selector and called abort(), so a
+// program could not catch a missing method AT ALL -- and a suite full of tests
+// that deliberately send an unknown selector had no way to run.
+//
+// Answers 0 when the send could not be made, and then the caller prints and
+// aborts exactly as before. That happens in two cases and both are real: the
+// BUILT-IN kernel has no Message class, and a receiver that does not understand
+// `doesNotUnderstand:` itself must not be asked twice.
+static _Bool sendDoesNotUnderstand(IcCell *cell, Value *receiverSlot,
+	uint64_t argc, Value *answer)
+{
+	// The recursion guard, and it has to be first: asking a receiver that does
+	// not understand `doesNotUnderstand:` to understand `doesNotUnderstand:`
+	// would come straight back here, forever.
+	if (rawStringEqualsBytes((RawString *) cell->selector, "doesNotUnderstand:",
+			sizeof "doesNotUnderstand:" - 1)) {
+		return 0;
+	}
+	Class *messageClass = getClass("Message");
+	if (messageClass == NULL) {
+		return 0;
+	}
+
+	HandleScope scope;
+	openHandleScope(&scope);
+	// The ARGUMENTS first, and read out of the frame AFTER the Array exists:
+	// allocating can collect, and the collector updates the frame slots it walks
+	// but not a copy taken before.
+	Array *arguments = newArray(argc);
+	for (uint64_t i = 0; i < argc; i++) {
+		// A fresh Array is young, so a young-to-anything store needs no barrier;
+		// the barrier exists for an OLD object learning about a young one.
+		arguments->raw->vars[i] = receiverSlot[-(intptr_t) (i + 1)];
+	}
+	Object *message = newObject(messageClass, 0);
+	RawMessageObject *raw = (RawMessageObject *) message->raw;
+	// cell->selector is re-read here rather than saved above: it is a bare
+	// pointer that rootsVisitCompiledCode updates, so the allocations just made
+	// may have moved what it names.
+	rawObjectStorePtr((RawObject *) raw, &raw->selector, cell->selector);
+	rawObjectStorePtr((RawObject *) raw, &raw->arguments,
+		(RawObject *) arguments->raw);
+	Value messageValue = objectTagged(message);
+	Value receiver = *receiverSlot; // re-read: the allocations may have moved it
+	closeHandleScope(&scope, NULL);
+
+	_Bool understood = 0;
+	Value result = jitSend(receiver, "doesNotUnderstand:", 1, &messageValue,
+		&understood);
+	if (!understood) {
+		return 0;
+	}
+	*answer = result;
+	return 1;
+}
+
+
 // The body of both send paths. `lookupStart` is the class the method search
 // begins at, and it is the ONLY thing that differs between an ordinary send and
 // a super send: everything else, the profile included, is the same site
@@ -290,8 +363,17 @@ static Value dispatchFrom(IcCell *cell, Value *receiverSlot, uint64_t packed,
 	RawCompiledMethod *method = lookupStart == NULL
 		? NULL : lookupMethod(lookupStart, cell->selector);
 	if (method == NULL) {
-		// PENDING: doesNotUnderstand. Failing loudly beats returning nil, which
-		// would turn a missing method into a wrong answer somewhere else.
+		// TO SMALLTALK FIRST. `Object>>doesNotUnderstand:` signals a catchable
+		// MessageNotUnderstood, which is what makes a missing method a condition
+		// a program can handle rather than the end of the process.
+		Value answer;
+		if (sendDoesNotUnderstand(cell, receiverSlot, argc, &answer)) {
+			compiledFrameLeave(&guard);
+			return answer;
+		}
+		// Nothing could take it: print loudly and stop. Failing loudly beats
+		// returning nil, which would turn a missing method into a wrong answer
+		// somewhere else.
 		// EVERY PART OF THIS GOES TO STDERR, and the selector is why: printing it
 		// on stdout put it in a block-buffered stream that abort() never flushes,
 		// so the message arrived as "doesNotUnderstand: " with nothing after it.

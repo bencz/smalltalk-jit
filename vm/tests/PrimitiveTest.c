@@ -457,9 +457,19 @@ int main(void)
 	checkFloat("a BoxedFloat64 argument",
 		sendBinary(plus, tagInt(2), tagPtr(boxed->raw)), 2.5);
 
-	// A result outside the SmallFloat64 window would have to be boxed, and
-	// allocation inside a primitive is not safe until native frames are
-	// walkable. It fails, and this is the check that keeps that honest.
+	// A result outside the SmallFloat64 window is BOXED, and answered.
+	//
+	// It used to FAIL here, on the stated grounds that the method's own Smalltalk
+	// code would build the box. It could not: BoxedFloat64 declares no methods
+	// and no constructor, so nothing in the image can make one, and the fallback
+	// had no correct answer available -- `1.0e300 * 10.0` ended in a
+	// primitiveFailed. So the boxing moved into the primitive, and these two
+	// checks are the pair that keeps the trade honest:
+	//
+	//   * an ordinary result is still an IMMEDIATE, which is the property that
+	//     makes arithmetic allocation-free on the path that matters;
+	//   * an extraordinary one is a real BoxedFloat64 carrying the exact value,
+	//     rather than a failure the caller cannot recover from.
 	//
 	// Both operands here are BOXED, because 1e300 is itself outside the window
 	// and cannot be written as an immediate at all.
@@ -467,9 +477,23 @@ int main(void)
 	huge->raw->value = 1e300;
 	Float *tiny = newObject(boxedFloat, 0);
 	tiny->raw->value = 1e-300;
-	checkInt("a result too large for an immediate falls back rather than allocating",
-		sendBinary(times, tagPtr(huge->raw), tagPtr(huge->raw)), FALLBACK_MARK);
-	checkFloat("but the same magnitudes multiply fine when the RESULT fits",
+	{
+		Value product = sendBinary(times, tagPtr(huge->raw), tagPtr(huge->raw));
+		// The class test alone settles it: a FAILED primitive runs the fallback,
+		// which answers the tagged SmallInteger FALLBACK_MARK, and that is not a
+		// pointer at all. Naming the mark here as well would read like a second
+		// condition and be one that cannot fail.
+		check("a result too large for an immediate is BOXED, not failed",
+			valueTypeOf(product, VALUE_POINTER)
+				&& rawObjectClassIndex(asObject(product))
+					== classIndexOf(boxedFloat));
+		check("and the box carries the exact double, which is what makes the "
+			"answer usable rather than merely non-failing",
+			valueTypeOf(product, VALUE_POINTER)
+				&& ((RawFloat *) asObject(product))->value == 1e300 * 1e300);
+	}
+	checkFloat("while a result that FITS is still an immediate, so the ordinary "
+		"path allocates nothing",
 		sendBinary(times, tagPtr(huge->raw), tagPtr(tiny->raw)), 1.0);
 
 	// ---- comparison ---------------------------------------------------------
