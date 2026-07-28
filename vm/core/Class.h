@@ -16,6 +16,28 @@
 // immediates have classes too.
 RawClass *classOf(Value value);
 
+// The superclass, or NULL at the root of the chain.
+//
+// TWO values mean "no superclass", and they mean it in two different languages.
+// The allocator writes ZERO into a field nobody set, and across the VM that is
+// what ABSENT means (core/Object.h); but `Object := nil [ ... ]` DECLARES its
+// superclass to be nil, and nil is the only absent Smalltalk has, because
+// Smalltalk code walks the chain with `superClass == nil ifTrue:` and reads the
+// field as an ordinary instance variable.
+//
+// So both reach this field, and testing only `is it a pointer` accepts nil and
+// walks INTO the UndefinedObject instance as though it were a class. That is why
+// this is one function and not seven copies of a two-part condition.
+static inline RawClass *rawClassSuperclass(RawClass *class)
+{
+	Value super = class->superClass;
+	if (!valueTypeOf(super, VALUE_POINTER)) {
+		return NULL; // never set: the VM's own absent
+	}
+	RawObject *object = asObject(super);
+	return object == Handles.nil.raw ? NULL : (RawClass *) object;
+}
+
 // Just the index, which is what every fast path actually wants: for a heap
 // object it is a field read with no indirection at all.
 static inline uint32_t classIndexOfValue(Value value);
@@ -25,6 +47,11 @@ static inline uint32_t classIndexOfValue(Value value);
 // the root.
 union String;
 Class *classCreate(Class *superclass, union String *name, InstanceShape shape);
+
+// Give the Smalltalk-only tagged fields of a class nil instead of the
+// allocator's zero. See the note at the definition for which fields, and for
+// the four that are deliberately left alone.
+void classFillAbsentSmalltalkFields(Class *class);
 
 // How a class object describes ITSELF: the tagged fields, then a raw trailer.
 // Both numbers come from the C struct, so a field added to RawClass changes

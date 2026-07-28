@@ -13,6 +13,43 @@ RawClass *classOf(Value value)
 }
 
 
+// The tagged fields of the class mirror that ONLY SMALLTALK reads answer nil
+// when nothing set them, because nil is the only absent Smalltalk has.
+//
+// The VM's own absent is the allocator's ZERO (core/Object.h), which is
+// `tagInt(0)`, and Smalltalk tests these fields with `isNil`. So an unset field
+// came back as the SmallInteger 0, `isNil` answered false, and the code went on
+// as if a value were there: `Class>>qualifiedName` asks `namespace isNil`, got
+// false for every kernel class, and went on to index a collection that does not
+// exist.
+//
+// FOUR FIELDS ARE DELIBERATELY NOT HERE. `name`, `methodDictionary`,
+// `instanceVariables` and `classVariables` are read in C as "is it a pointer",
+// and that test IS the VM's presence check -- nil is a pointer, so filling them
+// would turn "this class has no method dictionary" into "its method dictionary
+// is the nil object". Those four stay zero, and every one of them is written by
+// the class builder for every class it builds.
+//
+// Does nothing before nil exists: the first classes are made during bootstrap,
+// before there is an UndefinedObject to instantiate. They are all reopened by
+// packages/Core, and the class builder calls this again on the way through.
+void classFillAbsentSmalltalkFields(Class *class)
+{
+	if (Handles.nil.raw == NULL) {
+		return;
+	}
+	Value *fields[] = {
+		&class->raw->subClasses, &class->raw->comment,
+		&class->raw->category, &class->raw->namespace,
+	};
+	for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+		if (!valueTypeOf(*fields[i], VALUE_POINTER)) {
+			rawObjectStorePtr((RawObject *) class->raw, fields[i], Handles.nil.raw);
+		}
+	}
+}
+
+
 Class *classCreate(Class *superclass, union String *name, InstanceShape shape)
 {
 	HandleScope scope;
@@ -41,5 +78,6 @@ Class *classCreate(Class *superclass, union String *name, InstanceShape shape)
 		rawObjectStorePtr((RawObject *) class->raw, &class->raw->name,
 			(RawObject *) name->raw);
 	}
+	classFillAbsentSmalltalkFields(class);
 	return closeHandleScope(&scope, class);
 }

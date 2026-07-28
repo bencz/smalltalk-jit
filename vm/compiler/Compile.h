@@ -61,6 +61,22 @@ typedef struct {
 typedef struct {
 	Class *ownerClass;   // may be NULL for a bare expression
 	Dictionary *globals; // Symbol -> Association
+	// Where CLASS VARIABLES are looked up, which is NOT always ownerClass.
+	//
+	// A class variable is shared by a class, its subclasses AND its metaclass:
+	// `Character class initialize` assigns Table and `Character>>isVowel` reads
+	// it, and they have to reach the same Association. But a class-side method is
+	// compiled with the METACLASS as ownerClass, and a metaclass holds none of
+	// the class's class variables, so searching ownerClass answers nothing for
+	// the class side.
+	//
+	// Getting this wrong is silent, not loud: the name starts with a capital, so
+	// the unresolved write lands on a freshly minted forward-reference GLOBAL of
+	// the same name, and the instance-side read keeps seeing nil.
+	//
+	// NULL means "same as ownerClass", which is right for instance-side methods
+	// and for a bare expression.
+	Class *classVariableScope;
 } CompileContext;
 
 // Compile one parsed method. Answers a malloc'd CodeUnit, or NULL with `error`

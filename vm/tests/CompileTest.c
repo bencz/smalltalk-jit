@@ -272,7 +272,7 @@ static CodeUnit *compileSource(const char *source, Class *owner, CompileError *e
 		freeParser(&parser);
 		return NULL;
 	}
-	CompileContext context = { owner, gGlobals };
+	CompileContext context = { owner, gGlobals, NULL };
 	CodeUnit *unit = compileMethod(node, &context, error);
 	freeParser(&parser);
 	return unit;
@@ -349,6 +349,41 @@ static int countClosureOps(const CodeUnit *unit)
 		}
 	}
 	return count;
+}
+
+
+// Does this unit SEND `selector` anywhere?
+static int sendsSelector(const CodeUnit *unit, const char *selector)
+{
+	RawArray *literals = (RawArray *) asObject(unit->literals);
+	for (uint16_t i = 0; i < unit->instructionCount; i++) {
+		Opcode op = (Opcode) unit->code[i].op;
+		if (op != OP_SEND && op != OP_SENDSUPER) {
+			continue;
+		}
+		Value named = literals->vars[unit->code[i].b];
+		if (valueTypeOf(named, VALUE_POINTER)
+				&& rawStringEqualsBytes((RawString *) asObject(named), selector,
+					strlen(selector))) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+
+static int hasLiteralNamed(const CodeUnit *unit, const char *name)
+{
+	RawArray *literals = (RawArray *) asObject(unit->literals);
+	for (size_t i = 0; i < rawArraySize(literals); i++) {
+		Value literal = literals->vars[i];
+		if (valueTypeOf(literal, VALUE_POINTER)
+				&& rawStringEqualsBytes((RawString *) asObject(literal), name,
+					strlen(name))) {
+			return 1;
+		}
+	}
+	return 0;
 }
 
 
@@ -1015,6 +1050,96 @@ int main(void)
 	checkInt("basicNew: rejects a negative size rather than allocating nonsense",
 		call0(define(counter, "badSize [ ^(Array new: 0) size ]"),
 			objectTagged(instance)), 0);
+
+	// A LITERAL IS THE VALUE, not the shape the parser accumulated it in.
+	//
+	// Two node kinds carry the parser's working representation: a SYMBOL node
+	// holds a plain String, and an ARRAY node holds an OrderedCollection of
+	// LITERAL NODES. Emitting the field directly published both, and the failure
+	// is quiet in the expensive way -- the object exists and answers `size` with
+	// the right number, so `#(1 2 3) size` was 3 the whole time and only the
+	// class was wrong. Verified by reverting literalValueOf and watching these
+	// fail.
+	printf("\n  -- literals\n");
+	{
+		Value array = call0(define(counter, "lit [ ^#(1 2 3) ]"),
+			objectTagged(instance));
+		int isArray = valueTypeOf(array, VALUE_POINTER)
+			&& rawObjectClassIndex(asObject(array)) == classIndexOf(&Handles.Array);
+		check("a #( ) literal is an Array, and not the OrderedCollection the "
+			"parser built it in", isArray);
+		check("and its elements are the VALUES, not the syntax tree nodes",
+			isArray && rawArraySize((RawArray *) asObject(array)) == 3
+			&& rawArrayAt((RawArray *) asObject(array), 0) == tagInt(1)
+			&& rawArrayAt((RawArray *) asObject(array), 2) == tagInt(3));
+
+		Value nested = call0(define(counter, "nested [ ^#(1 #(2 3)) ]"),
+			objectTagged(instance));
+		Value inner = valueTypeOf(nested, VALUE_POINTER)
+			&& rawArraySize((RawArray *) asObject(nested)) == 2
+			? rawArrayAt((RawArray *) asObject(nested), 1) : 0;
+		check("and a nested one is an Array too, all the way down",
+			valueTypeOf(inner, VALUE_POINTER)
+			&& rawObjectClassIndex(asObject(inner)) == classIndexOf(&Handles.Array)
+			&& rawArrayAt((RawArray *) asObject(inner), 0) == tagInt(2));
+
+		// INTERNING is the point of a Symbol: identity is pointer identity, which
+		// is what makes a selector comparison one compare. A Symbol literal that
+		// is merely a String breaks that silently -- it prints almost the same and
+		// compares equal under `=`.
+		Value first = call0(define(counter, "s1 [ ^#abc ]"), objectTagged(instance));
+		Value again = call0(define(counter, "s2 [ ^#abc ]"), objectTagged(instance));
+		check("a symbol literal is a Symbol and not a String",
+			valueTypeOf(first, VALUE_POINTER)
+			&& rawObjectClassIndex(asObject(first)) == classIndexOf(&Handles.Symbol));
+		check("and it is INTERNED, so the same one written twice is one object",
+			first == again);
+	}
+
+	// A METHOD THAT IS NOTHING BUT A PRIMITIVE fails loudly instead of answering
+	// its receiver.
+	//
+	// The fall-through below a primitive is the general case written in
+	// Smalltalk, and when there is no body there is no general case: the implicit
+	// `^self` then hands back the RECEIVER for a method that computed nothing.
+	// A sweep of packages/Core found 77 methods shaped like this, 65 of them
+	// naming a primitive the VM has not implemented, so all 65 answered self on
+	// every call.
+	//
+	// The check reads the EMITTED BYTECODE rather than a return value, because
+	// the wrong behaviour is a plausible answer and not a crash: `'abc' asSymbol`
+	// came back a String, which is the receiver, and everything downstream kept
+	// running. Verified by disabling the emission and watching this fail.
+	printf("\n  -- a method that is nothing but a primitive\n");
+	{
+		CompileError primitiveError;
+		CodeUnit *bodyless = compileSource(
+			"asSymbol [ <primitive: StringAsSymbolPrimitive> ]", counter,
+			&primitiveError);
+		check("a bodyless primitive method compiles", bodyless != NULL);
+		if (bodyless != NULL) {
+			check("its fallback SENDS instead of answering the receiver",
+				sendsSelector(bodyless, "primitiveFailed:"));
+			check("and the message NAMES the primitive that did not run, which is "
+				"the half that says where to look",
+				hasLiteralNamed(bodyless, "StringAsSymbolPrimitive"));
+		}
+
+		// The other direction, which is what keeps this from being a rule that
+		// swallows every primitive method: a fallback that EXISTS is still the
+		// one that runs.
+		CodeUnit *withFallback = compileSource(
+			"asSymbol [ <primitive: StringAsSymbolPrimitive> ^7 ]", counter,
+			&primitiveError);
+		check("a primitive method that HAS a fallback keeps it untouched",
+			withFallback != NULL && !sendsSelector(withFallback, "primitiveFailed:"));
+
+		// And a bodyless method with NO primitive is an ordinary `^self`, which
+		// is correct Smalltalk and must not be turned into a failure.
+		CodeUnit *plain = compileSource("nothing [ ]", counter, &primitiveError);
+		check("a bodyless method with no primitive still answers self",
+			plain != NULL && !sendsSelector(plain, "primitiveFailed:"));
+	}
 
 	closeHandleScope(&outer, NULL);
 	printf("\n%d of %d checks passed\n", gChecks - gFailures, gChecks);

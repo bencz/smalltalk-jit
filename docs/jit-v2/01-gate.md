@@ -174,6 +174,8 @@ Apendar, nunca reescrever. Data, commit, o que destravou.
 | 2026-07-28 | 10 | `c4ef859` | construtor de classes: 142 arquivos do Core, 1567 metodos, 16 falhas nomeadas |
 | 2026-07-28 | 10 | `e77a111` | formas reconciliadas e os 5 arquivos v1 reescritos: o Core inteiro constroi |
 | 2026-07-28 | 10 | (nao commitado) | o Core EXECUTA: 158 inicializadores, metaclasses eager, sends ate 5 argumentos |
+| 2026-07-28 | 8 | (nao commitado) | metodo que e SO primitiva falha em voz alta: 93 de 93, e a varredura achou 77 |
+| 2026-07-28 | 10 | (nao commitado) | `printNl` contra o Core DE VERDADE: 5 bugs, nenhum na pilha de streams, 98 de 98 |
 
 ## O que o nivel 7 encontrou, e por que so ele podia encontrar
 
@@ -475,7 +477,7 @@ Tres regras que sairam disso:
   tentativa de primitiva simplesmente nao e emitida, e ele roda o fallback
   Smalltalk que ja carrega. As duas situacoes sao indistinguiveis de fora e
   tratar iguais seria esconder o typo;
-- por isso o `.def` e tambem o **checklist de paridade**: hoje **31 de 173**, e
+- por isso o `.def` e tambem o **checklist de paridade**: hoje **40 de 175**, e
   `primitiveCoverage()` responde isso em runtime em vez de alguem contar NULLs;
 - `IntAddPrimitive` e `FloatAddPrimitive` apontam para a MESMA funcao. E de graca
   e e exatamente o caminho rapido de aritmetica mista que o v1 nao tinha e pagava
@@ -655,7 +657,7 @@ mesmo processo. Nao precisa de imagem: e a maneira mais barata de descobrir o qu
 o kernel de verdade faz quando executa, e foi ela que achou tudo o que segue.
 
 ```
-142 files, 158 classes, 1727 methods, 158 initializers
+142 files, 158 classes, 1727 methods, 7 initializers
 ```
 
 Quatro coisas que so apareceram ao RODAR, cada uma um erro de desenho e nao um
@@ -663,10 +665,11 @@ detalhe:
 
 - **`initialize` de classe tinha que rodar.** Nada e opcional ali: e
   `ExternalStream class initialize` que faz Transcript ser um stream no descritor
-  1, e sem ele o proprio `printNl` do kernel manda `nextPutAll:` para nil. O
-  carregador roda os 158 na ordem do manifesto, que e a ordem em que as classes
-  foram definidas, porque um inicializador rotineiramente usa uma classe
-  definida antes;
+  1, e sem ele o proprio `printNl` do kernel manda `nextPutAll:` para nil. A
+  ordem e a do manifesto, que e a ordem em que as classes foram definidas, porque
+  um inicializador rotineiramente usa uma classe definida antes. **So a classe
+  que DEFINE um o roda**; a primeira versao mandava `initialize` para as 158 e
+  contava 158, e a contagem era o proprio bug, ver a secao de `printNl` abaixo;
 - **metaclasse preguicosa quebra HERANCA de metodo de classe.** Criar a
   metaclasse so para quem declara metodo de classe parecia economia e era bug: a
   cadeia de metaclasses e o que faz metodo de classe ser herdado, entao `Array`,
@@ -682,10 +685,10 @@ detalhe:
   ABI (receptor mais cinco, o conjunto de registradores inteiros do SysV), e
   passar disso DIZ isso em vez de chamar com argumentos que ninguem escreveu.
 
-Onde para hoje: `3 + 4` roda contra o kernel de verdade, `7 printStringBase: 10`
-tambem, e os bytes JA SAEM do processo (`ExternalStream write:next:from:` escreve
-no descritor). `printNl` ainda morre acima disso, dentro da pilha de streams. Sao
-**38 das 175 primitivas implementadas**, e os testes usam muito mais.
+Onde para hoje: `printNl` roda contra o Core de verdade, ver a secao propria
+abaixo. Sao **40 das 175 primitivas implementadas**, e os testes usam muito mais;
+o que falta agora aparece nomeado (`FloatAsStringPrimitive`, a familia
+`LargeInt*`) em vez de responder o receptor.
 
 Duas armadilhas achadas ali, as duas da mesma familia:
 
@@ -700,11 +703,185 @@ Duas armadilhas achadas ali, as duas da mesma familia:
   geral: primitiva nao implementada mais corpo vazio e um metodo que responde o
   receptor, silenciosamente.
 
+## A varredura: metodo que e SO primitiva, e os 77 que respondiam o RECEPTOR
+
+A licao acima (`IoError class last` respondendo a classe `IoError`) foi tratada
+como regra geral e VARRIDA, porque o modo de falha e silencio e um caso achado a
+mao nao diz quantos outros existem. O numero:
+
+| | |
+|---|---|
+| metodos com pragma de primitiva e CORPO VAZIO | **77** |
+| destes, nomeando primitiva **nao implementada** | **65** |
+| destes, nomeando primitiva implementada | 12 |
+
+Os 65 respondiam o receptor em TODA chamada. Os 12 respondem so quando a
+primitiva falha, e `Character>>codePoint` esta entre eles: implementar a
+primitiva calou o sintoma e deixou o caminho de falha intacto.
+
+Onde estao os 65, e o agrupamento importa porque ele e uma lista de trabalho:
+
+| | | |
+|---|---|---|
+| 22 | raiz de `src/` | Block, CompiledMethod, Context, Debugger, Exception, GarbageCollector, Namespace, Object, System |
+| 13 | `Magnitudes/` | Float (trigonometria, `sqrt`, `printString`), DateTime, Stopwatch |
+| 11 | `Processes/` | ProcessorScheduler inteiro |
+| 8 | `Files/` | Directory, File |
+| 4 + 3 | `Compiler/`, `Parser/` | as primitivas reflexivas |
+| 2 + 1 + 1 | `Collections/`, `Streams/`, `Concurrency/` | String `hash` e `asSymbol`, Socket, Atomic |
+
+**A varredura foi conferida contra o parser de verdade** antes de qualquer numero
+ser reivindicado: o scanner conta **1727 metodos em 142 arquivos**, exatamente o
+que `st -b packages/Core` reporta. Um scanner que discordasse ali estaria
+tokenizando errado, e a diferenca inicial (1730 em 144) era `VMTools.st` mais o
+proprio `package.st`, que existem no disco e nao no manifesto.
+
+### O conserto e no COMPILADOR, e por que nao nos 77 arquivos
+
+Editar 77 metodos a mao consertaria os 77 de hoje e nao o 78. A condicao e
+decidivel na COMPILACAO, entao a regra mora la:
+
+**Um metodo cujo corpo esta vazio e que carrega pragma de primitiva emite
+`self primitiveFailed: #NomeDaPrimitiva` no lugar do `^self` implicito.**
+
+Tres coisas decidiram o desenho:
+
+- **o kernel EMBUTIDO ja fazia isso** (`definePrimitiveMethod` em
+  `tools/Bootstrap.c` manda `#primitiveFailed` desde sempre). Entao a MESMA
+  FORMA DE FONTE significava duas coisas diferentes conforme quem compilou:
+  "falha em voz alta" no kernel de C, "responde o receptor" no `packages/Core`.
+  Essa divergencia era o defeito de verdade, e agora e uma regra so para os dois;
+- **a mensagem NOMEIA A PRIMITIVA.** A classe do receptor sozinha diz quem falhou
+  e omite o que estava sendo tentado, e para um Float isso e uma duzia de
+  candidatos. O `doesNotUnderstand` passou a imprimir os argumentos que sao
+  Symbol ou String, que sao os unicos seguros de imprimir dali, e a mensagem
+  ficou `doesNotUnderstand: primitiveFailed: (receiver is a String) (argument 1
+  is StringAsSymbolPrimitive)`;
+- **nao custa nada quando a primitiva funciona**: este codigo so e alcancado
+  quando ela nao rodou.
+
+Erro de compilacao seria a guarda mais forte e esta fora de questao: os 65 fariam
+`st -b packages/Core` parar de construir, e o nivel do gate so sobe.
+
+**Verificado DESLIGANDO o conserto**, nas duas direcoes. Com ele desligado
+`'abc' asSymbol` responde uma **String** (o receptor) e o programa segue; com ele
+ligado a chamada para e diz qual primitiva faltou. As duas checagens novas do
+nivel 8 falham com a emissao desligada, e as tres de controle passam dos dois
+jeitos, de proposito: elas existem para provar que a regra nao engole metodo com
+fallback de verdade nem metodo vazio sem primitiva, que continua sendo `^self` e
+continua sendo Smalltalk correto.
+
+**Nao entrou script de varredura no repositorio.** Ele e um SEGUNDO parser de
+Smalltalk, e a divergencia entre duas copias da mesma logica e exatamente o que
+custou caro nos backends do v1. A medicao foi feita uma vez, conferida contra o
+parser, e esta registrada acima; a regra que impede o 78 esta no compilador.
+
+## `printNl` contra o Core de verdade, e os cinco bugs que estavam atras dele
+
+O diagnostico anterior dizia que `printNl` morria "dentro da pilha de streams
+(BufferedStream/PositionableStream)". **Estava errado, e a pilha de streams nao
+tinha bug nenhum.** Eram cinco bugs, em cinco camadas diferentes, e o unico
+sintoma que qualquer um deles produzia era `printNl` nao funcionar.
+
+Fica registrado porque o erro de diagnostico e o item mais caro aqui: a peca que
+esta no meio do caminho leva a culpa, e nenhuma das cinco causas estava nela.
+
+### 1. `initialize` de classe rodava HERDADO, uma vez por subclasse
+
+`ExternalStream class initialize` faz `Transcript := self descriptor: 1`. Um
+metodo de classe e herdado pela cadeia de metaclasses como qualquer outro, e o
+carregador mandava `initialize` para as 158 classes, entao **FileStream e Socket,
+que nao declaram nenhum e sao construidos depois, rodavam o de ExternalStream com
+`self` diferente**. `Transcript` terminava um SOCKET no descritor 1.
+
+A busca do carregador agora **nao herda**: so a classe que DEFINE `initialize` o
+roda. O numero honesto caiu de "158 initializers" para **7**, que e exatamente
+quantas classes do Core declaram um (conferido: `grep -c` responde 7).
+
+### 2. Variavel de CLASSE era invisivel do lado da CLASSE
+
+Um metodo de classe e compilado com a METACLASSE como `ownerClass`, e a busca de
+variavel de classe andava a cadeia a partir dai. Uma metaclasse nao carrega as
+variaveis de classe da classe, entao **a busca nao achava nada**, e como o nome
+comeca com maiuscula ele caia na regra de referencia adiantada e ganhava uma
+Association GLOBAL nova.
+
+Resultado: `Character class initialize` escrevia `Table` numa Association, e
+`Character>>isVowel` lia `Table` de OUTRA. A tabela de tipos de caractere estava
+sempre nil, e `$a printNl` morria dentro de `isVowel`.
+
+`CompileContext` ganhou `classVariableScope`: variaveis de instancia e `super`
+continuam vindo da metaclasse, variaveis de classe vem da CLASSE. Silencioso do
+comeco ao fim, e sem sintoma nenhum ate alguem ler a variavel.
+
+### 3. Literal `#( )` era a colecao de trabalho do PARSER
+
+O no de array guarda uma `OrderedCollection` de NOS DA ARVORE, que e como o
+parser acumula os elementos enquanto le. O emissor publicava esse campo direto,
+entao `#(1 2 3)` era uma **OrderedCollection de LiteralNodes**.
+
+`#(1 2 3) size` respondia **3** o tempo todo. So a classe estava errada, e so o
+`do:` do print revelava.
+
+### 4. Literal `#sym` era uma String
+
+Mesma familia: o no de simbolo guarda uma String, e um Symbol e uma String
+INTERNADA. `#sym` saia String, entao `#sym == #sym` era **false**, que e
+exatamente a propriedade pela qual o interning existe.
+
+Os dois viraram `literalValueOf`, que traduz o no para o valor de runtime e
+recursa nos arrays aninhados. Cinco checagens novas no nivel 8, todas verificadas
+falhando com a traducao removida.
+
+### 5. `Object superClass` respondia 0, e derrubava `isKindOf:` inteiro
+
+`Object := nil [ ... ]` DECLARA que a superclasse e nil, e o construtor de
+classes descartava a declaracao: o campo ficava com o ZERO do alocador. Do lado
+C isso e certo, porque ausente e `valueTypeOf(slot, VALUE_POINTER)` falso. Do
+lado Smalltalk **nao ha zero, so nil**, e `inheritsFrom:` anda a cadeia com
+`aSuperClass == nil` ate parar.
+
+Entao a cadeia andava um passo A MAIS e mandava `superClass` para um
+SmallInteger. Isso e `isKindOf:` para toda classe que nao case exatamente, ou
+seja `3 isKindOf: Fraction`, e por baixo dele a torre numerica inteira: `(3/4) +
+(1/4)` levantava.
+
+**Duas linguagens, dois "ausente", e agora um lugar so**: `rawClassSuperclass()`
+responde NULL para os dois, e os sete leitores em C passam por ele. Sem isso, o
+lado C aceitaria nil como classe e andaria PARA DENTRO da instancia de
+UndefinedObject.
+
+O mesmo zero aparecia em `namespace` (`Class>>qualifiedName` pergunta
+`namespace isNil`, recebia false, e ia indexar uma colecao que nao existe, entao
+imprimir QUALQUER classe levantava). `classFillAbsentSmalltalkFields` poe nil nos
+quatro campos que **so o Smalltalk le**: `subClasses`, `comment`, `category`,
+`namespace`.
+
+**Os outros quatro ficam com zero de proposito**, e isso e a parte que nao pode
+ser esquecida: `name`, `methodDictionary`, `instanceVariables` e
+`classVariables` sao lidos em C como "e um ponteiro?", e esse teste E a checagem
+de presenca. nil e um ponteiro, entao enche-los trocaria "esta classe nao tem
+dicionario de metodos" por "o dicionario de metodos dela e o objeto nil".
+
+### O que passou a funcionar
+
+Nao so `(3 + 4) printNl`. Aferido com valor esperado, 24 de 24: inteiro, String,
+Symbol, Character, nil, true, Fraction, Array (aninhado), Dictionary, Set,
+SortedCollection, Interval com `collect:` e `inject:into:`, Association,
+`isKindOf:` nos dois sentidos, impressao de classe e de metaclasse.
+
+O que ainda nao: `3.5 printNl` (`FloatAsStringPrimitive`) e `100 factorial`
+(a familia `LargeInt*`). Os dois sao primitivas nao implementadas, os dois
+aparecem na varredura acima, e os dois agora DIZEM qual primitiva falta em vez de
+responder o receptor.
+
 E compilar nao e rodar. Entre isto e `run_tests.sh` verde estao, em ordem:
 a IMAGEM (Snapshot le e escreve o modelo novo), as EXCECOES (`signal`, `on:do:`,
 `ensure:`, que e o segundo cliente do unwind que o retorno nao local ja
-construiu), e as PRIMITIVAS: 31 das 174 estao implementadas, e os testes usam
-muito mais que isso.
+construiu), e as PRIMITIVAS: 40 das 175 estao implementadas, e os testes usam
+muito mais que isso. Um metodo que declara uma primitiva ausente E NAO TEM corpo
+de fallback agora falha nomeando-a, em vez de responder o receptor: sao 65 assim
+no Core, contados na varredura acima.
 
 ## O que o gate NAO cobre, e como cobrimos
 

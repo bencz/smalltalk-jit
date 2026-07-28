@@ -250,11 +250,11 @@ static RawCompiledMethod *lookupMethod(RawClass *class, RawObject *selector)
 				return method;
 			}
 		}
-		Value super = classHandle->raw->superClass;
-		if (!valueTypeOf(super, VALUE_POINTER)) {
+		RawClass *super = rawClassSuperclass(classHandle->raw);
+		if (super == NULL) {
 			break;
 		}
-		classHandle = scopeHandle(asObject(super));
+		classHandle = scopeHandle((RawObject *) super);
 	}
 	closeHandleScope(&scope, NULL);
 	return NULL;
@@ -311,7 +311,28 @@ static Value dispatchFrom(IcCell *cell, Value *receiverSlot, uint64_t packed,
 		} else {
 			fprintf(stderr, "of class %u", receiverClass);
 		}
-		fprintf(stderr, ")\n");
+		fprintf(stderr, ")");
+		// Arguments that are Symbols or Strings are printed, and nothing else is.
+		// A bodyless primitive method fails as `self primitiveFailed: #TheName`
+		// (compiler/Compile.c), so without this the message names the receiver's
+		// class and omits WHICH primitive was being attempted, which for a class
+		// like Float is a dozen candidates. Text-shaped arguments are the ones
+		// worth printing and the only ones that are safe to print from here.
+		for (uint64_t i = 0; i < argc; i++) {
+			Value argument = receiverSlot[-(intptr_t) (i + 1)];
+			if (!valueTypeOf(argument, VALUE_POINTER)) {
+				continue;
+			}
+			RawClass *argumentClassObject = classOf(argument);
+			if (argumentClassObject != Handles.String.raw
+					&& argumentClassObject != Handles.Symbol.raw) {
+				continue;
+			}
+			fprintf(stderr, " (argument %llu is ", (unsigned long long) (i + 1));
+			fprintRawString(stderr, (RawString *) asObject(argument));
+			fprintf(stderr, ")");
+		}
+		fprintf(stderr, "\n");
 		fflush(NULL);
 		abort();
 	}
@@ -941,9 +962,9 @@ NativeCode *jitCompileFor(const MacroAssemblerOps *ops, CodeUnit *unit,
 				|| !valueTypeOf(unit->ownerClass, VALUE_POINTER)) {
 			continue;
 		}
-		Value super = ((RawClass *) asObject(unit->ownerClass))->superClass;
-		if (valueTypeOf(super, VALUE_POINTER)) {
-			jit.cells[i].lookupStart = ((RawClass *) asObject(super))->classIndex;
+		RawClass *super = rawClassSuperclass((RawClass *) asObject(unit->ownerClass));
+		if (super != NULL) {
+			jit.cells[i].lookupStart = super->classIndex;
 		}
 	}
 	for (size_t i = 0; i < unit->instructionCount; i++) {

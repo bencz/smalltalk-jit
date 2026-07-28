@@ -85,10 +85,10 @@ Class *classMetaclassOf(Class *class)
 	// class-side method inherited by subclasses. At the root it lands on the
 	// class-of-classes, where the class-side methods every class has (new, new:)
 	// already live.
-	Value super = held->raw->superClass;
-	Class *superMeta = valueTypeOf(super, VALUE_POINTER)
-		? classMetaclassOf(scopeHandle(asObject(super)))
-		: &Handles.ClassClass;
+	RawClass *super = rawClassSuperclass(held->raw);
+	Class *superMeta = super == NULL
+		? &Handles.ClassClass
+		: classMetaclassOf(scopeHandle((RawObject *) super));
 
 	String *name = NULL;
 	if (valueTypeOf(held->raw->name, VALUE_POINTER)) {
@@ -208,7 +208,11 @@ static void buildMethods(Class *class, ClassNode *node, ClassBuildError *error)
 		_Bool classSide = side != NULL && stringEqualsC(side, "class");
 		Class *target = classSide ? classMetaclassOf(class) : class;
 
-		CompileContext context = { target, smalltalkGlobals() };
+		// Instance variables and super come from `target`, which for a class-side
+		// method is the metaclass; class variables come from `class`, which is
+		// where they were declared and where both sides have to find the same
+		// Association.
+		CompileContext context = { target, smalltalkGlobals(), class };
 		CompileError compileError;
 		CodeUnit *unit = compileMethod(methodNode, &context, &compileError);
 		if (unit == NULL) {
@@ -301,8 +305,8 @@ static size_t declaredVariableCount(Class *class)
 		if (valueTypeOf(declared, VALUE_POINTER)) {
 			count += ordCollSize(scopeHandle(asObject(declared)));
 		}
-		Value super = level->raw->superClass;
-		level = valueTypeOf(super, VALUE_POINTER) ? scopeHandle(asObject(super)) : NULL;
+		RawClass *super = rawClassSuperclass(level->raw);
+		level = super == NULL ? NULL : scopeHandle((RawObject *) super);
 	}
 	return count;
 }
@@ -444,6 +448,15 @@ Class *classBuild(ClassNode *node, ClassBuildError *error)
 		if (super != NULL) {
 			rawObjectStorePtr((RawObject *) class->raw, &class->raw->superClass,
 				(RawObject *) super->raw);
+		} else {
+			// `Object := nil [ ... ]` SAYS its superclass is nil, and the field is
+			// read from Smalltalk as an ordinary instance variable. Dropping the
+			// declaration left the allocator's zero there, so `Object superClass`
+			// answered the SmallInteger 0: not nil, so every `superClass == nil`
+			// loop ran one step too far and sent `superClass` to a 0. That is what
+			// `3 isKindOf: Fraction` did, and it is the whole isKindOf: protocol.
+			rawObjectStorePtr((RawObject *) class->raw, &class->raw->superClass,
+				Handles.nil.raw);
 		}
 	} else {
 		class = classCreate(super, (union String *) asSymbol(name), shape);
@@ -451,6 +464,9 @@ Class *classBuild(ClassNode *node, ClassBuildError *error)
 	}
 	rawObjectStorePtr((RawObject *) class->raw, &class->raw->instanceVariables,
 		(RawObject *) variables->raw);
+	// The built-in classes were made during bootstrap, before there was a nil to
+	// put in them, and this is the pass that reaches every one of them.
+	classFillAbsentSmalltalkFields(class);
 	declareClassVariables(class, node);
 	methodsOf(class);
 	classMetaclassOf(class); // established here so the chain is never partial

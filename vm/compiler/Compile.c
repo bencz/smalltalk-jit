@@ -766,7 +766,13 @@ static Place resolveName(Emitter *e, String *name)
 	//
 	// One is an Association, exactly like a global, so nothing new is emitted to
 	// read or write it: the difference is only where the Association was found.
-	for (Class *level = e->context->ownerClass; level != NULL; ) {
+	//
+	// The search starts at classVariableScope and not at ownerClass, because a
+	// CLASS-SIDE method is compiled against the METACLASS and a metaclass carries
+	// none of the class's class variables. See the note in compiler/Compile.h.
+	Class *scopeStart = e->context->classVariableScope != NULL
+		? e->context->classVariableScope : e->context->ownerClass;
+	for (Class *level = scopeStart; level != NULL; ) {
 		Value variables = level->raw->classVariables;
 		if (valueTypeOf(variables, VALUE_POINTER)) {
 			Dictionary *dictionary = scopeHandle(asObject(variables));
@@ -779,8 +785,8 @@ static Place resolveName(Emitter *e, String *name)
 			}
 			symbol = symbolOf(key); // the lookup may have moved it
 		}
-		Value super = level->raw->superClass;
-		level = valueTypeOf(super, VALUE_POINTER) ? scopeHandle(asObject(super)) : NULL;
+		RawClass *super = rawClassSuperclass(level->raw);
+		level = super == NULL ? NULL : scopeHandle((RawObject *) super);
 	}
 
 	if (e->context->globals != NULL) {
@@ -832,9 +838,8 @@ static OrderedCollection *collectInstanceVariables(Class *class)
 	Class *current = class;
 	while (current != NULL && depth < 64) {
 		chain[depth++] = current;
-		Value super = current->raw->superClass;
-		current = valueTypeOf(super, VALUE_POINTER)
-			? scopeHandle(asObject(super)) : NULL;
+		RawClass *super = rawClassSuperclass(current->raw);
+		current = super == NULL ? NULL : scopeHandle((RawObject *) super);
 	}
 	while (depth > 0) {
 		Class *level = chain[--depth];
@@ -1079,9 +1084,68 @@ static _Bool isLiteralNode(Object *node)
 }
 
 
+// The RUNTIME VALUE of a literal node, which is not always the value the node
+// carries.
+//
+// Two kinds hold the PARSER'S WORKING REPRESENTATION rather than the object the
+// program is meant to see, and emitting the field directly published both:
+//
+//   * a SYMBOL node holds a plain String. A Symbol is an INTERNED String, and
+//     interning is the whole reason symbol identity is pointer identity, so
+//     `#sym` came out a String: wrong class, and `#sym == #sym` false;
+//   * an ARRAY node holds an OrderedCollection of LITERAL NODES, which is how
+//     the parser accumulates elements while it reads them. So `#(1 2 3)` came
+//     out an OrderedCollection whose elements were SYNTAX TREE NODES.
+//
+// Both failures are quiet in the way this project keeps paying for: the object
+// exists, it answers `size` with the right number, and only its class is wrong.
+// `#(1 2 3) size` answered 3 the whole time.
+//
+// nil, true and false appear here only INSIDE an array literal; at statement
+// level emitValue turns them into their own instructions.
+static Value literalValueOf(Emitter *e, Object *node)
+{
+	if (isInstance(node, &Handles.SymbolNode)) {
+		return objectTagged(asSymbol(literalNodeGetStringValue((LiteralNode *) node)));
+	}
+	if (isInstance(node, &Handles.NilNode)) {
+		return tagPtr(Handles.nil.raw);
+	}
+	if (isInstance(node, &Handles.TrueNode)) {
+		return tagPtr(Handles.true_.raw);
+	}
+	if (isInstance(node, &Handles.FalseNode)) {
+		return tagPtr(Handles.false_.raw);
+	}
+	if (!isInstance(node, &Handles.ArrayNode)) {
+		return literalNodeGetValue((LiteralNode *) node);
+	}
+
+	HandleScope scope;
+	openHandleScope(&scope);
+	OrderedCollection *items = (OrderedCollection *) scopeHandle(
+		asObject(literalNodeGetValue((LiteralNode *) node)));
+	size_t count = items == NULL ? 0 : ordCollSize(items);
+	// A HANDLE, and it has to be: building a nested array allocates, and a
+	// collection in the middle of this loop would move an Array held only as a
+	// raw pointer.
+	Array *array = newArray(count);
+	for (size_t i = 0; i < count; i++) {
+		Object *item = scopeHandle(asObject(ordCollAt(items, i)));
+		Value element = literalValueOf(e, item);
+		if (valueTypeOf(element, VALUE_POINTER)) {
+			arrayAtPutObject(array, i, scopeHandle(asObject(element)));
+		} else {
+			array->raw->vars[i] = element;
+		}
+	}
+	return objectTagged((Array *) closeHandleScope(&scope, array));
+}
+
+
 static void emitLiteral(Emitter *e, LiteralNode *node, uint16_t dest)
 {
-	Value value = literalNodeGetValue(node);
+	Value value = literalValueOf(e, (Object *) node);
 	// A small integer goes in the instruction itself. It is by far the most
 	// common literal and does not deserve a slot in the frame the collector
 	// walks.
@@ -1650,11 +1714,44 @@ static CodeUnit *compileUnit(Emitter *parent, BlockNode *body, uint16_t arity,
 	}
 
 	uint16_t result = allocRegister(&e);
-	emitStatements(&e, blockNodeGetExpressions(body), result, 1);
-	if (!isBlock) {
-		// A method with no explicit return answers self. A block answers its
-		// last statement, which is already in `result`.
-		emit(&e, OP_MOVE, 0, result, 0, 0);
+	OrderedCollection *statements = blockNodeGetExpressions(body);
+	size_t statementCount = statements == NULL ? 0 : ordCollSize(statements);
+
+	// A METHOD THAT IS NOTHING BUT A PRIMITIVE fails loudly instead of answering
+	// the receiver.
+	//
+	// The fall-through below a primitive is the general case written in
+	// Smalltalk, and when there is no body there is no general case: the implicit
+	// `^self` then answers the RECEIVER for a method that computed nothing.
+	// Silently. It is a wrong answer that travels, and it has already cost this
+	// campaign two debugging sessions -- `Character>>codePoint` answered a
+	// Character, and `IoError class last` answered the class IoError.
+	//
+	// The built-in kernel has always done this (definePrimitiveMethod in
+	// tools/Bootstrap.c), so until now the SAME source shape meant two different
+	// things depending on which kernel compiled it. That divergence was the real
+	// defect; this is one rule for both.
+	//
+	// The fallback names the PRIMITIVE, because the receiver's class alone says
+	// what did not work and leaves out what was being attempted. Nothing is paid
+	// by a primitive that works: this code is only reached when it did not run.
+	if (!isBlock && primitive != PRIM_NONE && statementCount == 0) {
+		uint16_t mark = e.top;
+		uint16_t base = allocRegister(&e);
+		emit(&e, OP_MOVE, 0, base, 0, 0); // the receiver
+		uint16_t named = allocRegister(&e);
+		emit(&e, OP_LOADK, 0, named,
+			literalIndex(&e, objectTagged(asSymbol(stringFromC(
+				primitiveName((PrimitiveNumber) primitive))))), 0);
+		emitSendTo(&e, result, stringFromC("primitiveFailed:"), base, 1, 0);
+		releaseTo(&e, mark);
+	} else {
+		emitStatements(&e, statements, result, 1);
+		if (!isBlock) {
+			// A method with no explicit return answers self. A block answers its
+			// last statement, which is already in `result`.
+			emit(&e, OP_MOVE, 0, result, 0, 0);
+		}
 	}
 	// The trailing RET is unconditional: falling off the end of generated code
 	// has no defined meaning, so there is always one here even when the body

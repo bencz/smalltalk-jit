@@ -182,6 +182,11 @@ static void nameClasses(void)
 // failure into a wrong answer somewhere else: an overflowed sum has no
 // LargeInteger to fall back to here, and an out-of-range at: has no exception to
 // signal, because neither of those exists until packages/Core loads.
+//
+// The message NAMES THE PRIMITIVE, and it is the same message the front end
+// emits for a bodyless primitive method in packages/Core (compiler/Compile.c).
+// One shape for both kernels: before, the same source meant "fail loudly" here
+// and "answer the receiver" there.
 static void definePrimitiveMethod(Class *class, const char *selector,
 	PrimitiveNumber primitive, uint16_t argumentCount)
 {
@@ -189,21 +194,25 @@ static void definePrimitiveMethod(Class *class, const char *selector,
 	openHandleScope(&scope);
 
 	uint16_t base = (uint16_t) (argumentCount + 1);
-	Instruction *code = calloc(3, sizeof(Instruction));
+	Instruction *code = calloc(4, sizeof(Instruction));
 	ASSERT(code != NULL);
-	code[0] = (Instruction) { OP_MOVE, 0, base, 0, 0 };        // the receiver
-	code[1] = (Instruction) { OP_SEND, 0, base, 0, base };     // #primitiveFailed
-	code[2] = (Instruction) { OP_RET, 0, base, 0, 0 };
+	code[0] = (Instruction) { OP_MOVE, 0, base, 0, 0 };   // the receiver
+	code[1] = (Instruction) { OP_LOADK, 0,               // which primitive
+		(uint16_t) (base + 1), 1, 0 };
+	code[2] = (Instruction) { OP_SEND, 1, base, 0, base }; // #primitiveFailed:
+	code[3] = (Instruction) { OP_RET, 0, base, 0, 0 };
 
-	Array *literals = newArray(1);
-	arrayAtPutObject(literals, 0, (Object *) asSymbol(stringFromC("primitiveFailed")));
+	Array *literals = newArray(2);
+	arrayAtPutObject(literals, 0, (Object *) asSymbol(stringFromC("primitiveFailed:")));
+	arrayAtPutObject(literals, 1,
+		(Object *) asSymbol(stringFromC(primitiveName(primitive))));
 	String *name = asSymbol(stringFromC(selector));
 
 	CodeUnit *unit = calloc(1, sizeof(CodeUnit));
 	ASSERT(unit != NULL);
 	unit->code = code;
-	unit->instructionCount = 3;
-	unit->registerCount = (uint16_t) (argumentCount + 2);
+	unit->instructionCount = 4;
+	unit->registerCount = (uint16_t) (argumentCount + 3);
 	unit->argumentCount = argumentCount;
 	unit->primitive = primitive;
 	unit->literals = objectTagged(literals);
@@ -234,7 +243,7 @@ static void defineSourceMethod(Class *class, const char *source)
 		fprintf(stderr, "bootstrap: cannot parse '%s'\n", source);
 		abort();
 	}
-	CompileContext context = { class, smalltalkGlobals() };
+	CompileContext context = { class, smalltalkGlobals(), NULL };
 	CompileError error;
 	CodeUnit *unit = compileMethod(node, &context, &error);
 	freeParser(&parser);
@@ -565,14 +574,34 @@ void bootstrapLoadPackage(const char *directory, BootstrapReport *report)
 	// runs the kernel's own printNl sends nextPutAll: to nil. The order is the
 	// manifest's, which is the same order the classes were defined in, because
 	// one initializer routinely uses a class defined earlier.
+	//
+	// ONLY THE CLASS THAT DEFINES ONE RUNS IT, and this is a LOOKUP THAT DOES NOT
+	// INHERIT, deliberately. A class-side method is inherited down the metaclass
+	// chain like any other, so an ordinary send finds the SUPERCLASS's initialize
+	// for every subclass that has none of its own, and the loader then runs it
+	// once per subclass with a different `self` each time.
+	//
+	// Measured, and it is not hypothetical: `ExternalStream class initialize`
+	// assigns `Transcript := self descriptor: 1`, and FileStream and Socket
+	// inherit it and are built after it, so Transcript ended up a SOCKET on
+	// descriptor 1. Everything printed through it then went into the socket
+	// write path.
 	size_t built_count = ordCollSize(built);
+	String *initialize = asSymbol(stringFromC("initialize"));
 	for (size_t i = 0; i < built_count; i++) {
 		HandleScope each;
 		openHandleScope(&each);
 		Object *class = ordCollObjectAt(built, i);
-		_Bool understood = 0;
-		jitSendUnary(objectTagged(class), "initialize", &understood);
-		report->initializersRun += understood ? 1 : 0;
+		RawClass *metaclass = classOf(objectTagged(class));
+		Value methods = metaclass == NULL ? 0 : metaclass->methodDictionary;
+		_Bool definesOwn = valueTypeOf(methods, VALUE_POINTER)
+			&& valueTypeOf(symbolDictAt(scopeHandle(asObject(methods)), initialize),
+				VALUE_POINTER);
+		if (definesOwn) {
+			_Bool understood = 0;
+			jitSendUnary(objectTagged(class), "initialize", &understood);
+			report->initializersRun += understood ? 1 : 0;
+		}
 		closeHandleScope(&each, NULL);
 	}
 	closeHandleScope(&scope, NULL);
