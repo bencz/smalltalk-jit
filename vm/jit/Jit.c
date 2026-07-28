@@ -292,9 +292,27 @@ static Value dispatchFrom(IcCell *cell, Value *receiverSlot, uint64_t packed,
 	if (method == NULL) {
 		// PENDING: doesNotUnderstand. Failing loudly beats returning nil, which
 		// would turn a missing method into a wrong answer somewhere else.
+		// EVERY PART OF THIS GOES TO STDERR, and the selector is why: printing it
+		// on stdout put it in a block-buffered stream that abort() never flushes,
+		// so the message arrived as "doesNotUnderstand: " with nothing after it.
+		//
+		// The RECEIVER'S CLASS is named too. Without it the message says what was
+		// not understood and leaves out who did not understand it, which is the
+		// half that says where to look.
 		fprintf(stderr, "doesNotUnderstand: ");
-		printRawString((RawString *) cell->selector);
-		fprintf(stderr, "\n");
+		fprintRawString(stderr, (RawString *) cell->selector);
+		RawClass *receiverClassObject = classOf(receiver);
+		Value className = receiverClassObject == NULL
+			? 0 : receiverClassObject->name;
+		fprintf(stderr, " (receiver is ");
+		if (valueTypeOf(className, VALUE_POINTER)) {
+			fprintf(stderr, "a ");
+			fprintRawString(stderr, (RawString *) asObject(className));
+		} else {
+			fprintf(stderr, "of class %u", receiverClass);
+		}
+		fprintf(stderr, ")\n");
+		fflush(NULL);
 		abort();
 	}
 	if (method->native == NULL) {

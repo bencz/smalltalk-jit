@@ -168,7 +168,9 @@ Apendar, nunca reescrever. Data, commit, o que destravou.
 | 2026-07-28 | 8 | (nao commitado) | closures no FRONT END: analise de captura e emissao de CLOSURE, 69 de 69 |
 | 2026-07-28 | 0 | (nao commitado) | as closures acharam DOIS bugs de memoria pre-existentes, ver abaixo: 27 de 27 |
 | 2026-07-28 | 8 | `c2ac221` | closures commitadas |
-| 2026-07-28 | 8 | (nao commitado) | `super` no tier 1 e retorno nao local: 88 de 88 |
+| 2026-07-28 | 8 | `fe9b5e8` | `super` no tier 1 e retorno nao local: 88 de 88 |
+| 2026-07-28 | **9** | (nao commitado) | CMakeLists reescrito para o conjunto v2; `cmake --build` limpo com -Werror |
+| 2026-07-28 | **10** | (nao commitado) | kernel EMBUTIDO em C + `st -e`: `(3 + 4) printNl` imprime 7 |
 
 ## O que o nivel 7 encontrou, e por que so ele podia encontrar
 
@@ -496,6 +498,64 @@ Duas divergencias de desenho que a leitura revelou, e que nao sao renomeacao:
 
 Ha tambem pragmas de CLASSE (`<shape: BytesShape>`, `<shape: IndexedShape>`, ...)
 que o bootstrap novo vai ter que ler para carimbar a forma da instancia.
+
+## Niveis 9 e 10: o VM voltou a existir como PROGRAMA
+
+**O que compila.** O CMakeLists foi reescrito para o conjunto v2 e ficou MENOR de
+proposito. O corte seco tirou 87 arquivos; o que ainda nao foi reimplementado
+NAO esta na lista, em vez de estar listado e quebrado. Continuam no disco e fora
+do build, cada um voltando quando a camada dele voltar:
+`core/{CompiledCode,Entry,Exception,Lookup,Namespace,StackFrame}.c`,
+`compiler/{Compiler,Scope}.c`, `concurrency/Scheduler.c`,
+`runtime/{Base64,FileSystem,Iterator,Json,Message,Primitives,Socket,Stream}.c`,
+`tools/{Repl,Snapshot}.c`. Os backends POWER falham no CONFIGURE com mensagem
+propria: nao foram portados para o macro assembler novo, e um build que anda
+quase todo e depois nao acha um simbolo nao explica nada.
+
+**O kernel EMBUTIDO, e por que ele existe.** Ha um problema de ordem: o kernel
+de verdade e `packages/Core`, que e fonte Smalltalk, e ler fonte Smalltalk exige
+parser, compilador, heap, classes para compilar contra e primitivas para mandar
+mensagem. Alguma coisa tem que existir antes de qualquer imagem, e
+`vm/tools/Bootstrap.c` e essa coisa: a classe das classes, as classes que o
+proprio parser instancia, as classes dos imediatos, e as primitivas ja
+implementadas. E andaime, nao um subconjunto de `packages/Core` que tenha que
+ficar em sincronia com ele.
+
+Duas decisoes dentro dele:
+
+- **o fallback de uma primitiva embutida MANDA `#primitiveFailed`**, que ninguem
+  implementa, entao a falha para e diz quem falhou. Responder nil viraria
+  resposta errada em outro lugar: uma soma que estourou nao tem LargeInteger para
+  onde cair aqui, e um `at:` fora de faixa nao tem excecao para levantar, porque
+  nenhum dos dois existe antes de `packages/Core`;
+- **as comparacoes derivadas sao compiladas de FONTE no bootstrap**
+  (`> aNumber [ ^aNumber < self ]` e companhia), entao um bootstrap que passou
+  daqui ja exercitou parser, compilador e JIT antes de o primeiro programa rodar.
+
+**Uma primitiva que `packages/` nao escreve.** `PrintValuePrimitive`, e o
+`Primitives.def` diz isso na linha dela. O kernel embutido nao tem stream, nem
+`printOn:`, nem Transcript; sem ela o VM roda um programa e nao tem como dizer o
+que saiu. Ela nao e ligada em `packages/Core` de proposito: o `printNl` de la vai
+por stream BUFFERIZADO, e uma primitiva C escrevendo direto no descritor
+intercalaria com esse buffer.
+
+**A LICAO DO `Assert.h`, de novo.** A mensagem de `doesNotUnderstand` chegava
+como `doesNotUnderstand: ` e mais nada. O seletor era impresso com `printf`, ou
+seja em stdout, que quando redirecionado e bufferizado por bloco, e `abort()` nao
+faz flush. E exatamente como o abort do teto de 64KB no POWER embarcou silencioso.
+Agora a mensagem inteira vai para stderr, com `fflush(NULL)` antes do abort, e
+passou a nomear tambem a CLASSE do receptor: sem ela a mensagem diz o que nao foi
+entendido e omite quem nao entendeu, que e a metade que diz onde olhar.
+
+**O CLI continua inteiro.** O vocabulario vem de `vm/tools/Cli.h` sem mudanca
+nenhuma: `new`, `build`, `run`, `test`, `repl`, `help`, mais `-e -f -s -b -h`.
+Um port nao e motivo para mexer nisso. O que e estreito hoje e quanto de cada
+comando da para CUMPRIR: cada um termina numa operacao que o corte tirou e que
+ainda nao voltou (ler/escrever imagem, transformar diretorio de pacote em
+classes, o laco do REPL), e cada um DIZ qual e a peca que falta e sai com codigo
+nao-zero. Comando que finge trabalhar e pior que comando que recusa. Imagem
+achada pela BUSCA e passada por cima com um aviso; imagem pedida com `-s` e
+recusada, porque ai o chamador pediu aquela imagem.
 
 ## O que o gate NAO cobre, e como cobrimos
 

@@ -1,572 +1,340 @@
 #include "tools/Bootstrap.h"
-#include "core/Thread.h"
-#include "core/Object.h"
-#include "core/Smalltalk.h"
-#include "runtime/Dictionary.h"
+#include "compiler/Compile.h"
 #include "compiler/Parser.h"
-#include "core/Class.h"
-#include "compiler/Compiler.h"
-#include "runtime/Primitives.h"
-#include "memory/Heap.h"
-#include "core/Thread.h"
-#include "core/Entry.h"
-#include "core/Handle.h"
-#include "runtime/Iterator.h"
 #include "core/Assert.h"
-#include "core/Namespace.h"
-#include "compiler/Scope.h"
-#include <errno.h>
+#include "core/Class.h"
+#include "core/Handle.h"
+#include "core/Smalltalk.h"
+#include "core/Thread.h"
+#include "jit/CompiledMethod.h"
+#include "jit/Jit.h"
+#include "memory/Heap.h"
+#include "runtime/Closure.h"
+#include "runtime/Collection.h"
+#include "runtime/Dictionary.h"
+#include "runtime/Primitive.h"
+#include "runtime/String.h"
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 
-static void initSmalltalkStubs(void);
-static Class *newStubClass(Class *metaClass, InstanceShape shape, size_t instanceSize);
-static Class *newStubMetaClass(InstanceShape shape, size_t instanceSize);
-static Object *newStubObject(size_t size);
-static _Bool parseKernelFiles(char *coreDir);
+// ---------------------------------------------------------------------------
+// Classes
+// ---------------------------------------------------------------------------
 
-
-// Builds the initial image from nothing. The C side cannot be replaced by the
-// package system because the loader cannot load itself: PackageLoader and
-// Compiler evaluate: are kernel Smalltalk, and before the kernel is compiled
-// there is no Smalltalk to run them. What stays in C is exactly the
-// pre-Smalltalk minimum: the stub metaobjects the parser needs
-// (initSmalltalkStubs), the primitive table (registerPrimitives), the parse
-// loop over the core files (parseKernelFiles), the metaclass initialize sweep
-// and the layout ASSERTs. The FILE LIST is no longer C: the Core package
-// manifest (<coreDir>/package.st, normally packages/Core/package.st) is the
-// single source of truth for the kernel file set and its order.
-_Bool bootstrap(char *coreDir)
+// The class of classes, which is the one object that cannot be made the ordinary
+// way: creating a class needs a class to stamp on it, and this is the first one.
+// It describes ITSELF, so its own class index is its own.
+static void bootstrapClassOfClasses(Heap *heap)
 {
-	initSmalltalkStubs();
-	registerPrimitives();
-	return parseKernelFiles(coreDir);
+	size_t bytes = objectSizeForShape(CLASS_OF_CLASSES_SHAPE, CLASS_RAW_TRAILER_BYTES);
+	RawClass *class = (RawClass *) allocate(heap, bytes);
+	uint32_t index = classTableAdd(&heap->classes, (RawObject *) class);
+	class->header = makeObjectHeader(index, index, FORMAT_MIXED_BYTES,
+		bytes / sizeof(uint64_t));
+	class->instanceShape = CLASS_OF_CLASSES_SHAPE;
+	class->classIndex = index;
+	Handles.ClassClass.raw = class;
 }
 
 
-static void initSmalltalkStubs(void)
+static Class *fixedClass(Class *super, uint16_t slots)
 {
-	HandleScope scope;
-	openHandleScope(&scope);
-
-	Handles.nil = newStubObject(sizeof(struct { OBJECT_HEADER; }));
-	Class *metaClass = newStubMetaClass(FixedShape, 10);
-
-	Handles.MetaClass = newStubClass(metaClass, FixedShape, 6);
-	Handles.UndefinedObject = newStubClass(metaClass, FixedShape, 0);
-	Handles.True = newStubClass(metaClass, FixedShape, 0);
-	Handles.False = newStubClass(metaClass, FixedShape, 0);
-	Handles.SmallInteger = newStubClass(metaClass, FixedShape, 0);
-	Handles.Symbol = newStubClass(metaClass, StringShape, 0);
-	Handles.Character = newStubClass(metaClass, FixedShape, 0);
-	Handles.Float = newStubClass(metaClass, FloatShape, 0);
-	Handles.SmallFloat64 = newStubClass(metaClass, FixedShape, 0);
-	Handles.BoxedFloat64 = newStubClass(metaClass, FloatShape, 0);
-	Handles.String = newStubClass(metaClass, StringShape, 0);
-	Handles.Array = newStubClass(metaClass, IndexedShape, 0);
-	Handles.ByteArray = newStubClass(metaClass, BytesShape, 0);
-	Handles.Association = newStubClass(metaClass, FixedShape, 2);
-	Handles.Dictionary = newStubClass(metaClass, FixedShape, 2);
-	Handles.OrderedCollection = newStubClass(metaClass, FixedShape, 3);
-	Handles.Class = newStubClass(metaClass, FixedShape, 10);
-	Handles.TypeFeedback = newStubClass(metaClass, FixedShape, 2);
-	Handles.CompiledMethod = newStubClass(metaClass, CompiledCodeShape, 6);
-	Handles.CompiledBlock = newStubClass(metaClass, CompiledCodeShape, 4);
-	Handles.SourceCode = newStubClass(metaClass, FixedShape, 5);
-	Handles.FileSourceCode = newStubClass(metaClass, FixedShape, 5);
-	Handles.Block = newStubClass(metaClass, BlockShape, 3);
-	Handles.Message = newStubClass(metaClass, FixedShape, 2);
-	Handles.MethodContext = newStubClass(metaClass, ContextShape, 5);
-	Handles.BlockContext = newStubClass(metaClass, ContextShape, 5);
-	Handles.ExceptionHandler = newStubClass(metaClass, ExceptionHandlerShape, 2);
-	Handles.UnwindHandler = newStubClass(metaClass, UnwindHandlerShape, 3);
-	Handles.ClassNode = newStubClass(metaClass, FixedShape, 8);
-	Handles.MethodNode = newStubClass(metaClass, FixedShape, 5);
-	Handles.BlockNode = newStubClass(metaClass, FixedShape, 5);
-	Handles.BlockScope = newStubClass(metaClass, FixedShape, 7);
-	Handles.ExpressionNode = newStubClass(metaClass, FixedShape, 5);
-	Handles.MessageExpressionNode = newStubClass(metaClass, FixedShape, 3);
-	Handles.NilNode = newStubClass(metaClass, FixedShape, 2);
-	Handles.TrueNode = newStubClass(metaClass, FixedShape, 2);
-	Handles.FalseNode = newStubClass(metaClass, FixedShape, 2);
-	Handles.VariableNode = newStubClass(metaClass, FixedShape, 2);
-	Handles.IntegerNode = newStubClass(metaClass, FixedShape, 2);
-	Handles.CharacterNode = newStubClass(metaClass, FixedShape, 2);
-	Handles.SymbolNode = newStubClass(metaClass, FixedShape, 2);
-	Handles.StringNode = newStubClass(metaClass, FixedShape, 2);
-	Handles.ArrayNode = newStubClass(metaClass, FixedShape, 2);
-	Handles.ParseError = newStubClass(metaClass, FixedShape, 3);
-	Handles.UndefinedVariableError = newStubClass(metaClass, FixedShape, 2);
-	Handles.RedefinitionError = newStubClass(metaClass, FixedShape, 2);
-	Handles.ReadonlyVariableError = newStubClass(metaClass, FixedShape, 2);
-	Handles.InvalidPragmaError = newStubClass(metaClass, FixedShape, 2);
-	Handles.IoError = newStubClass(metaClass, FixedShape, 1);
-	Handles.Namespace = newStubClass(metaClass, FixedShape, 3);
-
-	Handles.nil->raw->class = Handles.UndefinedObject->raw;
-	Handles.true = persistHandle(newObject(Handles.True, 0));
-	Handles.false = persistHandle(newObject(Handles.False, 0));
-	Handles.Smalltalk = persistHandle(newDictionary(256));
-	Handles.SymbolTable = persistHandle(newArray(SYMBOL_TABLE_SIZE));
-	Handles.initializeSymbol = persistHandle(getSymbol("initialize"));
-	Handles.finalizeSymbol = persistHandle(getSymbol("finalize"));
-	Handles.valueSymbol = persistHandle(getSymbol("value"));
-	Handles.value_Symbol = persistHandle(getSymbol("value:"));
-	Handles.valueValueSymbol = persistHandle(getSymbol("value:value:"));
-	Handles.doesNotUnderstandSymbol = persistHandle(getSymbol("doesNotUnderstand:"));
-	Handles.cannotReturnSymbol = persistHandle(getSymbol("cannotReturn:"));
-	Handles.handlesSymbol = persistHandle(getSymbol("handles:"));
-	Handles.generateBacktraceSymbol = persistHandle(getSymbol("generateBacktrace"));
-	Handles.runHandledBySymbol = persistHandle(getSymbol("runHandledBy:"));
-
-	// The Core namespace WRAPS the core dictionary (same identity), sits in
-	// the registry under #Core, and starts as the default compile target.
-	// DefaultNamespace is an indirection CELL, never a second handle to the
-	// namespace object: Handles fields must stay distinct (see Handle.h).
-	Handles.Namespaces = persistHandle(newDictionary(16));
-	Handles.CoreNamespace = persistHandle(
-		newNamespace(getSymbol("Core"), Handles.Smalltalk, newArray(0)));
-	Association *defaultCell = (Association *) newObject(Handles.Association, 0);
-	objectStorePtr((Object *) defaultCell, &defaultCell->raw->key,
-		(Object *) getSymbol("DefaultNamespace"));
-	objectStorePtr((Object *) defaultCell, &defaultCell->raw->value,
-		(Object *) Handles.CoreNamespace);
-	Handles.DefaultNamespace = persistHandle(defaultCell);
-	symbolDictAtPutObject(Handles.Namespaces, getSymbol("Core"), (Object *) Handles.CoreNamespace);
-
-	setGlobalObject("UndefinedObject", (Object *) Handles.UndefinedObject);
-	setGlobalObject("nil", Handles.nil);
-	setGlobalObject("True", (Object *) Handles.True);
-	setGlobalObject("true", Handles.true);
-	setGlobalObject("False", (Object *) Handles.False);
-	setGlobalObject("false", Handles.false);
-	setGlobalObject("SmallInteger", (Object *) Handles.SmallInteger);
-	setGlobalObject("Character", (Object *) Handles.Character);
-	setGlobalObject("Float", (Object *) Handles.Float);
-	setGlobalObject("SmallFloat64", (Object *) Handles.SmallFloat64);
-	setGlobalObject("BoxedFloat64", (Object *) Handles.BoxedFloat64);
-
-	setGlobal("FixedShape", *(Value *) &FixedShape);
-	setGlobal("FloatShape", *(Value *) &FloatShape);
-	setGlobal("IndexedShape", *(Value *) &IndexedShape);
-	setGlobal("StringShape", *(Value *) &StringShape);
-	setGlobal("BytesShape", *(Value *) &BytesShape);
-	setGlobal("CompiledCodeShape", *(Value *) &CompiledCodeShape);
-	setGlobal("BlockShape", *(Value *) &BlockShape);
-	setGlobal("ContextShape", *(Value *) &ContextShape);
-	setGlobal("ExceptionHandlerShape", *(Value *) &ExceptionHandlerShape);
-	setGlobal("UnwindHandlerShape", *(Value *) &UnwindHandlerShape);
-
-	setGlobalObject("Symbol", (Object *) Handles.Symbol);
-	setGlobalObject("String", (Object *) Handles.String);
-	setGlobalObject("Array", (Object *) Handles.Array);
-	setGlobalObject("ByteArray", (Object *) Handles.ByteArray);
-	setGlobalObject("Association", (Object *) Handles.Association);
-	setGlobalObject("Dictionary", (Object *) Handles.Dictionary);
-	setGlobalObject("OrderedCollection", (Object *) Handles.OrderedCollection);
-	setGlobalObject("MetaClass", (Object *) Handles.MetaClass);
-	setGlobalObject("Class", (Object *) Handles.Class);
-	setGlobalObject("TypeFeedback", (Object *) Handles.TypeFeedback);
-	setGlobalObject("CompiledMethod", (Object *) Handles.CompiledMethod);
-	setGlobalObject("CompiledBlock", (Object *) Handles.CompiledBlock);
-	setGlobalObject("SourceCode", (Object *) Handles.SourceCode);
-	setGlobalObject("FileSourceCode", (Object *) Handles.FileSourceCode);
-	setGlobalObject("Block", (Object *) Handles.Block);
-	setGlobalObject("Message", (Object *) Handles.Message);
-	setGlobalObject("MethodContext", (Object *) Handles.MethodContext);
-	setGlobalObject("BlockContext", (Object *) Handles.BlockContext);
-	setGlobalObject("ExceptionHandler", (Object *) Handles.ExceptionHandler);
-	setGlobalObject("UnwindHandler", (Object *) Handles.UnwindHandler);
-	setGlobalObject("ClassNode", (Object *) Handles.ClassNode);
-	setGlobalObject("MethodNode", (Object *) Handles.MethodNode);
-	setGlobalObject("BlockNode", (Object *) Handles.BlockNode);
-	setGlobalObject("BlockScope", (Object *) Handles.BlockScope);
-	setGlobalObject("ExpressionNode", (Object *) Handles.ExpressionNode);
-	setGlobalObject("MessageExpressionNode", (Object *) Handles.MessageExpressionNode);
-	setGlobalObject("NilNode", (Object *) Handles.NilNode);
-	setGlobalObject("TrueNode", (Object *) Handles.TrueNode);
-	setGlobalObject("FalseNode", (Object *) Handles.FalseNode);
-	setGlobalObject("VariableNode", (Object *) Handles.VariableNode);
-	setGlobalObject("IntegerNode", (Object *) Handles.IntegerNode);
-	setGlobalObject("CharacterNode", (Object *) Handles.CharacterNode);
-	setGlobalObject("SymbolNode", (Object *) Handles.SymbolNode);
-	setGlobalObject("StringNode", (Object *) Handles.StringNode);
-	setGlobalObject("ArrayNode", (Object *) Handles.ArrayNode);
-	setGlobalObject("ParseError", (Object *) Handles.ParseError);
-	setGlobalObject("UndefinedVariableError", (Object *) Handles.UndefinedVariableError);
-	setGlobalObject("RedefinitionError", (Object *) Handles.RedefinitionError);
-	setGlobalObject("ReadonlyVariableError", (Object *) Handles.ReadonlyVariableError);
-	setGlobalObject("InvalidPragmaError", (Object *) Handles.InvalidPragmaError);
-	setGlobalObject("IoError", (Object *) Handles.IoError);
-	setGlobalObject("Namespace", (Object *) Handles.Namespace);
-	setGlobalObject("Namespaces", (Object *) Handles.Namespaces);
-	setGlobalObject("SymbolTable", (Object *) Handles.SymbolTable);
-	setGlobalObject("Smalltalk", (Object *) Handles.Smalltalk);
-
-	closeHandleScope(&scope, NULL);
+	return classCreate(super, NULL, (InstanceShape)
+		DEFINE_SHAPE(FORMAT_POINTERS, 0, 0, slots));
 }
 
 
-static Class *newStubClass(Class *metaClass, InstanceShape shape, size_t instanceSize)
+static Class *withMethods(Class *class)
 {
-	Class *class = (Class *) newStubObject(sizeof(RawClass));
-	class->raw->class = metaClass->raw;
-	objectStorePtr((Object *) class,  &class->raw->superClass, (Object *) Handles.nil);
-	objectStorePtr((Object *) class,  &class->raw->subClasses, (Object *) Handles.nil);
-	objectStorePtr((Object *) class,  &class->raw->methodDictionary, (Object *) Handles.nil);
-	shape.varsSize = instanceSize;
-	shape.size += shape.varsSize * sizeof(Value);
-	class->raw->instanceShape = shape;
-	objectStorePtr((Object *) class,  &class->raw->instanceVariables, (Object *) Handles.nil);
-	objectStorePtr((Object *) class,  &class->raw->name, (Object *) Handles.nil);
-	objectStorePtr((Object *) class,  &class->raw->comment, (Object *) Handles.nil);
-	objectStorePtr((Object *) class,  &class->raw->category, (Object *) Handles.nil);
-	objectStorePtr((Object *) class,  &class->raw->classVariables, (Object *) Handles.nil);
-	objectStorePtr((Object *) class,  &class->raw->namespace, (Object *) Handles.nil);
+	Dictionary *methods = newDictionary(16);
+	rawObjectStorePtr((RawObject *) class->raw, &class->raw->methodDictionary,
+		(RawObject *) methods->raw);
 	return class;
 }
 
 
-static Class *newStubMetaClass(InstanceShape shape, size_t instanceSize)
+// A name for a class, both as its own `name` field and as a global, so source
+// code can say `Array new: 3` and the compiler finds it.
+static void nameClass(Class *class, const char *name)
 {
-	RawObject *object = (RawObject *) allocate(CurrentThread.heap, sizeof(RawMetaClass));
-	object->hash = (Value) object >> 2; // XXX: replace with random hash generator
-	object->payloadSize = 0;
-	object->varsSize = 0;
-	object->tags = 0;
-
-	Class *metaClass = newStubClass(scopeHandle(NULL), FixedShape, 6);
-	metaClass->raw->class = (RawClass *) object;
-
-	MetaClass *class = (MetaClass *) scopeHandle(object);
-	class->raw->class = metaClass->raw;
-	objectStorePtr((Object *) class,  &class->raw->superClass, (Object *) Handles.nil);
-	objectStorePtr((Object *) class,  &class->raw->subClasses, (Object *) Handles.nil);
-	objectStorePtr((Object *) class,  &class->raw->methodDictionary, (Object *) Handles.nil);
-	shape.varsSize = instanceSize;
-	shape.size += shape.varsSize * sizeof(Value);
-	class->raw->instanceShape = shape;
-	objectStorePtr((Object *) class,  &class->raw->instanceVariables, (Object *) Handles.nil);
-	objectStorePtr((Object *) class,  &class->raw->instanceClass, (Object *) Handles.nil);
-	return (Class *) class;
+	String *symbol = asSymbol(stringFromC(name));
+	rawObjectStorePtr((RawObject *) class->raw, &class->raw->name,
+		(RawObject *) symbol->raw);
+	globalAtPut(symbol, objectTagged(class));
 }
 
 
-static Object *newStubObject(size_t size)
+static void bootstrapClasses(Heap *heap)
 {
-	RawObject *object = (RawObject *) allocate(CurrentThread.heap, size);
-	object->hash = (Value) object >> 2; // XXX: replace with random hash generator
-	object->payloadSize = 0;
-	object->varsSize = 0;
-	object->tags = 0;
-	return handle(object);
+	bootstrapClassOfClasses(heap);
+	InstanceShape bytes = DEFINE_SHAPE(FORMAT_BYTES, 0, 0, 0);
+	InstanceShape indexed = DEFINE_SHAPE(FORMAT_INDEXED_POINTERS, 0, 0, 0);
+	InstanceShape rawDouble = DEFINE_SHAPE(FORMAT_NO_POINTERS, 0, 0, 1);
+
+	Class *object = fixedClass(NULL, 0);
+	Handles.ObjectClass.raw = object->raw;
+	Handles.String.raw = classCreate(object, NULL, bytes)->raw;
+	Handles.Symbol.raw = classCreate(&Handles.String, NULL, bytes)->raw;
+	Handles.ByteArray.raw = classCreate(object, NULL, bytes)->raw;
+	Handles.Array.raw = classCreate(object, NULL, indexed)->raw;
+	Handles.Association.raw = fixedClass(object, 2)->raw;
+	Handles.Dictionary.raw = fixedClass(object, 2)->raw;
+	Handles.OrderedCollection.raw = fixedClass(object, 3)->raw;
+	Handles.CompiledMethod.raw = classCreate(object, NULL, COMPILED_METHOD_SHAPE)->raw;
+	Handles.UndefinedObject.raw = fixedClass(object, 0)->raw;
+	Handles.True.raw = fixedClass(object, 0)->raw;
+	Handles.False.raw = fixedClass(object, 0)->raw;
+	Handles.SmallInteger.raw = fixedClass(object, 0)->raw;
+	Handles.SmallFloat64.raw = fixedClass(object, 0)->raw;
+	Handles.BoxedFloat64.raw = classCreate(object, NULL, rawDouble)->raw;
+	Handles.Character.raw = fixedClass(object, 0)->raw;
+	Handles.Closure.raw = classCreate(object, NULL, CLOSURE_SHAPE)->raw;
+	Handles.Cell.raw = classCreate(object, NULL, CELL_SHAPE)->raw;
+
+	// The syntax tree is made of ORDINARY HEAP OBJECTS, so the parser cannot run
+	// until its classes exist. The field counts come from the structs in Ast.h;
+	// one too few and the parser writes past the object.
+	Handles.SourceCode.raw = fixedClass(object, 5)->raw;
+	Handles.FileSourceCode.raw = fixedClass(object, 5)->raw;
+	Handles.ClassNode.raw = fixedClass(object, 8)->raw;
+	Handles.MethodNode.raw = fixedClass(object, 5)->raw;
+	Handles.BlockNode.raw = fixedClass(object, 5)->raw;
+	Handles.ExpressionNode.raw = fixedClass(object, 5)->raw;
+	Handles.MessageExpressionNode.raw = fixedClass(object, 3)->raw;
+	Handles.IntegerNode.raw = fixedClass(object, 2)->raw;
+	Handles.StringNode.raw = fixedClass(object, 2)->raw;
+	Handles.SymbolNode.raw = fixedClass(object, 2)->raw;
+	Handles.CharacterNode.raw = fixedClass(object, 2)->raw;
+	Handles.ArrayNode.raw = fixedClass(object, 2)->raw;
+	Handles.VariableNode.raw = fixedClass(object, 2)->raw;
+	Handles.NilNode.raw = fixedClass(object, 2)->raw;
+	Handles.TrueNode.raw = fixedClass(object, 2)->raw;
+	Handles.FalseNode.raw = fixedClass(object, 2)->raw;
+
+	Handles.symbolTable.raw = newArray(SYMBOL_TABLE_SIZE)->raw;
+
+	// IMMORTAL, and that is load-bearing rather than tidy: generated code BAKES
+	// these three addresses as immediates, so they must never move. In the
+	// nursery everything works until the first collection, after which a value
+	// that IS false stops matching the baked false. jitCompileFor asserts it on
+	// every compilation.
+	Handles.nil.raw = ((Object *) newImmortalObject(&Handles.UndefinedObject, 0))->raw;
+	Handles.true_.raw = ((Object *) newImmortalObject(&Handles.True, 0))->raw;
+	Handles.false_.raw = ((Object *) newImmortalObject(&Handles.False, 0))->raw;
+
+	// Immediates have no header, so their class is found by TAG rather than read
+	// out of the object.
+	gImmediateClasses.smallInteger = classIndexOf(&Handles.SmallInteger);
+	gImmediateClasses.character = classIndexOf(&Handles.Character);
+	gImmediateClasses.smallFloat = classIndexOf(&Handles.SmallFloat64);
+
+	// The class-of-classes gets a method dictionary too: `Foo new` is a send
+	// whose RECEIVER is a class, so it is looked up in the class of that class.
+	withMethods(&Handles.ClassClass);
+	withMethods(&Handles.ObjectClass);
+	withMethods(&Handles.SmallInteger);
+	withMethods(&Handles.SmallFloat64);
+	withMethods(&Handles.BoxedFloat64);
+	withMethods(&Handles.Character);
+	withMethods(&Handles.String);
+	withMethods(&Handles.Symbol);
+	withMethods(&Handles.ByteArray);
+	withMethods(&Handles.Array);
+	withMethods(&Handles.UndefinedObject);
+	withMethods(&Handles.True);
+	withMethods(&Handles.False);
+	withMethods(&Handles.Closure);
 }
 
 
-// ---- core manifest reader ---------------------------------------------------
-// The kernel file list and its load order live in <coreDir>/package.st: the
-// Core package manifest is the single source of truth, shared with the package
-// tooling. The bootstrap runs before any Smalltalk exists, so this is a
-// MINIMAL scanner for the two tokens the bootstrap needs, not a parser of the
-// DSL: it skips "..." comments (with "" escape), consumes '...' strings (with
-// '' escape), validates name: 'Core' and collects the files: #('...' ...)
-// literal. Anything fancier in the manifest (computed lists, concatenation)
-// is a bootstrap error by design; the manifest is ours, not adversarial input.
-
-// Skip whitespace and "..." comments.
-static void manifestSkipBlanks(const char **p, const char *end)
+static void nameClasses(void)
 {
-	while (*p < end) {
-		char c = **p;
-		if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
-			(*p)++;
-		} else if (c == '"') {
-			(*p)++;
-			while (*p < end) {
-				if (**p == '"') {
-					(*p)++;
-					if (*p < end && **p == '"') {
-						(*p)++; // "" escape: keep scanning the comment
-						continue;
-					}
-					break;
-				}
-				(*p)++;
-			}
-		} else {
-			return;
-		}
-	}
+	nameClass(&Handles.ObjectClass, "Object");
+	nameClass(&Handles.ClassClass, "Class");
+	nameClass(&Handles.String, "String");
+	nameClass(&Handles.Symbol, "Symbol");
+	nameClass(&Handles.ByteArray, "ByteArray");
+	nameClass(&Handles.Array, "Array");
+	nameClass(&Handles.Association, "Association");
+	nameClass(&Handles.Dictionary, "Dictionary");
+	nameClass(&Handles.OrderedCollection, "OrderedCollection");
+	nameClass(&Handles.CompiledMethod, "CompiledMethod");
+	nameClass(&Handles.UndefinedObject, "UndefinedObject");
+	nameClass(&Handles.True, "True");
+	nameClass(&Handles.False, "False");
+	nameClass(&Handles.SmallInteger, "SmallInteger");
+	nameClass(&Handles.SmallFloat64, "SmallFloat64");
+	nameClass(&Handles.BoxedFloat64, "BoxedFloat64");
+	nameClass(&Handles.Character, "Character");
+	nameClass(&Handles.Closure, "Block");
 }
 
 
-// Read the '...' literal at *p (assumes **p == '\'') resolving the '' escape.
-// Answers a malloc'd copy and advances *p past the closing quote, or NULL on
-// an unterminated literal. Relies on the source buffer being NUL-terminated.
-static char *manifestReadString(const char **p, const char *end)
+// ---------------------------------------------------------------------------
+// Methods
+// ---------------------------------------------------------------------------
+
+// A method that is nothing but a primitive.
+//
+// Its fallback SENDS a selector nobody implements, so a primitive that fails in
+// the built-in kernel says so and stops. Answering nil instead would turn every
+// failure into a wrong answer somewhere else: an overflowed sum has no
+// LargeInteger to fall back to here, and an out-of-range at: has no exception to
+// signal, because neither of those exists until packages/Core loads.
+static void definePrimitiveMethod(Class *class, const char *selector,
+	PrimitiveNumber primitive, uint16_t argumentCount)
 {
-	const char *scan = *p + 1;
-	size_t size = 0;
-	while (scan < end) {
-		if (*scan == '\'') {
-			if (scan[1] == '\'') {
-				scan += 2;
-				size++;
-				continue;
-			}
-			break;
-		}
-		scan++;
-		size++;
-	}
-	if (scan >= end) {
-		return NULL;
-	}
-	char *result = malloc(size + 1);
-	char *out = result;
-	scan = *p + 1;
-	for (;;) {
-		if (*scan == '\'') {
-			if (scan[1] == '\'') {
-				*out++ = '\'';
-				scan += 2;
-				continue;
-			}
-			scan++;
-			break;
-		}
-		*out++ = *scan++;
-	}
-	*out = '\0';
-	*p = scan;
-	return result;
-}
-
-
-static void manifestFreeFiles(char **files, size_t count)
-{
-	for (size_t i = 0; i < count; i++) {
-		free(files[i]);
-	}
-	free(files);
-}
-
-
-static _Bool manifestIsLetter(char c)
-{
-	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
-}
-
-
-static _Bool manifestIsIdentifier(char c)
-{
-	return manifestIsLetter(c) || (c >= '0' && c <= '9');
-}
-
-
-// Extract the files: entries from <coreDir>/package.st. Answers a malloc'd
-// array of malloc'd strings (count in *countOut), or NULL after printing the
-// reason to stderr (bootstrap then fails noisily).
-static char **readCoreManifestFiles(const char *coreDir, size_t *countOut)
-{
-	char path[strlen(coreDir) + sizeof("/package.st") + 1];
-	sprintf(path, "%s/package.st", coreDir);
-
-	FILE *file = fopen(path, "r");
-	if (file == NULL) {
-		fprintf(stderr, "Bootstrap: cannot open core manifest %s: %s\n", path, strerror(errno));
-		return NULL;
-	}
-	fseek(file, 0, SEEK_END);
-	long fileSize = ftell(file);
-	fseek(file, 0, SEEK_SET);
-	if (fileSize < 0) {
-		fclose(file);
-		fprintf(stderr, "Bootstrap: cannot read core manifest %s\n", path);
-		return NULL;
-	}
-	char *source = malloc((size_t) fileSize + 1);
-	size_t sourceSize = fread(source, 1, (size_t) fileSize, file);
-	fclose(file);
-	source[sourceSize] = '\0';
-
-	const char *p = source;
-	const char *end = source + sourceSize;
-	char **files = NULL;
-	size_t count = 0;
-	size_t capacity = 0;
-	_Bool nameSeen = 0;
-	_Bool filesSeen = 0;
-	const char *error = NULL;
-	char errorBuffer[256];
-
-	while (p < end && error == NULL) {
-		manifestSkipBlanks(&p, end);
-		if (p >= end) {
-			break;
-		}
-		if (*p == '\'') {
-			// a string in cascade position (version:, summary:, ...): skip it
-			char *skipped = manifestReadString(&p, end);
-			if (skipped == NULL) {
-				error = "unterminated string";
-				break;
-			}
-			free(skipped);
-		} else if (manifestIsLetter(*p)) {
-			const char *start = p;
-			while (p < end && manifestIsIdentifier(*p)) {
-				p++;
-			}
-			_Bool keyword = p < end && *p == ':';
-			if (keyword) {
-				p++;
-			}
-			size_t tokenSize = (size_t) (p - start);
-			if (keyword && tokenSize == 5 && memcmp(start, "name:", 5) == 0) {
-				manifestSkipBlanks(&p, end);
-				if (p >= end || *p != '\'') {
-					error = "name: must be followed by a plain string";
-					break;
-				}
-				char *name = manifestReadString(&p, end);
-				if (name == NULL) {
-					error = "unterminated string after name:";
-					break;
-				}
-				if (strcmp(name, "Core") != 0) {
-					snprintf(errorBuffer, sizeof(errorBuffer),
-						"declares name: '%s', expected 'Core' - is -b pointing at the core package?", name);
-					error = errorBuffer;
-					free(name);
-					break;
-				}
-				free(name);
-				nameSeen = 1;
-			} else if (keyword && tokenSize == 6 && memcmp(start, "files:", 6) == 0) {
-				manifestSkipBlanks(&p, end);
-				if (p + 1 >= end || p[0] != '#' || p[1] != '(') {
-					error = "files: must be followed by a #('...' ...) literal";
-					break;
-				}
-				p += 2;
-				for (;;) {
-					manifestSkipBlanks(&p, end);
-					if (p >= end) {
-						error = "unterminated files: #( literal";
-						break;
-					}
-					if (*p == ')') {
-						p++;
-						filesSeen = 1;
-						break;
-					}
-					if (*p != '\'') {
-						error = "files: may only contain plain '...' strings";
-						break;
-					}
-					char *entry = manifestReadString(&p, end);
-					if (entry == NULL) {
-						error = "unterminated string in files:";
-						break;
-					}
-					if (count == capacity) {
-						capacity = capacity == 0 ? 160 : capacity * 2;
-						files = realloc(files, capacity * sizeof(char *));
-					}
-					files[count++] = entry;
-				}
-			}
-		} else {
-			p++; // any other char (#, (, ), ;, digits, ...) is not ours to check
-		}
-	}
-
-	free(source);
-	if (error == NULL && !nameSeen) {
-		error = "missing name: 'Core'";
-	}
-	if (error == NULL && (!filesSeen || count == 0)) {
-		error = "missing or empty files: list";
-	}
-	if (error != NULL) {
-		fprintf(stderr, "Bootstrap: bad core manifest %s: %s\n", path, error);
-		manifestFreeFiles(files, count);
-		return NULL;
-	}
-	*countOut = count;
-	return files;
-}
-
-
-static _Bool parseKernelFiles(char *coreDir)
-{
-	size_t kernelFileCount = 0;
-	char **kernelFiles = readCoreManifestFiles(coreDir, &kernelFileCount);
-	if (kernelFiles == NULL) {
-		return 0;
-	}
-
 	HandleScope scope;
 	openHandleScope(&scope);
 
-	Array *classInstanceVariables = newArray(classGetInstanceShape(Handles.Class).varsSize);
-	arrayAtPutObject(classInstanceVariables, 0, (Object *) asString("superClass"));
-	arrayAtPutObject(classInstanceVariables, 1, (Object *) asString("subClasses"));
-	arrayAtPutObject(classInstanceVariables, 2, (Object *) asString("methodDictionary"));
-	arrayAtPutObject(classInstanceVariables, 3, (Object *) asString("instanceShape"));
-	arrayAtPutObject(classInstanceVariables, 4, (Object *) asString("instanceVariables"));
-	arrayAtPutObject(classInstanceVariables, 5, (Object *) asString("name"));
-	arrayAtPutObject(classInstanceVariables, 6, (Object *) asString("comment"));
-	arrayAtPutObject(classInstanceVariables, 7, (Object *) asString("category"));
-	arrayAtPutObject(classInstanceVariables, 8, (Object *) asString("classVariables"));
-	arrayAtPutObject(classInstanceVariables, 9, (Object *) asString("namespace"));
-	classSetInstanceVariables(Handles.Class, classInstanceVariables);
+	uint16_t base = (uint16_t) (argumentCount + 1);
+	Instruction *code = calloc(3, sizeof(Instruction));
+	ASSERT(code != NULL);
+	code[0] = (Instruction) { OP_MOVE, 0, base, 0, 0 };        // the receiver
+	code[1] = (Instruction) { OP_SEND, 0, base, 0, base };     // #primitiveFailed
+	code[2] = (Instruction) { OP_RET, 0, base, 0, 0 };
 
-	size_t coreDirNameSize = strlen(coreDir);
-	for (size_t i = 0; i < kernelFileCount; i++) {
-		size_t fileNameSize = strlen(kernelFiles[i]);
-		char fileName[coreDirNameSize + fileNameSize + 2];
-		memcpy(fileName, coreDir, coreDirNameSize);
-		fileName[coreDirNameSize] = '/';
-		memcpy(fileName + coreDirNameSize + 1, kernelFiles[i], fileNameSize + 1);
-		if (!parseFile(fileName, NULL, NULL)) {
-			closeHandleScope(&scope, NULL);
-			manifestFreeFiles(kernelFiles, kernelFileCount);
-			return 0;
-		}
-	}
-	manifestFreeFiles(kernelFiles, kernelFileCount);
+	Array *literals = newArray(1);
+	arrayAtPutObject(literals, 0, (Object *) asSymbol(stringFromC("primitiveFailed")));
+	String *name = asSymbol(stringFromC(selector));
 
-	Iterator iterator;
-	initDictIterator(&iterator, Handles.Smalltalk);
-	while (iteratorHasNext(&iterator)) {
-		HandleScope scope2;
-		openHandleScope(&scope2);
-		Association *assoc = (Association *) iteratorNextObject(&iterator);
-		if (!isNil(assoc) && valueTypeOf(assoc->raw->value, VALUE_POINTER)) {
-			Object *object = scopeHandle(asObject(assoc->raw->value));
-			ASSERT(object->raw->class != NULL);
-			if (object->raw->class->class == Handles.MetaClass->raw) {
-				invokeInititalize(object);
-			}
-		}
-		closeHandleScope(&scope2, NULL);
-	}
+	CodeUnit *unit = calloc(1, sizeof(CodeUnit));
+	ASSERT(unit != NULL);
+	unit->code = code;
+	unit->instructionCount = 3;
+	unit->registerCount = (uint16_t) (argumentCount + 2);
+	unit->argumentCount = argumentCount;
+	unit->primitive = primitive;
+	unit->literals = objectTagged(literals);
+	unit->selector = objectTagged(name);
+	unit->ownerClass = objectTagged(class);
+	jitRegisterUnit(unit);
 
-	// Layout drift guards for VM-known objects: the C struct, the bootstrap
-	// stub size and the .st mirror must agree. The mirror's ivar count landed
-	// in instanceShape.varsSize when its class definition rebuilt the stub.
-	ASSERT(classGetInstanceShape(Handles.Namespace).varsSize
-		== (sizeof(RawNamespace) - HEADER_SIZE) / sizeof(Value));
-	ASSERT(classGetInstanceShape(Handles.Class).varsSize
-		== (sizeof(RawClass) - HEADER_SIZE) / sizeof(Value));
-	ASSERT(classGetInstanceShape(Handles.BlockScope).varsSize
-		== (sizeof(RawBlockScope) - HEADER_SIZE) / sizeof(Value));
-	ASSERT(classGetInstanceShape(Handles.ClassNode).varsSize
-		== (sizeof(RawClassNode) - HEADER_SIZE) / sizeof(Value));
-
+	CompiledMethod *method = compiledMethodCreate(unit, name, class);
+	Dictionary *methods = scopeHandle(asObject(class->raw->methodDictionary));
+	symbolDictAtPutObject(methods, name, (Object *) method);
 	closeHandleScope(&scope, NULL);
-	return 1;
+}
+
+
+// A method compiled from SOURCE, which is how the built-in kernel gets the few
+// things that are shorter to write in Smalltalk than to hand-assemble. It also
+// means the front end runs before any program does, so a bootstrap that got past
+// here has already exercised parser, compiler and JIT.
+static void defineSourceMethod(Class *class, const char *source)
+{
+	HandleScope scope;
+	openHandleScope(&scope);
+
+	Parser parser;
+	initParser(&parser, stringFromC(source));
+	MethodNode *node = parseMethod(&parser);
+	if (node == NULL) {
+		fprintf(stderr, "bootstrap: cannot parse '%s'\n", source);
+		abort();
+	}
+	CompileContext context = { class, smalltalkGlobals() };
+	CompileError error;
+	CodeUnit *unit = compileMethod(node, &context, &error);
+	freeParser(&parser);
+	if (unit == NULL) {
+		fprintf(stderr, "bootstrap: cannot compile '%s': %s\n", source,
+			compileStatusName(error.status));
+		abort();
+	}
+	String *selector = scopeHandle(asObject(unit->selector));
+	CompiledMethod *method = compiledMethodCreate(unit, selector, class);
+	Dictionary *methods = scopeHandle(asObject(class->raw->methodDictionary));
+	symbolDictAtPutObject(methods, selector, (Object *) method);
+	closeHandleScope(&scope, NULL);
+}
+
+
+// The arithmetic and comparison primitives, on every class whose instances the
+// VM can hold in a register.
+//
+// Int and Float share ONE implementation for each operation, which is not a
+// shortcut: it is the mixed-arithmetic fast path, and it is why `1 + 2.5` does
+// not have to become a coercion send here.
+static void defineNumberMethods(Class *class)
+{
+	static const struct {
+		const char *selector;
+		PrimitiveNumber primitive;
+		uint16_t argumentCount;
+	} arithmetic[] = {
+		{ "+", PRIM_IntAdd, 1 }, { "-", PRIM_IntSub, 1 }, { "*", PRIM_IntMul, 1 },
+		{ "/", PRIM_FloatDiv, 1 }, { "//", PRIM_IntFloorDiv, 1 },
+		{ "\\\\", PRIM_IntMod, 1 },
+		// Only < and = are primitives, because that is all the kernel declares;
+		// the rest of the relational protocol is derived below, in Smalltalk,
+		// exactly as Magnitude derives it.
+		{ "<", PRIM_IntLessThan, 1 }, { "=", PRIM_FloatEquals, 1 },
+	};
+	for (size_t i = 0; i < sizeof(arithmetic) / sizeof(arithmetic[0]); i++) {
+		definePrimitiveMethod(class, arithmetic[i].selector,
+			arithmetic[i].primitive, arithmetic[i].argumentCount);
+	}
+	defineSourceMethod(class, "> aNumber [ ^aNumber < self ]");
+	defineSourceMethod(class, "<= aNumber [ ^(aNumber < self) not ]");
+	defineSourceMethod(class, ">= aNumber [ ^(self < aNumber) not ]");
+	defineSourceMethod(class, "~= aNumber [ ^(self = aNumber) not ]");
+}
+
+
+static void bootstrapMethods(void)
+{
+	definePrimitiveMethod(&Handles.ObjectClass, "==", PRIM_Identity, 1);
+	definePrimitiveMethod(&Handles.ObjectClass, "class", PRIM_Class, 0);
+	definePrimitiveMethod(&Handles.ObjectClass, "hash", PRIM_Hash, 0);
+	definePrimitiveMethod(&Handles.ObjectClass, "printNl", PRIM_PrintValue, 0);
+	definePrimitiveMethod(&Handles.ObjectClass, "displayNl", PRIM_PrintValue, 0);
+
+	// `new` and `new:` are sends whose RECEIVER is a class, so they go on the
+	// class of classes: its instances are the classes themselves.
+	definePrimitiveMethod(&Handles.ClassClass, "new", PRIM_BehaviorNew, 0);
+	definePrimitiveMethod(&Handles.ClassClass, "new:", PRIM_BehaviorNewSize, 1);
+
+	defineNumberMethods(&Handles.SmallInteger);
+	defineNumberMethods(&Handles.SmallFloat64);
+	defineNumberMethods(&Handles.BoxedFloat64);
+
+	definePrimitiveMethod(&Handles.Array, "at:", PRIM_At, 1);
+	definePrimitiveMethod(&Handles.Array, "at:put:", PRIM_AtPut, 2);
+	definePrimitiveMethod(&Handles.Array, "size", PRIM_Size, 0);
+	definePrimitiveMethod(&Handles.ByteArray, "at:", PRIM_At, 1);
+	definePrimitiveMethod(&Handles.ByteArray, "at:put:", PRIM_AtPut, 2);
+	definePrimitiveMethod(&Handles.ByteArray, "size", PRIM_Size, 0);
+	definePrimitiveMethod(&Handles.String, "at:", PRIM_At, 1);
+	definePrimitiveMethod(&Handles.String, "at:put:", PRIM_AtPut, 2);
+	definePrimitiveMethod(&Handles.String, "size", PRIM_Size, 0);
+
+	definePrimitiveMethod(&Handles.Closure, "value", PRIM_BlockValue, 0);
+	definePrimitiveMethod(&Handles.Closure, "value:", PRIM_BlockValue1, 1);
+	definePrimitiveMethod(&Handles.Closure, "value:value:", PRIM_BlockValue2, 2);
+
+	// `not` is what the derived comparisons above are written in terms of, and
+	// on a singleton it is a constant.
+	defineSourceMethod(&Handles.True, "not [ ^false ]");
+	defineSourceMethod(&Handles.False, "not [ ^true ]");
+	defineSourceMethod(&Handles.True, "& aBoolean [ ^aBoolean ]");
+	defineSourceMethod(&Handles.False, "& aBoolean [ ^false ]");
+	defineSourceMethod(&Handles.True, "| aBoolean [ ^true ]");
+	defineSourceMethod(&Handles.False, "| aBoolean [ ^aBoolean ]");
+	defineSourceMethod(&Handles.UndefinedObject, "isNil [ ^true ]");
+	defineSourceMethod(&Handles.ObjectClass, "isNil [ ^false ]");
+	defineSourceMethod(&Handles.ObjectClass, "notNil [ ^self isNil not ]");
+	defineSourceMethod(&Handles.ObjectClass, "yourself [ ^self ]");
+}
+
+
+void bootstrapBuiltinKernel(void)
+{
+	HandleScope scope;
+	openHandleScope(&scope);
+	bootstrapClasses(CurrentThread.heap);
+	smalltalkInitGlobals(64);
+	nameClasses();
+	bootstrapMethods();
+	closeHandleScope(&scope, NULL);
 }

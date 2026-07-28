@@ -134,9 +134,7 @@ extern ptrdiff_t gCurrentThreadTpoff;
 // globals without including this header (which includes Heap.h back).
 
 void initThread(Thread *thread);
-void initThreadContext(Thread *thread);
 void freeThread(Thread *thread);
-void threadSetExitFrame(struct StackFrame *stackFrame);
 
 
 // The generational write barrier. Three tests, in the order that rejects

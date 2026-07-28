@@ -13,6 +13,7 @@
 
 #include "core/Handle.h"
 #include "core/Object.h"
+#include <stdio.h>
 
 typedef struct {
 	OBJECT_HEADER;
@@ -38,6 +39,12 @@ _Bool rawStringEqualsBytes(RawString *a, const char *bytes, size_t size);
 size_t selectorArgumentCount(RawString *selector);
 
 void printRawString(RawString *string);
+// The same, on a chosen stream. It exists because a message printed on the way
+// to abort() has to go to STDERR: abort does not flush stdio, so a diagnostic
+// written to a redirected (block-buffered) stdout dies with the process. That is
+// how the old VM's code-ceiling abort shipped silent, and how the v2's
+// doesNotUnderstand message shipped with an empty selector.
+void fprintRawString(FILE *out, RawString *string);
 void printValue(Value value);
 
 // Copy the characters into `buffer` and NUL-terminate. A Smalltalk String is

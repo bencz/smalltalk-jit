@@ -15,7 +15,11 @@
 
 #define SYMBOL_TABLE_SIZE 1024
 
-String *asSymbol(String *string);
+// The system dictionary, Symbol -> Association. Created by the bootstrap and
+// held in `Handles.globals`, so it is a root like every other well-known object.
+Dictionary *smalltalkGlobals(void);
+void smalltalkInitGlobals(size_t capacity);
+
 String *getSymbol(char *s);
 void setGlobal(char *key, Value value);
 void setGlobalObject(char *key, Object *value);
@@ -25,7 +29,9 @@ void globalAtPut(String *key, Value value);
 Value globalAt(String *key);
 Object *globalObjectAt(String *key);
 Class *getClass(char *key);
-void objectBecome(Object *object, Object *other);
+// `become:` is not in v2 yet. It was declared here and implemented by swapping
+// object bodies across three spaces and the stack, which is a decision the new
+// object model has to make again rather than inherit (ADR 0005).
 
 
 static inline _Bool isNil(void *handle)

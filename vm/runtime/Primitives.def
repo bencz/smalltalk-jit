@@ -11,6 +11,12 @@
 // image speaks. It was extracted from packages/ rather than invented: 173
 // distinct names in 186 declarations.
 //
+// ONE entry is not from packages/ and says so at its line: PrintValuePrimitive,
+// which is how the VM's BUILT-IN kernel shows a value before packages/Core
+// exists to be loaded. It is deliberately not wired into packages/Core, whose
+// printNl goes through Transcript and a buffered stream; a C primitive writing
+// straight to the descriptor would interleave with that buffer.
+//
 // An X-macro, included once to build the enum and once to build the table, so a
 // name and its implementation cannot drift apart. The old VM kept a positional
 // array whose comment said in capitals never to reorder it; here the position is
@@ -158,6 +164,7 @@ PRIMITIVE(ParseClass, "ParseClassPrimitive", NULL)  // Parser>>basicParseClass
 PRIMITIVE(ParseMethodOrBlock, "ParseMethodOrBlockPrimitive", NULL)  // Parser>>basicParseMethodOrBlock
 PRIMITIVE(ParseMethod, "ParseMethodPrimitive", NULL)  // Parser>>basicParseMethod
 PRIMITIVE(PrintHeap, "PrintHeapPrimitive", NULL)  // GarbageCollector>>class printHeap
+PRIMITIVE(PrintValue, "PrintValuePrimitive", primPrintValue)  // the BUILT-IN kernel's Object>>printNl, see the note at the top
 PRIMITIVE(ProcessCurrentId, "ProcessCurrentIdPrimitive", NULL)  // ProcessorScheduler>>currentId
 PRIMITIVE(ProcessResume, "ProcessResumePrimitive", NULL)  // ProcessorScheduler>>resumeId: anId
 PRIMITIVE(ProcessSleep, "ProcessSleepPrimitive", NULL)  // ProcessorScheduler>>sleepMicroseconds: micros

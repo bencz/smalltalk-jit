@@ -221,7 +221,13 @@ static void growSymbolTable(void)
 
 void printRawString(RawString *string)
 {
-	printf("%.*s", (int) rawStringSize(string), string->contents);
+	fprintRawString(stdout, string);
+}
+
+
+void fprintRawString(FILE *out, RawString *string)
+{
+	fprintf(out, "%.*s", (int) rawStringSize(string), string->contents);
 }
 
 

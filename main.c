@@ -1,408 +1,183 @@
-#include "vm/tools/Bootstrap.h"
-#include "vm/tools/Snapshot.h"
-#include "vm/core/Entry.h"
-#include "vm/tools/Repl.h"
-#include "vm/core/Thread.h"
-#include "vm/concurrency/Scheduler.h"
-#include "vm/runtime/Message.h"
-#include "vm/memory/Safepoint.h"
-#include "vm/core/Handle.h"
-#include "vm/core/Smalltalk.h"
-#include "vm/memory/Heap.h"
-#include "vm/core/Exception.h"
-#include "vm/os/Os.h"
-#include "vm/tools/Cli.h"
-#include "vm/tools/Project.h"
-#include "vm/memory/GarbageCollector.h"
-#include "vm/runtime/Primitives.h"
-#include "vm/jit/TargetCpu.h"
-#include "vm/jit/InlineCache.h"
-#include "vm/jit/Tier.h"
-#include "vm/core/Instrument.h"
-#include "vm/tests/SelfTests.h"
-#include <unistd.h>
-#include <string.h>
+// st: the VM's command line.
+//
+// THE VOCABULARY IS KEPT WHOLE and comes from vm/tools/Cli.h, unchanged: the
+// subcommands (new, build, run, test, repl, help) and the flags (-e, -f, -s, -b,
+// -h) are what the tooling, the scripts and the muscle memory around this
+// project already speak, and a port is not a reason to change any of it.
+//
+// What IS narrow today is how much of it can be carried out. Every subcommand
+// except evaluation ends in an operation the dry cut took out and that has not
+// been reimplemented yet: reading or writing an image (Snapshot), turning a
+// package directory into classes (the class builder), and the REPL loop. Those
+// say exactly what is missing and exit non-zero, because a command that
+// silently does nothing is worse than one that refuses.
+
+#include "compiler/Compile.h"
+#include "compiler/Parser.h"
+#include "core/Class.h"
+#include "core/Handle.h"
+#include "core/Smalltalk.h"
+#include "core/Thread.h"
+#include "jit/CompiledMethod.h"
+#include "jit/Jit.h"
+#include "memory/Heap.h"
+#include "runtime/Primitive.h"
+#include "tools/Bootstrap.h"
+#include "tools/Cli.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
-static void bootstrapSmalltalk(char *snapshotFileName, char *bootstrapDir);
-
-typedef struct {
-	CliArgs *cliArgs;
-	int result;
-	_Bool interactive; // REPL session: unhandled errors do not poison the exit code
-} ProgramContext;
-
-
-// Pre-flight for the project subcommands, BEFORE any image I/O: build/run/
-// test require a project root (package.st found walking upward); repl runs
-// in the project when there is one and as the plain base REPL otherwise.
-// `st run <script.st>` passes the SCRIPT's directory as scriptDir: the
-// project is looked up from there (not the CWD), and a script outside any
-// project is not an error — it simply runs on the base image.
-static _Bool planProject(CliArgs *cliArgs, ProjectPlan *plan, const char *scriptDir)
+// What a command needs that does not exist yet. One message, one place, so the
+// list of what is missing cannot drift from what the build actually contains.
+static int notPortedYet(const char *what, const char *needs)
 {
-	char *subcommand = cliArgs->subcommand;
-	_Bool wantsProject = strcmp(subcommand, "build") == 0 || strcmp(subcommand, "run") == 0
-		|| strcmp(subcommand, "test") == 0 || strcmp(subcommand, "repl") == 0;
-	if (!wantsProject) {
+	fprintf(stderr, "st: %s is not ported to jit-v2 yet (it needs %s)\n", what, needs);
+	return 3;
+}
+
+
+// Compile `source` as the body of a method and run it with nil as the receiver.
+//
+// A method and not something special: the front end compiles methods, the tier
+// compiles CodeUnits, and an expression typed at the command line is a body with
+// no arguments. Making it anything else would be a second path through the
+// compiler that nothing else exercises.
+static int evaluate(const char *source)
+{
+	HandleScope scope;
+	openHandleScope(&scope);
+
+	size_t length = strlen(source) + 32;
+	char *wrapped = malloc(length);
+	if (wrapped == NULL) {
+		closeHandleScope(&scope, NULL);
 		return 1;
 	}
-	if (scriptDir != NULL) {
-		if (!projectFindRootFrom(scriptDir, plan->root, sizeof(plan->root))) {
-			return 1;
-		}
-	} else if (!projectFindRoot(plan->root, sizeof(plan->root))) {
-		if (strcmp(subcommand, "repl") == 0) {
-			return 1;
-		}
-		printf("st %s: no %s found from the current directory upward\n",
-			subcommand, PROJECT_MANIFEST);
-		return 0;
+	snprintf(wrapped, length, "doIt [ %s ]", source);
+
+	Parser parser;
+	initParser(&parser, stringFromC(wrapped));
+	MethodNode *node = parseMethod(&parser);
+	if (node == NULL) {
+		printParseError(&parser, "-e");
+		freeParser(&parser);
+		free(wrapped);
+		closeHandleScope(&scope, NULL);
+		return 1;
 	}
-	plan->hasProject = 1;
-	projectBuildPath(plan->image, sizeof(plan->image), plan->root, PROJECT_IMAGE);
-	plan->force = cliArgs->force;
-	plan->stale = plan->force || projectIsStale(plan->root, cliArgs->snapshotFileName);
-	return 1;
+
+	// No owner class: an expression has no instance variables to resolve
+	// against, and every name in it is either its own temporary or a global.
+	CompileContext context = { NULL, smalltalkGlobals() };
+	CompileError error;
+	CodeUnit *unit = compileMethod(node, &context, &error);
+	freeParser(&parser);
+	free(wrapped);
+	if (unit == NULL) {
+		fprintf(stderr, "st: %s", compileStatusName(error.status));
+		if (error.what != NULL) {
+			fprintf(stderr, ": ");
+			printRawString(error.what->raw);
+		}
+		fprintf(stderr, "\n");
+		closeHandleScope(&scope, NULL);
+		return 1;
+	}
+
+	Opcode unsupported = OP_COUNT;
+	NativeCode *code = jitCompile(unit, &unsupported);
+	if (code == NULL) {
+		fprintf(stderr, "st: the tier does not implement %s yet\n",
+			opcodeName(unsupported));
+		closeHandleScope(&scope, NULL);
+		return 1;
+	}
+	jitCall0(code, tagPtr(Handles.nil.raw));
+	closeHandleScope(&scope, NULL);
+	return 0;
 }
 
 
-// st test: the image decides WHICH files run (ProjectTool prepareTests
-// answers newline-joined paths and points the session default namespace at
-// <Root>Tests); each file then goes through the exact -f path, so TestRun
-// test files work unchanged inside projects. Exit code = summed fail counts.
-static int runProjectTests(void)
-{
-	static char paths[65536];
-	if (!projectEvalToCString("ProjectTool prepareTests", paths, sizeof(paths))) {
-		return EXIT_FAILURE;
-	}
-	int total = 0;
-	char *cursor = paths;
-	while (*cursor != '\0') {
-		char *newline = strchr(cursor, '\n');
-		if (newline != NULL) {
-			*newline = '\0';
-		}
-		if (*cursor != '\0') {
-			printf("test %s\n", cursor);
-			fflush(stdout); // Smalltalk output below writes unbuffered
-			Value blockResult = tagInt(0);
-			if (!parseFileAndInitialize(cursor, &blockResult)) {
-				total += 1;
-			} else if (valueTypeOf(blockResult, VALUE_INT)) {
-				total += (int) asCInt(blockResult);
-			}
-		}
-		if (newline == NULL) {
-			break;
-		}
-		cursor = newline + 1;
-	}
-	return total;
-}
-
-
-// Runs the user program on the main fiber. Everything the program does
-// (compiling, evaluating, the REPL) executes as fiber #0 so that forked
-// processes can be scheduled cooperatively alongside it.
-static void runProgram(void *arg)
-{
-	ProgramContext *ctx = arg;
-	CliArgs *cliArgs = ctx->cliArgs;
-
-	if (cliArgs->error != NULL) {
-		printf(cliArgs->error, cliArgs->operand);
-		printf("\n");
-		ctx->result = EXIT_FAILURE;
-	} else if (cliArgs->printHelp) {
-		printCliHelp();
-	} else if (cliArgs->subcommand != NULL && strcmp(cliArgs->subcommand, "repl") != 0) {
-		// Project subcommands: thin eval bridges into ProjectTool
-		// (packages/Core/src/Packages/ProjectTool.st); `st repl` falls through to the
-		// ordinary REPL below, already inside the project image when one is
-		// loaded. Uncaught errors still poison the exit code through the
-		// scheduler's unhandled-error accounting.
-		if (strcmp(cliArgs->subcommand, "new") == 0) {
-			ctx->result = projectEvalToInt("ProjectTool scaffold");
-		} else if (strcmp(cliArgs->subcommand, "run") == 0) {
-			ctx->result = projectEvalToInt("ProjectTool run");
-		} else if (strcmp(cliArgs->subcommand, "test") == 0) {
-			ctx->result = runProjectTests();
-		} else {
-			ctx->result = EXIT_FAILURE;
-		}
-	} else if (cliArgs->fileName != NULL) {
-		Value blockResult;
-		if (parseFileAndInitialize(cliArgs->fileName, &blockResult)) {
-			ctx->result = valueTypeOf(blockResult, VALUE_INT) ? asCInt(blockResult) : ctx->result;
-		} else {
-			ctx->result = EXIT_FAILURE;
-		}
-	} else if (cliArgs->eval != NULL) {
-		ctx->result = asCInt(evalCode(cliArgs->eval));
-	} else {
-		ctx->interactive = 1;
-		runRepl();
-	}
-}
-
-
-int main(int argc, char **args)
+int main(int argc, char **argv)
 {
 	CliArgs cliArgs;
-	ProgramContext ctx = { .cliArgs = &cliArgs, .result = EXIT_SUCCESS };
-
-	// Which CPU MODEL of this architecture are we on (jit/TargetCpu.h). FIRST,
-	// before anything else: the JIT reads the answer while emitting, and the
-	// self-test dispatch below returns without ever reaching initThread, so
-	// anything later would leave the goldens and the JIT self-tests emitting
-	// against an undetected CPU. Read-only from here on, hence lock-free and
-	// TLS-free for every worker.
-	targetCpuDetect();
-
-	parseCliArgs(&cliArgs, argc, args);
+	parseCliArgs(&cliArgs, argc, argv);
+	if (cliArgs.error != NULL) {
+		fprintf(stderr, "st: ");
+		fprintf(stderr, cliArgs.error, cliArgs.operand);
+		fprintf(stderr, "\n");
+		printCliHelp();
+		return 2;
+	}
+	if (cliArgs.printHelp
+			|| (cliArgs.subcommand != NULL && strcmp(cliArgs.subcommand, "help") == 0)) {
+		printCliHelp();
+		return 0;
+	}
 	resolveSnapshotPath(&cliArgs);
 
-	// `st run <script.st>`: the first leftover operand ending in .st selects
-	// script mode — the script's PROJECT image is used (found from the
-	// script's directory, built if stale) and the script itself then runs
-	// through the ordinary -f path. The script sees the arguments AFTER its
-	// own name.
-	char *runScript = NULL;
-	static char runScriptPath[PROJECT_PATH_MAX];
-	static char runScriptDir[PROJECT_PATH_MAX];
-	if (cliArgs.subcommand != NULL && cliArgs.error == NULL
-			&& strcmp(cliArgs.subcommand, "run") == 0
-			&& cliArgs.argcAdjusted - cliArgs.argShift - optind > 0) {
-		char *operand = args[cliArgs.argShift + optind];
-		size_t operandLength = strlen(operand);
-		if (operandLength > 3 && strcmp(operand + operandLength - 3, ".st") == 0) {
-			if (realpath(operand, runScriptPath) == NULL) {
-				printf("st run: cannot open script '%s'\n", operand);
-				return EXIT_FAILURE;
-			}
-			strcpy(runScriptDir, runScriptPath);
-			*strrchr(runScriptDir, '/') = '\0'; // realpath always yields a slash
-			runScript = operand;
-		}
-	}
-
-	// Subcommand early dispatch (vm/tools/Cli.h). `st help`, argument errors
-	// and the project pre-flight (root discovery + staleness) all answer
-	// before any image is loaded; `st build` on a fresh project never boots a
-	// heap at all.
-	ProjectPlan plan = { 0 };
-	if (cliArgs.subcommand != NULL) {
-		if (cliArgs.error != NULL) {
-			printf(cliArgs.error, cliArgs.operand);
-			printf("\n");
-			return EXIT_FAILURE;
-		}
-		if (strcmp(cliArgs.subcommand, "help") == 0) {
-			printCliHelp();
-			return EXIT_SUCCESS;
-		}
-		if (!planProject(&cliArgs, &plan, runScript != NULL ? runScriptDir : NULL)) {
-			return EXIT_FAILURE;
-		}
-		if (strcmp(cliArgs.subcommand, "build") == 0 && !plan.stale) {
-			printf("up to date\n");
-			return EXIT_SUCCESS;
-		}
-	}
-
-	// Script-visible command line (CommandLinePrimitive): everything left after
-	// the subcommand word (if any) and the options, e.g. `st -f prog.st alpha
-	// beta` -> #('alpha' 'beta'). In script mode the script's own name is
-	// consumed too.
-	{
-		int argOffset = runScript != NULL ? 1 : 0;
-		primitivesSetCommandLine(cliArgs.argcAdjusted - cliArgs.argShift - optind - argOffset,
-			args + cliArgs.argShift + optind + argOffset);
-	}
-
-	// The C-level self-test battery (ST_*_TEST env vars) lives in
-	// vm/tests/SelfTests.c; -1 means "no self-test requested".
-	{
-		int selfTest = selfTestFromEnv(cliArgs.snapshotFileName, cliArgs.bootstrapDir, bootstrapSmalltalk);
-		if (selfTest >= 0) {
-			return selfTest;
-		}
-	}
-
-	// What THIS engine cannot see. A counter with no increment site must print
-	// "n/a", never 0: a zero that means "nothing counts this" is
-	// indistinguishable from a zero that means "this never happened", and the
-	// second is exactly what the jit-v2 acceptance criterion claims. See the
-	// second rule in core/Instrument.h.
-	//
-	// v1 cannot measure:
-	//   tagged_loads  no single site; it would mean instrumenting every load
-	//                 through a tagged pointer in emitted code
-	//   unboxes       the decode lives inside the float fast path, where TMP
-	//                 holds the receiver for the dispatch fall-through and no
-	//                 register is free without disturbing the [rsp] operands
-	//   f64_ops       same fast path, same reason
-	//   i64_ops       same
-	//   deopts        v1 has no deoptimization at all (jit/Tier.h says so)
-	// and the IC/tier counters only exist when their own emission flags are on.
-	instrumentSetUnmeasured(
-		ST_UNMEASURED(INSTR_TAGGED_LOADS) | ST_UNMEASURED(INSTR_UNBOXES)
-		| ST_UNMEASURED(INSTR_F64_OPS) | ST_UNMEASURED(INSTR_I64_OPS)
-		| ST_UNMEASURED(INSTR_DEOPTS));
-	if (!icStatsEnabled()) {
-		instrumentSetUnmeasured(ST_UNMEASURED(INSTR_IC_HITS) | ST_UNMEASURED(INSTR_IC_MISSES));
-	}
-	if (!tierStatsEnabled()) {
-		instrumentSetUnmeasured(ST_UNMEASURED(INSTR_GUARD_CHECKS) | ST_UNMEASURED(INSTR_GUARD_FAILS));
-	}
-
 	initThread(&CurrentThread);
-	// Project runs against a FRESH cache load the built project image; a stale
-	// (or first) build loads the base image and rebuilds below. Everything
-	// else loads the resolved base image.
-	{
-		char *image = cliArgs.snapshotFileName;
-		if (plan.hasProject && !plan.stale) {
-			image = plan.image;
-		}
-		bootstrapSmalltalk(image, cliArgs.bootstrapDir);
-	}
+	initHandles();
+	bootstrapBuiltinKernel();
 
-	// Stale project: build PRE-scheduler, mirroring the -b bootstrap path, so
-	// the image is snapshotted with zero fibers ever started. ProjectTool
-	// build loads the package graph, records the entry point and the default
-	// namespace IN the image, and answers the output path; C then collects
-	// the builder transients and writes the snapshot. st run/test/repl
-	// continue in the same process on the freshly built in-memory image.
-	if (plan.hasProject && plan.stale) {
-		char out[PROJECT_PATH_MAX];
-		// ProjectTool discovers the root from the image's working directory;
-		// in script mode the process may be anywhere, so hop into the
-		// project for the build and back out for the script itself.
-		char savedCwd[PROJECT_PATH_MAX];
-		_Bool hopped = runScript != NULL
-			&& getcwd(savedCwd, sizeof(savedCwd)) != NULL
-			&& chdir(plan.root) == 0;
-		_Bool built = projectEvalToCString("ProjectTool build", out, sizeof(out));
-		if (hopped && chdir(savedCwd) != 0) {
-			printf("st run: cannot return to '%s'\n", savedCwd);
-			return EXIT_FAILURE;
+	// The project subcommands. Each one is a real command with a real meaning;
+	// what it needs is named, so the gap is a checklist and not a mystery.
+	if (cliArgs.subcommand != NULL) {
+		const char *name = cliArgs.subcommand;
+		if (strcmp(name, "new") == 0) {
+			return notPortedYet("st new", "the project scaffolder");
 		}
-		if (!built) {
-			return EXIT_FAILURE; // the image already printed the build error
+		if (strcmp(name, "build") == 0) {
+			return notPortedYet("st build", "the class builder and the image writer");
 		}
-		collectGarbage(&CurrentThread);
-		FILE *image = fopen(out, "w+");
-		if (image == NULL) {
-			printf("Cannot write project image: '%s'\n", out);
-			return EXIT_FAILURE;
+		if (strcmp(name, "run") == 0) {
+			return notPortedYet("st run", "the class builder and the image reader");
 		}
-		snapshotWrite(image);
-		fclose(image);
-		printf("built %s\n", out);
-		fflush(stdout); // program output below writes unbuffered
-		if (strcmp(cliArgs.subcommand, "build") == 0) {
-			return EXIT_SUCCESS;
+		if (strcmp(name, "test") == 0) {
+			return notPortedYet("st test", "the class builder and the image reader");
+		}
+		if (strcmp(name, "repl") == 0) {
+			return notPortedYet("st repl", "the read-eval-print loop");
 		}
 	}
 
-	// Script mode: from here on it is exactly the -f path, running against
-	// the project image selected or freshly built above (or the base image
-	// when the script lives outside any project).
-	if (runScript != NULL) {
-		cliArgs.subcommand = NULL;
-		cliArgs.fileName = runScriptPath;
+	if (cliArgs.bootstrapDir != NULL) {
+		return notPortedYet("bootstrapping an image from a package directory",
+			"the class builder and the image writer");
+	}
+	if (cliArgs.fileName != NULL) {
+		return notPortedYet("running a source file", "the class builder");
 	}
 
-	// Image idempotence probe (scripts/check-image-idempotence.sh): re-save the
-	// just-loaded image and exit — a load->save round trip must be a fixpoint.
-	char *resavePath = getenv("ST_RESAVE");
-	if (resavePath != NULL) {
-		FILE *out = fopen(resavePath, "w+");
-		if (out == NULL) {
-			printf("Cannot write to snapshot file: '%s'\n", resavePath);
-			return EXIT_FAILURE;
+	// An image the caller NAMED with -s and that exists is refused rather than
+	// ignored: ignoring it would run the built-in kernel while the caller
+	// believed their image was loaded.
+	//
+	// One the SEARCH merely found is a different matter. Every checkout of this
+	// project has a `snapshot` left over from before the cut, nobody asked for
+	// it, and refusing would make `st -e` unusable in the source tree. It is
+	// passed over, with one line on stderr so that which kernel is running is
+	// never a guess. A path that does not exist is not an error at all: that is
+	// what every run looks like until there is a writer.
+	if (cliArgs.snapshotFileName != NULL) {
+		FILE *existing = fopen(cliArgs.snapshotFileName, "rb");
+		if (existing != NULL) {
+			fclose(existing);
+			if (cliArgs.snapshotExplicit) {
+				fprintf(stderr, "st: reading an image is not ported to jit-v2 yet "
+					"(would have read '%s')\n", cliArgs.snapshotFileName);
+				return 3;
+			}
+			fprintf(stderr, "st: ignoring the image at '%s' and running the "
+				"built-in kernel; reading an image is not ported to jit-v2 yet\n",
+				cliArgs.snapshotFileName);
 		}
-		snapshotWrite(out);
-		fclose(out);
-		return EXIT_SUCCESS;
 	}
 
-	schedulerInit();
-
-	// Hand execution over to the cooperative fiber scheduler: the program runs
-	// as the first fiber and the loop keeps running until it (and any processes
-	// it forked) are done.
-	schedulerSpawnC(runProgram, &ctx, 0);
-	schedulerRun();
-
-	// Execution counters (core/Instrument.h) under ST_INSTRUMENT_PRINT=1, in a
-	// -DST_INSTRUMENT=1 build. Two counters come from the existing JIT stats
-	// rather than their own emission sites, because those sites already exist
-	// and a second increment next to them would be pure duplication. This
-	// bridge is v1-specific and dies with the v1 JIT: in v2 both are ordinary
-	// counters at their own sites.
-	if (instrumentPrintEnabled()) {
-		gInstrument.c[INSTR_IC_HITS] = gIcStats.hits + gIcStats.picHits;
-		gInstrument.c[INSTR_IC_MISSES] = gIcStats.missCold;
-		gInstrument.c[INSTR_GUARD_CHECKS] = gTierStats.directCalls + gTierStats.guardFails;
-		gInstrument.c[INSTR_GUARD_FAILS] = gTierStats.guardFails;
-		instrumentPrint("exit");
+	if (cliArgs.eval != NULL) {
+		return evaluate(cliArgs.eval);
 	}
-	// Inline-cache observability (jit/InlineCache.h): dump the counters at exit
-	// under ST_IC_STATS=1 (the same flag that makes the JIT emit the hit/poly
-	// increments; without it those two stay zero and the rest still counts).
-	if (icStatsEnabled()) {
-		icPrintStats();
-	}
-	// Tier observability (jit/Tier.h): same contract under ST_TIER_STATS=1.
-	if (tierStatsEnabled()) {
-		tierPrintStats();
-	}
-	// Send-classification census (jit/Tier.h) under ST_TYPE_STATS=1: the
-	// measurement gate for optional type annotations.
-	if (typeStatsEnabled()) {
-		typePrintStats();
-	}
-
-	freeHandles();
-	freeThread(&CurrentThread);
-	// Any fiber that died in Exception>>defaultAction (unhandled error) makes a
-	// non-interactive run FAIL, even though the main block's own return value
-	// was fine: an uncaught error must never exit 0 (the historical false-pass
-	// that let a printed backtrace count as success). The REPL is exempt.
-	if (!ctx.interactive && ctx.result == 0 && schedulerUnhandledErrors() > 0) {
-		ctx.result = EXIT_FAILURE;
-	}
-	return ctx.result;
-}
-
-
-
-static void bootstrapSmalltalk(char *snapshotFileName, char *bootstrapDir)
-{
-	FILE *snapshot;
-	if (bootstrapDir) {
-		snapshot = fopen(snapshotFileName, "w+");
-		if (snapshot == NULL) {
-			printf("Cannot write to snapshot file: '%s'\n", snapshotFileName);
-			exit(EXIT_FAILURE);
-		}
-		if (!bootstrap(bootstrapDir)) {
-			printf("Bootstrap failed\n");
-			exit(EXIT_FAILURE);
-		}
-		snapshotWrite(snapshot);
-	} else {
-		snapshot = fopen(snapshotFileName, "r");
-		if (snapshot == NULL) {
-			printf("Cannot read snapshot file: '%s'\n", snapshotFileName);
-			exit(EXIT_FAILURE);
-		}
-		snapshotRead(snapshot);
-	}
-	fclose(snapshot);
+	printCliHelp();
+	return 0;
 }
