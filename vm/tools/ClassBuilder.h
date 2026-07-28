@@ -16,6 +16,7 @@
 #include "compiler/Ast.h"
 #include "compiler/Compile.h"
 #include "core/Class.h"
+#include "jit/CompiledMethod.h"
 
 typedef struct {
 	// What went wrong, in words, or NULL. Not an enum: these are diagnostics for
@@ -36,5 +37,21 @@ Class *classBuild(ClassNode *node, ClassBuildError *error);
 // the method dictionary of the class's OWN class, which is what makes
 // `Foo bar` find something different from `Foo new bar`.
 Class *classMetaclassOf(Class *class);
+
+// Compile ONE parsed method into `target` and install it in that class's method
+// dictionary. Answers NULL with `error` filled in.
+//
+// `classVariableScope` is where class variables are looked up, and it differs
+// from `target` for a class-side method: the method is compiled with the
+// METACLASS as its owner, but a metaclass holds none of the class's class
+// variables, so both sides have to be pointed at the class itself or they reach
+// different Associations for the same name. NULL means "same as target".
+//
+// EXPORTED so the reflective compiler primitive (runtime/primitives/Reflect.c)
+// and the class builder share one path. Two copies of this would be two answers
+// to "where does a class variable live", which is a question this project has
+// already got wrong once, silently.
+CompiledMethod *classCompileMethodInto(MethodNode *node, Class *target,
+	Class *classVariableScope, ClassBuildError *error);
 
 #endif

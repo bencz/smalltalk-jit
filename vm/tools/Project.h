@@ -2,19 +2,23 @@
 #define PROJECT_H
 
 // CLI-side plumbing for the st project subcommands (main.c): locate the
-// project root, decide staleness from .stbuild/build.deps, and shuttle eval
-// results across the C boundary. All project SEMANTICS (manifest evaluation,
-// dependency graph, entry point, scaffolding) live in-image in
-// packages/Core/src/Packages/; this file only walks directories, stats files and
-// copies strings, keeping the VM generic.
+// project root and decide staleness from .stbuild/build.deps. All project
+// SEMANTICS (manifest evaluation, dependency graph, entry point, scaffolding)
+// live in-image in packages/Core/src/Packages/; this file only walks
+// directories and stats files, keeping the VM generic.
+//
+// NO IMAGE, NO OBJECT MODEL, NO COMPILER. It used to also hold the two eval
+// bridges (`ProjectTool build` -> a C string, and -> an int), and that pulled
+// core/Entry.h in here, which in jit-v2 reaches a header the dry cut deleted.
+// The bridges moved to main.c, which is where the compiler is already wired and
+// where the only two callers were. What is left runs BEFORE any heap exists,
+// which is what `st build` on a fresh project needs: root discovery and the
+// staleness decision both have to answer without booting anything.
 
-#include "core/Entry.h"
-#include "core/Handle.h"
-#include "core/Smalltalk.h"
-#include "runtime/String.h"
+#include "os/Os.h"
 #include "tools/Snapshot.h"
-#include "vm/os/Os.h"
 #include <sys/stat.h>
+#include <stdint.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -151,40 +155,5 @@ static _Bool projectIsStale(const char *root, const char *baseImage)
 	return 0;
 }
 
-
-// Evaluate `code` and copy its String result out. Returns 1 when the result
-// was a String/Symbol; 0 otherwise (buffer untouched). The bytes are copied
-// before any further allocation, so the raw pointer cannot move under us
-// (the Repl.c autocomplete pattern).
-static _Bool projectEvalToCString(char *code, char *buffer, size_t size)
-{
-	HandleScope scope;
-	openHandleScope(&scope);
-	Value value = evalObject(code);
-	if (!valueTypeOf(value, VALUE_POINTER)) {
-		closeHandleScope(&scope, NULL);
-		return 0;
-	}
-	Object *object = scopeHandle(asObject(value));
-	if (object->raw->class != Handles.String->raw
-			&& object->raw->class != Handles.Symbol->raw) {
-		closeHandleScope(&scope, NULL);
-		return 0;
-	}
-	RawString *raw = (RawString *) object->raw;
-	size_t length = (size_t) raw->size < size - 1 ? (size_t) raw->size : size - 1;
-	memcpy(buffer, raw->contents, length);
-	buffer[length] = '\0';
-	closeHandleScope(&scope, NULL);
-	return 1;
-}
-
-
-// Evaluate `code` expecting an integer exit code; EXIT_FAILURE otherwise.
-static int projectEvalToInt(char *code)
-{
-	Value value = evalObject(code);
-	return valueTypeOf(value, VALUE_INT) ? (int) asCInt(value) : EXIT_FAILURE;
-}
 
 #endif

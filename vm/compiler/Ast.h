@@ -87,118 +87,118 @@ OBJECT_HANDLE(SourceCode);
 
 union BlockScope;
 
-static void classNodeSetName(ClassNode *class, LiteralNode *node);
-static LiteralNode *classNodeGetName(ClassNode *class);
-static void classNodeSetSuperName(ClassNode *class, LiteralNode *superName);
-static LiteralNode *classNodeGetSuperName(ClassNode *class);
-static void classNodeSetPragmas(ClassNode *class, OrderedCollection *pragmas);
-static OrderedCollection *classNodeGetPragmas(ClassNode *class);
-static void classNodeSetVars(ClassNode *class, OrderedCollection *vars);
-static OrderedCollection *classNodeGetVars(ClassNode *class);
-static void classNodeSetMethods(ClassNode *class, OrderedCollection *methods);
-static OrderedCollection *classNodeGetMethods(ClassNode *class);
-static void classNodeSetSourceCode(ClassNode *class, SourceCode *sourceCode);
-static SourceCode *classNodeGetSourceCode(ClassNode *class);
-static void classNodeSetIsExtension(ClassNode *class, _Bool isExtension);
-static _Bool classNodeIsExtension(ClassNode *class);
-static void classNodeSetMembers(ClassNode *class, OrderedCollection *members);
-static OrderedCollection *classNodeGetMembers(ClassNode *class);
-static _Bool classNodeIsNamespace(ClassNode *class);
+static inline void classNodeSetName(ClassNode *class, LiteralNode *node);
+static inline LiteralNode *classNodeGetName(ClassNode *class);
+static inline void classNodeSetSuperName(ClassNode *class, LiteralNode *superName);
+static inline LiteralNode *classNodeGetSuperName(ClassNode *class);
+static inline void classNodeSetPragmas(ClassNode *class, OrderedCollection *pragmas);
+static inline OrderedCollection *classNodeGetPragmas(ClassNode *class);
+static inline void classNodeSetVars(ClassNode *class, OrderedCollection *vars);
+static inline OrderedCollection *classNodeGetVars(ClassNode *class);
+static inline void classNodeSetMethods(ClassNode *class, OrderedCollection *methods);
+static inline OrderedCollection *classNodeGetMethods(ClassNode *class);
+static inline void classNodeSetSourceCode(ClassNode *class, SourceCode *sourceCode);
+static inline SourceCode *classNodeGetSourceCode(ClassNode *class);
+static inline void classNodeSetIsExtension(ClassNode *class, _Bool isExtension);
+static inline _Bool classNodeIsExtension(ClassNode *class);
+static inline void classNodeSetMembers(ClassNode *class, OrderedCollection *members);
+static inline OrderedCollection *classNodeGetMembers(ClassNode *class);
+static inline _Bool classNodeIsNamespace(ClassNode *class);
 
-static void methodNodeSetClassName(MethodNode *method, String *className);
-static String *methodNodeGetClassName(MethodNode *method);
-static void methodNodeSetSelector(MethodNode *method, String *selector);
-static String *methodNodeGetSelector(MethodNode *method);
-static void methodNodeSetPragmas(MethodNode *method, OrderedCollection *pragmas);
-static OrderedCollection *methodNodeGetPragmas(MethodNode *method);
-static void methodNodeSetBody(MethodNode *method, BlockNode *body);
-static BlockNode *methodNodeGetBody(MethodNode *method);
-static void methodNodeSetSourceCode(MethodNode *method, SourceCode *sourceCode);
-static SourceCode *methodNodeGetSourceCode(MethodNode *method);
+static inline void methodNodeSetClassName(MethodNode *method, String *className);
+static inline String *methodNodeGetClassName(MethodNode *method);
+static inline void methodNodeSetSelector(MethodNode *method, String *selector);
+static inline String *methodNodeGetSelector(MethodNode *method);
+static inline void methodNodeSetPragmas(MethodNode *method, OrderedCollection *pragmas);
+static inline OrderedCollection *methodNodeGetPragmas(MethodNode *method);
+static inline void methodNodeSetBody(MethodNode *method, BlockNode *body);
+static inline BlockNode *methodNodeGetBody(MethodNode *method);
+static inline void methodNodeSetSourceCode(MethodNode *method, SourceCode *sourceCode);
+static inline SourceCode *methodNodeGetSourceCode(MethodNode *method);
 
-static void blockNodeSetArgs(BlockNode *block, OrderedCollection *args);
-static OrderedCollection *blockNodeGetArgs(BlockNode *block);
-static void blockNodeSetTempVars(BlockNode *block, OrderedCollection *vars);
-static OrderedCollection *blockNodeGetTempVars(BlockNode *block);
-static void blockNodeSetExpressions(BlockNode *block, OrderedCollection *expressions);
-static OrderedCollection *blockNodeGetExpressions(BlockNode *block);
-static void blockNodeSetScope(BlockNode *block, union BlockScope *scope);
-static union BlockScope *blockNodeGetScope(BlockNode *block);
-static void blockNodeSetSourceCode(BlockNode *block, SourceCode *sourceCode);
-static SourceCode *blockNodeGetSourceCode(BlockNode *block);
+static inline void blockNodeSetArgs(BlockNode *block, OrderedCollection *args);
+static inline OrderedCollection *blockNodeGetArgs(BlockNode *block);
+static inline void blockNodeSetTempVars(BlockNode *block, OrderedCollection *vars);
+static inline OrderedCollection *blockNodeGetTempVars(BlockNode *block);
+static inline void blockNodeSetExpressions(BlockNode *block, OrderedCollection *expressions);
+static inline OrderedCollection *blockNodeGetExpressions(BlockNode *block);
+static inline void blockNodeSetScope(BlockNode *block, union BlockScope *scope);
+static inline union BlockScope *blockNodeGetScope(BlockNode *block);
+static inline void blockNodeSetSourceCode(BlockNode *block, SourceCode *sourceCode);
+static inline SourceCode *blockNodeGetSourceCode(BlockNode *block);
 
-static void expressionNodeEnableReturn(ExpressionNode *expression);
-static void expressionNodeDisableReturn(ExpressionNode *expression);
-static _Bool expressionNodeReturns(ExpressionNode *expression);
-static void expressionNodeSetAssigments(ExpressionNode *expression, OrderedCollection *assigments);
-static OrderedCollection *expressionNodeGetAssigments(ExpressionNode *expression);
-static void expressionNodeSetReceiver(ExpressionNode *expression, LiteralNode *receiver);
-static LiteralNode *expressionNodeGetReceiver(ExpressionNode *expression);
-static void expressionNodeSetMessageExpressions(ExpressionNode *expression, OrderedCollection *messageExpressions);
-static OrderedCollection *expressionNodeGetMessageExpressions(ExpressionNode *expression);
-static void expressionNodeSetSourceCode(ExpressionNode *expression, SourceCode *sourceCode);
-static SourceCode *expressionNodeGetSourceCode(ExpressionNode *expression);
+static inline void expressionNodeEnableReturn(ExpressionNode *expression);
+static inline void expressionNodeDisableReturn(ExpressionNode *expression);
+static inline _Bool expressionNodeReturns(ExpressionNode *expression);
+static inline void expressionNodeSetAssigments(ExpressionNode *expression, OrderedCollection *assigments);
+static inline OrderedCollection *expressionNodeGetAssigments(ExpressionNode *expression);
+static inline void expressionNodeSetReceiver(ExpressionNode *expression, LiteralNode *receiver);
+static inline LiteralNode *expressionNodeGetReceiver(ExpressionNode *expression);
+static inline void expressionNodeSetMessageExpressions(ExpressionNode *expression, OrderedCollection *messageExpressions);
+static inline OrderedCollection *expressionNodeGetMessageExpressions(ExpressionNode *expression);
+static inline void expressionNodeSetSourceCode(ExpressionNode *expression, SourceCode *sourceCode);
+static inline SourceCode *expressionNodeGetSourceCode(ExpressionNode *expression);
 
-static void messageExpressionNodeSetSelector(MessageExpressionNode *messageExpression, String *selector);
-static String *messageExpressionNodeGetSelector(MessageExpressionNode *messageExpression);
-static void messageExpressionNodeSetArgs(MessageExpressionNode *messageExpression, OrderedCollection *args);
-static OrderedCollection *messageExpressionNodeGetArgs(MessageExpressionNode *messageExpression);
-static void messageExpressionNodeSetSourceCode(MessageExpressionNode *messageExpression, SourceCode *sourceCode);
-static SourceCode *messageExpressionNodeGetSourceCode(MessageExpressionNode *messageExpression);
+static inline void messageExpressionNodeSetSelector(MessageExpressionNode *messageExpression, String *selector);
+static inline String *messageExpressionNodeGetSelector(MessageExpressionNode *messageExpression);
+static inline void messageExpressionNodeSetArgs(MessageExpressionNode *messageExpression, OrderedCollection *args);
+static inline OrderedCollection *messageExpressionNodeGetArgs(MessageExpressionNode *messageExpression);
+static inline void messageExpressionNodeSetSourceCode(MessageExpressionNode *messageExpression, SourceCode *sourceCode);
+static inline SourceCode *messageExpressionNodeGetSourceCode(MessageExpressionNode *messageExpression);
 
-static void literalNodeSetValue(LiteralNode *literal, Object *value);
-static void literalNodeSetIntValue(LiteralNode *literal, intptr_t value);
-static void literalNodeSetCharValue(LiteralNode *literal, char value);
-static Value literalNodeGetValue(LiteralNode *literal);
-static intptr_t literalNodeGetIntValue(LiteralNode *literal);
-static String *literalNodeGetStringValue(LiteralNode *literal);
-static OrderedCollection *literalNodeGetOrdCollValue(LiteralNode *literal);
-static void literalNodeSetSourceCode(LiteralNode *literal, SourceCode *sourceCode);
-static SourceCode *literalNodeGetSourceCode(LiteralNode *literal);
+static inline void literalNodeSetValue(LiteralNode *literal, Object *value);
+static inline void literalNodeSetIntValue(LiteralNode *literal, intptr_t value);
+static inline void literalNodeSetCharValue(LiteralNode *literal, char value);
+static inline Value literalNodeGetValue(LiteralNode *literal);
+static inline intptr_t literalNodeGetIntValue(LiteralNode *literal);
+static inline String *literalNodeGetStringValue(LiteralNode *literal);
+static inline OrderedCollection *literalNodeGetOrdCollValue(LiteralNode *literal);
+static inline void literalNodeSetSourceCode(LiteralNode *literal, SourceCode *sourceCode);
+static inline SourceCode *literalNodeGetSourceCode(LiteralNode *literal);
 
-static void sourceCodeSetSourceOrFileName(SourceCode *sourceCode, String *sourceOrFileName);
-static String *sourceCodeGetSourceOrFileName(SourceCode *sourceCode);
-static void sourceCodeSetPosition(SourceCode *sourceCode, uintptr_t position);
-static uintptr_t sourceCodeGetPosition(SourceCode *sourceCode);
-static void sourceCodeSetSourceSize(SourceCode *sourceCode, uintptr_t sourceSize);
-static uintptr_t sourceCodeGetSourceSize(SourceCode *sourceCode);
-static void sourceCodeSetLine(SourceCode *sourceCode, uintptr_t line);
-static uintptr_t sourceCodeGetLine(SourceCode *sourceCode);
-static void sourceCodeSetColumn(SourceCode *sourceCode, uintptr_t column);
-static uintptr_t sourceCodeGetColumn(SourceCode *sourceCode);
+static inline void sourceCodeSetSourceOrFileName(SourceCode *sourceCode, String *sourceOrFileName);
+static inline String *sourceCodeGetSourceOrFileName(SourceCode *sourceCode);
+static inline void sourceCodeSetPosition(SourceCode *sourceCode, uintptr_t position);
+static inline uintptr_t sourceCodeGetPosition(SourceCode *sourceCode);
+static inline void sourceCodeSetSourceSize(SourceCode *sourceCode, uintptr_t sourceSize);
+static inline uintptr_t sourceCodeGetSourceSize(SourceCode *sourceCode);
+static inline void sourceCodeSetLine(SourceCode *sourceCode, uintptr_t line);
+static inline uintptr_t sourceCodeGetLine(SourceCode *sourceCode);
+static inline void sourceCodeSetColumn(SourceCode *sourceCode, uintptr_t column);
+static inline uintptr_t sourceCodeGetColumn(SourceCode *sourceCode);
 
 
-static void classNodeSetName(ClassNode *class, LiteralNode *name)
+static inline void classNodeSetName(ClassNode *class, LiteralNode *name)
 {
 	objectStorePtr((Object *) class,  &class->raw->name, (Object *) name);
 }
 
 
-static LiteralNode *classNodeGetName(ClassNode *class)
+static inline LiteralNode *classNodeGetName(ClassNode *class)
 {
 	return (LiteralNode *) scopeHandle(asObject(class->raw->name));
 }
 
 
-static void classNodeSetIsExtension(ClassNode *class, _Bool isExtension)
+static inline void classNodeSetIsExtension(ClassNode *class, _Bool isExtension)
 {
 	objectStorePtr((Object *) class,  &class->raw->isExtension, asBool(isExtension));
 }
 
 
-static _Bool classNodeIsExtension(ClassNode *class)
+static inline _Bool classNodeIsExtension(ClassNode *class)
 {
 	return asObject(class->raw->isExtension) == Handles.true_.raw;
 }
 
 
-static void classNodeSetMembers(ClassNode *class, OrderedCollection *members)
+static inline void classNodeSetMembers(ClassNode *class, OrderedCollection *members)
 {
 	objectStorePtr((Object *) class,  &class->raw->members, (Object *) members);
 }
 
 
-static OrderedCollection *classNodeGetMembers(ClassNode *class)
+static inline OrderedCollection *classNodeGetMembers(ClassNode *class)
 {
 	// Unset for every class that is not a namespace declaration.
 	return valueTypeOf(class->raw->members, VALUE_POINTER)
@@ -215,20 +215,20 @@ static OrderedCollection *classNodeGetMembers(ClassNode *class)
 // It mattered the first time the class builder ran: `members` is set only for a
 // namespace, the old test read "is it not nil", and EVERY ordinary class in
 // packages/Core came back claiming to be one.
-static _Bool classNodeIsNamespace(ClassNode *class)
+static inline _Bool classNodeIsNamespace(ClassNode *class)
 {
 	return valueTypeOf(class->raw->members, VALUE_POINTER)
 		&& !isTaggedNil(class->raw->members);
 }
 
 
-static void classNodeSetSuperName(ClassNode *class, LiteralNode *superName)
+static inline void classNodeSetSuperName(ClassNode *class, LiteralNode *superName)
 {
 	objectStorePtr((Object *) class,  &class->raw->superName, (Object *) superName);
 }
 
 
-static LiteralNode *classNodeGetSuperName(ClassNode *class)
+static inline LiteralNode *classNodeGetSuperName(ClassNode *class)
 {
 	// Unset for `Name extend [ ... ]`, which names no superclass at all.
 	return valueTypeOf(class->raw->superName, VALUE_POINTER)
@@ -236,61 +236,61 @@ static LiteralNode *classNodeGetSuperName(ClassNode *class)
 }
 
 
-static void classNodeSetPragmas(ClassNode *class, OrderedCollection *pragmas)
+static inline void classNodeSetPragmas(ClassNode *class, OrderedCollection *pragmas)
 {
 	objectStorePtr((Object *) class,  &class->raw->pragmas, (Object *) pragmas);
 }
 
 
-static OrderedCollection *classNodeGetPragmas(ClassNode *class)
+static inline OrderedCollection *classNodeGetPragmas(ClassNode *class)
 {
 	return (OrderedCollection *) scopeHandle(asObject(class->raw->pragmas));
 }
 
 
-static void classNodeSetVars(ClassNode *class, OrderedCollection *vars)
+static inline void classNodeSetVars(ClassNode *class, OrderedCollection *vars)
 {
 	objectStorePtr((Object *) class,  &class->raw->vars, (Object *) vars);
 }
 
 
-static OrderedCollection *classNodeGetVars(ClassNode *class)
+static inline OrderedCollection *classNodeGetVars(ClassNode *class)
 {
 	return (OrderedCollection *) scopeHandle(asObject(class->raw->vars));
 }
 
 
-static void classNodeSetMethods(ClassNode *class, OrderedCollection *methods)
+static inline void classNodeSetMethods(ClassNode *class, OrderedCollection *methods)
 {
 	objectStorePtr((Object *) class,  &class->raw->methods, (Object *) methods);
 }
 
 
-static OrderedCollection *classNodeGetMethods(ClassNode *class)
+static inline OrderedCollection *classNodeGetMethods(ClassNode *class)
 {
 	return (OrderedCollection *) scopeHandle(asObject(class->raw->methods));
 }
 
 
-static void classNodeSetSourceCode(ClassNode *class, SourceCode *sourceCode)
+static inline void classNodeSetSourceCode(ClassNode *class, SourceCode *sourceCode)
 {
 	objectStorePtr((Object *) class,  &class->raw->sourceCode, (Object *) sourceCode);
 }
 
 
-static SourceCode *classNodeGetSourceCode(ClassNode *class)
+static inline SourceCode *classNodeGetSourceCode(ClassNode *class)
 {
 	return (SourceCode *) scopeHandle(asObject(class->raw->sourceCode));
 }
 
 
-static void methodNodeSetClassName(MethodNode *method, String *className)
+static inline void methodNodeSetClassName(MethodNode *method, String *className)
 {
 	objectStorePtr((Object *) method,  &method->raw->className, (Object *) className);
 }
 
 
-static String *methodNodeGetClassName(MethodNode *method)
+static inline String *methodNodeGetClassName(MethodNode *method)
 {
 	// Set only for a CLASS-SIDE method, written `class foo [ ... ]`, so an
 	// instance-side method leaves it unset and this is how that is asked.
@@ -299,25 +299,25 @@ static String *methodNodeGetClassName(MethodNode *method)
 }
 
 
-static void methodNodeSetSelector(MethodNode *method, String *selector)
+static inline void methodNodeSetSelector(MethodNode *method, String *selector)
 {
 	objectStorePtr((Object *) method,  &method->raw->selector, (Object *) selector);
 }
 
 
-static String *methodNodeGetSelector(MethodNode *method)
+static inline String *methodNodeGetSelector(MethodNode *method)
 {
 	return (String *) scopeHandle(asObject(method->raw->selector));
 }
 
 
-static void methodNodeSetPragmas(MethodNode *method, OrderedCollection *pragmas)
+static inline void methodNodeSetPragmas(MethodNode *method, OrderedCollection *pragmas)
 {
 	objectStorePtr((Object *) method,  &method->raw->pragmas, (Object *) pragmas);
 }
 
 
-static OrderedCollection *methodNodeGetPragmas(MethodNode *method)
+static inline OrderedCollection *methodNodeGetPragmas(MethodNode *method)
 {
 	// A node the PARSER built always has one, even empty; a node built by hand
 	// does not. `st -f` makes one to wrap a top-level block, which is the first
@@ -328,73 +328,73 @@ static OrderedCollection *methodNodeGetPragmas(MethodNode *method)
 }
 
 
-static void methodNodeSetBody(MethodNode *method, BlockNode *body)
+static inline void methodNodeSetBody(MethodNode *method, BlockNode *body)
 {
 	objectStorePtr((Object *) method,  &method->raw->body, (Object *) body);
 }
 
 
-static BlockNode *methodNodeGetBody(MethodNode *method)
+static inline BlockNode *methodNodeGetBody(MethodNode *method)
 {
 	return (BlockNode *) scopeHandle(asObject(method->raw->body));
 }
 
 
-static void methodNodeSetSourceCode(MethodNode *method, SourceCode *sourceCode)
+static inline void methodNodeSetSourceCode(MethodNode *method, SourceCode *sourceCode)
 {
 	objectStorePtr((Object *) method,  &method->raw->sourceCode, (Object *) sourceCode);
 }
 
 
-static SourceCode *methodNodeGetSourceCode(MethodNode *method)
+static inline SourceCode *methodNodeGetSourceCode(MethodNode *method)
 {
 	return (SourceCode *) scopeHandle(asObject(method->raw->sourceCode));
 }
 
 
-static void blockNodeSetArgs(BlockNode *block, OrderedCollection *args)
+static inline void blockNodeSetArgs(BlockNode *block, OrderedCollection *args)
 {
 	objectStorePtr((Object *) block,  &block->raw->args, (Object *) args);
 }
 
 
-static OrderedCollection *blockNodeGetArgs(BlockNode *block)
+static inline OrderedCollection *blockNodeGetArgs(BlockNode *block)
 {
 	return (OrderedCollection *) scopeHandle(asObject(block->raw->args));
 }
 
 
-static void blockNodeSetTempVars(BlockNode *block, OrderedCollection *vars)
+static inline void blockNodeSetTempVars(BlockNode *block, OrderedCollection *vars)
 {
 	objectStorePtr((Object *) block,  &block->raw->tempVars, (Object *) vars);
 }
 
 
-static OrderedCollection *blockNodeGetTempVars(BlockNode *block)
+static inline OrderedCollection *blockNodeGetTempVars(BlockNode *block)
 {
 	return (OrderedCollection *) scopeHandle(asObject(block->raw->tempVars));
 }
 
 
-static void blockNodeSetExpressions(BlockNode *block, OrderedCollection *expressions)
+static inline void blockNodeSetExpressions(BlockNode *block, OrderedCollection *expressions)
 {
 	objectStorePtr((Object *) block,  &block->raw->expressions, (Object *) expressions);
 }
 
 
-static OrderedCollection *blockNodeGetExpressions(BlockNode *block)
+static inline OrderedCollection *blockNodeGetExpressions(BlockNode *block)
 {
 	return (OrderedCollection *) scopeHandle(asObject(block->raw->expressions));
 }
 
 
-static void blockNodeSetScope(BlockNode *block, union BlockScope *scope)
+static inline void blockNodeSetScope(BlockNode *block, union BlockScope *scope)
 {
 	objectStorePtr((Object *) block,  &block->raw->scope, (Object *) scope);
 }
 
 
-static union BlockScope *blockNodeGetScope(BlockNode *block)
+static inline union BlockScope *blockNodeGetScope(BlockNode *block)
 {
 	// Never set in v2: the front end keeps its capture analysis in its own
 	// tables rather than on the tree (vm/compiler/Compile.c).
@@ -403,139 +403,139 @@ static union BlockScope *blockNodeGetScope(BlockNode *block)
 }
 
 
-static void blockNodeSetSourceCode(BlockNode *block, SourceCode *sourceCode)
+static inline void blockNodeSetSourceCode(BlockNode *block, SourceCode *sourceCode)
 {
 	objectStorePtr((Object *) block,  &block->raw->sourceCode, (Object *) sourceCode);
 }
 
 
-static SourceCode *blockNodeGetSourceCode(BlockNode *block)
+static inline SourceCode *blockNodeGetSourceCode(BlockNode *block)
 {
 	return (SourceCode *) scopeHandle(asObject(block->raw->sourceCode));
 }
 
 
-static void expressionNodeEnableReturn(ExpressionNode *expression)
+static inline void expressionNodeEnableReturn(ExpressionNode *expression)
 {
 	objectStorePtr((Object *) expression,  &expression->raw->returns, (Object *) &Handles.true_);
 }
 
 
-static void expressionNodeDisableReturn(ExpressionNode *expression)
+static inline void expressionNodeDisableReturn(ExpressionNode *expression)
 {
 	objectStorePtr((Object *) expression,  &expression->raw->returns, (Object *) &Handles.false_);
 }
 
 
-static _Bool expressionNodeReturns(ExpressionNode *expression)
+static inline _Bool expressionNodeReturns(ExpressionNode *expression)
 {
 	return isTaggedTrue(expression->raw->returns);
 }
 
 
-static void expressionNodeSetAssigments(ExpressionNode *expression, OrderedCollection *assigments)
+static inline void expressionNodeSetAssigments(ExpressionNode *expression, OrderedCollection *assigments)
 {
 	objectStorePtr((Object *) expression,  &expression->raw->assigments, (Object *) assigments);
 }
 
 
-static OrderedCollection *expressionNodeGetAssigments(ExpressionNode *expression)
+static inline OrderedCollection *expressionNodeGetAssigments(ExpressionNode *expression)
 {
 	return (OrderedCollection *) scopeHandle(asObject(expression->raw->assigments));
 }
 
 
-static void expressionNodeSetReceiver(ExpressionNode *expression, LiteralNode *receiver)
+static inline void expressionNodeSetReceiver(ExpressionNode *expression, LiteralNode *receiver)
 {
 	objectStorePtr((Object *) expression,  &expression->raw->receiver, (Object *) receiver);
 }
 
 
-static LiteralNode *expressionNodeGetReceiver(ExpressionNode *expression)
+static inline LiteralNode *expressionNodeGetReceiver(ExpressionNode *expression)
 {
 	return (LiteralNode *) scopeHandle(asObject(expression->raw->receiver));
 }
 
 
-static void expressionNodeSetMessageExpressions(ExpressionNode *expression, OrderedCollection *messageExpressions)
+static inline void expressionNodeSetMessageExpressions(ExpressionNode *expression, OrderedCollection *messageExpressions)
 {
 	objectStorePtr((Object *) expression,  &expression->raw->messageExpressions, (Object *) messageExpressions);
 }
 
 
-static OrderedCollection *expressionNodeGetMessageExpressions(ExpressionNode *expression)
+static inline OrderedCollection *expressionNodeGetMessageExpressions(ExpressionNode *expression)
 {
 	return (OrderedCollection *) scopeHandle(asObject(expression->raw->messageExpressions));
 }
 
 
-static void expressionNodeSetSourceCode(ExpressionNode *expression, SourceCode *sourceCode)
+static inline void expressionNodeSetSourceCode(ExpressionNode *expression, SourceCode *sourceCode)
 {
 	objectStorePtr((Object *) expression,  &expression->raw->sourceCode, (Object *) sourceCode);
 }
 
 
-static SourceCode *expressionNodeGetSourceCode(ExpressionNode *expression)
+static inline SourceCode *expressionNodeGetSourceCode(ExpressionNode *expression)
 {
 	return (SourceCode *) scopeHandle(asObject(expression->raw->sourceCode));
 }
 
 
-static void messageExpressionNodeSetSelector(MessageExpressionNode *messageExpression, String *selector)
+static inline void messageExpressionNodeSetSelector(MessageExpressionNode *messageExpression, String *selector)
 {
 	objectStorePtr((Object *) messageExpression,  &messageExpression->raw->selector, (Object *) selector);
 }
 
 
-static String *messageExpressionNodeGetSelector(MessageExpressionNode *messageExpression)
+static inline String *messageExpressionNodeGetSelector(MessageExpressionNode *messageExpression)
 {
 	return (String *) scopeHandle(asObject(messageExpression->raw->selector));
 }
 
 
-static void messageExpressionNodeSetArgs(MessageExpressionNode *messageExpression, OrderedCollection *args)
+static inline void messageExpressionNodeSetArgs(MessageExpressionNode *messageExpression, OrderedCollection *args)
 {
 	objectStorePtr((Object *) messageExpression,  &messageExpression->raw->args, (Object *) args);
 }
 
 
-static OrderedCollection *messageExpressionNodeGetArgs(MessageExpressionNode *messageExpression)
+static inline OrderedCollection *messageExpressionNodeGetArgs(MessageExpressionNode *messageExpression)
 {
 	return (OrderedCollection *) scopeHandle(asObject(messageExpression->raw->args));
 }
 
 
-static void messageExpressionNodeSetSourceCode(MessageExpressionNode *messageExpression, SourceCode *sourceCode)
+static inline void messageExpressionNodeSetSourceCode(MessageExpressionNode *messageExpression, SourceCode *sourceCode)
 {
 	objectStorePtr((Object *) messageExpression,  &messageExpression->raw->sourceCode, (Object *) sourceCode);
 }
 
 
-static SourceCode *messageExpressionNodeGetSourceCode(MessageExpressionNode *messageExpression)
+static inline SourceCode *messageExpressionNodeGetSourceCode(MessageExpressionNode *messageExpression)
 {
 	return (SourceCode *) scopeHandle(asObject(messageExpression->raw->sourceCode));
 }
 
 
-static void literalNodeSetValue(LiteralNode *literal, Object *value)
+static inline void literalNodeSetValue(LiteralNode *literal, Object *value)
 {
 	objectStorePtr((Object *) literal,  &literal->raw->value, (Object *) value);
 }
 
 
-static void literalNodeSetIntValue(LiteralNode *literal, intptr_t value)
+static inline void literalNodeSetIntValue(LiteralNode *literal, intptr_t value)
 {
 	literal->raw->value = tagInt(value);
 }
 
 
-static void literalNodeSetCharValue(LiteralNode *literal, char value)
+static inline void literalNodeSetCharValue(LiteralNode *literal, char value)
 {
 	literal->raw->value = tagChar(value);
 }
 
 
-static void literalNodeSetRawValue(LiteralNode *literal, Value value)
+static inline void literalNodeSetRawValue(LiteralNode *literal, Value value)
 {
 	if (valueTypeOf(value, VALUE_POINTER)) {
 		rawObjectStorePtr((RawObject *) literal->raw, &literal->raw->value, asObject(value));
@@ -545,97 +545,97 @@ static void literalNodeSetRawValue(LiteralNode *literal, Value value)
 }
 
 
-static Value literalNodeGetValue(LiteralNode *literal)
+static inline Value literalNodeGetValue(LiteralNode *literal)
 {
 	return literal->raw->value;
 }
 
 
-static intptr_t literalNodeGetIntValue(LiteralNode *literal)
+static inline intptr_t literalNodeGetIntValue(LiteralNode *literal)
 {
 	return asCInt(literalNodeGetValue(literal));
 }
 
 
-static String *literalNodeGetStringValue(LiteralNode *literal)
+static inline String *literalNodeGetStringValue(LiteralNode *literal)
 {
 	return (String *) scopeHandle(asObject(literalNodeGetValue(literal)));
 }
 
 
-static OrderedCollection *literalNodeGetOrdCollValue(LiteralNode *literal)
+static inline OrderedCollection *literalNodeGetOrdCollValue(LiteralNode *literal)
 {
 	return scopeHandle(asObject(literalNodeGetValue(literal)));
 }
 
 
-static void literalNodeSetSourceCode(LiteralNode *literal, SourceCode *sourceCode)
+static inline void literalNodeSetSourceCode(LiteralNode *literal, SourceCode *sourceCode)
 {
 	objectStorePtr((Object *) literal,  &literal->raw->sourceCode, (Object *) sourceCode);
 }
 
 
-static SourceCode *literalNodeGetSourceCode(LiteralNode *literal)
+static inline SourceCode *literalNodeGetSourceCode(LiteralNode *literal)
 {
 	return (SourceCode *) scopeHandle(asObject(literal->raw->sourceCode));
 }
 
 
-static void sourceCodeSetSourceOrFileName(SourceCode *sourceCode, String *sourceOrFileName)
+static inline void sourceCodeSetSourceOrFileName(SourceCode *sourceCode, String *sourceOrFileName)
 {
 	objectStorePtr((Object *) sourceCode,  &sourceCode->raw->sourceOrFileName, (Object *) sourceOrFileName);
 }
 
 
-static String *sourceCodeGetSourceOrFileName(SourceCode *sourceCode)
+static inline String *sourceCodeGetSourceOrFileName(SourceCode *sourceCode)
 {
 	return (String *) scopeHandle(asObject(sourceCode->raw->sourceOrFileName));
 }
 
 
-static void sourceCodeSetPosition(SourceCode *sourceCode, uintptr_t position)
+static inline void sourceCodeSetPosition(SourceCode *sourceCode, uintptr_t position)
 {
 	sourceCode->raw->position = tagInt(position);
 }
 
 
-static uintptr_t sourceCodeGetPosition(SourceCode *sourceCode)
+static inline uintptr_t sourceCodeGetPosition(SourceCode *sourceCode)
 {
 	return asCInt(sourceCode->raw->position);
 }
 
 
-static void sourceCodeSetSourceSize(SourceCode *sourceCode, uintptr_t sourceSize)
+static inline void sourceCodeSetSourceSize(SourceCode *sourceCode, uintptr_t sourceSize)
 {
 	sourceCode->raw->sourceSize = tagInt(sourceSize);
 }
 
 
-static uintptr_t sourceCodeGetSourceSize(SourceCode *sourceCode)
+static inline uintptr_t sourceCodeGetSourceSize(SourceCode *sourceCode)
 {
 	return asCInt(sourceCode->raw->sourceSize);
 }
 
 
-static void sourceCodeSetLine(SourceCode *sourceCode, uintptr_t line)
+static inline void sourceCodeSetLine(SourceCode *sourceCode, uintptr_t line)
 {
 	sourceCode->raw->line = tagInt(line);
 }
 
 
-static uintptr_t sourceCodeGetLine(SourceCode *sourceCode)
+static inline uintptr_t sourceCodeGetLine(SourceCode *sourceCode)
 {
 	return asCInt(sourceCode->raw->line);
 }
 
 
-static void sourceCodeSetColumn(SourceCode *sourceCode, uintptr_t column)
+static inline void sourceCodeSetColumn(SourceCode *sourceCode, uintptr_t column)
 {
 	sourceCode->raw->column = tagInt(column);
 }
 
 
-static uintptr_t sourceCodeGetColumn(SourceCode *sourceCode)
+static inline uintptr_t sourceCodeGetColumn(SourceCode *sourceCode)
 {
 	return asCInt(sourceCode->raw->column);
 }

@@ -193,6 +193,32 @@ static String *shapePragmaOf(ClassNode *node)
 // Building
 // ---------------------------------------------------------------------------
 
+CompiledMethod *classCompileMethodInto(MethodNode *node, Class *target,
+	Class *classVariableScope, ClassBuildError *error)
+{
+	// Instance variables and super come from `target`, which for a class-side
+	// method is the metaclass; class variables come from the scope, which is
+	// where they were declared and where both sides have to find the same
+	// Association.
+	CompileContext context = { target, smalltalkGlobals(),
+		classVariableScope != NULL ? classVariableScope : target };
+	CompileError compileError;
+	CodeUnit *unit = compileMethod(node, &context, &compileError);
+	if (unit == NULL) {
+		// BOTH names: what failed and where. The selector alone sends a
+		// reader looking through a file for a name the message never gave.
+		error->status = compileError.status;
+		error->inMethod = methodNodeGetSelector(node);
+		fail(error, compileStatusName(compileError.status), compileError.what);
+		return NULL;
+	}
+	String *selector = scopeHandle(asObject(unit->selector));
+	CompiledMethod *method = compiledMethodCreate(unit, selector, target);
+	symbolDictAtPutObject(methodsOf(target), selector, (Object *) method);
+	return method;
+}
+
+
 static void buildMethods(Class *class, ClassNode *node, ClassBuildError *error)
 {
 	OrderedCollection *methods = classNodeGetMethods(node);
@@ -208,26 +234,11 @@ static void buildMethods(Class *class, ClassNode *node, ClassBuildError *error)
 		_Bool classSide = side != NULL && stringEqualsC(side, "class");
 		Class *target = classSide ? classMetaclassOf(class) : class;
 
-		// Instance variables and super come from `target`, which for a class-side
-		// method is the metaclass; class variables come from `class`, which is
-		// where they were declared and where both sides have to find the same
-		// Association.
-		CompileContext context = { target, smalltalkGlobals(), class };
-		CompileError compileError;
-		CodeUnit *unit = compileMethod(methodNode, &context, &compileError);
-		if (unit == NULL) {
-			// BOTH names: what failed and where. The selector alone sends a
-			// reader looking through a file for a name the message never gave.
-			error->status = compileError.status;
-			error->inMethod = methodNodeGetSelector(methodNode);
-			fail(error, compileStatusName(compileError.status), compileError.what);
-			closeHandleScope(&scope, NULL);
+		classCompileMethodInto(methodNode, target, class, error);
+		closeHandleScope(&scope, NULL);
+		if (error->message != NULL) {
 			return;
 		}
-		String *selector = scopeHandle(asObject(unit->selector));
-		CompiledMethod *method = compiledMethodCreate(unit, selector, target);
-		symbolDictAtPutObject(methodsOf(target), selector, (Object *) method);
-		closeHandleScope(&scope, NULL);
 	}
 }
 

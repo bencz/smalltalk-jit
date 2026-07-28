@@ -3,7 +3,15 @@ project(smalltalk-jit C)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-set(CMAKE_C_FLAGS "-std=gnu11 -pedantic -Werror -Wno-flexible-array-extensions -Wno-c11-extensions -Wno-gnu -fcommon -fno-omit-frame-pointer")
+# -Wall AND -Wextra, not just -Werror.
+#
+# -Werror on its own promotes the warnings GCC emits by default, and that set is
+# small: -Wunused-function, -Wunused-variable, -Wsign-compare and most of the
+# rest are only produced under -Wall or -Wextra, so without them "every warning
+# is an error" was true and nearly empty. It was measured before being turned
+# on: 65 objects, ZERO warnings, so this costs nothing today and only ever costs
+# what it catches.
+set(CMAKE_C_FLAGS "-std=gnu11 -pedantic -Wall -Wextra -Werror -Wno-flexible-array-extensions -Wno-c11-extensions -Wno-gnu -fcommon -fno-omit-frame-pointer")
 
 # Default to an optimized build with debug info and assertions kept on (the VM's
 # ASSERTs are valuable while the GC/JIT are still maturing). Pass
@@ -183,7 +191,28 @@ set(vmSources
 	vm/runtime/Collection.c
 	vm/runtime/Dictionary.c
 	vm/runtime/Number.c
+	# The primitive TABLE, and then one file per domain beside it. LISTED and
+	# not globbed: CMake does not re-run when a file appears, so a glob here
+	# would build yesterday's set until something else forced a configure.
+	# scripts/gate.sh, which links these by hand, does glob -- see the note
+	# there for why the two answers differ.
 	vm/runtime/Primitive.c
+	vm/runtime/primitives/Allocation.c
+	vm/runtime/primitives/Arithmetic.c
+	vm/runtime/primitives/Bits.c
+	vm/runtime/primitives/Block.c
+	vm/runtime/primitives/Characters.c
+	vm/runtime/primitives/Comparison.c
+	vm/runtime/primitives/Exceptions.c
+	vm/runtime/primitives/FileSystem.c
+	vm/runtime/primitives/FloatMath.c
+	vm/runtime/primitives/Identity.c
+	vm/runtime/primitives/Indexed.c
+	vm/runtime/primitives/PrintValue.c
+	vm/runtime/primitives/Reflect.c
+	vm/runtime/primitives/Streams.c
+	vm/runtime/primitives/Strings.c
+	vm/runtime/primitives/Time.c
 	vm/runtime/String.c
 	vm/thirdparty/cityhash/city.c
 	vm/tools/Bootstrap.c

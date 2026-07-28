@@ -154,6 +154,11 @@ typedef struct {
 static void writeVariable(Builder *builder, uint16_t reg, IrBlock *block,
 	IrValue *value)
 {
+	// `builder` is unused: a write is a store into the block's own def table and
+	// needs nothing global, while a READ may have to walk predecessors and build
+	// a phi. The parameter stays for the pairing with readVariable, which is the
+	// half of Braun's algorithm that this one is only meaningful next to.
+	(void) builder;
 	block->defs[reg] = value;
 }
 

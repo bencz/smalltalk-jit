@@ -94,11 +94,16 @@ static inline Value primitiveArgument(Value *args, uint64_t index)
 // The .def is extracted from packages/, so the NAMES here are the ones the
 // kernel writes in its <primitive: ...> pragmas, not a numbering this file
 // invented. PRIM_NONE stays 0 so a zeroed CodeUnit means "no primitive".
+// Both macros expand to the same thing here: whether an implementation exists is
+// a fact about the TABLE, not about the vocabulary, and an enum that skipped the
+// absent ones would renumber itself every time one got implemented.
 typedef enum {
 	PRIM_NONE = 0,
 #define PRIMITIVE(id, name, function) PRIM_##id,
+#define PRIMITIVE_ABSENT(id, name) PRIM_##id,
 #include "runtime/Primitives.def"
 #undef PRIMITIVE
+#undef PRIMITIVE_ABSENT
 	PRIM_COUNT
 } PrimitiveNumber;
 

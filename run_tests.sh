@@ -116,16 +116,35 @@ SNAP_ABS="$(cd "$(dirname "$SNAP")" && pwd)/$(basename "$SNAP")"
 ST_ABS="$(cd "$BUILD" && pwd)/st"
 DEVSNAP="$ROOT/samples/.stbuild/program.img"
 echo "${B}building samples project image (core + Std packages)...${Z}"
+# A FAILURE HERE IS REPORTED, NOT FATAL TO THE RUN.
+#
+# It used to `exit 1`, and under the dry cut that made the runner useless: one
+# missing subsystem stopped the suite before a single test file had run, so the
+# whole thing said nothing about the other 154 items. A runner that cannot
+# report the state of what DOES work cannot be used to steer.
+#
+# It stays fatal to the EXIT CODE -- SAMPLES_IMAGE is counted as a failed item
+# below, so "158 ok" still means what it meant and the level 13 criterion is
+# unchanged. What changes is only that the rest of the suite gets to run and be
+# counted first. The sample GROUP is skipped when this fails, because running
+# samples against an image that was never built would report 71 failures that
+# all have one cause.
+SAMPLES_IMAGE_OK=1
 if ! (cd samples && ST_PACKAGE_PATH="$ROOT/packages" ST_IMAGE="$SNAP_ABS" \
 		"$ST_ABS" build >/dev/null 2>&1); then
-	echo "${R}SAMPLES IMAGE BUILD FAILED${Z}"
-	(cd samples && ST_PACKAGE_PATH="$ROOT/packages" ST_IMAGE="$SNAP_ABS" "$ST_ABS" build)
-	exit 1
+	SAMPLES_IMAGE_OK=0
+	echo "${R}SAMPLES IMAGE BUILD FAILED${Z} — the sample groups will be skipped"
+	(cd samples && ST_PACKAGE_PATH="$ROOT/packages" ST_IMAGE="$SNAP_ABS" "$ST_ABS" build) \
+		2>&1 | sed 's/^/        /'
 fi
 
 pass=0
 fail=0
 failed=""
+
+# Counted as an ordinary item so it lands in the totals like everything else.
+# This is what keeps the change above from being a way to hide a red suite.
+report_result "$((1 - SAMPLES_IMAGE_OK))" "SAMPLES_IMAGE" 0
 
 # C-level self-tests that gate every run (no image needed, milliseconds)
 echo ""
@@ -384,7 +403,13 @@ run_sandboxed_hammer() {
 [ "$RUN_TESTS" -eq 1 ] && run_group "tests" "$SNAP" tests/*.st
 [ "$RUN_TESTS" -eq 1 ] && run_package_tests
 [ "$RUN_TESTS" -eq 1 ] && run_sandboxed_hammer
-if [ "$RUN_SAMPLES" -eq 1 ]; then
+if [ "$RUN_SAMPLES" -eq 1 ] && [ "$SAMPLES_IMAGE_OK" -eq 0 ]; then
+	echo ""
+	echo "${Y}skipping the sample groups: the samples project image did not build${Z}"
+	echo "${D}  (counted once as SAMPLES_IMAGE above; running them here would report${Z}"
+	echo "${D}   71 failures with a single cause)${Z}"
+fi
+if [ "$RUN_SAMPLES" -eq 1 ] && [ "$SAMPLES_IMAGE_OK" -eq 1 ]; then
 	run_group "samples" "$DEVSNAP" samples/*.st
 	run_group "samples/advanced" "$DEVSNAP" samples/advanced/*.st
 	run_group "samples/concurrency" "$DEVSNAP" samples/concurrency/*.st

@@ -46,6 +46,68 @@ SCRATCH="${TMPDIR:-/tmp}/st-gate-$$"
 mkdir -p "$SCRATCH"
 trap 'rm -rf "$SCRATCH"' EXIT
 
+# The primitives, for the three levels below that link them BY HAND.
+#
+# A GLOB and not a list, and that is the point: levels 3, 7 and 8 each link
+# Primitive.c, the implementations now live one file per domain beside it, and
+# a domain file missing from any one of the three is a link error in a level
+# that has nothing to do with the change. That has already broken this gate
+# twice in this campaign, the last time for want of -lm when math.h arrived.
+# The shell expands this on every run, so a new domain file reaches all three
+# by existing. CMakeLists.txt lists them instead, because a glob there is not
+# re-evaluated when a file appears.
+#
+# Deliberately UNQUOTED at every use, so it word-splits and globs.
+PRIMITIVE_SOURCES="vm/runtime/Primitive.c vm/runtime/primitives/*.c"
+
+# The domain files that need the FRONT END -- the parser, the compiler and the
+# class builder -- and therefore cannot go into the standalone levels.
+#
+# This is not a build accident, it is the shape of the system. The hand-linked
+# levels exist to prove a subsystem with nothing above it (docs/jit-v2/01-gate.md):
+# level 3 has no front end at all, level 7 has no compiler, and level 8 brings
+# its own stubs for the globals table. Reflect.c is the reflective compiler --
+# parsing and class building driven FROM Smalltalk -- so it sits above all
+# three, and linking the compiler and the class builder into them to satisfy one
+# domain file would dissolve exactly the property they are for.
+#
+# It is not untested: it is exercised from level 9 (the whole tree compiles)
+# upward, by the real build, `st -b` and the package images.
+#
+# The table in runtime/Primitive.c names every implemented primitive, so a link
+# that omits this file would still have to resolve its symbols; that is what the
+# WEAK DEFAULTS there are for, and the reasoning is written at them.
+#
+# Named rather than silently dropped, and the levels still GLOB, so a new domain
+# file is picked up everywhere by existing.
+PRIMITIVE_SOURCES_NEEDING_FRONTEND="Reflect.c"
+
+# The primitives minus the ones above, for the standalone levels.
+standalonePrimitiveSources() {
+	local file base
+	for file in $PRIMITIVE_SOURCES; do
+		base="${file##*/}"
+		case " $PRIMITIVE_SOURCES_NEEDING_FRONTEND " in
+			*" $base "*) continue ;;
+		esac
+		printf '%s ' "$file"
+	done
+}
+
+# The flags every hand-linked level compiles with. ONE definition, because nine
+# copies of a flag list is nine chances for the gate to be laxer than the real
+# build, and the whole point of levels 0 to 8 is that they are the same code
+# under the same rules.
+#
+# -Wall -Wextra -Werror, matching CMakeLists.txt. -Werror alone promotes only
+# GCC's default warnings, which leaves out unused-function, unused-parameter,
+# sign-compare and missing-field-initializers -- and the last of those is what
+# caught main.c leaving classVariableScope implicit, the same field whose
+# absence was already silent once.
+#
+# Deliberately UNQUOTED at every use, so it word-splits.
+GATE_CFLAGS="-std=gnu11 -pedantic -Wall -Wextra -Werror -Wno-flexible-array-extensions -g -O1"
+
 fail=0
 
 run_level() {
@@ -67,7 +129,7 @@ run_level() {
 # proved, and it is linked by hand from seven files precisely so it keeps
 # passing while the rest of the VM does not yet compile.
 level0() {
-	gcc -std=gnu11 -pedantic -Wno-flexible-array-extensions -g -O1 \
+	gcc $GATE_CFLAGS \
 		-Ivm -I. -Ivm/os/linux \
 		vm/tests/MemoryTest.c vm/memory/Heap.c vm/memory/Collector.c \
 		vm/memory/PageSpace.c vm/memory/Nursery.c vm/memory/RememberedSet.c \
@@ -83,7 +145,7 @@ level0() {
 # switch is either exactly right or it corrupts the machine somewhere else
 # entirely, so it is worth proving before anything runs on top of it.
 level1() {
-	gcc -std=gnu11 -pedantic -Wno-flexible-array-extensions -g -O1 \
+	gcc $GATE_CFLAGS \
 		-Ivm -I. -Ivm/os/linux \
 		vm/tests/FiberTest.c vm/concurrency/Fiber.c vm/concurrency/FiberSwitchX64.c \
 		vm/memory/Roots.c vm/os/linux/OsMemory.c \
@@ -98,7 +160,7 @@ level1() {
 # after a collection has moved it. Selector dispatch is a pointer compare, so
 # broken interning makes every send in the system silently miss.
 level2() {
-	gcc -std=gnu11 -pedantic -Wno-flexible-array-extensions -g -O1 \
+	gcc $GATE_CFLAGS \
 		-Ivm -I. -Ivm/os/linux \
 		vm/tests/ObjectTest.c vm/core/Class.c vm/core/ClassTable.c vm/core/Handle.c \
 		vm/runtime/String.c vm/runtime/Collection.c \
@@ -115,11 +177,11 @@ level2() {
 # bytecode, so writing it by hand is what lets the JIT be proved before anything
 # exists that can produce any.
 level3() {
-	gcc -std=gnu11 -pedantic -Wno-flexible-array-extensions -g -O1 \
+	gcc $GATE_CFLAGS \
 		-Ivm -I. -Ivm/os/linux \
 		vm/tests/JitTest.c vm/jit/Jit.c vm/jit/CompiledMethod.c \
 		vm/jit/MacroAssembler.c vm/jit/Backends.c vm/jit/InlineCache.c \
-		vm/runtime/Primitive.c vm/runtime/Closure.c \
+		$(standalonePrimitiveSources) vm/runtime/Closure.c \
 		vm/jit/x64/MacroAssemblerX64.c \
 		vm/jit/x64/abi/sysv/AbiSysV.c vm/jit/x64/abi/win64/AbiWin64.c \
 		vm/core/Class.c vm/core/ClassTable.c vm/core/Handle.c \
@@ -134,7 +196,7 @@ level3() {
 
 # ---- level 4: bytecode becomes SSA, with deopt state attached ---------------
 level4() {
-	gcc -std=gnu11 -pedantic -Wno-flexible-array-extensions -g -O1 \
+	gcc $GATE_CFLAGS \
 		-Ivm -I. -Ivm/os/linux \
 		vm/tests/SsaTest.c vm/jit/Ir.c vm/jit/SsaBuild.c \
 		-o "$SCRATCH/ssatest" || return 1
@@ -143,7 +205,7 @@ level4() {
 
 # ---- level 5: the optimizer -------------------------------------------------
 level5() {
-	gcc -std=gnu11 -pedantic -Wno-flexible-array-extensions -g -O1 \
+	gcc $GATE_CFLAGS \
 		-Ivm -I. -Ivm/os/linux \
 		vm/tests/PassTest.c vm/jit/Ir.c vm/jit/Passes.c vm/jit/SsaBuild.c \
 		-o "$SCRATCH/passtest" || return 1
@@ -156,7 +218,7 @@ level5() {
 # no materialization recipe is not an aggressive optimization, it is a wrong
 # answer waiting for a deoptimization.
 level6() {
-	gcc -std=gnu11 -pedantic -Wno-flexible-array-extensions -g -O1 \
+	gcc $GATE_CFLAGS \
 		-Ivm -I. -Ivm/os/linux \
 		vm/tests/DeoptTest.c vm/jit/Ir.c vm/jit/Passes.c vm/jit/Deopt.c \
 		vm/core/Class.c vm/core/ClassTable.c vm/core/Handle.c \
@@ -179,9 +241,9 @@ level6() {
 # the call site, and when its fast path HIT it jumped over the cache, so the
 # profile at exactly the hottest sites recorded only the cases that MISSED.
 level7() {
-	gcc -std=gnu11 -pedantic -Wno-flexible-array-extensions -g -O1 \
+	gcc $GATE_CFLAGS \
 		-Ivm -I. -Ivm/os/linux \
-		vm/tests/PrimitiveTest.c vm/runtime/Primitive.c vm/runtime/Closure.c \
+		vm/tests/PrimitiveTest.c $(standalonePrimitiveSources) vm/runtime/Closure.c \
 		vm/jit/Jit.c vm/jit/CompiledMethod.c \
 		vm/jit/MacroAssembler.c vm/jit/Backends.c vm/jit/InlineCache.c \
 		vm/jit/x64/MacroAssemblerX64.c \
@@ -201,11 +263,12 @@ level7() {
 # Ast are the ORIGINAL ones; name resolution and emission are new, because the
 # bytecode they targeted is gone.
 level8() {
-	gcc -std=gnu11 -pedantic -Wno-flexible-array-extensions -g -O1 \
+	gcc $GATE_CFLAGS \
 		-Ivm -I. -Ivm/os/linux \
 		vm/tests/CompileTest.c vm/compiler/Compile.c vm/compiler/Parser.c \
 		vm/compiler/Tokenizer.c \
-		vm/runtime/Primitive.c vm/runtime/Number.c vm/runtime/BigInt.c \
+		$(standalonePrimitiveSources) \
+		vm/runtime/Number.c vm/runtime/BigInt.c \
 		vm/runtime/Closure.c \
 		vm/jit/Jit.c vm/jit/CompiledMethod.c \
 		vm/jit/MacroAssembler.c vm/jit/Backends.c vm/jit/InlineCache.c \

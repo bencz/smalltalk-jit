@@ -177,6 +177,7 @@ Apendar, nunca reescrever. Data, commit, o que destravou.
 | 2026-07-28 | 8 | (nao commitado) | metodo que e SO primitiva falha em voz alta: 93 de 93, e a varredura achou 77 |
 | 2026-07-28 | 10 | (nao commitado) | `printNl` contra o Core DE VERDADE: 5 bugs, nenhum na pilha de streams, 98 de 98 |
 | 2026-07-28 | **11** | (nao commitado) | imagem: 1,1 MB, recarrega e RODA, e salvar-carregar-salvar e byte-identico |
+| 2026-07-28 | 11 | (nao commitado) | `Primitive.c` quebrado em 14 dominios: 1730 -> 104 linhas, gate 0..11 verde, 66 de 175 e 109 de 109 |
 
 ## O que o nivel 7 encontrou, e por que so ele podia encontrar
 
