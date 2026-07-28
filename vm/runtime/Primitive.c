@@ -70,6 +70,8 @@ WEAK_FRONTEND_PRIMITIVE(primParseMethod)
 WEAK_FRONTEND_PRIMITIVE(primParseMethodOrBlock)
 WEAK_FRONTEND_PRIMITIVE(primBuildClass)
 WEAK_FRONTEND_PRIMITIVE(primCompileMethod)
+WEAK_FRONTEND_PRIMITIVE(primDefaultNamespace)
+WEAK_FRONTEND_PRIMITIVE(primSetDefaultNamespace)
 
 
 // Designated initialisers, so the array is indexed by the enum and a primitive

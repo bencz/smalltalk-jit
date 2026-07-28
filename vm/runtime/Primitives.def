@@ -91,7 +91,7 @@ PRIMITIVE_ABSENT(ContextPositionDescriptor, "ContextPositionDescriptorPrimitive"
 PRIMITIVE_ABSENT(ContextTemporaryAt, "ContextTemporaryAt")  // Context>>temporaryAt: anInteger
 PRIMITIVE_ABSENT(CpuCount, "CpuCountPrimitive")  // System>>class primitiveCpuCount
 PRIMITIVE(CurrentMicroTime, "CurrentMicroTimePrimitive", primCurrentMicroTime)  // DateTime>>class currentMicroTime
-PRIMITIVE_ABSENT(DefaultNamespace, "DefaultNamespacePrimitive")  // Namespace>>class default
+PRIMITIVE(DefaultNamespace, "DefaultNamespacePrimitive", primDefaultNamespace)  // Namespace>>class default
 PRIMITIVE(ExceptionSignal, "ExceptionSignal", primExceptionSignal)  // Exception>>basicSignal; HandlerEscape>>signal
 PRIMITIVE_ABSENT(ExecutablePath, "ExecutablePathPrimitive")  // System>>class executablePath
 PRIMITIVE_ABSENT(ExitWithCode, "ExitWithCodePrimitive")  // System>>class primitiveExit: anInteger
@@ -191,7 +191,7 @@ PRIMITIVE_ABSENT(ProcessTerminate, "ProcessTerminatePrimitive")  // ProcessorSch
 PRIMITIVE_ABSENT(ProcessYield, "ProcessYieldPrimitive")  // ProcessorScheduler>>yield
 PRIMITIVE_ABSENT(RandomBytes, "RandomBytesPrimitive")  // Random>>primitiveRandomBytes: aByteArray; System>>class primitiveRandomBytes: aByteArray
 PRIMITIVE_ABSENT(ReplaceBytes, "ReplaceBytesPrimitive")
-PRIMITIVE_ABSENT(SetDefaultNamespace, "SetDefaultNamespacePrimitive")  // Namespace>>class default: aNamespace
+PRIMITIVE(SetDefaultNamespace, "SetDefaultNamespacePrimitive", primSetDefaultNamespace)  // Namespace>>class default: aNamespace
 PRIMITIVE(Size, "SizePrimitive", primBasicSize)  // Object>>size; Object>>basicSize
 PRIMITIVE_ABSENT(SocketAccept, "SocketAcceptPrimitive")  // ServerSocket>>basicAccept
 PRIMITIVE_ABSENT(SocketBind, "SocketBindPrimitive")  // ServerSocket>>class bind: address port: port queueSize: queueSize

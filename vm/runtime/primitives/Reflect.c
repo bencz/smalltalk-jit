@@ -311,6 +311,63 @@ Value primBuildClass(Value *args, uint64_t argc)
 }
 
 
+// ---------------------------------------------------------------------------
+// The session default namespace
+// ---------------------------------------------------------------------------
+//
+// `Namespace default` is what a class build without an explicit namespace
+// compiles against, and ProjectTool sets it to the project's own namespace
+// before loading the package graph. It has to survive across primitive calls
+// and across a SNAPSHOT, so the question is where the VM keeps it.
+//
+// IN THE GLOBALS DICTIONARY, under a reserved name, and not in a new VM field.
+// The old VM held it in a dedicated handle; that needs a root provider so the
+// collector keeps it, and a line in the snapshot writer and reader so an image
+// does not lose it -- and a field the writer persists and the reader drops is
+// exactly the failure the level 11 fixpoint check exists to catch. The globals
+// dictionary is ALREADY a root and ALREADY written to the image, so putting it
+// there is one line instead of three seams, and it cannot be forgotten by
+// either half.
+//
+// These two live in this file rather than a domain of their own because they
+// are compile-time scope: the same reason the reflective compiler is here.
+#define DEFAULT_NAMESPACE_GLOBAL "DefaultNamespace"
+
+Value primDefaultNamespace(Value *args, uint64_t argc)
+{
+	(void) args;
+	if (argc != 0) {
+		return PRIMITIVE_FAILED;
+	}
+	Value current = getGlobal(DEFAULT_NAMESPACE_GLOBAL);
+	// Unset means nothing has chosen one yet, and that is not an error: the
+	// kernel's own comment says the default is Core until a project image
+	// changes it. Failing would run the empty fallback and abort.
+	return valueTypeOf(current, VALUE_POINTER) ? current : tagPtr(Handles.nil.raw);
+}
+
+
+Value primSetDefaultNamespace(Value *args, uint64_t argc)
+{
+	if (argc != 1) {
+		return PRIMITIVE_FAILED;
+	}
+	Value namespace = primitiveArgument(args, 0);
+	Class *namespaceClass = getClass("Namespace");
+	// A non-Namespace FAILS, and here that is right: the kernel's fallback is
+	// `InvalidArgumentError signal:`, which is a better answer than anything
+	// this can produce.
+	if (namespaceClass == NULL || !isNodeOfClass(namespace, namespaceClass)) {
+		return PRIMITIVE_FAILED;
+	}
+	PRIMITIVE_ALLOCATES(args); // interning the name may allocate
+	setGlobal(DEFAULT_NAMESPACE_GLOBAL, primitiveArgument(args, 0));
+	Value answer = primitiveReceiver(args);
+	PRIMITIVE_DONE_ALLOCATING();
+	return answer;
+}
+
+
 Value primCompileMethod(Value *args, uint64_t argc)
 {
 	if (argc != 2) {

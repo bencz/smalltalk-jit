@@ -168,6 +168,41 @@ static void nameClasses(void)
 	nameClass(&Handles.BoxedFloat64, "BoxedFloat64");
 	nameClass(&Handles.Character, "Character");
 	nameClass(&Handles.Closure, "Block");
+
+	// THE SYNTAX TREE CLASSES ARE NAMED TOO, and that is not tidiness.
+	//
+	// The C parser allocates its nodes as instances of these, and the REFLECTIVE
+	// compiler (runtime/primitives/Reflect.c) hands one straight to Smalltalk,
+	// which then sends it `body`, `selector`, `expressions`. Those methods live
+	// in packages/Core/src/Parser/. A class is reopened BY NAME, so leaving
+	// these anonymous meant packages/Core defined a SECOND MethodNode, the
+	// parser kept building instances of the first, and the image's node
+	// understood nothing.
+	//
+	// That is the scaffold rule (docs/jit-v2/01-gate.md) in the direction that
+	// is easy to miss: the usual failure is a scaffold method SHADOWING the real
+	// one, and this is the same defect seen from the other side -- a scaffold
+	// CLASS that the real definition never reaches, so the two coexist forever.
+	//
+	// The slot counts were already derived from Ast.h and they agree with what
+	// packages/Core declares, so naming them is all that was missing. The leaf
+	// nodes get 2 here and declare none of their own there, inheriting both from
+	// LiteralNode.
+	nameClass(&Handles.SourceCode, "SourceCode");
+	nameClass(&Handles.ClassNode, "ClassNode");
+	nameClass(&Handles.MethodNode, "MethodNode");
+	nameClass(&Handles.BlockNode, "BlockNode");
+	nameClass(&Handles.ExpressionNode, "ExpressionNode");
+	nameClass(&Handles.MessageExpressionNode, "MessageExpressionNode");
+	nameClass(&Handles.IntegerNode, "IntegerNode");
+	nameClass(&Handles.StringNode, "StringNode");
+	nameClass(&Handles.SymbolNode, "SymbolNode");
+	nameClass(&Handles.CharacterNode, "CharacterNode");
+	nameClass(&Handles.ArrayNode, "ArrayNode");
+	nameClass(&Handles.VariableNode, "VariableNode");
+	nameClass(&Handles.NilNode, "NilNode");
+	nameClass(&Handles.TrueNode, "TrueNode");
+	nameClass(&Handles.FalseNode, "FalseNode");
 }
 
 
