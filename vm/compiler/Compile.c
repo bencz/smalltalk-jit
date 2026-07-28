@@ -213,6 +213,10 @@ typedef struct {
 	OrderedCollection *blockCaptures;  // parallel, an OrderedCollection of Symbols
 	OrderedCollection *blockUses;      // parallel, times the emitter used it
 	OrderedCollection *instanceVariables;
+	// Some block of this method does a `^`, so the method's activations have to
+	// be findable by one at runtime (jit/Jit.c). Set while emitting a block and
+	// read when the METHOD's unit is finished, which is after every block of it.
+	_Bool hasNonLocalReturn;
 } Analysis;
 
 // One lexical level for the analysis. `block` is NULL for the method and for
@@ -1164,6 +1168,13 @@ static void emitShortCircuit(Emitter *e, uint16_t testReg, BlockNode *rest,
 static void emitSendTo(Emitter *e, uint16_t dest, String *selector,
 	uint16_t receiverReg, uint8_t argc, _Bool toSuper)
 {
+	if (toSuper && e->context->ownerClass == NULL) {
+		// Where a super send starts looking is the superclass of the class that
+		// DEFINED the method. With no defining class there is no such place, and
+		// the tier would have to invent one.
+		fail(e, COMPILE_UNSUPPORTED, stringFromC("a super send outside a class"));
+		return;
+	}
 	emit(e, toSuper ? OP_SENDSUPER : OP_SEND, argc, dest,
 		selectorIndex(e, selector), receiverReg);
 }
@@ -1516,11 +1527,18 @@ static void emitStatements(Emitter *e, OrderedCollection *statements,
 		emitExpression(e, statement, into);
 		if (expressionNodeReturns(statement)) {
 			if (e->isBlock) {
-				// `^` inside a non-inlined block returns from the HOME METHOD,
-				// which is RETOUTER and the frame token of ADR 0008. Emitting a
-				// plain RET here would return from the block instead, quietly.
-				fail(e, COMPILE_UNSUPPORTED,
-					stringFromC("a non-local return from a block"));
+				// `^` inside a non-inlined block returns from the METHOD the
+				// block was written in, not from the block, and that is a
+				// different instruction (ADR 0008). Inside an INLINED block there
+				// is no separate activation, so a plain RET is already right and
+				// this branch is not reached: e->isBlock is a property of the
+				// UNIT, and an inlined block has no unit of its own.
+				emit(e, OP_RETOUTER, 0, into, 0, 0);
+				// The method this block belongs to has to be findable at runtime,
+				// so its activations get a token and a record. Recorded on the
+				// analysis, which every nested emitter shares, because the method
+				// unit is finished last and reads it then.
+				e->analysis->hasNonLocalReturn = 1;
 			} else {
 				emit(e, OP_RET, 0, into, 0, 0);
 			}
@@ -1620,6 +1638,10 @@ static CodeUnit *compileUnit(Emitter *parent, BlockNode *body, uint16_t arity,
 	unit->captureCount = captureNames == NULL
 		? 0 : (uint16_t) ordCollSize(captureNames);
 	unit->primitive = primitive;
+	unit->isBlock = isBlock;
+	// A block is never a home: `^` inside it returns from the METHOD it was
+	// written in, and that is the unit that has to be findable.
+	unit->couldBeHome = !isBlock && e.analysis->hasNonLocalReturn;
 	// No allocation between here and jitRegisterUnit: until the unit is on the
 	// registry these four words are reachable from nowhere the collector looks.
 	unit->literals = objectTagged(literalArray);
@@ -1690,6 +1712,7 @@ CodeUnit *compileMethod(MethodNode *method, const CompileContext *context,
 	analysis.blockCaptures = newOrdColl(4);
 	analysis.blockUses = newOrdColl(4);
 	analysis.instanceVariables = collectInstanceVariables(context->ownerClass);
+	analysis.hasNonLocalReturn = 0;
 
 	// The capture analysis runs over the WHOLE method before a single
 	// instruction exists, because whether a variable lives in a register or in a

@@ -20,13 +20,21 @@
 // variables copies them in, which is the common case in the targets of this
 // project (the body of to:do:, the body of whileTrue:).
 //
-// LAYOUT. FORMAT_INDEXED_POINTERS with one named slot, so the whole object is
+// LAYOUT. FORMAT_INDEXED_POINTERS with two named slots, so the whole object is
 // tagged and the collector needs no special case:
 //
 //     body word 0    capture count      (the indexed formats' element count)
 //     body word 1    method             the CompiledMethod holding this block's
 //                                       code unit and its compiled code
-//     body word 2+i  captured[i]
+//     body word 2    home token         which activation a `^` inside this block
+//                                       returns from, as a tagged SmallInteger
+//     body word 3+i  captured[i]
+//
+// The token is TAGGED rather than raw so that the object stays uniformly tagged
+// and the collector still needs no case for it. It names an activation and not
+// an address: a token is minted per activation and never reused, so a block that
+// outlives its home finds nothing to return to, rather than finding whatever
+// frame now sits where its home used to be (ADR 0008).
 //
 // The code is reached through a HEAP OBJECT rather than through raw C pointers,
 // which is what keeps a closure's code unit reachable for as long as the closure
@@ -39,17 +47,19 @@ typedef struct {
 	OBJECT_HEADER;
 	uint64_t captureCount;
 	Value method;
+	Value homeToken;
 	Value captured[];
 } RawClosure;
 OBJECT_HANDLE(Closure);
 
-#define CLOSURE_NAMED_SLOTS 1
+#define CLOSURE_NAMED_SLOTS 2
 #define CLOSURE_SHAPE \
 	((InstanceShape) DEFINE_SHAPE(FORMAT_INDEXED_POINTERS, 0, 0, CLOSURE_NAMED_SLOTS))
-// Field index of captured[i], for generated code: body word 0 is the count and
-// word 1 is the method.
-#define CLOSURE_CAPTURE_FIELD(i) ((uint16_t) (2 + (i)))
+// Field index of captured[i], for generated code: body word 0 is the count,
+// word 1 is the method and word 2 is the home token.
+#define CLOSURE_CAPTURE_FIELD(i) ((uint16_t) (3 + (i)))
 #define CLOSURE_METHOD_FIELD 1
+#define CLOSURE_HOME_FIELD 2
 
 // The most a closure may capture, and the tighter of two ceilings wins.
 //
@@ -61,8 +71,11 @@ OBJECT_HANDLE(Closure);
 //
 // The front end reports going past this as a clean compile error, which is what
 // this bytecode does with every ceiling.
-#define CLOSURE_MAX_CAPTURES 250
-_Static_assert(CLOSURE_MAX_CAPTURES + 4 < SIZE_WORDS_BIG,
+//
+// Worst case a closure occupies 5 + captures words: header, count, method, home
+// token, the captures, and one word of alignment padding.
+#define CLOSURE_MAX_CAPTURES 248
+_Static_assert(CLOSURE_MAX_CAPTURES + 5 < SIZE_WORDS_BIG,
 	"a closure has to stay sizeable from its header alone");
 
 // A box for a variable that is captured and then assigned. One slot, so the
@@ -77,7 +90,7 @@ OBJECT_HANDLE(Cell);
 #define CELL_SHAPE ((InstanceShape) DEFINE_SHAPE(FORMAT_POINTERS, 0, 0, 1))
 #define CELL_VALUE_FIELD 0
 
-Closure *newClosure(Object *method, uint16_t captureCount);
+Closure *newClosure(Object *method, uint16_t captureCount, uint64_t homeToken);
 Cell *newCell(Value value);
 
 #endif

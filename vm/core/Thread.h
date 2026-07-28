@@ -44,7 +44,7 @@ typedef struct Thread {
 	struct EntryStackFrame *stackFramesTail;
 	// Head of this mutator's on:do: handler chain (was a standalone TLS `CurrentExceptionHandler`).
 	// Per-mutator so the JIT reaches it via CTX->thread (like tlab/stackFramesTail) instead of a
-	// baked TLS address — a baked address in SHARED JIT code would be the CODEGEN thread's slot,
+	// baked TLS address: a baked address in SHARED JIT code would be the CODEGEN thread's slot,
 	// breaking on:do: on every other worker. A fiber's saved handler is loaded here on resume; the
 	// B2.5 context rebind keeps CTX->thread pointing at the running worker.
 	Value exceptionHandler;
@@ -72,7 +72,7 @@ typedef struct Thread {
 	struct Fiber **schedCurrent;
 	// Address of this mutator's TLS CurrentExceptionHandler (a Value holding the head
 	// of its running fiber's on:do: chain), so a cross-thread GC collector can scan a
-	// peer's live handler chain — it is a root reachable ONLY through this slot, not
+	// peer's live handler chain, because it is a root reachable ONLY through this slot, not
 	// the Smalltalk stack. NULL until published (initThread / schedulerInit / worker
 	// registration). Stale for a scheduler mutator parked in the scheduler context.
 	Value *schedExceptionHandler;
@@ -80,7 +80,7 @@ typedef struct Thread {
 	Value *schedUnwindHandler;
 	// Striped sync monitor bookkeeping. The stripe for a sync object is computed ONCE at
 	// monitorEnterOn: (mix of obj->hash) and stashed here; monitorExit/parkOnMonitor read
-	// it back and NEVER recompute — so enter/exit/park provably drop the same lock they
+	// it back and NEVER recompute, so enter/exit/park provably drop the same lock they
 	// took even if the object moved/was become:-d mid-critical-section. `heldMonitor`
 	// makes a reentrant monitorEnter fail-fast (critical sections must stay flat). Valid
 	// only while heldMonitor==1. APPENDED at struct end so JIT-baked field offsets are
@@ -97,12 +97,34 @@ typedef struct Thread {
 	// return. It costs NOTHING in generated code: the frame pointer follows from
 	// the slot address the call already passes (jit/Jit.h).
 	struct CompiledFrameGuard *compiledFrames;
+
+	// Non-local return (ADR 0008). `unwinds` is the chain of activations a `^`
+	// inside a block can return FROM, newest first, and each entry lives on the
+	// C frame that entered that activation, so the chain unwinds itself.
+	//
+	// `homeToken` is the token of the innermost such activation now running, and
+	// `nextHomeToken` mints them. A token is minted per ACTIVATION and never
+	// reused, which is what makes a return into an activation that has already
+	// finished fail to find anything instead of matching a frame that happens to
+	// sit at the same address.
+	//
+	// Only methods whose blocks actually contain a `^` push a record, so a
+	// program that never writes one pays nothing at all for this.
+	//
+	// PENDING(fibers): these are per-THREAD, like compiledFrames above, and a
+	// fiber switch will have to save and restore all three. A record lives on the
+	// C stack of the frame that entered the activation, so a fiber that is
+	// switched away from must not leave its records reachable from the thread
+	// that keeps running on another stack.
+	struct UnwindRecord *unwinds;
+	uint64_t homeToken;
+	uint64_t nextHomeToken;
 } Thread;
 
 extern __thread Thread CurrentThread;
 
 // Offset of &CurrentThread from the OS thread pointer (%fs base) for the initial-exec
-// TLS model — a link-time constant, identical on every thread. Computed once in
+// TLS model, a link-time constant, identical on every thread. Computed once in
 // initThread. JIT code bakes this to read EACH running worker's CurrentThread via
 // %fs:tpoff (see asmLoadTls), instead of a per-thread address that would be wrong in
 // shared code.

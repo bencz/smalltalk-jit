@@ -113,6 +113,16 @@ typedef struct CodeUnit {
 	uint16_t argumentCount;   // registers 1..argumentCount
 	uint16_t captureCount;    // for a block: how many values it closes over
 
+	// A BLOCK's register 0 holds the running closure; a METHOD's holds self.
+	// That one difference is what CLOSURE reads to decide where a nested block's
+	// home token comes from, and it cannot be inferred from captureCount, since
+	// a block that captures nothing is still a block.
+	_Bool isBlock;
+	// This method has a block that does a NON-LOCAL RETURN somewhere inside it,
+	// so its activations have to be findable by one (jit/Jit.c). Methods without
+	// one pay nothing: no token is minted and no record is pushed.
+	_Bool couldBeHome;
+
 	// PrimitiveNumber, or PRIM_NONE. Compiled code attempts it right after the
 	// prologue and returns its answer; on failure it falls through into the
 	// bytecode below, which is the general case written in Smalltalk. Kept as a

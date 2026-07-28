@@ -167,6 +167,8 @@ Apendar, nunca reescrever. Data, commit, o que destravou.
 | 2026-07-27 | 7 | (nao commitado) | nomes de primitiva alinhados a packages/ (173 declaradas, 31 implementadas): 109 de 109 |
 | 2026-07-28 | 8 | (nao commitado) | closures no FRONT END: analise de captura e emissao de CLOSURE, 69 de 69 |
 | 2026-07-28 | 0 | (nao commitado) | as closures acharam DOIS bugs de memoria pre-existentes, ver abaixo: 27 de 27 |
+| 2026-07-28 | 8 | `c2ac221` | closures commitadas |
+| 2026-07-28 | 8 | (nao commitado) | `super` no tier 1 e retorno nao local: 88 de 88 |
 
 ## O que o nivel 7 encontrou, e por que so ele podia encontrar
 
@@ -306,13 +308,64 @@ que a analise nao viu, uma escrita em captura por valor, e "todo bloco preparado
 foi emitido exatamente uma vez", que e a unica maneira de tornar barulhenta a
 divergencia na direcao contraria.
 
-Faltam ainda, e sao o proximo item:
+## `super`, e onde a busca comeca
 
-- **`super`**: o emissor gera `SENDSUPER` e o tier 1 ainda nao o implementa, e
-  reporta o opcode pelo nome;
-- **retorno nao local** (`^` dentro de bloco nao inlinado), que depende do token
-  de frame home do ADR 0008. Ate la e **recusa nomeada**, nunca um `RET` que
-  retornaria do bloco em vez do metodo.
+`SENDSUPER` roda no tier 1. O conteudo inteiro da palavra e UM argumento
+diferente no caminho de send: a busca comeca onde o COMPILADOR disse, na classe
+acima da que DEFINIU o metodo em execucao, e nao em nada que o receptor nomeie.
+
+Nao da para derivar em runtime. O receptor pode ser instancia de uma subclasse
+tres niveis abaixo, e comecar pela classe dele acharia o proprio metodo em
+execucao de novo, que e recursao infinita. Por isso o indice da classe inicial e
+resolvido na COMPILACAO e mora na celula do sitio (`IcCell.lookupStart`): indice
+e estavel e nao precisa de relocacao (ADR 0005), a sequencia de chamada ja
+materializa o endereco da celula, e o sitio continua sendo um send comum com
+perfil comum. O teste que separa uma implementacao certa de uma errada e o de
+RECEPTOR DE SUBCLASSE; com a versao errada ele responde 2 em vez de 1.
+
+Super numa classe sem superclasse tem `lookupStart` invalido e vai para
+doesNotUnderstand, em vez de recomecar pelo receptor, que e a mesma recursao.
+Super sem classe definidora nenhuma e **erro limpo** de compilacao.
+
+## Retorno nao local: o token e o registro
+
+`^` dentro de bloco retorna do METODO EM QUE O BLOCO FOI ESCRITO, quantas
+ativacoes houver no meio, e entre o bloco e o home ha frames compilados E frames
+C alternados. Os frames C sao o que descarta "vai desempilhando frame compilado".
+
+Duas metades:
+
+**O TOKEN responde QUAL ativacao.** E um contador, nao um endereco de frame,
+porque endereco e reusado: um bloco que sobrevive ao home tem que achar NADA, e
+um endereco acabaria casando com o frame de um estranho no mesmo lugar. A closure
+carrega o token da ativacao em que nasceu, como SmallInteger tagueado, entao o
+objeto continua uniformemente tagueado e o coletor continua sem caso especial.
+
+**O REGISTRO responde COMO CHEGAR LA.** Mora no frame C que ENTROU na ativacao
+home, entao a cadeia se desfaz sozinha conforme esses frames retornam, e guarda o
+destino do salto mais o estado que um salto deixaria para tras (a cadeia de
+ancoras de frame compilado e a de handle scopes: quem foi pulado nao passou pelo
+proprio `leave`).
+
+**QUEM PAGA.** So um metodo que de fato tem `^` dentro de bloco ganha registro, e
+quem decide isso e o front end na compilacao (`CodeUnit.couldBeHome`). Programa
+que nunca escreve um roda exatamente como antes: token nenhum e cunhado, registro
+nenhum e empilhado, e NADA e emitido em send nenhum. Essa e a razao de o custo
+ficar aqui e nao como uma checagem depois de cada send, que e o outro jeito de
+construir isso e taxaria o caminho mais quente do sistema por causa de um recurso
+que a maioria dos sends nao usa.
+
+Tres checagens do nivel 8 sao as que separam desenho certo de desenho parecido, e
+as tres foram verificadas DESLIGANDO o conserto:
+
+- **recursao**: cada ativacao do mesmo metodo cunha o proprio token, entao cada
+  bloco retorna da ativacao que o construiu, e nao da mais externa;
+- **bloco dentro de bloco**: o de dentro herda o home do de fora, e nao a ativacao
+  sob a qual esta rodando. Com uma home intermediaria empilhada de proposito, a
+  versao errada responde 0 em vez de 14;
+- **home ja retornado**: token aposentado nao casa com registro nenhum, entao
+  levanta. Roda em processo FILHO, porque levantar hoje e abortar (nao ha
+  excecoes no v2 ainda), e o teste confere COMO o filho morreu.
 
 ## O que as closures encontraram no subsistema de memoria
 

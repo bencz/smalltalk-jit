@@ -38,6 +38,16 @@ typedef struct {
 typedef struct IcCell {
 	RawObject *selector;
 	uint64_t sends;         // total executions of this site
+	// Where lookup STARTS at a `super` site: the class above the one that
+	// defined the running method, as an INDEX, resolved once when the method is
+	// compiled. CLASS_INDEX_INVALID at an ordinary site, and also at a super site
+	// in a class with no superclass, where the send has nowhere to look and must
+	// answer doesNotUnderstand rather than restart at the receiver.
+	//
+	// It belongs in the cell rather than being passed at the call, because the
+	// call sequence already materialises the cell's address and has no spare
+	// operand, and because it is a compile-time constant of the SITE.
+	uint32_t lookupStart;
 	uint8_t wayCount;
 	// Set once more than IC_MAX_WAYS classes have been seen. PERMANENT: a site
 	// that has been megamorphic has proved it has no dominant class, and

@@ -3,7 +3,7 @@
 #include "memory/Heap.h"
 
 
-Closure *newClosure(Object *method, uint16_t captureCount)
+Closure *newClosure(Object *method, uint16_t captureCount, uint64_t homeToken)
 {
 	HandleScope scope;
 	openHandleScope(&scope);
@@ -12,6 +12,9 @@ Closure *newClosure(Object *method, uint16_t captureCount)
 	Object *held = scopeHandle(method->raw);
 	Closure *closure = newObject(&Handles.Closure, captureCount);
 	rawObjectStorePtr((RawObject *) closure->raw, &closure->raw->method, held->raw);
+	// Tagged, so the object stays uniformly tagged and no barrier is involved:
+	// a token is a number naming an activation, not a pointer to one.
+	closure->raw->homeToken = tagInt((intptr_t) homeToken);
 	// Every capture slot starts as nil rather than as zero: a slot the emitter
 	// has not filled yet must still be a legal Value if a collection lands
 	// between the allocation and the stores.

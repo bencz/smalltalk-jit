@@ -11,6 +11,7 @@
 #include "core/Handle.h"
 #include "memory/Heap.h"
 #include "os/Os.h"
+#include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -260,9 +261,14 @@ static RawCompiledMethod *lookupMethod(RawClass *class, RawObject *selector)
 }
 
 
-Value jitDispatch(void *cellPointer, Value *receiverSlot, uint64_t packed)
+// The body of both send paths. `lookupStart` is the class the method search
+// begins at, and it is the ONLY thing that differs between an ordinary send and
+// a super send: everything else, the profile included, is the same site
+// machinery. `returnAddress` has to be taken in the function compiled code
+// called, which is why it is a parameter here.
+static Value dispatchFrom(IcCell *cell, Value *receiverSlot, uint64_t packed,
+	RawClass *lookupStart, void *returnAddress)
 {
-	IcCell *cell = cellPointer;
 	Value receiver = *receiverSlot;
 	uint64_t argc = packed & 0xFFFFFFFFu;
 
@@ -270,7 +276,7 @@ Value jitDispatch(void *cellPointer, Value *receiverSlot, uint64_t packed)
 	// collection from in here can walk the compiled frames underneath.
 	CompiledFrameGuard guard;
 	compiledFrameEnter(&guard, receiverSlot, (uint16_t) (packed >> 32),
-		__builtin_return_address(0));
+		returnAddress);
 
 	// PROFILE FIRST, before anything can fail. The receiver's class and, when
 	// there is one, the first ARGUMENT's class: that second one is what lets
@@ -281,8 +287,8 @@ Value jitDispatch(void *cellPointer, Value *receiverSlot, uint64_t packed)
 		? classIndexOfValue(receiverSlot[-1]) : CLASS_INDEX_INVALID;
 	IcWay *way = icRecord(cell, receiverClass, argumentClass);
 
-	RawClass *class = classOf(receiver);
-	RawCompiledMethod *method = lookupMethod(class, cell->selector);
+	RawCompiledMethod *method = lookupStart == NULL
+		? NULL : lookupMethod(lookupStart, cell->selector);
 	if (method == NULL) {
 		// PENDING: doesNotUnderstand. Failing loudly beats returning nil, which
 		// would turn a missing method into a wrong answer somewhere else.
@@ -308,6 +314,12 @@ Value jitDispatch(void *cellPointer, Value *receiverSlot, uint64_t packed)
 	}
 	// Arguments are at DESCENDING addresses from the receiver's slot, because
 	// consecutive registers are consecutive slots and slots grow down.
+	//
+	// Re-read from the FRAME and not from the local above: the frame slot is a
+	// root the collector updates, and a bare Value held in a C local across the
+	// lookup would not be. Nothing between here and there collects today, and
+	// this is what keeps that from being a requirement.
+	receiver = *receiverSlot;
 	Value answer;
 	switch (argc) {
 	case 0:
@@ -324,6 +336,158 @@ Value jitDispatch(void *cellPointer, Value *receiverSlot, uint64_t packed)
 	}
 	compiledFrameLeave(&guard);
 	return answer;
+}
+
+
+Value jitDispatch(void *cellPointer, Value *receiverSlot, uint64_t packed)
+{
+	return dispatchFrom(cellPointer, receiverSlot, packed, classOf(*receiverSlot),
+		__builtin_return_address(0));
+}
+
+
+// `super`, and the whole content of the keyword is the one argument that differs
+// from the line above: the search starts where the COMPILER said, at the class
+// ABOVE the one that defined the running method, and not at anything the
+// receiver names. That is what makes `super foo` inside `Foo>>foo` finite, and
+// it is why the start cannot be derived at runtime from the receiver, which may
+// be an instance of a subclass three levels down.
+//
+// The receiver is unchanged: super is not another object, it is another place to
+// start looking.
+Value jitDispatchSuper(void *cellPointer, Value *receiverSlot, uint64_t packed)
+{
+	IcCell *cell = cellPointer;
+	// A super send in a class with no superclass has nowhere to look, and NULL
+	// takes it to doesNotUnderstand. Falling back to the receiver's class would
+	// find the running method again and recurse until the stack ran out.
+	RawClass *start = cell->lookupStart == CLASS_INDEX_INVALID ? NULL
+		: (RawClass *) classTableAt(&CurrentThread.heap->classes, cell->lookupStart);
+	return dispatchFrom(cell, receiverSlot, packed, start,
+		__builtin_return_address(0));
+}
+
+
+// A runtime helper is handed the ADDRESS of one frame slot plus, packed into an
+// immediate the call sequence was already materialising, WHICH slot that was and
+// whatever else it needs. The slot index is what turns the address back into a
+// frame pointer, which is how the helper reaches the rest of the frame and how a
+// collection under it finds the compiled frames beneath.
+#define PACKED_LOW(packed) ((uint16_t) ((packed) & 0xFFFF))
+#define PACKED_MID(packed) ((uint16_t) (((packed) >> 16) & 0xFFFF))
+#define PACKED_SLOT(packed) ((uint16_t) (((packed) >> 32) & 0xFFFF))
+
+
+// ---------------------------------------------------------------------------
+// Non-local return (ADR 0008)
+// ---------------------------------------------------------------------------
+//
+// `^` inside a block returns from the method the block was WRITTEN in, however
+// many activations are stacked in between. Between the block and its home there
+// are compiled frames AND C frames, alternating, and the C frames are what rules
+// out simply popping compiled frames.
+//
+// The mechanism, and what each half buys:
+//
+//   THE TOKEN answers "which activation", and it is a counter rather than a
+//   frame address because addresses are reused: a block that outlives its home
+//   must find NOTHING, and a stale address would eventually find a stranger's
+//   frame sitting in the same place. The closure carries the token of the
+//   activation it was born in.
+//
+//   THE RECORD answers "how to get there". It lives on the C frame that ENTERED
+//   the home activation, so the chain unwinds itself as those frames return, and
+//   it holds the jump destination plus the thread state a jump would otherwise
+//   leave behind.
+//
+// WHO PAYS. Only a method that actually contains a `^` inside a block gets a
+// record, and the front end decides that at compile time (CodeUnit.couldBeHome).
+// A program that never writes one runs exactly as it did before: no token is
+// minted, no record is pushed, and nothing is emitted at any send. That is why
+// the cost sits here and not as a check after every send, which is the other way
+// to build this and would tax the hottest path in the system for a feature most
+// sends never use.
+
+typedef struct UnwindRecord {
+	struct UnwindRecord *previous;
+	uint64_t token;
+	jmp_buf destination;
+	Value answer;
+	// Thread state to put back, because the jump skips every frame in between
+	// and each of them would otherwise leave its bookkeeping on these chains.
+	struct CompiledFrameGuard *savedFrames;
+	struct HandleScope *savedScopes;
+	uint64_t savedHomeToken;
+} UnwindRecord;
+
+
+// Make the activation about to be entered findable by a non-local return.
+static void unwindPush(UnwindRecord *record)
+{
+	record->token = ++CurrentThread.nextHomeToken;
+	record->answer = tagPtr(Handles.nil.raw);
+	record->savedFrames = CurrentThread.compiledFrames;
+	record->savedScopes = CurrentThread.handleScopes;
+	record->savedHomeToken = CurrentThread.homeToken;
+	record->previous = CurrentThread.unwinds;
+	CurrentThread.unwinds = record;
+	CurrentThread.homeToken = record->token;
+}
+
+
+static void unwindPop(UnwindRecord *record)
+{
+	ASSERT(CurrentThread.unwinds == record);
+	CurrentThread.unwinds = record->previous;
+	CurrentThread.homeToken = record->savedHomeToken;
+}
+
+
+// Arrived by a jump rather than by a return: the frames in between were skipped,
+// so their entries on these chains are put back from what was saved.
+//
+// PENDING: the handle scopes of the skipped frames are dropped by restoring the
+// head, which leaks their overflow chunks. Bounded by one unwind and worth
+// fixing when unwinding gets its second client, which is `ensure:`.
+static Value unwindAnswer(UnwindRecord *record)
+{
+	CurrentThread.unwinds = record->previous;
+	CurrentThread.compiledFrames = record->savedFrames;
+	CurrentThread.handleScopes = record->savedScopes;
+	CurrentThread.homeToken = record->savedHomeToken;
+	return record->answer;
+}
+
+
+// RETOUTER: return `*valueSlot` from the home of the closure in slot 0. Never
+// returns to its caller.
+static Value jitReturnOuter(void *unused, Value *valueSlot, uint64_t packed)
+{
+	(void) unused;
+	// The value's register is what turns its slot address back into the frame
+	// pointer, and slot 0 of a block's frame is the running closure.
+	uint8_t *frame = (uint8_t *) valueSlot
+		+ (size_t) (PACKED_SLOT(packed) + 1) * sizeof(Value);
+	RawClosure *closure = (RawClosure *) asObject(((Value *) frame)[-1]);
+	uint64_t token = (uint64_t) asCInt(closure->homeToken);
+
+	for (UnwindRecord *record = CurrentThread.unwinds; record != NULL;
+			record = record->previous) {
+		if (record->token != token) {
+			continue;
+		}
+		record->answer = *valueSlot;
+		longjmp(record->destination, 1);
+	}
+	// The home activation has already returned. ADR 0008 says this RAISES rather
+	// than jumping anywhere, and the token scheme is what makes it detectable at
+	// all: no live record can ever carry a retired token.
+	//
+	// PENDING: this is BlockCannotReturn once exceptions exist in v2. Aborting is
+	// the same thing doesNotUnderstand does today, and for the same reason:
+	// answering something would turn a broken program into a wrong answer.
+	fprintf(stderr, "non-local return from a method that has already returned\n");
+	abort();
 }
 
 
@@ -355,9 +519,6 @@ static Value jitStoreGlobal(void *unitPointer, Value *valueSlot,
 // The packing is two or three 16-bit fields in an immediate the call sequence
 // was already materialising, so carrying them costs nothing.
 
-#define PACKED_LOW(packed) ((uint16_t) ((packed) & 0xFFFF))
-#define PACKED_MID(packed) ((uint16_t) (((packed) >> 16) & 0xFFFF))
-#define PACKED_SLOT(packed) ((uint16_t) (((packed) >> 32) & 0xFFFF))
 
 
 // Build a closure over `blocks[index]`, capturing the values in the `count`
@@ -373,11 +534,27 @@ static Value jitMakeClosure(void *unitPointer, Value *baseSlot, uint64_t packed)
 	uint16_t index = PACKED_LOW(packed);
 	uint16_t count = PACKED_MID(packed);
 
+	// WHERE the home token comes from, and it is not a detail: a `^` inside this
+	// block returns from the method the block was WRITTEN in, so a block built
+	// inside another block inherits that block's home rather than naming the
+	// activation it happens to be running under. Taking the thread's current
+	// token here would name whatever method called `value`, which is a different
+	// method entirely and usually somebody else's.
+	uint64_t homeToken;
+	if (unit->isBlock) {
+		// Slot 0 of a block's frame IS the running closure, and the frame pointer
+		// is one slot above it.
+		RawClosure *running = (RawClosure *) asObject(((Value *) guard.frame)[-1]);
+		homeToken = (uint64_t) asCInt(running->homeToken);
+	} else {
+		homeToken = CurrentThread.homeToken;
+	}
+
 	HandleScope scope;
 	openHandleScope(&scope);
 	RawArray *blocks = (RawArray *) asObject(unit->blocks);
 	Object *method = scopeHandle(asObject(blocks->vars[index]));
-	Closure *closure = newClosure(method, count);
+	Closure *closure = newClosure(method, count, homeToken);
 	// The captures are copied AFTER the allocation and read from the frame each
 	// time, because allocating the closure may have moved every one of them.
 	for (uint16_t i = 0; i < count; i++) {
@@ -536,7 +713,8 @@ static _Bool emitInstruction(JitContext *jit, size_t index, Opcode *unsupported)
 			jit->labels[instruction->c]);
 		return 1;
 
-	case OP_SEND: {
+	case OP_SEND:
+	case OP_SENDSUPER: {
 		// Arguments live in CONSECUTIVE registers above the receiver, and slots
 		// grow downward, so the ADDRESS of the receiver's slot is the whole
 		// argument list. No marshalling, and nothing here knows how the target
@@ -546,7 +724,13 @@ static _Bool emitInstruction(JitContext *jit, size_t index, Opcode *unsupported)
 		// given back into a frame pointer, which is how a collection triggered
 		// under a send finds the compiled frames beneath it. It rides in an
 		// immediate that was already being materialised, so it costs nothing.
-		maCallRuntime3(ma, jitDispatch, &jit->cells[index], instruction->c,
+		//
+		// A super send is the SAME sequence to a different runtime entry point,
+		// so where the lookup starts costs nothing here and nothing at the site:
+		// it was decided when this method was compiled and it lives in the cell.
+		maCallRuntime3(ma,
+			(Opcode) instruction->op == OP_SEND ? jitDispatch : jitDispatchSuper,
+			&jit->cells[index], instruction->c,
 			(uint64_t) instruction->n | ((uint64_t) instruction->c << 32));
 		maStoreSlot(ma, instruction->a);
 		return 1;
@@ -554,6 +738,15 @@ static _Bool emitInstruction(JitContext *jit, size_t index, Opcode *unsupported)
 
 	case OP_RET:
 		maEpilogue(ma, instruction->a);
+		return 1;
+
+	case OP_RETOUTER:
+		// Never comes back, so nothing follows it and no result is stored. The
+		// register rides in the immediate for the same reason every other helper
+		// takes it: it is what turns the slot address into the frame pointer,
+		// and from there into the running closure in slot 0.
+		maCallRuntime3(ma, jitReturnOuter, NULL, instruction->a,
+			(uint64_t) instruction->a << 32);
 		return 1;
 
 	case OP_CLOSURE:
@@ -648,10 +841,27 @@ NativeCode *jitCompileFor(const MacroAssemblerOps *ops, CodeUnit *unit,
 	ASSERT(jit.labels != NULL && jit.machineOffsetAt != NULL && jit.cells != NULL);
 	// A cache cell per send site, its selector resolved once here rather than
 	// on every execution.
+	//
+	// And, at a SUPER site, where the lookup starts: the class above the one that
+	// DEFINED this method, as an index, which is stable and needs no relocation
+	// (ADR 0005). It is resolved here because it is a property of the site and of
+	// the compile, and deriving it at runtime is impossible: the receiver may be
+	// an instance of a subclass, and starting from its class would find this very
+	// method again.
 	for (uint16_t i = 0; i < unit->instructionCount; i++) {
-		if (opcodeIsSend((Opcode) unit->code[i].op)) {
-			jit.cells[i].selector = asObject(
-				((RawArray *) asObject(unit->literals))->vars[unit->code[i].b]);
+		if (!opcodeIsSend((Opcode) unit->code[i].op)) {
+			continue;
+		}
+		jit.cells[i].selector = asObject(
+			((RawArray *) asObject(unit->literals))->vars[unit->code[i].b]);
+		jit.cells[i].lookupStart = CLASS_INDEX_INVALID;
+		if ((Opcode) unit->code[i].op != OP_SENDSUPER
+				|| !valueTypeOf(unit->ownerClass, VALUE_POINTER)) {
+			continue;
+		}
+		Value super = ((RawClass *) asObject(unit->ownerClass))->superClass;
+		if (valueTypeOf(super, VALUE_POINTER)) {
+			jit.cells[i].lookupStart = ((RawClass *) asObject(super))->classIndex;
 		}
 	}
 	for (size_t i = 0; i < unit->instructionCount; i++) {
@@ -758,11 +968,31 @@ typedef Value (*Entry1)(Value, Value);
 typedef Value (*Entry2)(Value, Value, Value);
 
 
+// Entering compiled code, and the ONE place a non-local return can land.
+//
+// The record has to be made here rather than inside a helper, because a jump
+// resumes in the frame that took the destination: taking it one call deeper
+// would resume in a frame that no longer exists. That is also why the three
+// functions repeat the shape instead of sharing it.
+//
+// The test is a field of the unit the compiler already filled, so a method with
+// no `^` inside a block enters exactly as it did before.
+
 Value jitCall0(NativeCode *code, Value receiver)
 {
 	Entry0 entry;
 	memcpy(&entry, &code->entry, sizeof(entry));
-	return entry(receiver);
+	if (!code->unit->couldBeHome) {
+		return entry(receiver);
+	}
+	UnwindRecord record;
+	unwindPush(&record);
+	if (setjmp(record.destination) != 0) {
+		return unwindAnswer(&record);
+	}
+	Value answer = entry(receiver);
+	unwindPop(&record);
+	return answer;
 }
 
 
@@ -770,7 +1000,17 @@ Value jitCall1(NativeCode *code, Value receiver, Value a)
 {
 	Entry1 entry;
 	memcpy(&entry, &code->entry, sizeof(entry));
-	return entry(receiver, a);
+	if (!code->unit->couldBeHome) {
+		return entry(receiver, a);
+	}
+	UnwindRecord record;
+	unwindPush(&record);
+	if (setjmp(record.destination) != 0) {
+		return unwindAnswer(&record);
+	}
+	Value answer = entry(receiver, a);
+	unwindPop(&record);
+	return answer;
 }
 
 
@@ -778,5 +1018,15 @@ Value jitCall2(NativeCode *code, Value receiver, Value a, Value b)
 {
 	Entry2 entry;
 	memcpy(&entry, &code->entry, sizeof(entry));
-	return entry(receiver, a, b);
+	if (!code->unit->couldBeHome) {
+		return entry(receiver, a, b);
+	}
+	UnwindRecord record;
+	unwindPush(&record);
+	if (setjmp(record.destination) != 0) {
+		return unwindAnswer(&record);
+	}
+	Value answer = entry(receiver, a, b);
+	unwindPop(&record);
+	return answer;
 }

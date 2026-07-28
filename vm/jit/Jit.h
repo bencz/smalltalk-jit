@@ -139,4 +139,11 @@ NativeCode *jitCodeContaining(const void *address);
 // down.
 Value jitDispatch(void *cell, Value *receiverSlot, uint64_t argc);
 
+// The `super` send path. Identical to the line above except for where the method
+// search starts: at the class ABOVE the one that DEFINED the running method,
+// which the compiler resolved into the cell (jit/InlineCache.h, lookupStart).
+// It cannot be derived here, because the receiver may be an instance of a
+// subclass and starting from its class would find the running method again.
+Value jitDispatchSuper(void *cell, Value *receiverSlot, uint64_t argc);
+
 #endif

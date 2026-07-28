@@ -38,8 +38,12 @@
 #include "runtime/Dictionary.h"
 #include "runtime/Primitive.h"
 #include "runtime/String.h"
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 __thread Thread CurrentThread;
 ptrdiff_t gCurrentThreadTpoff;
@@ -515,6 +519,58 @@ int main(void)
 	checkInt("and writing one updates that same Association",
 		bound->raw->value, 99);
 
+	// ---- super -------------------------------------------------------------------
+	//
+	// `super foo` sends foo to the SAME receiver and starts the method search one
+	// level above the class that DEFINED the running method. Both halves matter,
+	// and the second is the one an implementation gets wrong: starting above the
+	// RECEIVER's class would find the running method again whenever the receiver
+	// is an instance of a subclass, which is an infinite recursion, and it is
+	// exactly what the subclass check below rules out.
+	printf("\n  -- super, which is another place to start looking\n");
+	define(&Handles.ObjectClass, "kind [ ^1 ]");
+	define(counter, "kind [ ^2 ]");
+	NativeCode *kindViaSuper = define(counter, "kindViaSuper [ ^super kind ]");
+	NativeCode *kindViaSelf = define(counter, "kindViaSelf [ ^self kind ]");
+	checkInt("super skips the method the receiver's class defines",
+		call0(kindViaSuper, objectTagged(instance)), 1);
+	checkInt("and self does not", call0(kindViaSelf, objectTagged(instance)), 2);
+
+	// A SUBCLASS receiver, which is what tells the two implementations apart.
+	Class *refined = fixedClass(counter, 2);
+	withMethods(refined);
+	Object *refinedInstance = newObject(refined, 0);
+	define(refined, "kind [ ^3 ]");
+	checkInt("self on a subclass instance finds the subclass's method",
+		call0(kindViaSelf, objectTagged(refinedInstance)), 3);
+	checkInt("while super in the SUPERCLASS's method still starts above the "
+		"class that defined it, not above the receiver's",
+		call0(kindViaSuper, objectTagged(refinedInstance)), 1);
+
+	define(&Handles.ObjectClass, "twice: x [ ^x + x ]");
+	define(counter, "twice: x [ ^0 ]");
+	checkInt("a super send carries its arguments like any other",
+		call1(define(counter, "twiceViaSuper: x [ ^super twice: x ]"),
+			objectTagged(instance), tagInt(21)), 42);
+	checkInt("and super inside a block reaches the same place, through the "
+		"captured self",
+		call0(define(counter, "kindInBlock [ ^[ super kind ] value ]"),
+			objectTagged(instance)), 1);
+	{
+		// The site profiles the RECEIVER even though the lookup ignored it, and
+		// the two calls above came from two different classes. A super send is an
+		// ordinary send with one thing decided early, so ADR 0006 holds here too.
+		uint64_t sends = 0;
+		uint8_t ways = 0;
+		for (uint16_t i = 0; i < kindViaSuper->unit->instructionCount; i++) {
+			if (kindViaSuper->cells[i].selector != NULL) {
+				sends += kindViaSuper->cells[i].sends;
+				ways = kindViaSuper->cells[i].wayCount;
+			}
+		}
+		check("a super site carries a profile like every other send, and it "
+			"records the two receiver classes it saw", sends == 2 && ways == 2);
+	}
 	// ---- closures ----------------------------------------------------------------
 	//
 	// A block that is NOT inlined becomes a real closure (ADR 0008): it captures
@@ -684,6 +740,126 @@ int main(void)
 		call0(define(counter, "deepIvar [ ^[ [ count ] value ] value ]"),
 			objectTagged(instance)), 9);
 
+	// ---- the non-local return ----------------------------------------------------
+	//
+	// `^` inside a block returns from the METHOD THE BLOCK WAS WRITTEN IN, however
+	// many activations are stacked in between, and between the block and its home
+	// there are compiled frames AND C frames alternating. Those C frames are what
+	// rules out simply popping compiled frames, and they are why this is a jump to
+	// a record left by whoever entered the home rather than a chain of returns.
+	printf("\n  -- the non-local return, which crosses C frames to get home\n");
+	NativeCode *applyBlock = define(counter, "apply: aBlock [ ^aBlock value: 7 ]");
+	define(counter, "applyTwice: aBlock [ ^self apply: aBlock ]");
+	checkInt("a ^ inside a block returns from the method that wrote it, not from "
+		"the block",
+		call0(define(counter, "early [ self apply: [ :x | ^x + 1 ]. ^0 ]"),
+			objectTagged(instance)), 8);
+	checkInt("and the rest of the home method does not run",
+		call0(define(counter,
+			"skipsRest [ | n | n := 1. self apply: [ :x | ^99 ]. n := 2. ^n ]"),
+			objectTagged(instance)), 99);
+	checkInt("through as many activations as it takes",
+		call0(define(counter, "deepEarly [ self applyTwice: [ :x | ^x * 2 ]. ^0 ]"),
+			objectTagged(instance)), 14);
+	checkInt("a block that does NOT take the ^ answers normally",
+		call0(define(counter, "noEarly [ ^self apply: [ :x | x + 1 ] ]"),
+			objectTagged(instance)), 8);
+	checkInt("a ^ inside an INLINED block inside a real block still returns home",
+		call0(define(counter,
+			"innerInline [ self apply: [ :x | (3 < x) ifTrue: [ ^100 ]. ^200 ]. ^0 ]"),
+			objectTagged(instance)), 100);
+	checkInt("and it carries the block's captures with it",
+		call1(define(counter, "capturedEarly: v [ self apply: [ :x | ^x + v ]. ^0 ]"),
+			objectTagged(instance), tagInt(35)), 42);
+
+	// RECURSION is what tells a token apart from a frame address: every
+	// activation of the same method mints its own, and each block returns from
+	// the one that built it. Answering 1 here would mean the innermost block had
+	// returned from the OUTERMOST activation.
+	checkInt("each activation of a recursive method is a distinct home",
+		call1(define(counter,
+			"downTo: n [ | inner | (n < 1) ifTrue: [ ^0 ]. "
+			"inner := self downTo: n - 1. "
+			"self apply: [ :x | ^n + inner ]. ^999 ]"),
+			objectTagged(instance), tagInt(3)), 6);
+
+	// A block built INSIDE another block, with a method that is itself a home
+	// stacked in between. The inner block's home is the method it was WRITTEN in,
+	// so it has to inherit the outer block's home rather than name the activation
+	// it happens to be running under. Taking the running activation's token would
+	// return 14 from applyHome:, and this method would then answer 0.
+	define(counter,
+		"applyHome: aBlock [ | r | r := aBlock value: 7. "
+		"self apply: [ :z | ^r ]. ^0 ]");
+	checkInt("a block built inside another block inherits ITS home, not the "
+		"activation it is running under",
+		call0(define(counter,
+			"nestedEarly [ self applyHome: [ :x | self apply: [ :y | ^x + y ] ]. ^0 ]"),
+			objectTagged(instance)), 14);
+
+	// The jump skips every frame in between, so what those frames had put on the
+	// thread's chains has to be put back. A handle scope left open would have the
+	// next scopeHandle writing into a C frame that no longer exists.
+	{
+		struct HandleScope *before = CurrentThread.handleScopes;
+		struct CompiledFrameGuard *frames = CurrentThread.compiledFrames;
+		call0(define(counter, "unwinds [ self apply: [ :x | ^x ]. ^0 ]"),
+			objectTagged(instance));
+		check("and the jump puts back the handle scopes and frame anchors of "
+			"every frame it skipped",
+			CurrentThread.handleScopes == before
+			&& CurrentThread.compiledFrames == frames);
+	}
+
+	// A collection between building the block and returning through it. The token
+	// is a tagged SmallInteger inside the closure, so it travels with the object
+	// and no collection can invalidate it.
+	checkInt("a closure survives collections and still knows its home",
+		call0(define(counter,
+			"gcEarly [ | b | b := [ :x | ^x + 1 ]. "
+			"1 to: 40000 do: [ :i | Array new: 200 ]. "
+			"self apply: b. ^0 ]"), objectTagged(instance)), 8);
+
+	// And what the token buys that a frame address could not: the method with no
+	// `^` in any block pays NOTHING for any of this.
+	check("a method with no non-local return anywhere in it is not a home, so it "
+		"mints no token and pushes no record",
+		!define(counter, "plainMethod [ ^self apply: [ :x | x ] ]")->unit->couldBeHome
+		&& define(counter, "homeMethod [ self apply: [ :x | ^x ]. ^0 ]")
+			->unit->couldBeHome);
+
+	{
+		// A block that OUTLIVES its home. Its token names an activation that has
+		// already returned, and no live record can carry a retired token, so the
+		// return has nowhere to go. That is the case the token exists for: a
+		// frame ADDRESS would eventually match a stranger's frame sitting in the
+		// same place, and the jump would land in the middle of somebody else.
+		//
+		// ADR 0008 says this RAISES. Raising means aborting until v2 has
+		// exceptions, exactly as doesNotUnderstand does today, so the check runs
+		// in a CHILD PROCESS and looks at how it died.
+		NativeCode *maker = define(counter, "maker [ ^[ :x | ^x ] ]");
+		Value escaped = call0(maker, objectTagged(instance));
+		Object *orphan = valueTypeOf(escaped, VALUE_POINTER)
+			? scopeHandle(asObject(escaped)) : NULL;
+		fflush(NULL);
+		pid_t child = fork();
+		if (child == 0) {
+			struct rlimit noCore = { 0, 0 };
+			setrlimit(RLIMIT_CORE, &noCore);
+			if (freopen("/dev/null", "w", stderr) == NULL) {
+				_exit(2);
+			}
+			call1(applyBlock, objectTagged(instance), objectTagged(orphan));
+			_exit(0); // reached only if the return did NOT raise
+		}
+		int status = 0;
+		check("a non-local return whose home has already returned raises instead "
+			"of jumping into a frame that is gone",
+			orphan != NULL && child > 0 && waitpid(child, &status, 0) == child
+			&& WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+	}
+
 	// ---- closures and the collector ----------------------------------------------
 	//
 	// A block's CodeUnit is built while its enclosing method compiles and does
@@ -743,14 +919,11 @@ int main(void)
 			unit == NULL && error.status == COMPILE_UNDECLARED_NAME);
 	}
 	{
-		// The non-local return needs RETOUTER and the home-frame token of ADR
-		// 0008, which is the next milestone. A plain RET here would return from
-		// the BLOCK, quietly answering the wrong thing.
 		CompileError error;
-		CodeUnit *unit = compileSource(
-			"bad [ ^[ :x | ^x ] ]", counter, &error);
-		check("a non-local return is refused BY NAME rather than emitted as a "
-			"return from the block", unit == NULL && error.status == COMPILE_UNSUPPORTED);
+		CodeUnit *unit = compileSource("bad [ ^super kind ]", NULL, &error);
+		check("a super send with no defining class is a clean error rather than "
+			"a guess about where to start", unit == NULL
+			&& error.status == COMPILE_UNSUPPORTED);
 	}
 
 	// ---- the profile, which is why arithmetic is a send ------------------------
