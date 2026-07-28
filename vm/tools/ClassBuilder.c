@@ -2,6 +2,7 @@
 #include "core/Assert.h"
 #include "core/ClassTable.h"
 #include "core/Handle.h"
+#include "core/Namespace.h"
 #include "core/Smalltalk.h"
 #include "core/Thread.h"
 #include "jit/CompiledMethod.h"
@@ -20,13 +21,43 @@
 // (vm/compiler/Compile.c), and the definition being built now is what fills it
 // in. Reading one as an existing class is how `Integer` came back with the wrong
 // shape and how its subclasses then walked nil looking for instance variables.
-static Class *definedClassNamed(String *name)
+//
+// OWN BINDINGS ONLY, never the import chain. Resolving through the chain would
+// find an imported package's class of the same name and REOPEN it, so two
+// packages that both define `Formatter` would silently become one -- which is
+// precisely the shadowing the modules sample exists to demonstrate working.
+static Class *classFromBinding(Association *binding)
 {
-	Object *found = globalObjectAt(name);
-	if (found == NULL || found->raw == Handles.nil.raw) {
+	if (binding == NULL) {
 		return NULL;
 	}
-	return (Class *) found;
+	Value value = binding->raw->value;
+	if (!valueTypeOf(value, VALUE_POINTER) || asObject(value) == Handles.nil.raw) {
+		return NULL;
+	}
+	return (Class *) scopeHandle(asObject(value));
+}
+
+
+// The class this DEFINITION is reopening, if any: own bindings only, for the
+// reason above.
+static Class *definedClassNamed(Namespace *namespace, String *name)
+{
+	return classFromBinding(namespaceOwnAssocAt(namespace, name));
+}
+
+
+// A class a definition REFERS to -- its superclass, or the target of
+// `Name extend [ ... ]` -- through the full chain: own bindings, then imports
+// in declaration order, then Core.
+//
+// It has to be the chain and not own bindings: a package subclasses `Object`,
+// which lives in Core, so an own-only probe answers nothing and the build stops
+// with "superclass is not defined yet: Object". Referring to a name and
+// defining one are different questions, and this is the pair that answers them.
+static Class *resolvedClassNamed(Namespace *namespace, String *name)
+{
+	return classFromBinding(namespaceResolveAssoc(namespace, name));
 }
 
 
@@ -194,14 +225,14 @@ static String *shapePragmaOf(ClassNode *node)
 // ---------------------------------------------------------------------------
 
 CompiledMethod *classCompileMethodInto(MethodNode *node, Class *target,
-	Class *classVariableScope, ClassBuildError *error)
+	Class *classVariableScope, Namespace *namespace, ClassBuildError *error)
 {
 	// Instance variables and super come from `target`, which for a class-side
 	// method is the metaclass; class variables come from the scope, which is
 	// where they were declared and where both sides have to find the same
 	// Association.
 	CompileContext context = { target, smalltalkGlobals(),
-		classVariableScope != NULL ? classVariableScope : target };
+		classVariableScope != NULL ? classVariableScope : target, namespace };
 	CompileError compileError;
 	CodeUnit *unit = compileMethod(node, &context, &compileError);
 	if (unit == NULL) {
@@ -219,7 +250,8 @@ CompiledMethod *classCompileMethodInto(MethodNode *node, Class *target,
 }
 
 
-static void buildMethods(Class *class, ClassNode *node, ClassBuildError *error)
+static void buildMethods(Class *class, ClassNode *node, Namespace *namespace,
+	ClassBuildError *error)
 {
 	OrderedCollection *methods = classNodeGetMethods(node);
 	size_t count = methods == NULL ? 0 : ordCollSize(methods);
@@ -234,7 +266,7 @@ static void buildMethods(Class *class, ClassNode *node, ClassBuildError *error)
 		_Bool classSide = side != NULL && stringEqualsC(side, "class");
 		Class *target = classSide ? classMetaclassOf(class) : class;
 
-		classCompileMethodInto(methodNode, target, class, error);
+		classCompileMethodInto(methodNode, target, class, namespace, error);
 		closeHandleScope(&scope, NULL);
 		if (error->message != NULL) {
 			return;
@@ -329,7 +361,8 @@ static uint16_t inheritedSlots(Class *super)
 }
 
 
-Class *classBuild(ClassNode *node, ClassBuildError *error)
+Class *classBuildIn(ClassNode *node, Namespace *namespace,
+	ClassBuildError *error)
 {
 	shapesResolve();
 	HandleScope scope;
@@ -350,7 +383,7 @@ Class *classBuild(ClassNode *node, ClassBuildError *error)
 		size_t count = members == NULL ? 0 : ordCollSize(members);
 		for (size_t i = 0; i < count && error->message == NULL; i++) {
 			ClassNode *member = scopeHandle(asObject(ordCollAt(members, i)));
-			classBuild(member, error);
+			classBuildIn(member, namespace, error);
 		}
 		closeHandleScope(&scope, NULL);
 		return NULL;
@@ -359,13 +392,16 @@ Class *classBuild(ClassNode *node, ClassBuildError *error)
 	// `Name extend [ ... ]` adds methods to a class that must already exist. An
 	// extension cannot change a shape by construction, so nothing else happens.
 	if (classNodeIsExtension(node)) {
-		Class *class = definedClassNamed(name);
+		// Through the CHAIN: `Object extend [ ... ]` from inside a package means
+		// Core's Object, and an extension adds methods to a class that already
+		// exists rather than declaring one of its own.
+		Class *class = resolvedClassNamed(namespace, name);
 		if (class == NULL) {
 			fail(error, "extending a class that does not exist", name);
 			closeHandleScope(&scope, NULL);
 			return NULL;
 		}
-		buildMethods(class, node, error);
+		buildMethods(class, node, namespace, error);
 		return closeHandleScope(&scope, error->message == NULL ? class : NULL);
 	}
 
@@ -374,7 +410,7 @@ Class *classBuild(ClassNode *node, ClassBuildError *error)
 	String *superName = literalNodeGetStringValue(classNodeGetSuperName(node));
 	Class *super = NULL;
 	if (!stringEqualsC(superName, "nil")) {
-		super = definedClassNamed(superName);
+		super = resolvedClassNamed(namespace, superName);
 		if (super == NULL) {
 			fail(error, "superclass is not defined yet", superName);
 			closeHandleScope(&scope, NULL);
@@ -446,7 +482,7 @@ Class *classBuild(ClassNode *node, ClassBuildError *error)
 	// already exist, and packages/Core defines them again with their real
 	// contents. Making a second class object would leave every immediate's class
 	// index, and every inline cache that has run, pointing at the first one.
-	Class *class = definedClassNamed(name);
+	Class *class = definedClassNamed(namespace, name);
 	if (class != NULL) {
 		InstanceShape existing = class->raw->instanceShape;
 		if (existing.format != shape.format || existing.fixedSlots != shape.fixedSlots) {
@@ -471,7 +507,9 @@ Class *classBuild(ClassNode *node, ClassBuildError *error)
 		}
 	} else {
 		class = classCreate(super, (union String *) asSymbol(name), shape);
-		globalAtPut(name, objectTagged(class));
+		// Into the NAMESPACE's own bindings. With no namespace this is the
+		// globals dictionary, byte for byte what it used to be.
+		namespaceAtPutObject(namespace, name, (Object *) class);
 	}
 	rawObjectStorePtr((RawObject *) class->raw, &class->raw->instanceVariables,
 		(RawObject *) variables->raw);
@@ -482,6 +520,6 @@ Class *classBuild(ClassNode *node, ClassBuildError *error)
 	methodsOf(class);
 	classMetaclassOf(class); // established here so the chain is never partial
 
-	buildMethods(class, node, error);
+	buildMethods(class, node, namespace, error);
 	return closeHandleScope(&scope, error->message == NULL ? class : NULL);
 }

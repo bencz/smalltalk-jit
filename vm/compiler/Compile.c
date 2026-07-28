@@ -1,4 +1,5 @@
 #include "compiler/Compile.h"
+#include "core/Namespace.h"
 #include "core/Assert.h"
 #include "core/Class.h"
 #include "core/Smalltalk.h"
@@ -791,7 +792,12 @@ static Place resolveName(Emitter *e, String *name)
 
 	if (e->context->globals != NULL) {
 		String *key = scopeHandle(symbol);
-		Association *association = symbolDictAssocAt(e->context->globals, key);
+		// THROUGH THE NAMESPACE when there is one: own bindings, then imports in
+		// declaration order, then Core. With none, this is the plain dictionary
+		// probe it has always been (core/Namespace.h; NULL means core only).
+		Association *association = e->context->namespace != NULL
+			? namespaceResolveAssoc(e->context->namespace, key)
+			: symbolDictAssocAt(e->context->globals, key);
 		if (association == NULL && rawStringSize((RawString *) symbol) > 0
 				&& ((RawString *) symbol)->contents[0] >= 'A'
 				&& ((RawString *) symbol)->contents[0] <= 'Z') {
@@ -809,8 +815,16 @@ static Place resolveName(Emitter *e, String *name)
 			// global. A lowercase name that resolves nowhere is still an error,
 			// because that is a misspelled variable and there is nothing later
 			// that could define it.
-			association = symbolDictAtPut(e->context->globals, key,
-				tagPtr(Handles.nil.raw));
+			//
+			// It is minted in the namespace's OWN bindings, never in an import's
+			// and never in Core: a package that forward-references a name is
+			// declaring its own, and putting the placeholder in Core would let
+			// one package's unresolved name become every other package's.
+			association = e->context->namespace != NULL
+				? symbolDictAtPut(namespaceBindings(e->context->namespace), key,
+					tagPtr(Handles.nil.raw))
+				: symbolDictAtPut(e->context->globals, key,
+					tagPtr(Handles.nil.raw));
 		}
 		if (association != NULL) {
 			place.kind = PLACE_GLOBAL;

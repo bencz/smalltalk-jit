@@ -76,14 +76,14 @@ PRIMITIVE(BlockValue2, "BlockValuePrimitive2", primClosureValue2)  // Block>>val
 PRIMITIVE_ABSENT(BlockValue3, "BlockValuePrimitive3")  // Block>>value: arg1 value: arg2 value: arg3
 PRIMITIVE_ABSENT(BlockWhileTrue2, "BlockWhileTrue2Primitive")  // Block>>whileTrue: aBlock
 PRIMITIVE_ABSENT(BlockWhileTrue, "BlockWhileTruePrimitive")  // Block>>whileTrue
-PRIMITIVE_ABSENT(BuildClassIn, "BuildClassInPrimitive")  // Compiler>>basicBuildClass: aClassNode in: aNamespace
+PRIMITIVE(BuildClassIn, "BuildClassInPrimitive", primBuildClassIn)  // Compiler>>basicBuildClass: aClassNode in: aNamespace
 PRIMITIVE(BuildClass, "BuildClassPrimitive", primBuildClass)  // Compiler>>basicBuildClass: aClassNode
 PRIMITIVE(CharacterCode, "CharacterCodePrimitive", primCharacterCode)  // Character>>codePoint
 PRIMITIVE(CharacterNew, "CharacterNewPrimitive", primCharacterNew)  // Character>>class codePoint: anInteger
 PRIMITIVE(Class, "ClassPrimitive", primClass)  // Object>>class
 PRIMITIVE_ABSENT(ClassRemoveSelector, "ClassRemoveSelectorPrimitive")  // Behavior>>removeSelector: aSymbol
 PRIMITIVE_ABSENT(CommandLine, "CommandLinePrimitive")  // System>>class primitiveCommandLine
-PRIMITIVE_ABSENT(CompileMethodIn, "CompileMethodInPrimitive")  // Compiler>>basicCompileMethod: aMethodNode in: aClass namespace: aNamespace
+PRIMITIVE(CompileMethodIn, "CompileMethodInPrimitive", primCompileMethodIn)  // Compiler>>basicCompileMethod: aMethodNode in: aClass namespace: aNamespace
 PRIMITIVE(CompileMethod, "CompileMethodPrimitive", primCompileMethod)  // Compiler>>basicCompileMethod: aMethodNode in: aClass
 PRIMITIVE_ABSENT(ContextArgumentAt, "ContextArgumentAt")  // Context>>argumentAt: anInteger
 PRIMITIVE_ABSENT(ContextParent, "ContextParentPrimitive")  // Context>>parent
@@ -136,7 +136,7 @@ PRIMITIVE(FloatTimesTwoPower, "FloatTimesTwoPowerPrimitive", primFloatTimesTwoPo
 PRIMITIVE(FloatTruncated, "FloatTruncatedPrimitive", primFloatTruncated)  // Float>>truncated
 PRIMITIVE_ABSENT(FlushSendCaches, "FlushSendCachesPrimitive")  // System>>class flushSendCaches
 PRIMITIVE(GC, "GCPrimitive", primCollectGarbage)  // GarbageCollector>>class collectGarbage
-PRIMITIVE_ABSENT(GetEnv, "GetEnvPrimitive")  // System>>class primitiveGetEnv: aString
+PRIMITIVE(GetEnv, "GetEnvPrimitive", primGetEnv)  // System>>class primitiveGetEnv: aString
 PRIMITIVE(Hash, "HashPrimitive", primIdentityHash)  // Symbol>>hash; Object>>hash
 PRIMITIVE(Identity, "IdentityPrimitive", primIdentical)  // Object>>= anObject; Object>>== anObject
 PRIMITIVE_ABSENT(IndexOfByte, "IndexOfBytePrimitive")  // String>>indexOfByte: anInteger startingAt: start
@@ -170,8 +170,8 @@ PRIMITIVE_ABSENT(LastGCStats, "LastGCStatsPrimitive")  // GarbageCollector>>clas
 PRIMITIVE_ABSENT(LastIoError, "LastIoErrorPrimitive")  // IoError>>class last
 PRIMITIVE_ABSENT(LocalUtcOffset, "LocalUtcOffsetPrimitive")  // DateTime>>class localUtcOffsetAt: epochSeconds
 PRIMITIVE_ABSENT(MemoryReleaseFence, "MemoryReleaseFencePrimitive")  // Atomic>>class releaseFence
-PRIMITIVE_ABSENT(MethodSendArgs, "MethodSendArgsPrimitive")  // CompiledMethod>>sendTo: anObject withArguments: anArray
-PRIMITIVE_ABSENT(MethodSend, "MethodSendPrimitive")  // CompiledMethod>>sendTo: anObject
+PRIMITIVE(MethodSendArgs, "MethodSendArgsPrimitive", primMethodSendArgs)  // CompiledMethod>>sendTo: anObject withArguments: anArray
+PRIMITIVE(MethodSend, "MethodSendPrimitive", primMethodSend)  // CompiledMethod>>sendTo: anObject
 PRIMITIVE_ABSENT(MonitorEnterOn, "MonitorEnterOnPrimitive")  // ProcessorScheduler>>monitorEnterOn: anObject
 PRIMITIVE_ABSENT(MonitorEnter, "MonitorEnterPrimitive")  // ProcessorScheduler>>monitorEnter
 PRIMITIVE_ABSENT(MonitorExit, "MonitorExitPrimitive")  // ProcessorScheduler>>monitorExit

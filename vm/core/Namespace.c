@@ -1,72 +1,105 @@
 #include "core/Namespace.h"
 #include "core/Smalltalk.h"
 
-
-// asSymbol FAILs on an already-interned Symbol; the namespace API accepts
-// either a String (parser identifiers) or a Symbol (getSymbol, image code).
+// A name arrives either as a parser identifier (a String) or already interned
+// (a Symbol, from getSymbol or from image code). asSymbol on an interned Symbol
+// would intern it again, so the class is checked first.
 static String *toSymbol(String *name)
 {
-	return name->raw->class == Handles.Symbol->raw ? name : asSymbol(name);
+	if (Handles.Symbol.raw != NULL
+			&& rawObjectClassIndex((RawObject *) name->raw)
+				== classIndexOf(&Handles.Symbol)) {
+		return name;
+	}
+	return asSymbol(name);
 }
 
 
-Namespace *newNamespace(String *name, Dictionary *bindings, Array *imports)
+Dictionary *namespaceBindings(Namespace *namespace)
 {
-	HandleScope scope;
-	openHandleScope(&scope);
-	Namespace *ns = (Namespace *) newObject(Handles.Namespace, 0);
-	namespaceSetName(ns, toSymbol(name));
-	namespaceSetBindings(ns, bindings);
-	namespaceSetImports(ns, imports);
-	return closeHandleScope(&scope, ns);
+	if (namespace == NULL) {
+		return smalltalkGlobals();
+	}
+	Value bindings = namespace->raw->bindings;
+	if (!valueTypeOf(bindings, VALUE_POINTER)) {
+		return smalltalkGlobals(); // a half-built namespace: core is the safe read
+	}
+	return (Dictionary *) scopeHandle(asObject(bindings));
 }
 
 
-Association *namespaceResolveAssoc(Namespace *ns, String *name)
+// Is this the Core namespace? Asked by IDENTITY of the bindings dictionary
+// rather than by name.
+//
+// packages/Core/src/Namespace.st states the invariant that makes this work:
+// "(Namespaces at: #Core) bindings == Smalltalk". Comparing the name against
+// the string "Core" would be a second encoding of the same fact, and one a
+// package could spoof by calling itself Core.
+static _Bool isCoreNamespace(Namespace *namespace)
+{
+	if (namespace == NULL) {
+		return 1;
+	}
+	Value bindings = namespace->raw->bindings;
+	return valueTypeOf(bindings, VALUE_POINTER)
+		&& asObject(bindings) == (RawObject *) smalltalkGlobals()->raw;
+}
+
+
+Association *namespaceResolveAssoc(Namespace *namespace, String *name)
 {
 	HandleScope scope;
 	openHandleScope(&scope);
 	String *symbol = toSymbol(name);
 
-	// The Core namespace's own bindings ARE the core dictionary, so skipping
-	// straight to the fallback keeps the common (core-only) path at exactly
-	// one probe.
-	if (ns != NULL && ns->raw != (RawNamespace *) Handles.CoreNamespace->raw) {
-		Association *assoc = symbolDictAssocAt(namespaceGetBindings(ns), symbol);
-		if (!isNil(assoc)) {
-			return closeHandleScope(&scope, assoc);
+	// Core's own bindings ARE the globals dictionary, so going straight to the
+	// fallback keeps the common case at exactly one probe.
+	if (!isCoreNamespace(namespace)) {
+		Association *own = symbolDictAssocAt(namespaceBindings(namespace), symbol);
+		if (own != NULL) {
+			return closeHandleScope(&scope, own);
 		}
-		Array *imports = namespaceGetImports(ns);
-		size_t importsSize = imports->raw->size;
-		for (size_t i = 0; i < importsSize; i++) {
-			Namespace *import = (Namespace *) arrayObjectAt(imports, i);
-			assoc = symbolDictAssocAt(namespaceGetBindings(import), symbol);
-			if (!isNil(assoc)) {
-				return closeHandleScope(&scope, assoc);
+		Value importsValue = namespace->raw->imports;
+		if (valueTypeOf(importsValue, VALUE_POINTER)) {
+			Array *imports = scopeHandle(asObject(importsValue));
+			size_t count = rawArraySize(imports->raw);
+			for (size_t i = 0; i < count; i++) {
+				// FIRST IMPORT WINS, which is why this is a loop in declaration
+				// order and not a set. Two packages exporting the same name is
+				// ordinary, and the manifest's order is the answer to which one
+				// the importer meant.
+				Value entry = rawArrayAt(imports->raw, i);
+				if (!valueTypeOf(entry, VALUE_POINTER)) {
+					continue;
+				}
+				Namespace *import = scopeHandle(asObject(entry));
+				Association *found =
+					symbolDictAssocAt(namespaceBindings(import), symbol);
+				if (found != NULL) {
+					return closeHandleScope(&scope, found);
+				}
 			}
 		}
 	}
-	return closeHandleScope(&scope, symbolDictAssocAt(Handles.Smalltalk, symbol));
+	return closeHandleScope(&scope,
+		symbolDictAssocAt(smalltalkGlobals(), symbol));
 }
 
 
-Association *namespaceOwnAssocAt(Namespace *ns, String *name)
+Association *namespaceOwnAssocAt(Namespace *namespace, String *name)
 {
 	HandleScope scope;
 	openHandleScope(&scope);
-	Dictionary *bindings = ns == NULL
-		? Handles.Smalltalk
-		: namespaceGetBindings(ns);
-	return closeHandleScope(&scope, symbolDictAssocAt(bindings, toSymbol(name)));
+	return closeHandleScope(&scope,
+		symbolDictAssocAt(namespaceBindings(namespace), toSymbol(name)));
 }
 
 
-Association *namespaceAtPutObject(Namespace *ns, String *name, Object *value)
+Association *namespaceAtPutObject(Namespace *namespace, String *name,
+	Object *value)
 {
 	HandleScope scope;
 	openHandleScope(&scope);
-	Dictionary *bindings = ns == NULL
-		? Handles.Smalltalk
-		: namespaceGetBindings(ns);
-	return closeHandleScope(&scope, symbolDictAtPutObject(bindings, toSymbol(name), value));
+	return closeHandleScope(&scope,
+		symbolDictAtPutObject(namespaceBindings(namespace), toSymbol(name), value));
 }

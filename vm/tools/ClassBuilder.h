@@ -16,6 +16,7 @@
 #include "compiler/Ast.h"
 #include "compiler/Compile.h"
 #include "core/Class.h"
+#include "core/Namespace.h"
 #include "jit/CompiledMethod.h"
 
 typedef struct {
@@ -31,7 +32,14 @@ typedef struct {
 // built-in kernel already defines Object, Array, SmallInteger and the rest, and
 // packages/Core defines them again with their real contents. A second class
 // object would leave every immediate's class index pointing at the first.
-Class *classBuild(ClassNode *node, ClassBuildError *error);
+Class *classBuildIn(ClassNode *node, Namespace *namespace, ClassBuildError *error);
+
+// Core only, which is what the bootstrap and `st -b` want. NULL is the
+// core-only namespace everywhere (core/Namespace.h).
+static inline Class *classBuild(ClassNode *node, ClassBuildError *error)
+{
+	return classBuildIn(node, NULL, error);
+}
 
 // The metaclass of a class, created on first use. A class-side method belongs in
 // the method dictionary of the class's OWN class, which is what makes
@@ -52,6 +60,6 @@ Class *classMetaclassOf(Class *class);
 // to "where does a class variable live", which is a question this project has
 // already got wrong once, silently.
 CompiledMethod *classCompileMethodInto(MethodNode *node, Class *target,
-	Class *classVariableScope, ClassBuildError *error);
+	Class *classVariableScope, Namespace *namespace, ClassBuildError *error);
 
 #endif

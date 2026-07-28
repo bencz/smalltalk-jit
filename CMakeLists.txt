@@ -169,6 +169,7 @@ set(vmSources
 	vm/core/ClassTable.c
 	vm/core/Handle.c
 	vm/core/Instrument.c
+	vm/core/Namespace.c
 	vm/core/Smalltalk.c
 	vm/core/Thread.c
 	vm/jit/Backends.c
@@ -208,9 +209,11 @@ set(vmSources
 	vm/runtime/primitives/FloatMath.c
 	vm/runtime/primitives/Identity.c
 	vm/runtime/primitives/Indexed.c
+	vm/runtime/primitives/Method.c
 	vm/runtime/primitives/PrintValue.c
 	vm/runtime/primitives/Reflect.c
 	vm/runtime/primitives/Streams.c
+	vm/runtime/primitives/System.c
 	vm/runtime/primitives/Strings.c
 	vm/runtime/primitives/Time.c
 	vm/runtime/String.c

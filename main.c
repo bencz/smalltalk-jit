@@ -41,6 +41,8 @@
 // second one: a test file inside a project is an ordinary file of blocks.
 static int runFile(const char *path);
 static _Bool evalToCString(const char *code, char *buffer, size_t size);
+static _Bool stringBytesOf(Value value, char *buffer, size_t size);
+static _Bool evalValue(const char *source, const char *what, Value *answer);
 static int evalToInt(const char *code);
 
 
@@ -91,7 +93,7 @@ static _Bool planProject(CliArgs *cliArgs, ProjectPlan *plan)
 static int runProjectTests(void)
 {
 	static char paths[65536];
-	if (!evalToCString("ProjectTool prepareTests", paths, sizeof paths)) {
+	if (!evalToCString("^ProjectTool prepareTests", paths, sizeof paths)) {
 		return EXIT_FAILURE;
 	}
 	int total = 0;
@@ -185,7 +187,7 @@ static Value runBody(BlockNode *body, const char *what, int *failed)
 
 	// No owner class: a top-level body has no instance variables to resolve
 	// against, and every name in it is either its own temporary or a global.
-	CompileContext context = { NULL, smalltalkGlobals(), NULL };
+	CompileContext context = { NULL, smalltalkGlobals(), NULL, NULL };
 	CompileError error;
 	CodeUnit *unit = compileMethod(node, &context, &error);
 	if (unit == NULL) {
@@ -323,7 +325,7 @@ static _Bool evalValue(const char *source, const char *what, Value *answer)
 	// The third field is spelled out rather than left to the implicit zero: it is
 	// classVariableScope, whose NULL means "same as ownerClass", and it is the
 	// field whose absence was silent the last time it was got wrong.
-	CompileContext context = { NULL, smalltalkGlobals(), NULL };
+	CompileContext context = { NULL, smalltalkGlobals(), NULL, NULL };
 	CompileError error;
 	CodeUnit *unit = compileMethod(node, &context, &error);
 	freeParser(&parser);
@@ -365,20 +367,19 @@ static int evaluate(const char *source)
 }
 
 
-// Evaluate `code` and copy its String answer into `buffer`.
+// The bytes of a String answer, copied out.
 //
-// The bytes are copied BEFORE anything else allocates, which is the whole
-// reason this is a function and not two lines at each call site: the String is
-// a heap object, and the next allocation may move it.
-static _Bool evalToCString(const char *code, char *buffer, size_t size)
+// The copy happens BEFORE anything else allocates, which is the whole reason
+// this is a function and not two lines at each call site: the String is a heap
+// object and the next allocation may move it.
+static _Bool stringBytesOf(Value value, char *buffer, size_t size)
 {
-	Value value;
-	if (!evalValue(code, code, &value) || !valueTypeOf(value, VALUE_POINTER)) {
+	if (!valueTypeOf(value, VALUE_POINTER)) {
 		return 0;
 	}
 	RawObject *object = asObject(value);
 	if (rawObjectFormat(object) != FORMAT_BYTES) {
-		return 0; // nil, which is how ProjectTool reports a failure it printed
+		return 0; // nil, or anything else that is not text
 	}
 	size_t length = rawObjectElementCount(object);
 	if (length + 1 > size) {
@@ -387,6 +388,23 @@ static _Bool evalToCString(const char *code, char *buffer, size_t size)
 	memcpy(buffer, rawObjectBytes(object), length);
 	buffer[length] = '\0';
 	return 1;
+}
+
+
+// Evaluate `code` and copy its String answer into `buffer`.
+//
+// THE CALLER WRITES THE CARET. `code` is compiled as a method body, and a
+// Smalltalk method with no `^` answers SELF -- which here is nil, because these
+// are evaluated with nil as the receiver. So every bridge that wants a value
+// passes `"^ProjectTool build"`, not `"ProjectTool build"`.
+//
+// The caret is not added here because `-e` shares this path and an expression
+// there is a SEQUENCE: prefixing `^` to `a printNl. b printNl.` would return
+// after the first statement. Only the caller knows which it has.
+static _Bool evalToCString(const char *code, char *buffer, size_t size)
+{
+	Value value;
+	return evalValue(code, code, &value) && stringBytesOf(value, buffer, size);
 }
 
 
@@ -457,10 +475,28 @@ int main(int argc, char **argv)
 		if (plan.hasProject && plan.stale) {
 			char out[PROJECT_PATH_MAX];
 			// ProjectTool answers the path it wants the image written to, or nil
-			// after printing its own error. nil is not a String, so evalToCString
-			// answers 0 and the message the image already printed is the whole
-			// report; adding one here would say it twice.
-			if (!evalToCString("ProjectTool build", out, sizeof out)) {
+			// after printing its own error through the Transcript.
+			//
+			// The two cases are told apart HERE rather than both becoming a bare
+			// EXIT_FAILURE. A silent non-zero exit is the failure mode this
+			// project keeps paying for: the first version of this said nothing at
+			// all when the answer was neither, and "st build exits 1 and prints
+			// nothing" is indistinguishable from a crash.
+			Value answer;
+			if (!evalValue("^ProjectTool build", "st build", &answer)) {
+				return EXIT_FAILURE; // evalValue already said what it could not do
+			}
+			if (!stringBytesOf(answer, out, sizeof out)) {
+				if (valueTypeOf(answer, VALUE_POINTER)
+						&& asObject(answer) == Handles.nil.raw) {
+					// The image caught it and printed it; saying so again here
+					// would report one failure twice.
+					return EXIT_FAILURE;
+				}
+				fprintf(stderr, "st build: ProjectTool build answered %s instead "
+					"of the image path\n",
+					valueTypeOf(answer, VALUE_POINTER)
+						? "an object that is not a String" : "an immediate");
 				return EXIT_FAILURE;
 			}
 			// COLLECT FIRST. The build allocated a package loader, a parse tree per
@@ -480,10 +516,10 @@ int main(int argc, char **argv)
 		}
 
 		if (strcmp(name, "new") == 0) {
-			return evalToInt("ProjectTool scaffold");
+			return evalToInt("^ProjectTool scaffold");
 		}
 		if (strcmp(name, "run") == 0) {
-			return evalToInt("ProjectTool run");
+			return evalToInt("^ProjectTool run");
 		}
 		if (strcmp(name, "test") == 0) {
 			return runProjectTests();

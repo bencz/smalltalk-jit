@@ -31,6 +31,7 @@
 #include "core/Smalltalk.h"
 #include "os/OsFile.h"
 #include "runtime/String.h"
+#include "core/Namespace.h"
 #include "tools/ClassBuilder.h"
 #include <stdio.h>
 #include <unistd.h>
@@ -311,6 +312,87 @@ Value primBuildClass(Value *args, uint64_t argc)
 }
 
 
+// The namespace argument of the `...in:` forms. nil means CORE, which is the
+// same NULL convention core/Namespace.h uses everywhere, so a package that
+// declares no namespace behaves exactly as before namespaces existed.
+static _Bool namespaceArgument(Value value, Namespace **answer)
+{
+	*answer = NULL;
+	if (!valueTypeOf(value, VALUE_POINTER) || asObject(value) == Handles.nil.raw) {
+		return 1;
+	}
+	Class *namespaceClass = getClass("Namespace");
+	if (namespaceClass == NULL || !isNodeOfClass(value, namespaceClass)) {
+		return 0;
+	}
+	*answer = scopeHandle(asObject(value));
+	return 1;
+}
+
+
+// Compiler>>basicBuildClass: aClassNode in: aNamespace
+Value primBuildClassIn(Value *args, uint64_t argc)
+{
+	if (argc != 2) {
+		return PRIMITIVE_FAILED;
+	}
+	if (!isNodeOfClass(primitiveArgument(args, 0), &Handles.ClassNode)) {
+		return PRIMITIVE_FAILED;
+	}
+	PRIMITIVE_ALLOCATES(args);
+	HandleScope scope;
+	openHandleScope(&scope);
+	Namespace *namespace;
+	Value answer;
+	if (!namespaceArgument(primitiveArgument(args, 1), &namespace)) {
+		answer = PRIMITIVE_FAILED;
+	} else {
+		ClassNode *node = scopeHandle(asObject(primitiveArgument(args, 0)));
+		ClassBuildError error = { NULL, NULL, NULL, COMPILE_OK };
+		Class *class = classBuildIn(node, namespace, &error);
+		answer = error.message != NULL
+			? buildErrorFrom(&error)
+			: objectTagged((Object *) class);
+	}
+	closeHandleScope(&scope, NULL);
+	PRIMITIVE_DONE_ALLOCATING();
+	return answer;
+}
+
+
+// Compiler>>basicCompileMethod: aMethodNode in: aClass namespace: aNamespace
+Value primCompileMethodIn(Value *args, uint64_t argc)
+{
+	if (argc != 3) {
+		return PRIMITIVE_FAILED;
+	}
+	if (!isNodeOfClass(primitiveArgument(args, 0), &Handles.MethodNode)
+			|| receiverAsClass(primitiveArgument(args, 1)) == NULL) {
+		return PRIMITIVE_FAILED;
+	}
+	PRIMITIVE_ALLOCATES(args);
+	HandleScope scope;
+	openHandleScope(&scope);
+	Namespace *namespace;
+	Value answer;
+	if (!namespaceArgument(primitiveArgument(args, 2), &namespace)) {
+		answer = PRIMITIVE_FAILED;
+	} else {
+		MethodNode *node = scopeHandle(asObject(primitiveArgument(args, 0)));
+		Class *target = receiverAsClass(primitiveArgument(args, 1));
+		ClassBuildError error = { NULL, NULL, NULL, COMPILE_OK };
+		CompiledMethod *method =
+			classCompileMethodInto(node, target, NULL, namespace, &error);
+		answer = error.message != NULL
+			? buildErrorFrom(&error)
+			: objectTagged((Object *) method);
+	}
+	closeHandleScope(&scope, NULL);
+	PRIMITIVE_DONE_ALLOCATING();
+	return answer;
+}
+
+
 // ---------------------------------------------------------------------------
 // The session default namespace
 // ---------------------------------------------------------------------------
@@ -386,7 +468,7 @@ Value primCompileMethod(Value *args, uint64_t argc)
 	// classVariableScope NULL, meaning "same as the target". The caller named
 	// the class it wants the method in, exactly as the old VM's form did, and
 	// nothing here can second-guess which side it meant.
-	CompiledMethod *method = classCompileMethodInto(node, target, NULL, &error);
+	CompiledMethod *method = classCompileMethodInto(node, target, NULL, NULL, &error);
 	Value answer = error.message != NULL
 		? buildErrorFrom(&error)
 		: objectTagged((Object *) method);

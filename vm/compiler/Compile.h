@@ -34,6 +34,7 @@
 
 #include "compiler/Bytecode.h"
 #include "compiler/Ast.h"
+#include "core/Object.h"
 #include "core/Handle.h"
 #include "runtime/Dictionary.h"
 
@@ -77,6 +78,19 @@ typedef struct {
 	// NULL means "same as ownerClass", which is right for instance-side methods
 	// and for a bare expression.
 	Class *classVariableScope;
+	// The NAMESPACE a global name resolves through: own bindings, then imports
+	// in declaration order, then Core (core/Namespace.h).
+	//
+	// NULL means CORE ONLY, and that is the right answer for the bootstrap, for
+	// `-e`, and for anything compiled before packages exist -- which is why
+	// adding this did not change a single existing call site's behaviour.
+	//
+	// It is separate from `globals` rather than replacing it because the two
+	// answer different questions: `globals` is the one dictionary a forward
+	// reference is minted into when there is no namespace, and a namespace is a
+	// CHAIN. Collapsing them would mean either losing the chain or giving every
+	// namespace-free caller a fake namespace to carry.
+	Namespace *namespace;
 } CompileContext;
 
 // Compile one parsed method. Answers a malloc'd CodeUnit, or NULL with `error`

@@ -203,6 +203,19 @@ static void nameClasses(void)
 	nameClass(&Handles.NilNode, "NilNode");
 	nameClass(&Handles.TrueNode, "TrueNode");
 	nameClass(&Handles.FalseNode, "FalseNode");
+
+	// THE GLOBALS DICTIONARY, UNDER ITS OWN NAME. `Smalltalk` is how image code
+	// reaches the system dictionary (`Smalltalk at: #Foo`), and it is also the
+	// object identity that makes the Core namespace what it is: Namespace.st
+	// states the invariant "(Namespaces at: #Core) bindings == Smalltalk", and
+	// core/Namespace.c decides "is this Core?" by comparing that identity rather
+	// than by comparing a name a package could spoof.
+	//
+	// It is registered IN ITSELF, which is not a trick: a dictionary holding an
+	// Association to itself is an ordinary cycle and the collector already
+	// handles cycles.
+	globalAtPut(asSymbol(stringFromC("Smalltalk")),
+		objectTagged(smalltalkGlobals()));
 }
 
 
@@ -278,7 +291,7 @@ static void defineSourceMethod(Class *class, const char *source)
 		fprintf(stderr, "bootstrap: cannot parse '%s'\n", source);
 		abort();
 	}
-	CompileContext context = { class, smalltalkGlobals(), NULL };
+	CompileContext context = { class, smalltalkGlobals(), NULL, NULL };
 	CompileError error;
 	CodeUnit *unit = compileMethod(node, &context, &error);
 	freeParser(&parser);

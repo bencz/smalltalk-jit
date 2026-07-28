@@ -4,6 +4,8 @@
 // truncation signal beyond filling the buffer, so a result that used the whole
 // buffer is treated as "does not fit".
 #include "os/Os.h"
+#include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <string.h>
 #include <errno.h>
@@ -49,4 +51,19 @@ void osErrorMessage(int code, char *buffer, size_t size)
 _Bool osJitMapPath(char *buffer, size_t size)
 {
 	return snprintf(buffer, size, "/tmp/perf-%d.map", (int) getpid()) < (int) size;
+}
+
+
+_Bool osEnvironmentValue(const char *name, char *buffer, size_t size)
+{
+	const char *value = getenv(name);
+	if (value == NULL) {
+		return 0;
+	}
+	size_t length = strlen(value);
+	if (length + 1 > size) {
+		return 0;
+	}
+	memcpy(buffer, value, length + 1);
+	return 1;
 }

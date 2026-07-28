@@ -145,6 +145,13 @@ void osIgnoreBrokenPipe(void);
 // reliable answer (return 0 and the callers fall back to CWD-relative paths).
 _Bool osExecutablePath(char *buffer, size_t size);
 
+// The value of an environment variable, copied out. 0 when the variable is
+// unset OR when its value does not fit, and the buffer is untouched either way.
+//
+// COPIED rather than answered as a pointer: getenv answers memory the next
+// setenv may reuse, and a Smalltalk String has to be built from stable bytes.
+_Bool osEnvironmentValue(const char *name, char *buffer, size_t size);
+
 // Path for the JIT symbol map consumed by the platform profiler, or 0 when
 // the platform has no such consumer (the feature then stays disabled).
 // Linux: /tmp/perf-<pid>.map for `perf`. PORT_ME(jit-map): others return 0.

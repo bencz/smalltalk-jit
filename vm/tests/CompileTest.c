@@ -50,7 +50,7 @@ ptrdiff_t gCurrentThreadTpoff;
 
 static int gFailures;
 static int gChecks;
-static Dictionary *gGlobals;
+
 
 
 static void check(const char *what, int ok)
@@ -65,24 +65,11 @@ static void check(const char *what, int ok)
 }
 
 
-// Declared by core/Smalltalk.h and normally defined in Smalltalk.c, which is
-// still a v1 file. Supplied here so this level links against the front end
-// alone, exactly as the levels below it link against one subsystem each.
-Class *getClass(char *key)
-{
-	Object *found = globalObjectAt(stringFromC(key));
-	return (Class *) found;
-}
-
-
-Object *globalObjectAt(String *key)
-{
-	Association *association = symbolDictAssocAt(gGlobals, asSymbol(key));
-	if (association == NULL || !valueTypeOf(association->raw->value, VALUE_POINTER)) {
-		return NULL;
-	}
-	return scopeHandle(asObject(association->raw->value));
-}
+// getClass and globalObjectAt used to be defined HERE, because Smalltalk.c was
+// still a v1 file at the time. It is in the build now, and this level links it:
+// two definitions of "what is a global" is the drift this project keeps paying
+// for, and the front end reaches globals through a namespace chain that only
+// the real one implements (core/Namespace.c).
 
 
 // ---- bootstrap --------------------------------------------------------------
@@ -255,7 +242,7 @@ static void installPrimitives(void)
 
 static void defineGlobal(const char *name, Value value)
 {
-	symbolDictAtPut(gGlobals, asSymbol(stringFromC(name)), value);
+	symbolDictAtPut(smalltalkGlobals(), asSymbol(stringFromC(name)), value);
 }
 
 
@@ -272,7 +259,7 @@ static CodeUnit *compileSource(const char *source, Class *owner, CompileError *e
 		freeParser(&parser);
 		return NULL;
 	}
-	CompileContext context = { owner, gGlobals, NULL };
+	CompileContext context = { owner, smalltalkGlobals(), NULL, NULL };
 	CodeUnit *unit = compileMethod(node, &context, error);
 	freeParser(&parser);
 	return unit;
@@ -417,7 +404,7 @@ int main(void)
 	HandleScope outer;
 	openHandleScope(&outer);
 	bootstrapKernel(&heap);
-	gGlobals = newDictionary(64);
+	smalltalkInitGlobals(64);
 	installPrimitives();
 
 	// A class with two instance variables, to compile methods into.
@@ -546,7 +533,7 @@ int main(void)
 
 	// ---- globals ---------------------------------------------------------------
 	printf("\n  -- globals, reached through an Association\n");
-	Association *bound = symbolDictAtPut(gGlobals, asSymbol(stringFromC("Answer")),
+	Association *bound = symbolDictAtPut(smalltalkGlobals(), asSymbol(stringFromC("Answer")),
 		tagInt(42));
 	checkInt("a global reads through its Association",
 		call0(define(counter, "readGlobal [ ^Answer ]"), objectTagged(instance)), 42);
