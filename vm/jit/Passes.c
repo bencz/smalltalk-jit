@@ -214,6 +214,19 @@ static uint32_t removeRedundantGuards(PassContext *context)
 // `unbox(box(x))` becoming `x` is what GVN then finds across blocks.
 // ---------------------------------------------------------------------------
 
+// Does anything between `from` and `to`, which share a block, write memory?
+static _Bool writesBetween(IrValue *from, IrValue *to)
+{
+	for (IrValue *value = from->next; value != NULL && value != to;
+			value = value->next) {
+		if (irOpWritesMemory((IrOp) value->op)) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+
 static uint32_t simplify(PassContext *context)
 {
 	uint32_t rewritten = 0;
@@ -246,8 +259,19 @@ static uint32_t simplify(PassContext *context)
 				// it. THIS is what makes scalar replacement work: once every
 				// read is answered from the arguments, the allocation has no
 				// users left and can go.
+				//
+				// ONLY WHEN NOTHING WROTE IN BETWEEN, which is the same trap GVN
+				// was in: the allocation's argument is what the field held when
+				// the object was BUILT, and a store between there and here means
+				// that is no longer what it holds. Answered by walking the
+				// instructions between the two rather than by a version counter,
+				// because that also settles availability -- if the allocation is
+				// not in this block, it is not walkable from here and the
+				// substitution is simply not made.
 				if (source != NULL && (source->op == IR_NEW || source->op == IR_NEWV)
-						&& value->extra < source->argCount) {
+						&& value->extra < source->argCount
+						&& source->block == value->block
+						&& !writesBetween(source, value)) {
 					IrValue *field = source->args[value->extra];
 					if (field->repr == value->repr) { replacement = field; }
 				}
@@ -377,19 +401,90 @@ static uint32_t scalarReplacement(PassContext *context, uint32_t *recipes)
 // catch locally collapse, and where repeated field loads and conversions
 // become one.
 
+// Defined with the loop passes below, and used here too: reusing a value is only
+// legal when its definition DOMINATES the use.
+static IrBlock **computeDominators(PassContext *context);
+static _Bool dominates(IrBlock **idom, IrBlock *a, IrBlock *b);
+
+
+// ---- what a store invalidates ----------------------------------------------
+//
+// PRECISE IN THE FIELD, CONSERVATIVE IN THE OBJECT. A store to field N kills
+// reads of field N from anything, and does not touch reads of any other field.
+// That is the cheapest split that is both sound and useful: proving two
+// expressions name different OBJECTS is alias analysis and this optimizer has
+// none, while the field index is sitting right there in the instruction.
+//
+// Everything else -- a send, a safepoint, an array store, a global store --
+// bumps the ONE counter that every read depends on. A send runs arbitrary
+// Smalltalk; a safepoint is a point execution can leave and another fiber can
+// store at (ADR 0007); an array store is indexed by a runtime value, so nothing
+// here can say which element it hit.
+#define MEMORY_FIELD_SLOTS 64
+
+typedef struct {
+	uint32_t all;
+	uint32_t field[MEMORY_FIELD_SLOTS];
+} MemoryVersion;
+
+
+static size_t memorySlot(int64_t fieldIndex)
+{
+	// A collision costs a missed reuse and nothing else, which is why a small
+	// fixed table is enough for a field index that is a 16-bit operand.
+	return (size_t) ((uint64_t) fieldIndex % MEMORY_FIELD_SLOTS);
+}
+
+
+static void memoryAdvance(MemoryVersion *version, IrValue *value)
+{
+	switch ((IrOp) value->op) {
+	case IR_SETFIELD_T: case IR_SETFIELD_F:
+		version->field[memorySlot(value->extra)]++;
+		break;
+	case IR_ASTORE: case IR_VASTORE:
+	case IR_SETGLOBAL: case IR_SEND: case IR_SAFEPOINT:
+		version->all++;
+		break;
+	default:
+		break;
+	}
+}
+
+
+// The field counter a given read depends on, or NULL when it depends only on
+// `all` (an array load or a length).
+static uint32_t memoryFieldVersion(const MemoryVersion *version, IrValue *read)
+{
+	if (read->op == IR_FIELD_T || read->op == IR_FIELD_F) {
+		return version->field[memorySlot(read->extra)];
+	}
+	return 0;
+}
+
+
 typedef struct {
 	IrValue *value;
 	uint32_t hash;
+	// The two counters this entry was recorded at. Only meaningful for a memory
+	// read, and together they are what stops one being reused across a store
+	// that could have changed it.
+	uint32_t memoryAll;
+	uint32_t memoryField;
 } GvnEntry;
 
 
-static uint32_t gvnHash(IrValue *value)
+static uint32_t gvnHash(IrValue *value, const MemoryVersion *memory)
 {
 	uint32_t hash = (uint32_t) value->op * 2654435761u;
 	hash ^= (uint32_t) value->extra * 40503u;
 	hash ^= (uint32_t) value->konst;
 	for (uint16_t i = 0; i < value->argCount; i++) {
 		hash = hash * 31u + (value->args[i] != NULL ? value->args[i]->id : 0);
+	}
+	if (irOpReadsMemory((IrOp) value->op)) {
+		hash = hash * 31u + memory->all;
+		hash = hash * 31u + memoryFieldVersion(memory, value);
 	}
 	return hash;
 }
@@ -415,12 +510,19 @@ static uint32_t globalValueNumbering(PassContext *context)
 	uint32_t removed = 0;
 	size_t capacity = 1024;
 	GvnEntry *table = calloc(capacity, sizeof(GvnEntry));
+	IrBlock **idom = computeDominators(context);
+	// Advanced by anything that may write. A memory read carries the counters it
+	// depends on in its key, so an identical read on the other side of a store
+	// that could have changed it is a DIFFERENT value.
+	MemoryVersion memory;
+	memset(&memory, 0, sizeof(memory));
 
 	for (uint32_t i = 0; i < context->rpoCount; i++) {
 		IrBlock *block = context->rpo[i];
 		IrValue *value = block->first;
 		while (value != NULL) {
 			IrValue *next = value->next;
+			memoryAdvance(&memory, value);
 			// Allocations are pure but must NOT be numbered together: two
 			// `new` instructions produce two distinct objects, and collapsing
 			// them would give one identity where the program expects two.
@@ -429,12 +531,28 @@ static uint32_t globalValueNumbering(PassContext *context)
 				&& value->op != IR_ANEW && value->op != IR_VNEW
 				&& value->op != IR_PARAM && value->op != IR_PHI;
 			if (numberable) {
-				uint32_t hash = gvnHash(value);
+				uint32_t hash = gvnHash(value, &memory);
 				size_t slot = hash % capacity;
 				IrValue *found = NULL;
 				for (size_t probe = 0; probe < capacity; probe++) {
 					if (table[slot].value == NULL) { break; }
-					if (table[slot].hash == hash && gvnEqual(table[slot].value, value)) {
+					if (table[slot].hash == hash
+							&& gvnEqual(table[slot].value, value)
+							// SAME HEAP. Equal operands are not enough for a
+							// memory read: the earlier one describes the heap as
+							// it was at ITS version.
+							&& (!irOpReadsMemory((IrOp) value->op)
+								|| (table[slot].memoryAll == memory.all
+									&& table[slot].memoryField
+										== memoryFieldVersion(&memory, value)))
+							// AND IT HAS TO DOMINATE. Reusing a value from a
+							// block that merely ran EARLIER in reverse post
+							// order is not the same thing as reusing one that is
+							// guaranteed to have run: two arms of a conditional
+							// are ordered by the walk and neither reaches the
+							// other, so the replacement would read a register
+							// that was never written on the path taken.
+							&& dominates(idom, table[slot].value->block, block)) {
 						found = table[slot].value;
 						break;
 					}
@@ -447,11 +565,14 @@ static uint32_t globalValueNumbering(PassContext *context)
 				} else {
 					table[slot].value = value;
 					table[slot].hash = hash;
+					table[slot].memoryAll = memory.all;
+					table[slot].memoryField = memoryFieldVersion(&memory, value);
 				}
 			}
 			value = next;
 		}
 	}
+	free(idom);
 	free(table);
 	return removed;
 }
@@ -587,6 +708,27 @@ static uint32_t hoistLoopInvariants(PassContext *context)
 				continue;
 			}
 
+			// WHAT THE LOOP WRITES. A memory read is pure and still cannot leave
+			// a loop that stores to what it reads: hoisted, it would answer the
+			// first iteration's value for every iteration.
+			//
+			// Same split as GVN, and the same reason: the field index is known,
+			// the object is not. A loop that writes field 3 does not stop a read
+			// of field 2 from being hoisted, which is exactly the case the
+			// existing check below exercises.
+			MemoryVersion loopWrites;
+			memset(&loopWrites, 0, sizeof(loopWrites));
+			for (uint32_t b = 0; b < context->rpoCount; b++) {
+				IrBlock *block = context->rpo[b];
+				if (!inLoop[block->id]) {
+					continue;
+				}
+				for (IrValue *value = block->first; value != NULL;
+						value = value->next) {
+					memoryAdvance(&loopWrites, value);
+				}
+			}
+
 			for (uint32_t b = 0; b < context->rpoCount; b++) {
 				IrBlock *block = context->rpo[b];
 				if (!inLoop[block->id]) {
@@ -598,6 +740,10 @@ static uint32_t hoistLoopInvariants(PassContext *context)
 					_Bool movable = irOpIsPure((IrOp) value->op)
 						&& value->op != IR_PHI && value->op != IR_PARAM
 						&& value->deopt == NULL;
+					if (movable && irOpReadsMemory((IrOp) value->op)) {
+						movable = loopWrites.all == 0
+							&& memoryFieldVersion(&loopWrites, value) == 0;
+					}
 					for (uint16_t k = 0; k < value->argCount && movable; k++) {
 						IrValue *arg = value->args[k];
 						// An operand defined INSIDE the loop makes the value

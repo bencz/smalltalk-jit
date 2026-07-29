@@ -268,6 +268,11 @@ NativeCode *jitCodeContaining(const void *address);
 // method that was there before. Details at the definition.
 void jitFlushSendCaches(void);
 
+// Run the front half of tier 2 (SsaBuild plus the passes) over a unit and throw
+// the result away, under ST_TIER2_DRYRUN=1. Weakly no-op when the optimizer is
+// not linked; the real one is jit/Tier2DryRun.c.
+void tier2DryRun(CodeUnit *unit);
+
 // The unconditional send path, called by compiled code. `receiverSlot` points
 // at the receiver's frame slot; arguments are at DESCENDING addresses from it,
 // because consecutive bytecode registers are consecutive slots and slots grow

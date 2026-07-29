@@ -60,6 +60,13 @@ typedef enum {
 	IR_FIELD_T,    // tagged instance variable read, `extra` = index
 	IR_FIELD_F,    // raw f64 field of a value class
 	IR_SETFIELD_T, IR_SETFIELD_F,
+	// A global, reached through the literal frame's Association. `extra` is the
+	// literal index, and the ADDRESS never appears in the IR: the Association is
+	// a heap object the collector moves, and what does not move is the unit's own
+	// field holding the literal frame, which is where the backend loads from.
+	// Neither is PURE: a store to the same global, or any send that could reach
+	// one, changes what a later read answers.
+	IR_GLOBAL, IR_SETGLOBAL,
 	IR_ALOAD, IR_ASTORE, IR_ALEN,       // generic Array of tagged
 	IR_VALOAD, IR_VASTORE, IR_VALEN,    // flat value array, phase 7
 
@@ -204,6 +211,13 @@ void irReplaceAllUses(IrFunction *function, IrValue *from, IrValue *to);
 
 Repr irOpRepr(IrOp op);
 _Bool irOpIsPure(IrOp op);
+// PURE IS NOT ENOUGH, and these two exist because treating it as enough is a
+// wrong-answer bug. A field read is pure in the sense the optimizer cares about
+// -- it has no side effect, so a dead one may be deleted -- and it is still NOT
+// interchangeable with an identical read on the other side of a store. Any pass
+// that reuses or MOVES a value has to ask these as well.
+_Bool irOpReadsMemory(IrOp op);
+_Bool irOpWritesMemory(IrOp op);
 _Bool irOpIsTerminator(IrOp op);
 const char *irOpName(IrOp op);
 

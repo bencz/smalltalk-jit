@@ -182,6 +182,7 @@ set(vmSources
 	vm/jit/MacroAssembler.c
 	vm/jit/Passes.c
 	vm/jit/SsaBuild.c
+	vm/jit/Tier2DryRun.c
 	vm/memory/Collector.c
 	vm/memory/Heap.c
 	vm/memory/Nursery.c

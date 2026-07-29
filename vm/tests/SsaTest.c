@@ -87,7 +87,7 @@ int main(void)
 		{ OP_LOADI, 0, 1, 42, 0 },
 		{ OP_RET, 0, 1, 0, 0 },
 	};
-	IrFunction *simple = ssaBuild(makeUnit(straight, 2, 2, 0));
+	IrFunction *simple = ssaBuild(makeUnit(straight, 2, 2, 0), NULL);
 	check("straight-line code is one block", simple->blockCount == 1);
 	check("the constant becomes a value", countOp(simple, IR_CONST) == 1);
 	check("the return is a terminator", countOp(simple, IR_RET) == 1);
@@ -101,7 +101,7 @@ int main(void)
 		{ OP_LOADI, 0, 2, 200, 0 },
 		{ OP_RET, 0, 2, 0, 0 },
 	};
-	IrFunction *merged = ssaBuild(makeUnit(merge, 5, 3, 1));
+	IrFunction *merged = ssaBuild(makeUnit(merge, 5, 3, 1), NULL);
 	check("a branch and a join make four blocks", merged->blockCount == 4);
 	check("the merge introduces exactly one phi", countOp(merged, IR_PHI) == 1);
 
@@ -130,7 +130,7 @@ int main(void)
 		{ OP_JUMP, 0, 2, 0, 0 },       // 5: back to 2
 		{ OP_RET, 0, 2, 0, 0 },        // 6
 	};
-	IrFunction *looping = ssaBuild(makeUnit(loop, 7, 4, 1));
+	IrFunction *looping = ssaBuild(makeUnit(loop, 7, 4, 1), NULL);
 	IrBlock *header = NULL;
 	for (IrBlock *block = looping->blocks; block != NULL; block = block->next) {
 		if (block->label == 2) {

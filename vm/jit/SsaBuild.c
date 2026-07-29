@@ -1,6 +1,8 @@
 #include "jit/SsaBuild.h"
 #include "core/Assert.h"
+#include <stdio.h>
 #include "runtime/Collection.h"
+#include "runtime/Closure.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -67,10 +69,22 @@ static void instructionUseDef(const Instruction *instruction, uint16_t *uses,
 		uses[(*useCount)++] = instruction->c;
 		*define = instruction->a;
 		break;
+	case OP_GETUP:
+		// Register 0 of a block's frame IS the running closure (jit/Jit.c), so
+		// reading a capture reads a field of it.
+		uses[(*useCount)++] = 0;
+		*define = instruction->a;
+		break;
 	case OP_JUMP: case OP_SAFEPOINT:
 		break;
 	default:
-		break;
+		// Same contract as the emit switch below: ssaBuild refused everything
+		// this does not name before calling it. An opcode arriving here would
+		// contribute no uses and no definition, so the liveness -- and every
+		// deopt state derived from it -- would silently omit its registers.
+		fprintf(stderr, "ssaBuild: opcode %s is modelled but has no def/use\n",
+			opcodeName((Opcode) instruction->op));
+		FAIL();
 	}
 }
 
@@ -400,6 +414,43 @@ static void lower(Builder *builder, uint16_t bci)
 		break;
 	}
 
+	case OP_GETUP: {
+		// A CAPTURED VALUE, and modelling it as an ordinary tagged field read is
+		// only sound because a capture is IMMUTABLE. ADR 0008 is what makes it
+		// so: a variable that is captured and then ASSIGNED does not live in the
+		// closure at all, it gets a heap CELL and the closure captures the cell's
+		// address. So nothing ever writes captured[i] after the closure is built,
+		// and treating the read as pure -- which is what lets GVN and LICM move
+		// it -- cannot be invalidated by a store that does not exist.
+		//
+		// That reasoning does NOT extend to GETCELL, which is why the cell
+		// opcodes are still refused: a cell exists precisely to be written, and
+		// this optimizer's GVN has no memory effects yet.
+		IrValue *value = emit(builder, IR_FIELD_T);
+		irAddArg(function, value, readVariable(builder, 0, block));
+		value->extra = CLOSURE_CAPTURE_FIELD(instruction->b);
+		writeVariable(builder, instruction->a, block, value);
+		break;
+	}
+
+	case OP_GETGLOBAL: {
+		// The Association's VALUE, and the association itself never becomes an IR
+		// operand: it is a heap object that moves, so the backend reaches it the
+		// way tier 1 does, through the address of the unit's literal-frame field
+		// (jit/Jit.c). What the IR carries is the literal INDEX, which is stable.
+		IrValue *value = emit(builder, IR_GLOBAL);
+		value->extra = instruction->b;
+		writeVariable(builder, instruction->a, block, value);
+		break;
+	}
+
+	case OP_SETGLOBAL: {
+		IrValue *value = emit(builder, IR_SETGLOBAL);
+		irAddArg(function, value, readVariable(builder, instruction->b, block));
+		value->extra = instruction->a;
+		break;
+	}
+
 	case OP_SEND: case OP_SENDSUPER: {
 		IrValue *value = emit(builder, IR_SEND);
 		for (uint16_t i = 0; i <= instruction->n; i++) {
@@ -461,13 +512,70 @@ static void lower(Builder *builder, uint16_t bci)
 	}
 
 	default:
-		break;
+		// UNREACHABLE: ssaBuild refuses anything ssaModels does not name, before
+		// a single node is built. Reaching here means the two disagree, which is
+		// an opcode added to that list and not to this switch -- the silent drop
+		// this whole arrangement exists to prevent, so it stops here loudly.
+		fprintf(stderr, "ssaBuild: opcode %s is modelled but not emitted\n",
+			opcodeName((Opcode) instruction->op));
+		FAIL();
 	}
 }
 
 
-IrFunction *ssaBuild(CodeUnit *unit)
+// Every opcode this builder MODELS.
+//
+// A LIST, CHECKED UP FRONT, and not a `default:` arm in each of the two switches
+// above. Those both end in `default: break`, which for an opcode nobody taught
+// them means the instruction is SILENTLY SKIPPED: its effect vanishes from the
+// IR and its registers vanish from the liveness. That is not a missed
+// optimization, it is a method whose closure operations were dropped, answering
+// wrongly, with nothing anywhere reporting a problem.
+//
+// The bytecode grew after this builder was written. `CLOSURE`, `NEWCELL`,
+// `GETCELL`, `SETCELL`, `GETUP` and `SETUP` (ADR 0008) are exactly the opcodes
+// that arrived later and are not modelled here, which is why this check exists
+// before anything is built rather than as an assertion inside the walk: the
+// answer for those is REFUSE, by name, the same way jitCompile refuses an
+// opcode the template compiler does not implement.
+// THE LIST IS THE EMIT SWITCH'S, and getting that wrong is the mistake this
+// comment exists to stop. The first version of it was copied from the def/use
+// scanner above, which knows about five opcodes the emit switch does NOT build
+// anything for (GETGLOBAL, SETGLOBAL, NEW, NEWIDX, RETOUTER). Those would have
+// passed the check and then been dropped in silence, which is the exact defect
+// the check was added to remove -- so the emit switch now ABORTS on anything
+// that gets past here, and the two cannot drift apart quietly again.
+static _Bool ssaModels(Opcode op)
 {
+	switch (op) {
+	case OP_MOVE: case OP_LOADK: case OP_LOADI: case OP_LOADNIL:
+	case OP_LOADTRUE: case OP_LOADFALSE:
+	case OP_GETIVAR: case OP_SETIVAR:
+	case OP_GETUP:
+	case OP_GETGLOBAL: case OP_SETGLOBAL:
+	case OP_SEND: case OP_SENDSUPER:
+	case OP_JUMP: case OP_JUMPFALSE: case OP_JUMPTRUE: case OP_GUARDCLASS:
+	case OP_RET:
+	case OP_SAFEPOINT:
+		return 1;
+	default:
+		return 0;
+	}
+}
+
+
+IrFunction *ssaBuild(CodeUnit *unit, Opcode *unsupported)
+{
+	for (uint16_t i = 0; i < unit->instructionCount; i++) {
+		Opcode op = (Opcode) unit->code[i].op;
+		if (!ssaModels(op)) {
+			if (unsupported != NULL) {
+				*unsupported = op;
+			}
+			return NULL;
+		}
+	}
+
 	Builder builder;
 	memset(&builder, 0, sizeof(builder));
 	builder.function = irCreate(unit);

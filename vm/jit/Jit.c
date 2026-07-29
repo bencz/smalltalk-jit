@@ -517,6 +517,18 @@ static _Bool sendDoesNotUnderstand(IcCell *cell, Value *receiverSlot,
 }
 
 
+// The tier-2 dry run (jit/Tier2DryRun.c), reached through a WEAK no-op for the
+// same reason rootsVisitNativeFrames is: gate levels 3, 7 and 8 hand-link this
+// file with half a dozen others and no optimizer at all, and a hard reference to
+// SsaBuild from here would make those levels stop linking. That is not
+// hypothetical -- it is what happened the first time this was wired.
+__attribute__((weak))
+void tier2DryRun(CodeUnit *unit)
+{
+	(void) unit;
+}
+
+
 // ST_IC_STATS=1 reports, at exit, how many sends the inline cache served itself
 // and how many reached the runtime.
 //
@@ -1682,6 +1694,7 @@ NativeCode *jitCompileFor(const MacroAssemblerOps *ops, CodeUnit *unit,
 	// collection triggered between the calloc and here would walk a half-built
 	// entry.
 	compiledCodeRegister(code);
+	tier2DryRun(unit);
 	return code;
 }
 

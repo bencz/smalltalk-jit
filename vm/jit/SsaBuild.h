@@ -16,6 +16,9 @@
 #include "compiler/Bytecode.h"
 #include "jit/Ir.h"
 
-IrFunction *ssaBuild(CodeUnit *unit);
+// Answers NULL when the unit uses an opcode this builder does not model, and
+// says which through `unsupported`. Same contract as jitCompile, and for the
+// same reason: an opcode nobody taught it would otherwise be skipped in silence.
+IrFunction *ssaBuild(CodeUnit *unit, Opcode *unsupported);
 
 #endif

@@ -53,6 +53,8 @@ static const struct {
 	[IR_FIELD_F]   = { "fieldf",    REPR_F64,    1 },
 	[IR_SETFIELD_T]= { "setfieldt", REPR_VOID,   0 },
 	[IR_SETFIELD_F]= { "setfieldf", REPR_VOID,   0 },
+	[IR_GLOBAL]    = { "global",    REPR_TAGGED, 0 },
+	[IR_SETGLOBAL] = { "setglobal", REPR_VOID,   0 },
 	[IR_ALOAD]     = { "aload",     REPR_TAGGED, 1 },
 	[IR_ASTORE]    = { "astore",    REPR_VOID,   0 },
 	[IR_ALEN]      = { "alen",      REPR_I64,    1 },
@@ -77,6 +79,47 @@ static const struct {
 	[IR_BRANCH]    = { "branch",    REPR_VOID,   0 },
 	[IR_PHI]       = { "phi",       REPR_TAGGED, 1 },
 };
+
+
+// Reads mutable heap memory. Two of these are the same value only if nothing
+// wrote in between, which is the fact `pure` does not carry.
+_Bool irOpReadsMemory(IrOp op)
+{
+	switch (op) {
+	case IR_FIELD_T: case IR_FIELD_F:
+	case IR_ALOAD: case IR_VALOAD:
+	// The lengths are conservative: an array's length cannot change, so these
+	// two could be memoryless. Listed anyway, because the cost is one missed
+	// redundancy on a load nobody has measured and the alternative is a
+	// correctness argument carried in a comment.
+	case IR_ALEN: case IR_VALEN:
+		return 1;
+	default:
+		return 0;
+	}
+}
+
+
+// Writes memory, or might.
+//
+// IR_SEND is the one that matters: a residual dispatch runs arbitrary Smalltalk,
+// so every memory read after it is a different read from every one before it.
+// IR_SAFEPOINT is here for a less obvious reason -- execution can LEAVE at one
+// (ADR 0007) and another fiber can run and store, so a read cannot be carried
+// across one either.
+_Bool irOpWritesMemory(IrOp op)
+{
+	switch (op) {
+	case IR_SETFIELD_T: case IR_SETFIELD_F:
+	case IR_ASTORE: case IR_VASTORE:
+	case IR_SETGLOBAL:
+	case IR_SEND:
+	case IR_SAFEPOINT:
+		return 1;
+	default:
+		return 0;
+	}
+}
 
 
 Repr irOpRepr(IrOp op) { return gOps[op].repr; }
