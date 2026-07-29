@@ -28,6 +28,7 @@
 #include "tools/Project.h"
 #include "tools/Snapshot.h"
 #include <setjmp.h>
+#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -72,6 +73,76 @@ static int foldUnhandledErrors(int status)
 		return truncated != 0 ? truncated : 1;
 	}
 	return primitiveUnhandledErrorCount() > 0 ? 1 : 0;
+}
+
+
+// The session's default namespace, or NULL for Core.
+//
+// `st -f` and `-e` used to compile against CORE unconditionally, and that is
+// what made `st test` fail for every package: ProjectTool>>basicPrepareTests
+// builds a <Root>Tests namespace importing the package under test, points
+// `Namespace default:` at it, and hands the file list back -- and then the
+// files were compiled as if none of that had happened, so `Uuid` was looked up
+// in Core and answered nil. packages/Core/src/Compiler/Compiler.st states the
+// rule these paths were missing: a build with no explicit namespace falls back
+// to Namespace default.
+//
+// NULL IS CORE everywhere in this VM (core/Namespace.h), so a session that
+// never set one behaves exactly as before.
+static Namespace *sessionNamespace(void)
+{
+	Object *current = getGlobalObject("DefaultNamespace");
+	if (current == NULL || current->raw == Handles.nil.raw) {
+		return NULL;
+	}
+	Class *namespaceClass = getClass("Namespace");
+	if (namespaceClass == NULL
+			|| rawObjectClassIndex(current->raw) != classIndexOf(namespaceClass)) {
+		return NULL;
+	}
+	return (Namespace *) current;
+}
+
+
+// Run a freshly built class's own `class initialize`, if it declares one.
+//
+// THE PACKAGE LOADER ALREADY DID THIS AND `-f` DID NOT, which is why a file of
+// class definitions could not use a class variable: `Strength class initialize`
+// in benchmarks/DeltaBlue.st fills StrengthTable and StrengthConstants, and
+// with it never run every read of them answered nil -- surfacing four hundred
+// lines later as `#required is out of allowed range (1 to 0)`, an `at:` that
+// had fallen through to Object because the receiver was nil.
+//
+// ONLY THE CLASS THAT DEFINES ONE RUNS IT, which is the rule tools/Bootstrap.c
+// states and the one that cost this project a Transcript that was a Socket:
+// `initialize` is inherited through the metaclass chain like any other
+// class-side method, so sending it to every class runs an ancestor's with a
+// different `self`.
+//
+// IMMEDIATELY, not at the end of the file. A file is a SEQUENCE -- `[` opens a
+// block that is evaluated where it stands -- so a block may use the class
+// defined just above it, and deferring would make that read an uninitialised
+// one. The package loader defers because a package has no interleaved
+// evaluation to be wrong about.
+static void runClassInitializer(Class *class)
+{
+	if (class == NULL) {
+		return;
+	}
+	HandleScope scope;
+	openHandleScope(&scope);
+	Class *held = scopeHandle((RawObject *) class->raw);
+	RawClass *metaclass = classOf(objectTagged(held));
+	Value methods = metaclass == NULL ? 0 : metaclass->methodDictionary;
+	if (valueTypeOf(methods, VALUE_POINTER)) {
+		String *selector = asSymbol(stringFromC("initialize"));
+		Value own = symbolDictAt(scopeHandle(asObject(methods)), selector);
+		if (valueTypeOf(own, VALUE_POINTER)) {
+			_Bool understood = 0;
+			jitSendUnary(objectTagged(held), "initialize", &understood);
+		}
+	}
+	closeHandleScope(&scope, NULL);
 }
 
 
@@ -216,7 +287,9 @@ static Value runBody(BlockNode *body, const char *what, int *failed)
 
 	// No owner class: a top-level body has no instance variables to resolve
 	// against, and every name in it is either its own temporary or a global.
-	CompileContext context = { NULL, smalltalkGlobals(), NULL, NULL };
+	// The NAMESPACE is the session's, so a block in a test file sees the
+	// package under test exactly as a method of that package would.
+	CompileContext context = { NULL, smalltalkGlobals(), NULL, sessionNamespace() };
 	CompileError error;
 	CodeUnit *unit = compileMethod(node, &context, &error);
 	if (unit == NULL) {
@@ -289,8 +362,14 @@ static int runFile(const char *path)
 				printParseError(&parser, (char *) path);
 				failed = 1;
 			} else {
-				ClassBuildError error;
-				classBuild(node, &error);
+				ClassBuildError error = CLASS_BUILD_ERROR_NONE;
+				// INTO THE SESSION'S NAMESPACE, for the same reason the blocks
+				// above compile in it: a test file that defines a helper class
+				// must put it where the rest of the file can see it.
+				Class *built = classBuildIn(node, sessionNamespace(), &error);
+				if (error.message == NULL) {
+					runClassInitializer(built);
+				}
 				if (error.message != NULL) {
 					fprintf(stderr, "st: %s: %s", path, error.message);
 					if (error.what != NULL) {
@@ -354,7 +433,7 @@ static _Bool evalValue(const char *source, const char *what, Value *answer)
 	// The third field is spelled out rather than left to the implicit zero: it is
 	// classVariableScope, whose NULL means "same as ownerClass", and it is the
 	// field whose absence was silent the last time it was got wrong.
-	CompileContext context = { NULL, smalltalkGlobals(), NULL, NULL };
+	CompileContext context = { NULL, smalltalkGlobals(), NULL, sessionNamespace() };
 	CompileError error;
 	CodeUnit *unit = compileMethod(node, &context, &error);
 	freeParser(&parser);
@@ -465,6 +544,18 @@ int main(int argc, char **argv)
 		return 0;
 	}
 	resolveSnapshotPath(&cliArgs);
+
+	// THE PROGRAM'S ARGUMENTS, which is what `System arguments` answers: what
+	// is left of argv after the VM's own flags, exactly where Cli.h says it is
+	// (argv + argShift + optind). Handing over the already-parsed tail is what
+	// keeps the runtime from forming a second opinion about which words were
+	// the VM's -- and until this existed, `System arguments` failed and took
+	// `st new`, `st run` and every project end-to-end check down with it.
+	{
+		int consumed = cliArgs.argShift + optind;
+		int remaining = cliArgs.argcAdjusted - consumed;
+		primitiveSetCommandLine(remaining < 0 ? 0 : remaining, argv + consumed);
+	}
 
 	ProjectPlan plan = { 0, 0, 0, { 0 }, { 0 } };
 

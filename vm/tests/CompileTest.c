@@ -161,9 +161,8 @@ static void bootstrapKernel(Heap *heap)
 	Handles.true_.raw = ((Object *) newImmortalObject(&Handles.True, 0))->raw;
 	Handles.false_.raw = ((Object *) newImmortalObject(&Handles.False, 0))->raw;
 
-	gImmediateClasses.smallInteger = classIndexOf(&Handles.SmallInteger);
-	gImmediateClasses.character = classIndexOf(&Handles.Character);
-	gImmediateClasses.smallFloat = classIndexOf(&Handles.SmallFloat64);
+	classSetImmediateIndices(classIndexOf(&Handles.SmallInteger),
+		classIndexOf(&Handles.Character), classIndexOf(&Handles.SmallFloat64));
 
 	// The class-of-classes too: `Foo new` is a send whose RECEIVER is a class, so
 	// it is looked up in the class of that class, which is this one.

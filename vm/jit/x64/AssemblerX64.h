@@ -165,6 +165,23 @@ static inline void asmAddRegImm32(CodeBuffer *buffer, Register dst, int32_t valu
 }
 
 
+// [base + displacement] += value, sixty-four bits, WITHOUT a register.
+//
+// The inline cache bumps two counters per hit (the site's total and the way's),
+// and doing it through a register would be three instructions each plus a
+// scratch that has to survive the rest of the sequence. The counters are
+// uint64_t, so this is the REX.W form: a 32-bit add would wrap silently at four
+// billion sends, which a long-running program reaches.
+static inline void asmAddMemImm32(CodeBuffer *buffer, Register base,
+	int32_t displacement, int32_t value)
+{
+	emitRexW(buffer, (Register) 0, base);
+	emit8(buffer, 0x81);
+	emitModRmMem(buffer, (Register) 0, base, displacement);
+	emit32(buffer, (uint32_t) value);
+}
+
+
 static inline void asmSubRegImm32(CodeBuffer *buffer, Register dst, int32_t value)
 {
 	emitRexW(buffer, (Register) 5, dst);
@@ -242,6 +259,23 @@ static inline void asmMov32RegMem(CodeBuffer *buffer, Register dst, Register bas
 	}
 	emit8(buffer, 0x8B);
 	emitModRmMem(buffer, dst, base, displacement);
+}
+
+
+// [base + displacement] = src, THIRTY-TWO BITS. The inline cache writes the
+// argument's class index into its way with it: the field is uint32_t, and a
+// 64-bit store would take the neighbouring field with it.
+static inline void asmMov32MemReg(CodeBuffer *buffer, Register base,
+	int32_t displacement, Register src)
+{
+	if (src >= R8 || base >= R8) {
+		uint8_t rex = 0x40;
+		if (src >= R8) { rex |= 0x04; }
+		if (base >= R8) { rex |= 0x01; }
+		emit8(buffer, rex);
+	}
+	emit8(buffer, 0x89);
+	emitModRmMem(buffer, src, base, displacement);
 }
 
 

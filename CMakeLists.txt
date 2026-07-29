@@ -188,7 +188,9 @@ set(vmSources
 	vm/memory/PageSpace.c
 	vm/memory/RememberedSet.c
 	vm/memory/Roots.c
+	vm/runtime/Base64.c
 	vm/runtime/BigInt.c
+	vm/runtime/Json.c
 	vm/runtime/Closure.c
 	vm/runtime/Collection.c
 	vm/runtime/Dictionary.c
@@ -200,6 +202,7 @@ set(vmSources
 	# there for why the two answers differ.
 	vm/runtime/Primitive.c
 	vm/runtime/primitives/Atomics.c
+	vm/runtime/primitives/Base64.c
 	vm/runtime/primitives/Allocation.c
 	vm/runtime/primitives/Arithmetic.c
 	vm/runtime/primitives/Bits.c
@@ -208,13 +211,17 @@ set(vmSources
 	vm/runtime/primitives/Comparison.c
 	vm/runtime/primitives/Exceptions.c
 	vm/runtime/primitives/FileSystem.c
+	vm/runtime/primitives/FloatArray.c
 	vm/runtime/primitives/FloatMath.c
 	vm/runtime/primitives/Identity.c
+	vm/runtime/primitives/Json.c
+	vm/runtime/primitives/LargeInteger.c
 	vm/runtime/primitives/Indexed.c
 	vm/runtime/primitives/Method.c
 	vm/runtime/primitives/PrintValue.c
 	vm/runtime/primitives/Process.c
 	vm/runtime/primitives/Reflect.c
+	vm/runtime/primitives/Socket.c
 	vm/runtime/primitives/Streams.c
 	vm/runtime/primitives/System.c
 	vm/runtime/primitives/Strings.c

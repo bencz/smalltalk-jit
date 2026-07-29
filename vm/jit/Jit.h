@@ -80,10 +80,6 @@ typedef struct NativeCode {
 	// arity against the Abi being compiled for. Written once, here, and read by
 	// every caller: see the header comment.
 	_Bool wide;
-	// Every compiled unit, chained, so the collector can reach the heap
-	// references this structure holds outside the heap: the unit's literal
-	// frame and each cell's selector (memory/Roots.h, rootsVisitCompiledCode).
-	struct NativeCode *nextCompiled;
 } NativeCode;
 
 // Compile one unit. Returns NULL only if the unit uses an opcode this tier does

@@ -12,7 +12,11 @@
 
 #include "jit/x64/EmitterX64.h"
 #include "jit/x64/AssemblerX64.h"
+#include "jit/InlineCache.h"
+#include "jit/Jit.h"
 #include "core/Assert.h"
+#include "core/Class.h"
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -21,6 +25,19 @@
 #define X64_ACCUMULATOR RAX  // the value flowing between load and store
 #define X64_SCRATCH RCX      // second operand of a comparison, address scratch
 #define X64_FRAME RBP
+// Two more, for the inline cache only. They have to survive from the class
+// guard to the call, so they cannot be argument registers under EITHER ABI this
+// emitter serves, and they cannot be callee-saved or the sequence would owe a
+// save. R10 and R11 are neither under SysV or Win64 -- which is a fact about two
+// tables, so x64Send ASSERTS it rather than trusting this comment.
+//
+// TWO IS ALL THERE IS. RAX, R10 and R11 are the only registers with that
+// property, and the accumulator is one of them, which is why the callee's entry
+// point rides in the ACCUMULATOR across the argument marshalling instead of in a
+// register of its own: marshalling writes argument registers and nothing else,
+// so the accumulator is safe there and a third scratch would not exist to find.
+#define X64_CELL R11         // the site's IcCell
+#define X64_WAY R10          // the candidate way inside it, walked by the probe
 
 // The label pool GROWS. A label already handed out must never move, because
 // branches hold pointers to it, so the pool is a vector of pointers and each
@@ -306,6 +323,213 @@ void x64CallRuntime3(MacroAssembler *a, MaRuntimeFunction function,
 	}
 	// The result is already in the ABI's result register, which is also this
 	// backend's accumulator; a backend where they differ moves it here.
+}
+
+
+// ---- the inline cache ------------------------------------------------------
+
+// Byte offsets into the site's cell. Way ZERO is the only one the emitted code
+// reads, which is what icPromoteHottest exists to keep true.
+#define IC_OFF_SENDS  ((int32_t) offsetof(IcCell, sends))
+#define IC_OFF_WAYS   ((int32_t) offsetof(IcCell, ways))
+// And into one way, which a register walks along, so the block that commits to
+// a hit is emitted ONCE however many ways are tested.
+#define WAY_OFF_CLASS  ((int32_t) offsetof(IcWay, classIndex))
+#define WAY_OFF_ARG    ((int32_t) offsetof(IcWay, argClassIndex))
+#define WAY_OFF_COUNT  ((int32_t) offsetof(IcWay, count))
+#define WAY_OFF_TARGET ((int32_t) offsetof(IcWay, target))
+#define WAY_STRIDE     ((int32_t) sizeof(IcWay))
+
+
+// The class index of the value in `slot`, into X64_SCRATCH, clobbering the
+// accumulator.
+//
+// THE SAME TWO CASES AS classIndexOfValue (core/Class.h), in the same order and
+// out of the same table. A pointer answers from the low word of its own header,
+// which is the whole point of the class index living there (ADR 0005); anything
+// else answers from gClassIndexByTag. Emitting a switch over the three immediate
+// tags instead would be a second encoding of a fact the C already owns, and the
+// two would drift the first time a tag is added.
+static void emitClassIndexOfSlot(MacroAssembler *a, uint16_t slot)
+{
+	CodeBuffer *buffer = maBuffer(a);
+	MaLabel *immediate = x64NewLabel(a);
+	MaLabel *done = x64NewLabel(a);
+
+	asmMovRegMem(buffer, X64_ACCUMULATOR, X64_FRAME, slotOffset(slot));
+	asmMovRegReg(buffer, X64_SCRATCH, X64_ACCUMULATOR);
+	asmAnd32RegImm32(buffer, X64_SCRATCH, 3); // the tag, zero-extended
+	asmCmp32RegImm32(buffer, X64_SCRATCH, (uint32_t) VALUE_POINTER);
+	asmJcc(buffer, COND_NOT_EQUAL, (X64Label *) immediate);
+
+	// A heap object: untag, then read the class index out of the header's low
+	// word. Bits 22..31 there are identity hash, hence the mask.
+	asmSubRegImm32(buffer, X64_ACCUMULATOR, (int32_t) VALUE_POINTER);
+	asmMov32RegMem(buffer, X64_SCRATCH, X64_ACCUMULATOR, 0);
+	asmAnd32RegImm32(buffer, X64_SCRATCH, (uint32_t) OBJ_CLASS_MASK);
+	asmJmp(buffer, (X64Label *) done);
+
+	// An immediate: gClassIndexByTag[tag]. The scale is done with a shift and an
+	// add rather than a scaled-index addressing mode, because a shift and an add
+	// are what every backend this vocabulary targets already has.
+	x64Bind(a, immediate);
+	asmShlRegImm8(buffer, X64_SCRATCH, 2); // * sizeof(uint32_t)
+	asmMovRegImm64(buffer, X64_ACCUMULATOR,
+		(uint64_t) (uintptr_t) gClassIndexByTag);
+	asmAddRegReg(buffer, X64_ACCUMULATOR, X64_SCRATCH);
+	asmMov32RegMem(buffer, X64_SCRATCH, X64_ACCUMULATOR, 0);
+	x64Bind(a, done);
+}
+
+
+// A send: the monomorphic inline cache, and the runtime call it falls back to.
+//
+// WHAT THE FAST PATH IS ALLOWED TO SKIP, and what it is not. It skips the
+// lookup, the frame anchor and the C call. It does NOT skip the PROFILE, and
+// that is the whole difference between this and the fast path the previous VM
+// had: there, arithmetic that hit its fast path bypassed the cache entirely, so
+// the profile of an arithmetic site described exactly the executions that had
+// FAILED -- inverted, not merely incomplete (ADR 0004, ADR 0006). Here the hit
+// bumps the site's count and the way's, and records the argument's class the
+// same way icRecord does, so `a + b` still learns what `b` is. Three extra
+// memory operations buys a profile the optimizer can believe.
+//
+// NO FRAME ANCHOR, and that is not an omission. An anchor exists so a collection
+// triggered under a C frame can find the compiled frames beneath it; compiled
+// code calling compiled code leaves the saved-frame-pointer chain unbroken, so
+// the walk from whatever anchor is pushed deeper runs straight through this
+// frame. Anything in the callee that can allocate reaches the runtime through a
+// call that pushes one.
+//
+// WHICH CONVENTION THE CALLEE USES IS DECIDED HERE, statically. A send with n
+// arguments can only ever reach a method of arity n, and narrow-or-wide is a
+// function of the arity and the ABI alone, so the site knows it without a
+// runtime test -- and the runtime refuses to install a target that disagrees
+// (jit/Jit.c), which is what keeps this from being an assumption.
+// ST_NO_INLINE_CACHE=1 kill-switch: emit EXACTLY the pre-cache send sequence,
+// which is the runtime call and nothing else. Read once and cached.
+//
+// Two things need it. A performance claim needs the other side of the A/B, and
+// the profile claim needs more than that: the send counters have to come out
+// identical with the fast path on and off, and there is no way to check that
+// without being able to turn it off.
+static _Bool inlineCacheEnabled(void)
+{
+	static int enabled = -1;
+	if (enabled < 0) {
+		enabled = getenv("ST_NO_INLINE_CACHE") == NULL;
+	}
+	return enabled != 0;
+}
+
+
+void x64Send(MacroAssembler *a, const MaSendSite *site)
+{
+	CodeBuffer *buffer = maBuffer(a);
+	const Abi *abi = maAbi(a);
+
+	if (!inlineCacheEnabled()) {
+		x64CallRuntime3(a, site->miss, site->cell, site->receiverSlot,
+			site->missInteger);
+		return;
+	}
+
+	MaLabel *miss = x64NewLabel(a);
+	MaLabel *done = x64NewLabel(a);
+
+	// The two registers the sequence carries across the marshalling. Checked,
+	// not assumed: an argument register here would be overwritten by the
+	// marshalling on one ABI and not the other, which is the silent kind.
+	ASSERT(!abiUsesAsArgument(abi, X64_CELL));
+	ASSERT(!abiUsesAsArgument(abi, X64_WAY));
+	ASSERT(!abiUsesAsArgument(abi, X64_ACCUMULATOR));
+
+	MaLabel *found = x64NewLabel(a);
+	asmMovRegImm64(buffer, X64_CELL, (uint64_t) (uintptr_t) site->cell);
+	emitClassIndexOfSlot(a, site->receiverSlot);
+
+	// Walk the emitted ways, in order, with a REGISTER pointing at the candidate.
+	// The pointer is what lets the commit block below be emitted once no matter
+	// how many ways are tested; the alternative is that block duplicated per way,
+	// and the argument-class sequence inside it is the largest piece of the whole
+	// send.
+	//
+	// The LAST way branches to the miss and the others branch to the hit, so
+	// falling off the end of the walk means the last way matched. No jump is
+	// emitted for the common case of the first way matching except the one that
+	// skips the remaining compares.
+	asmLeaRegMem(buffer, X64_WAY, X64_CELL, IC_OFF_WAYS);
+	for (uint8_t way = 0; way < IC_EMITTED_WAYS; way++) {
+		if (way > 0) {
+			asmLeaRegMem(buffer, X64_WAY, X64_WAY, WAY_STRIDE);
+		}
+		asmMov32RegMem(buffer, X64_ACCUMULATOR, X64_WAY, WAY_OFF_CLASS);
+		asmCmpRegReg(buffer, X64_SCRATCH, X64_ACCUMULATOR);
+		if (way + 1 == IC_EMITTED_WAYS) {
+			asmJcc(buffer, COND_NOT_EQUAL, (X64Label *) miss);
+		} else {
+			asmJcc(buffer, COND_EQUAL, (X64Label *) found);
+		}
+	}
+	x64Bind(a, found);
+
+	// A way exists for the class before its target does: icRecord creates the
+	// way to profile with, and the target is filled in only once the lookup has
+	// run. So a null target is an ordinary state and not a broken one, and it
+	// means the same thing as a class mismatch -- go to the runtime. It is also
+	// what makes an UNUSED way harmless: a zeroed one carries class index 0,
+	// which some class really does have, and a null target is what stops that
+	// coincidence from being a call.
+	asmMovRegMem(buffer, X64_ACCUMULATOR, X64_WAY, WAY_OFF_TARGET);
+	asmCmpRegImm32(buffer, X64_ACCUMULATOR, 0);
+	asmJcc(buffer, COND_EQUAL, (X64Label *) miss);
+
+	// Committed. The counters move only now, because a miss reaches icRecord and
+	// bumping them before the decision would count this send twice.
+	asmAddMemImm32(buffer, X64_CELL, IC_OFF_SENDS, 1);
+	asmAddMemImm32(buffer, X64_WAY, WAY_OFF_COUNT, 1);
+	if (site->argumentCount > 0) {
+		// The first argument's class, kept as LAST SEEN exactly as icRecord
+		// keeps it. It clobbers the accumulator, so the target is re-read from
+		// the way afterwards rather than parked somewhere across it: one load
+		// against a fourth register this sequence would have to find.
+		emitClassIndexOfSlot(a, (uint16_t) (site->receiverSlot + 1));
+		asmMov32MemReg(buffer, X64_WAY, WAY_OFF_ARG, X64_SCRATCH);
+		asmMovRegMem(buffer, X64_ACCUMULATOR, X64_WAY, WAY_OFF_TARGET);
+	}
+
+	// The entry point, in the ACCUMULATOR, where it survives the marshalling
+	// below because that writes argument registers and nothing else.
+	asmMovRegMem(buffer, X64_ACCUMULATOR, X64_ACCUMULATOR,
+		(int32_t) offsetof(NativeCode, entry));
+
+	if (maWideForArity(abi, site->argumentCount)) {
+		// The wide convention wants one pointer to the receiver's slot, and the
+		// arguments already descend from it. Nothing is marshalled.
+		asmLeaRegMem(buffer, (Register) abi->argumentRegisters[0], X64_FRAME,
+			slotOffset(site->receiverSlot));
+	} else {
+		// Narrow: the receiver and each argument into the ABI's registers, in
+		// order. Consecutive bytecode registers are consecutive frame slots at
+		// DESCENDING addresses, which is the same walk the wide prologue does.
+		for (uint16_t i = 0; i <= site->argumentCount; i++) {
+			asmMovRegMem(buffer, (Register) abi->argumentRegisters[i], X64_FRAME,
+				slotOffset((uint16_t) (site->receiverSlot + i)));
+		}
+	}
+	// NO SHADOW SPACE, unlike a runtime call: the callee is compiled code, whose
+	// prologue moves its argument registers straight into its own frame and
+	// never spills them to the caller's. What the callee owes a C function it
+	// calls, its own call sequence reserves.
+	asmCallReg(buffer, X64_ACCUMULATOR);
+	asmJmp(buffer, (X64Label *) done);
+
+	x64Bind(a, miss);
+	x64CallRuntime3(a, site->miss, site->cell, site->receiverSlot,
+		site->missInteger);
+	x64Bind(a, done);
+	// Both arms leave the answer in the ABI's result register, which is this
+	// backend's accumulator, so the caller's storeSlot needs no help.
 }
 
 

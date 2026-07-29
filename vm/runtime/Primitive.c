@@ -89,6 +89,13 @@ WEAK_FRONTEND_PRIMITIVE(primMonitorEnter)
 WEAK_FRONTEND_PRIMITIVE(primMonitorEnterOn)
 WEAK_FRONTEND_PRIMITIVE(primMonitorExit)
 WEAK_FRONTEND_PRIMITIVE(primMonitorPark)
+WEAK_FRONTEND_PRIMITIVE(primSocketConnect)
+WEAK_FRONTEND_PRIMITIVE(primSocketBind)
+WEAK_FRONTEND_PRIMITIVE(primSocketAccept)
+WEAK_FRONTEND_PRIMITIVE(primSocketRead)
+WEAK_FRONTEND_PRIMITIVE(primSocketWrite)
+WEAK_FRONTEND_PRIMITIVE(primSocketSetNoDelay)
+WEAK_FRONTEND_PRIMITIVE(primSocketHostLookup)
 
 
 // Designated initialisers, so the array is indexed by the enum and a primitive

@@ -101,6 +101,22 @@ static void bootstrapClasses(Heap *heap)
 	Handles.Closure.raw = classCreate(object, NULL, CLOSURE_SHAPE)->raw;
 	Handles.Cell.raw = classCreate(object, NULL, CELL_SHAPE)->raw;
 
+	// THE CLASS OF EVERY METACLASS, and it is created HERE rather than waiting
+	// for packages/Core to declare it, because the first metaclass is made the
+	// moment the first class-side method is compiled -- which is inside the
+	// built-in kernel, long before any package is read. A MetaClass that arrived
+	// later would leave every metaclass built before it stamped as a plain
+	// Class, and the fixup pass to restamp them would have to identify them
+	// after the fact.
+	//
+	// It stamps the CLASS shape onto its instances, because its instances ARE
+	// classes: a metaclass's instance is the class it belongs to (core/Object.h,
+	// RawMetaClass). packages/Core reopens it as `MetaClass := ClassDescription
+	// [...]`, which sets the real superclass and adds the Smalltalk protocol
+	// while keeping this object's identity, exactly as it does for Object and
+	// Class.
+	Handles.MetaClass.raw = classCreate(object, NULL, CLASS_OF_CLASSES_SHAPE)->raw;
+
 	// The syntax tree is made of ORDINARY HEAP OBJECTS, so the parser cannot run
 	// until its classes exist. The field counts come from the structs in Ast.h;
 	// one too few and the parser writes past the object.
@@ -134,13 +150,13 @@ static void bootstrapClasses(Heap *heap)
 
 	// Immediates have no header, so their class is found by TAG rather than read
 	// out of the object.
-	gImmediateClasses.smallInteger = classIndexOf(&Handles.SmallInteger);
-	gImmediateClasses.character = classIndexOf(&Handles.Character);
-	gImmediateClasses.smallFloat = classIndexOf(&Handles.SmallFloat64);
+	classSetImmediateIndices(classIndexOf(&Handles.SmallInteger),
+		classIndexOf(&Handles.Character), classIndexOf(&Handles.SmallFloat64));
 
 	// The class-of-classes gets a method dictionary too: `Foo new` is a send
 	// whose RECEIVER is a class, so it is looked up in the class of that class.
 	withMethods(&Handles.ClassClass);
+	withMethods(&Handles.MetaClass);
 	withMethods(&Handles.ObjectClass);
 	withMethods(&Handles.SmallInteger);
 	withMethods(&Handles.Float);
@@ -162,6 +178,7 @@ static void nameClasses(void)
 {
 	nameClass(&Handles.ObjectClass, "Object");
 	nameClass(&Handles.ClassClass, "Class");
+	nameClass(&Handles.MetaClass, "MetaClass");
 	nameClass(&Handles.String, "String");
 	nameClass(&Handles.Symbol, "Symbol");
 	nameClass(&Handles.ByteArray, "ByteArray");

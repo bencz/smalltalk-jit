@@ -1890,8 +1890,14 @@ CodeUnit *compileMethod(MethodNode *method, const CompileContext *context,
 			rawStringSize(name->raw));
 		if (number == PRIM_NONE) {
 			error->status = COMPILE_UNKNOWN_PRIMITIVE;
-			error->what = name;
-			closeHandleScope(&outer, NULL);
+			// CARRIED OUT of the scope, not merely assigned. `name` is a handle
+			// in `outer`, so closing the scope releases the slot it lives in,
+			// and the caller prints error->what afterwards -- reading a handle
+			// that has been given back. It crashed INSIDE THE ERROR REPORT,
+			// which is the one place a crash costs most: the message stopped
+			// at `unknown primitive name '` and the process died without ever
+			// naming the primitive it could not find.
+			error->what = closeHandleScope(&outer, name);
 			return NULL;
 		}
 		primitive = (uint16_t) number;

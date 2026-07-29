@@ -13,6 +13,7 @@
 // missing without anybody noticing.
 
 #include "runtime/primitives/Shared.h"
+#include "runtime/String.h"
 #include "os/OsFile.h"
 
 
@@ -119,4 +120,110 @@ Value primStreamFlush(Value *args, uint64_t argc)
 	// Transcript. Measured as an infinite recursion on `last`.
 	(void) descriptor;
 	return primitiveReceiver(args);
+}
+
+
+// ---------------------------------------------------------------------------
+// Position, readiness, and the last error
+// ---------------------------------------------------------------------------
+
+// ExternalStream class>>position: descriptor
+Value primStreamGetPosition(Value *args, uint64_t argc)
+{
+	if (argc != 1) {
+		return PRIMITIVE_FAILED;
+	}
+	int descriptor;
+	if (!streamDescriptorOf(primitiveArgument(args, 0), &descriptor)) {
+		return PRIMITIVE_FAILED;
+	}
+	int64_t position = osFileGetPosition((OsFd) descriptor);
+	if (position < 0) {
+		return PRIMITIVE_FAILED; // a pipe or a terminal: the fallback signals
+	}
+	return tagInt((intptr_t) position);
+}
+
+
+// ExternalStream class>>position: descriptor to: anInteger
+Value primStreamSetPosition(Value *args, uint64_t argc)
+{
+	if (argc != 2) {
+		return PRIMITIVE_FAILED;
+	}
+	int descriptor;
+	Value position = primitiveArgument(args, 1);
+	if (!streamDescriptorOf(primitiveArgument(args, 0), &descriptor)
+			|| !valueTypeOf(position, VALUE_INT) || asCInt(position) < 0) {
+		return PRIMITIVE_FAILED;
+	}
+	if (!osFileSetPosition((OsFd) descriptor, (int64_t) asCInt(position))) {
+		return PRIMITIVE_FAILED;
+	}
+	return primitiveReceiver(args);
+}
+
+
+// ExternalStream class>>available: descriptor
+//
+// HOW MANY BYTES CAN BE READ WITHOUT BLOCKING, which is not the same question
+// as how long the file is: on a pipe or a socket it is what has arrived, and on
+// a regular file it is what is left from here to the end.
+Value primStreamAvailable(Value *args, uint64_t argc)
+{
+	if (argc != 1) {
+		return PRIMITIVE_FAILED;
+	}
+	int descriptor;
+	if (!streamDescriptorOf(primitiveArgument(args, 0), &descriptor)) {
+		return PRIMITIVE_FAILED;
+	}
+	int64_t available = osFileAvailable((OsFd) descriptor);
+	if (available < 0) {
+		return PRIMITIVE_FAILED;
+	}
+	return tagInt((intptr_t) available);
+}
+
+
+// IoError class>>last
+//
+// THE LAST OS ERROR AS AN EXCEPTION, carrying the system's own words. Every
+// stream and socket primitive in this VM fails silently and lets the kernel
+// signal `IoError last`, so this is the one place the errno actually becomes
+// readable -- and without it every I/O failure in the system reported the same
+// sentence, 'input/output error', whatever had gone wrong.
+//
+// It builds the exception rather than answering a String because that is what
+// the kernel's fallback does, and the two have to be interchangeable: a caller
+// writes `IoError last signal` and cannot be made to care which one answered.
+Value primLastIoError(Value *args, uint64_t argc)
+{
+	if (argc != 0) {
+		return PRIMITIVE_FAILED;
+	}
+	Class *ioError = receiverAsClass(primitiveReceiver(args));
+	if (ioError == NULL) {
+		return PRIMITIVE_FAILED;
+	}
+	// READ THE ERROR FIRST, before anything can allocate: allocating runs the
+	// collector, and a collection is entitled to make syscalls of its own.
+	char text[256];
+	osErrorMessage(osLastError(), text, sizeof text);
+
+	PRIMITIVE_ALLOCATES(args);
+	HandleScope scope;
+	openHandleScope(&scope);
+	Class *held = scopeHandle((RawObject *) ioError->raw);
+	Object *error = newObject(held, 0);
+	// messageText is the FIRST instance variable of every exception in this
+	// kernel: Exception.st declares `| messageText |` and nothing above it
+	// does. Through the barrier, because the String is young and the error may
+	// already have been promoted.
+	rawObjectStorePtr((RawObject *) error->raw, (Value *) error->raw->body,
+		(RawObject *) stringFromC(text)->raw);
+	Value answer = objectTagged(error);
+	closeHandleScope(&scope, NULL);
+	PRIMITIVE_DONE_ALLOCATING();
+	return answer;
 }

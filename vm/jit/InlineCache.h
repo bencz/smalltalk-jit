@@ -28,6 +28,24 @@ struct NativeCode;
 
 #define IC_MAX_WAYS 6
 
+// How many ways the EMITTED cache tests before giving up and calling the
+// runtime. The backend emits this many compares and icPromoteHottest orders
+// exactly this many positions, so it is one constant and not two that have to
+// agree.
+//
+// TWO, and the number came from measuring rather than from taste. With one way,
+// 5.4% of Richards' sends missed and 9.5% of MixedArith's, and reading the cells
+// afterwards said where those went: 100% of them to the site's SECOND class in
+// both, and zero to a third. Mixed arithmetic is the clearest case -- `a + b`
+// alternating between SmallInteger and Float is two classes at one site by
+// construction, which is exactly the shape a one-way cache cannot hold and the
+// shape ADR 0006 says the profile exists to see.
+//
+// Raising it further is a code-size decision that needs its own measurement:
+// each way is about five more instructions at EVERY send site, paid by the many
+// monomorphic sites to help the few polymorphic ones.
+#define IC_EMITTED_WAYS 2
+
 typedef struct {
 	uint32_t classIndex;    // receiver class this way matches
 	uint32_t argClassIndex; // dominant class of the first argument here
@@ -59,6 +77,19 @@ typedef struct IcCell {
 
 // Record one execution and answer the way it belongs to, creating it when the
 // class is new and there is room.
+//
+// TWO IMPLEMENTATIONS OF THIS COUNTING EXIST, and that is worth stating plainly
+// because it is the shape of defect this VM keeps paying for. This one runs on a
+// MISS; the send site's emitted fast path (the backend's `send` operation) does
+// the same three updates inline on a HIT -- the site's total, the way's count,
+// and the argument's class as last seen. They have to agree, and a fast path
+// that quietly stopped counting is precisely how the previous VM ended up with
+// arithmetic profiles that described only the executions which had FAILED.
+//
+// WHAT KEEPS THEM HONEST is not review, it is a comparison anyone can run: a
+// deterministic program under ST_IC_STATS=1 must report the SAME send total with
+// the fast path on and with ST_NO_INLINE_CACHE=1. Change either half without the
+// other and that equality breaks.
 IcWay *icRecord(IcCell *cell, uint32_t receiverClass, uint32_t argumentClass);
 
 // The dominant receiver class and the fraction of executions it accounts for.

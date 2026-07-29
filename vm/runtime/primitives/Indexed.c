@@ -164,3 +164,109 @@ Value primAtPut(Value *args, uint64_t argc)
 		return value;
 	}
 }
+
+
+// ---------------------------------------------------------------------------
+// Named instance variables, by index
+// ---------------------------------------------------------------------------
+//
+// `instVarAt:` reaches the NAMED slots -- the ones a class declares in its
+// `| a b c |` -- and never the indexed elements, which is what `at:` above is
+// for. An Array has three named slots and a thousand elements or none at all,
+// and the two are numbered separately.
+//
+// WHERE THEY START DEPENDS ON THE FORMAT and the class agrees with the
+// collector's own walk (memory/ObjectWalk.h, objectPointerSlots):
+//
+//   POINTERS          body word 0, `fixedSlots` of them;
+//   INDEXED_POINTERS  body word 1, after the element count, `fixedSlots` of
+//                     them, and the elements follow;
+//   MIXED_BYTES       after `rawWords`, `pointerWords` of them: a class, whose
+//                     named slots are its mirror fields;
+//   everything else   NONE. A BoxedFloat64's body word is an IEEE double and a
+//                     String's is text; handing either back as a Value would be
+//                     a fabricated object pointer, which is the one answer a
+//                     reflective accessor must never give.
+static Value *namedSlots(RawObject *object, size_t *count)
+{
+	RawClass *class = (RawClass *) classTableAt(&CurrentThread.heap->classes,
+		rawObjectClassIndex(object));
+	if (class == NULL) {
+		*count = 0;
+		return NULL;
+	}
+	InstanceShape shape = class->instanceShape;
+	Value *body = (Value *) object->body;
+	switch (rawObjectFormat(object)) {
+	case FORMAT_POINTERS:
+		*count = shape.fixedSlots;
+		return body;
+	case FORMAT_INDEXED_POINTERS:
+		*count = shape.fixedSlots;
+		return body + 1; // past the element count
+	case FORMAT_MIXED_BYTES:
+		*count = shape.pointerWords;
+		return body + shape.rawWords;
+	default:
+		*count = 0;
+		return NULL;
+	}
+}
+
+
+// Object>>instVarAt: anInteger
+Value primInstVarAt(Value *args, uint64_t argc)
+{
+	if (argc != 1) {
+		return PRIMITIVE_FAILED;
+	}
+	Value receiver = primitiveReceiver(args);
+	Value index = primitiveArgument(args, 0);
+	if (!valueTypeOf(receiver, VALUE_POINTER) || !valueTypeOf(index, VALUE_INT)) {
+		return PRIMITIVE_FAILED;
+	}
+	size_t count;
+	Value *slots = namedSlots(asObject(receiver), &count);
+	intptr_t i = asCInt(index);
+	if (slots == NULL || i < 1 || (size_t) i > count) {
+		return PRIMITIVE_FAILED; // the kernel raises with the honest range
+	}
+	// The allocator's ZERO reads back as nil, because a slot nothing has set is
+	// ABSENT in the VM and there is no such thing in Smalltalk (memory/Heap.c).
+	// Answering the raw zero would hand the image a SmallInteger 0 where it can
+	// only mean "not set", which is a wrong answer rather than a missing one.
+	Value value = slots[i - 1];
+	return valueTypeOf(value, VALUE_POINTER) ? value : tagPtr(Handles.nil.raw);
+}
+
+
+// Object>>instVarAt: anInteger put: anObject
+//
+// THROUGH THE BARRIER, and that is the whole reason this cannot be done from
+// Smalltalk: storing a young object into a slot of an old one has to be
+// remembered, and only C is on that side of the line.
+Value primInstVarAtPut(Value *args, uint64_t argc)
+{
+	if (argc != 2) {
+		return PRIMITIVE_FAILED;
+	}
+	Value receiver = primitiveReceiver(args);
+	Value index = primitiveArgument(args, 0);
+	if (!valueTypeOf(receiver, VALUE_POINTER) || !valueTypeOf(index, VALUE_INT)) {
+		return PRIMITIVE_FAILED;
+	}
+	RawObject *object = asObject(receiver);
+	size_t count;
+	Value *slots = namedSlots(object, &count);
+	intptr_t i = asCInt(index);
+	if (slots == NULL || i < 1 || (size_t) i > count) {
+		return PRIMITIVE_FAILED;
+	}
+	Value value = primitiveArgument(args, 1);
+	if (valueTypeOf(value, VALUE_POINTER)) {
+		rawObjectStorePtr(object, &slots[i - 1], asObject(value));
+	} else {
+		slots[i - 1] = value;
+	}
+	return value;
+}

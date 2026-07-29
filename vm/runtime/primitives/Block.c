@@ -12,39 +12,89 @@
 #include "runtime/primitives/Shared.h"
 #include "jit/CompiledMethod.h"
 #include "runtime/Closure.h"
+#include "runtime/Collection.h"
+#include <stdlib.h>
 
 
-static Value enterClosure(Value *args, uint64_t argc)
+// The closure's compiled code, or NULL when the receiver is not a closure, its
+// arity does not match, or the tier cannot compile it.
+static RawCompiledMethod *runnableClosure(Value receiver, uint64_t argc)
 {
-	Value receiver = primitiveReceiver(args);
 	if (!isClosure(receiver)) {
-		return PRIMITIVE_FAILED;
+		return NULL;
 	}
 	RawClosure *closure = (RawClosure *) asObject(receiver);
 	RawCompiledMethod *method = (RawCompiledMethod *) asObject(closure->method);
 	if (method->unit->argumentCount != argc) {
-		return PRIMITIVE_FAILED; // wrong number of arguments for this block
+		return NULL; // wrong number of arguments for this block
 	}
 	if (method->native == NULL) {
 		Opcode unsupported;
 		method->native = jitCompile(method->unit, &unsupported);
 		if (method->native == NULL) {
-			return PRIMITIVE_FAILED;
+			return NULL;
 		}
 	}
-	// Re-read the receiver: compiling allocates nothing on the heap today, but
-	// entering the block certainly does, and the value handed to jitCall has to
-	// be the current one.
-	receiver = primitiveReceiver(args);
-	switch (argc) {
-	case 0:
-		return jitCall0(method->native, receiver);
-	case 1:
-		return jitCall1(method->native, receiver, primitiveArgument(args, 0));
-	default:
-		return jitCall2(method->native, receiver, primitiveArgument(args, 0),
-			primitiveArgument(args, 1));
+	return method;
+}
+
+
+// Enter a closure with `count` arguments, given ASCENDING in `values`.
+//
+// ONE PLACE THAT KNOWS BOTH CALLING CONVENTIONS, so `value:`, `value:value:`
+// and `valueWithArguments:` cannot drift apart on which one a given block uses.
+// A block whose arity passes the ABI's argument registers is compiled WIDE and
+// takes a pointer to a descending argument block instead (jit/Jit.h); the
+// closure itself is register 0 of the block's frame either way, which is how
+// GETUP reaches the captured values with one load.
+//
+// NOTHING ALLOCATES between laying out that block and the call, which is what
+// makes a malloc'd buffer of bare Values safe here: the callee's prologue copies
+// them into its own frame slots before any Smalltalk runs.
+static Value enterClosureWith(Value receiver, RawCompiledMethod *method,
+	const Value *values, uint64_t count)
+{
+	if (method->native->wide) {
+		Value *block = malloc((size_t) (count + 1) * sizeof(Value));
+		if (block == NULL) {
+			return PRIMITIVE_FAILED;
+		}
+		block[count] = receiver; // the receiver is HIGHEST, arguments descend
+		for (uint64_t i = 0; i < count; i++) {
+			block[count - 1 - i] = values[i];
+		}
+		Value answer = jitCallWide(method->native, &block[count]);
+		free(block);
+		return answer;
 	}
+	switch (count) {
+	case 0: return jitCall0(method->native, receiver);
+	case 1: return jitCall1(method->native, receiver, values[0]);
+	case 2: return jitCall2(method->native, receiver, values[0], values[1]);
+	case 3: return jitCall3(method->native, receiver, values[0], values[1], values[2]);
+	case 4: return jitCall4(method->native, receiver, values[0], values[1], values[2],
+		values[3]);
+	default: return jitCall5(method->native, receiver, values[0], values[1], values[2],
+		values[3], values[4]);
+	}
+}
+
+
+// `value`, `value:`, `value:value:` and `value:value:value:`: the arguments are
+// in this primitive's own frame slots.
+static Value enterClosure(Value *args, uint64_t argc)
+{
+	RawCompiledMethod *method = runnableClosure(primitiveReceiver(args), argc);
+	if (method == NULL) {
+		return PRIMITIVE_FAILED;
+	}
+	// READ OUT OF THE FRAME AFTER compiling and with nothing allocating after:
+	// a frame slot is a root the collector updates, a copy of one is not.
+	Value values[JIT_MAX_NARROW_ARGS];
+	for (uint64_t i = 0; i < argc && i < JIT_MAX_NARROW_ARGS; i++) {
+		values[i] = primitiveArgument(args, i);
+	}
+	return enterClosureWith(primitiveReceiver(args), method, values, argc);
 }
 
 
@@ -79,6 +129,60 @@ Value primClosureValue2(Value *args, uint64_t argc)
 	}
 	PRIMITIVE_ALLOCATES(args);
 	Value answer = enterClosure(args, 2);
+	PRIMITIVE_DONE_ALLOCATING();
+	return answer;
+}
+
+
+Value primClosureValue3(Value *args, uint64_t argc)
+{
+	if (argc != 3) {
+		return PRIMITIVE_FAILED;
+	}
+	PRIMITIVE_ALLOCATES(args);
+	Value answer = enterClosure(args, 3);
+	PRIMITIVE_DONE_ALLOCATING();
+	return answer;
+}
+
+
+// Block>>valueWithArguments: anArray
+//
+// NO ARITY CEILING, because the arguments never become C arguments: a block
+// past the register set is entered through the wide convention, which takes one
+// pointer however many there are. The positional `value:` family stops at three
+// because that is where the kernel's selectors stop, not because of the ABI.
+Value primClosureValueArgs(Value *args, uint64_t argc)
+{
+	if (argc != 1) {
+		return PRIMITIVE_FAILED;
+	}
+	Value arguments = primitiveArgument(args, 0);
+	if (!valueTypeOf(arguments, VALUE_POINTER)
+			|| rawObjectFormat(asObject(arguments)) != FORMAT_INDEXED_POINTERS) {
+		return PRIMITIVE_FAILED;
+	}
+	size_t count = rawObjectElementCount(asObject(arguments));
+	PRIMITIVE_ALLOCATES(args);
+	RawCompiledMethod *method = runnableClosure(primitiveReceiver(args), count);
+	if (method == NULL) {
+		PRIMITIVE_DONE_ALLOCATING();
+		return PRIMITIVE_FAILED; // wrong arity: the kernel's fallback raises
+	}
+	// The Array is re-read HERE, after compiling, and copied out with nothing
+	// allocating before the call: entering the block allocates, and an Array
+	// address taken earlier would be one a collection may have moved.
+	Value *values = malloc((count == 0 ? 1 : count) * sizeof(Value));
+	if (values == NULL) {
+		PRIMITIVE_DONE_ALLOCATING();
+		return PRIMITIVE_FAILED;
+	}
+	RawArray *array = (RawArray *) asObject(primitiveArgument(args, 0));
+	for (size_t i = 0; i < count; i++) {
+		values[i] = array->vars[i];
+	}
+	Value answer = enterClosureWith(primitiveReceiver(args), method, values, count);
+	free(values);
 	PRIMITIVE_DONE_ALLOCATING();
 	return answer;
 }

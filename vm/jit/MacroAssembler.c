@@ -81,11 +81,17 @@ const Abi *maAbi(MacroAssembler *assembler) { return assembler->ops->abi; }
 // through positional entry points and there are only six of them
 // (JIT_MAX_NARROW_ARGS), so a method past that is wide even on an ABI with the
 // registers to carry it: narrow code nothing can call is not an improvement.
+_Bool maWideForArity(const Abi *abi, uint16_t argumentCount)
+{
+	uint32_t incoming = (uint32_t) argumentCount + 1;
+	return incoming > (uint32_t) JIT_MAX_NARROW_ARGS + 1
+		|| incoming > abi->argumentRegisterCount;
+}
+
+
 _Bool maUsesWideArguments(MacroAssembler *assembler)
 {
-	uint32_t incoming = (uint32_t) assembler->argumentCount + 1;
-	return incoming > (uint32_t) JIT_MAX_NARROW_ARGS + 1
-		|| incoming > assembler->ops->abi->argumentRegisterCount;
+	return maWideForArity(assembler->ops->abi, assembler->argumentCount);
 }
 
 
@@ -103,17 +109,27 @@ const MacroAssemblerOps *maBackendNamed(const char *name)
 
 const MacroAssemblerOps *maHostBackend(void)
 {
+	// CACHED, because this stopped being a question asked once per compilation.
+	// Arming an inline cache asks it on every miss to check the callee's calling
+	// convention, and the lookup underneath is a strcmp walk over the backend
+	// table: free at a thousand calls, MEASURED at a hundred million (it was 14%
+	// of the send path when the check was first added).
+	static const MacroAssemblerOps *host;
+	if (host != NULL) {
+		return host;
+	}
 #if defined(__x86_64__)
-	return maBackendNamed("x64");
+	host = maBackendNamed("x64");
 #elif defined(__aarch64__)
-	return maBackendNamed("arm64");
+	host = maBackendNamed("arm64");
 #elif defined(__powerpc64__) && defined(__LITTLE_ENDIAN__)
-	return maBackendNamed("ppc64le");
+	host = maBackendNamed("ppc64le");
 #elif defined(__powerpc64__)
-	return maBackendNamed("ppc64");
+	host = maBackendNamed("ppc64");
 #else
 #error "no macro assembler backend for this host - see docs/adr/0009"
 #endif
+	return host;
 }
 
 
@@ -166,6 +182,12 @@ void maCallRuntime3(MacroAssembler *a, MaRuntimeFunction function,
 	void *pointerArg, uint16_t slotAddressArg, uint64_t integerArg)
 {
 	a->ops->callRuntime3(a, function, pointerArg, slotAddressArg, integerArg);
+}
+
+
+void maSend(MacroAssembler *a, const MaSendSite *site)
+{
+	a->ops->send(a, site);
 }
 
 

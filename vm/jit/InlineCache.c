@@ -81,15 +81,26 @@ void icPromoteHottest(IcCell *cell)
 	if (cell->wayCount < 2) {
 		return;
 	}
-	uint8_t hottest = 0;
-	for (uint8_t i = 1; i < cell->wayCount; i++) {
-		if (cell->ways[i].count > cell->ways[hottest].count) {
-			hottest = i;
+	// The emitted cache tests ways 0..IC_EMITTED_WAYS-1 in order, so those
+	// positions have to HOLD the hottest classes or the fast path spends its
+	// compares on classes the site rarely sees.
+	//
+	// A selection pass over just those positions, not a sort of the whole array:
+	// what is below them is never read by compiled code, so ordering it would be
+	// work with no reader.
+	uint8_t ordered = IC_EMITTED_WAYS < cell->wayCount
+		? IC_EMITTED_WAYS : cell->wayCount;
+	for (uint8_t position = 0; position < ordered; position++) {
+		uint8_t hottest = position;
+		for (uint8_t i = (uint8_t) (position + 1); i < cell->wayCount; i++) {
+			if (cell->ways[i].count > cell->ways[hottest].count) {
+				hottest = i;
+			}
 		}
-	}
-	if (hottest != 0) {
-		IcWay swap = cell->ways[0];
-		cell->ways[0] = cell->ways[hottest];
-		cell->ways[hottest] = swap;
+		if (hottest != position) {
+			IcWay swap = cell->ways[position];
+			cell->ways[position] = cell->ways[hottest];
+			cell->ways[hottest] = swap;
+		}
 	}
 }

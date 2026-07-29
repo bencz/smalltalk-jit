@@ -73,8 +73,95 @@ void codeSpacePublish(uint8_t *destination, const uint8_t *bytes, size_t size)
 // answers doesNotUnderstand for a method that plainly exists, starting at the
 // first collection and never before it.
 
-static NativeCode *gCompiledCode;
+// EVERY COMPILED UNIT, IN ONE STRUCTURE: an array kept sorted by entry address.
+//
+// It answers two different questions, and the second is why this is an array and
+// not the linked list it replaces. The root walk and the cache flush ITERATE it,
+// which a list did fine. jitCodeContaining SEARCHES it, and that one is called
+// by compiledFrameEnter, which the send path runs on EVERY message: a linear
+// scan there is O(methods compiled) per send.
+//
+// MEASURED, because the comment that used to sit on the scan said it "runs once
+// per frame per collection, not per send" and that had stopped being true: at
+// the time this was written it was 42.75% of all cycles in Richards, the largest
+// single item in the profile by a factor of five. The shape is what made it easy
+// to miss -- the cost is proportional to how much of the kernel has been
+// compiled, so it is invisible in a small test and dominant in a real program,
+// which is also why the test suite cost more than the benchmarks did.
+//
+// ONE structure and not two, deliberately. An index kept ALONGSIDE the list
+// would be a second registration that a future caller can forget, and the miss
+// is silent in the worst way: jitCodeContaining answering NULL for a live frame
+// ends that segment of the root walk early, so the collector evacuates objects
+// a running frame still holds. Registration has one place because there is one
+// place to register in.
+static NativeCode **gCompiledCode;
+static size_t gCompiledCount;
+static size_t gCompiledCapacity;
 static CodeUnit *gRegisteredUnits;
+
+
+// The number of entries whose code starts at or below `pointer`. Both the
+// search and the insertion point come from this, because the ranges are
+// disjoint: the only entry that can contain an address is the last one that
+// starts at or below it.
+static size_t compiledCodeUpperBound(const uint8_t *pointer)
+{
+	size_t low = 0;
+	size_t high = gCompiledCount;
+	while (low < high) {
+		size_t middle = low + (high - low) / 2;
+		if (gCompiledCode[middle]->entry <= pointer) {
+			low = middle + 1;
+		} else {
+			high = middle;
+		}
+	}
+	return low;
+}
+
+
+static void compiledCodeRegister(NativeCode *code)
+{
+	// A zero-length range would let two entries share a start address, and then
+	// "the last one that starts at or below" stops naming one entry.
+	ASSERT(code->size > 0);
+	if (gCompiledCount == gCompiledCapacity) {
+		size_t capacity = gCompiledCapacity == 0 ? 64 : gCompiledCapacity * 2;
+		NativeCode **grown = realloc(gCompiledCode, capacity * sizeof(*grown));
+		if (grown == NULL) {
+			FAIL(); // clean error: silence here is a root walk that stops early
+		}
+		gCompiledCode = grown;
+		gCompiledCapacity = capacity;
+	}
+	size_t index = compiledCodeUpperBound(code->entry);
+	// DISJOINT AND SORTED is what the search depends on, and these are ASSERTs
+	// rather than tests because the failure mode is silence: an overlapping range
+	// makes the search answer the WRONG method for a return address, and the
+	// wrong method's frame map is what the collector then walks.
+	ASSERT(index == 0 || gCompiledCode[index - 1]->entry
+		+ gCompiledCode[index - 1]->size <= code->entry);
+	ASSERT(index == gCompiledCount
+		|| code->entry + code->size <= gCompiledCode[index]->entry);
+	memmove(&gCompiledCode[index + 1], &gCompiledCode[index],
+		(gCompiledCount - index) * sizeof(*gCompiledCode));
+	gCompiledCode[index] = code;
+	gCompiledCount++;
+}
+
+
+static void compiledCodeUnregister(NativeCode *code)
+{
+	size_t index = compiledCodeUpperBound(code->entry);
+	if (index == 0 || gCompiledCode[index - 1] != code) {
+		return;
+	}
+	index--;
+	memmove(&gCompiledCode[index], &gCompiledCode[index + 1],
+		(gCompiledCount - index - 1) * sizeof(*gCompiledCode));
+	gCompiledCount--;
+}
 
 
 // A unit is registered when it is BUILT, not when it is compiled, and the
@@ -111,7 +198,8 @@ void rootsVisitCompiledCode(RootVisitor visit, void *ctx)
 		visitUnitField(visit, ctx, &unit->selector);
 		visitUnitField(visit, ctx, &unit->ownerClass);
 	}
-	for (NativeCode *code = gCompiledCode; code != NULL; code = code->nextCompiled) {
+	for (size_t index = 0; index < gCompiledCount; index++) {
+		NativeCode *code = gCompiledCode[index];
 		// The cells' selectors are UNTAGGED, so they are tagged for the visit
 		// and written back, exactly as the class table does for its entries.
 		for (uint16_t i = 0; i < code->unit->instructionCount; i++) {
@@ -144,31 +232,83 @@ void rootsVisitCompiledCode(RootVisitor visit, void *ctx)
 // "which code does this class dispatch to", not "which classes has this site
 // seen": the profile is what the optimizer learns from, and throwing it away
 // would make a dev-time reload cost the tier its accumulated knowledge for no
-// correctness reason. wayCount going to zero is enough, because a way is
-// rebuilt by the next send through the ordinary lookup.
+// correctness reason.
+//
+// EVERY TARGET IS CLEARED, not just the way count. Zeroing wayCount alone was
+// enough while the runtime was the only reader, because the next icRecord starts
+// over at way 0. It stopped being enough the moment the EMITTED code grew a fast
+// path: that path reads way 0's class and target without consulting wayCount, so
+// a stale target would stay armed inside compiled code and keep calling the
+// method that was just replaced. Same wrong ANSWER this function exists to
+// prevent, reached by the half of the system that was added after the comment.
 void jitFlushSendCaches(void)
 {
-	for (NativeCode *code = gCompiledCode; code != NULL; code = code->nextCompiled) {
+	for (size_t index = 0; index < gCompiledCount; index++) {
+		NativeCode *code = gCompiledCode[index];
 		for (uint16_t i = 0; i < code->unit->instructionCount; i++) {
 			code->cells[i].wayCount = 0;
+			for (uint8_t way = 0; way < IC_MAX_WAYS; way++) {
+				code->cells[i].ways[way].target = NULL;
+			}
 		}
 	}
+}
+
+
+// The same question answered the slow way: every range tested, order and
+// disjointness assumed nowhere. It exists to be an INDEPENDENT oracle for the
+// search below, which is why it walks the array rather than sharing any part of
+// it.
+static NativeCode *compiledCodeContainingLinear(const uint8_t *pointer)
+{
+	for (size_t index = 0; index < gCompiledCount; index++) {
+		NativeCode *code = gCompiledCode[index];
+		if (pointer >= code->entry && pointer < code->entry + code->size) {
+			return code;
+		}
+	}
+	return NULL;
+}
+
+
+// ST_JIT_CODE_MAP_CHECK=1 answers every query BOTH ways and compares.
+//
+// The knob exists because the invariant the search rests on is one no test can
+// see. If the array ever went out of order, or two ranges overlapped, the search
+// would answer the WRONG method for a return address rather than no method at
+// all, and the wrong method's frame map is what the collector would then walk:
+// silent corruption, arbitrarily far from the cause. Read once and cached; unset
+// is the default and costs one predictable branch.
+static _Bool codeMapCheckEnabled(void)
+{
+	static int enabled = -1;
+	if (enabled < 0) {
+		enabled = getenv("ST_JIT_CODE_MAP_CHECK") != NULL;
+	}
+	return enabled != 0;
 }
 
 
 NativeCode *jitCodeContaining(const void *address)
 {
 	const uint8_t *pointer = address;
-	// A linear scan. Correct and, for now, cheap enough: it runs once per frame
-	// per collection, not per send. A sorted array of ranges is the obvious
-	// replacement once there are thousands of methods, and the interface here
-	// does not change when it arrives.
-	for (NativeCode *code = gCompiledCode; code != NULL; code = code->nextCompiled) {
-		if (pointer >= code->entry && pointer < code->entry + code->size) {
-			return code;
+	// The ranges are disjoint and sorted, so the only entry that can contain
+	// `pointer` is the last one that starts at or below it. One comparison after
+	// the search, and a miss is the same NULL the scan answered: an address in
+	// no compiled method is the boundary where C called in, which is a normal
+	// answer and not an error.
+	size_t index = compiledCodeUpperBound(pointer);
+	NativeCode *found = NULL;
+	if (index > 0) {
+		NativeCode *code = gCompiledCode[index - 1];
+		if (pointer < code->entry + code->size) {
+			found = code;
 		}
 	}
-	return NULL;
+	if (codeMapCheckEnabled()) {
+		ASSERT(found == compiledCodeContainingLinear(pointer));
+	}
+	return found;
 }
 
 
@@ -240,6 +380,25 @@ void compiledFrameLeave(const CompiledFrameGuard *guard)
 {
 	ASSERT(CurrentThread.compiledFrames == guard);
 	CurrentThread.compiledFrames = guard->previous;
+}
+
+
+// Anchor a frame whose caller IS compiled code. That is what the three runtime
+// helpers the template emits calls to have in common, and what a primitive does
+// NOT have: PRIMITIVE_ALLOCATES is legitimately reached from C as well, so it
+// anchors through compiledFrameEnter directly and a NULL there is an answer.
+//
+// The ASSERT enforces the one failure the registration design above ARGUES away
+// rather than checks: a NativeCode that runs but never entered the array.
+// jitCodeContaining would answer NULL, this frame would be anchored with no
+// code, and rootsVisitNativeFrames ends the segment exactly there -- so the
+// collector evacuates objects a running frame still holds, arbitrarily far from
+// the cause. A named abort at the first send beats that.
+static void compiledFrameEnterFromCompiled(CompiledFrameGuard *guard,
+	Value *slotAddress, uint16_t slotIndex, void *returnAddress)
+{
+	compiledFrameEnter(guard, slotAddress, slotIndex, returnAddress);
+	ASSERT(guard->code != NULL);
 }
 
 // ---------------------------------------------------------------------------
@@ -358,6 +517,121 @@ static _Bool sendDoesNotUnderstand(IcCell *cell, Value *receiverSlot,
 }
 
 
+// ST_IC_STATS=1 reports, at exit, how many sends the inline cache served itself
+// and how many reached the runtime.
+//
+// It exists because the two things worth doubting about a fast path are exactly
+// the two a benchmark cannot tell apart. FIRST, is it taken at all: a cache that
+// always misses is invisible, every test passes and the clock barely moves.
+// SECOND, and this project has a scar from it: is the PROFILE still true? The
+// previous VM's arithmetic fast path bypassed its cache when it hit, so a hot
+// site's profile described only the executions that had FAILED -- inverted, not
+// incomplete (ADR 0004). The check for that is not a number but a COMPARISON:
+// run the same deterministic program with ST_NO_INLINE_CACHE=1 and the send
+// totals must come out IDENTICAL, because the emitted hit counts exactly what
+// icRecord counts.
+static uint64_t gDispatchMisses;
+
+// WHERE THE MISSES ARE, which is the only question worth asking next: a
+// monomorphic cache tests one class, so every send to a site's second class is a
+// miss by construction. The breakdown says whether that is worth a second way or
+// whether the misses are somewhere else entirely, and it is read out of the
+// cells rather than counted at miss time because the cells already hold it.
+static void icStatsReport(void)
+{
+	uint64_t sends = 0;
+	uint64_t wayCounts = 0;
+	uint64_t inWay0 = 0;       // what the emitted cache can serve
+	uint64_t inWay1 = 0;       // what a SECOND way in the emitted cache would serve
+	uint64_t inOtherWays = 0;  // what it still would not
+	uint64_t megamorphicSends = 0;
+	uint64_t unarmedSends = 0; // way 0 exists but nothing ever resolved into it
+	uint64_t sites = 0, armedSites = 0, polySites = 0, megaSites = 0;
+	for (size_t index = 0; index < gCompiledCount; index++) {
+		NativeCode *code = gCompiledCode[index];
+		for (uint16_t i = 0; i < code->unit->instructionCount; i++) {
+			const IcCell *cell = &code->cells[i];
+			sends += cell->sends;
+			if (cell->sends == 0) {
+				continue;
+			}
+			sites++;
+			if (cell->megamorphic) {
+				megaSites++;
+				megamorphicSends += cell->sends;
+			} else if (cell->ways[0].target == NULL) {
+				unarmedSends += cell->sends;
+			} else {
+				armedSites++;
+			}
+			if (cell->wayCount > 1) {
+				polySites++;
+			}
+			for (uint8_t way = 0; way < cell->wayCount; way++) {
+				wayCounts += cell->ways[way].count;
+				if (way == 0) {
+					inWay0 += cell->ways[way].count;
+				} else if (way == 1) {
+					inWay1 += cell->ways[way].count;
+				} else {
+					inOtherWays += cell->ways[way].count;
+				}
+			}
+		}
+	}
+	fprintf(stderr, "ic: sends=%llu ways=%llu misses=%llu hits=%llu\n",
+		(unsigned long long) sends, (unsigned long long) wayCounts,
+		(unsigned long long) gDispatchMisses,
+		(unsigned long long) (sends - gDispatchMisses));
+	fprintf(stderr, "ic: way0=%llu way1=%llu ways2plus=%llu megamorphic=%llu unarmed=%llu\n",
+		(unsigned long long) inWay0, (unsigned long long) inWay1,
+		(unsigned long long) inOtherWays,
+		(unsigned long long) megamorphicSends, (unsigned long long) unarmedSends);
+	fprintf(stderr, "ic: sites=%llu armed=%llu polymorphic=%llu megamorphic=%llu\n",
+		(unsigned long long) sites, (unsigned long long) armedSites,
+		(unsigned long long) polySites, (unsigned long long) megaSites);
+	fflush(NULL);
+}
+
+
+// The counter is UNCONDITIONAL and only the report is gated. An env test per
+// dispatch would put a branch on the hot miss path to save one increment, which
+// is the wrong trade in both directions.
+static void icStatsCountMiss(void)
+{
+	static _Bool armed;
+	gDispatchMisses++;
+	if (!armed) {
+		armed = 1;
+		if (getenv("ST_IC_STATS") != NULL) {
+			atexit(icStatsReport);
+		}
+	}
+}
+
+
+// May compiled code call this method DIRECTLY, through a send site's inline
+// cache, instead of coming through one of the C entry points at the bottom of
+// this file?
+//
+// Only when entering it costs nothing but the call, and there is exactly one
+// thing today that costs more. A method that could be the HOME of a non-local
+// return needs an unwind record, and the record's jump destination has to be
+// taken by setjmp IN THE FRAME THAT RESUMES -- so it cannot be pushed by the
+// callee's own prologue, and generated code cannot take a setjmp at all. Enter
+// such a method directly and a `^` inside one of its blocks finds no record
+// carrying its token, which the token scheme then reports as a return from an
+// activation that has already returned. That is not a hypothesis: it is what the
+// gate answered the first time this fast path was wired without this test.
+//
+// ONE PREDICATE, and the only place that arms a cache reads it, so an obligation
+// added to ENTER_COMPILED has one place here to be added too.
+static _Bool jitMayEnterDirectly(const NativeCode *code)
+{
+	return !code->unit->couldBeHome;
+}
+
+
 // The body of both send paths. `lookupStart` is the class the method search
 // begins at, and it is the ONLY thing that differs between an ordinary send and
 // a super send: everything else, the profile included, is the same site
@@ -372,13 +646,14 @@ static Value dispatchFrom(IcCell *cell, Value *receiverSlot, uint64_t packed,
 	// Anchor the caller's frame before doing anything that can allocate, so a
 	// collection from in here can walk the compiled frames underneath.
 	CompiledFrameGuard guard;
-	compiledFrameEnter(&guard, receiverSlot, (uint16_t) (packed >> 32),
+	compiledFrameEnterFromCompiled(&guard, receiverSlot, (uint16_t) (packed >> 32),
 		returnAddress);
 
 	// PROFILE FIRST, before anything can fail. The receiver's class and, when
 	// there is one, the first ARGUMENT's class: that second one is what lets
 	// the optimizer choose between integer and floating-point arithmetic
 	// without guessing, and it is the field easiest to forget.
+	icStatsCountMiss();
 	uint32_t receiverClass = classIndexOfValue(receiver);
 	uint32_t argumentClass = argc > 0
 		? classIndexOfValue(receiverSlot[-1]) : CLASS_INDEX_INVALID;
@@ -451,10 +726,27 @@ static Value dispatchFrom(IcCell *cell, Value *receiverSlot, uint64_t packed,
 		}
 	}
 	NativeCode *code = method->native;
-	if (way != NULL) {
-		// Remember where this class dispatches to, so a future inline fast path
-		// can call it without coming through here at all.
+	// ARM THE INLINE CACHE, but only for a target whose calling convention is the
+	// one the SITE emitted for, and only for one compiled code may enter at all.
+	//
+	// The site decided narrow-or-wide from its own argument count, because a send
+	// of n arguments can only reach a method of arity n and the convention is a
+	// function of arity and ABI alone. Installing a target that disagreed would
+	// have compiled code hand over a pointer where the callee reads registers, or
+	// the reverse, and the failure is a callee reading arguments nobody wrote --
+	// no crash at the call, a wrong answer later.
+	//
+	// It cannot happen. It is CHECKED anyway, and the check is the condition
+	// rather than an assertion, because a build with assertions off would
+	// otherwise arm the site: leaving the target null is always safe, and only
+	// costs the site its fast path.
+	if (way != NULL && jitMayEnterDirectly(code)
+			&& code->unit->argumentCount == argc) {
+		ASSERT(code->wide
+			== maWideForArity(maHostBackend()->abi, (uint16_t) argc));
 		way->target = code;
+		// The fast path reads way 0 and only way 0, so the hottest class has to
+		// BE way 0 or the cache tests a class it rarely sees.
 		icPromoteHottest(cell);
 	}
 	// Arguments are at DESCENDING addresses from the receiver's slot, because
@@ -970,7 +1262,7 @@ static Value jitStoreGlobal(void *unitPointer, Value *valueSlot,
 static Value jitMakeClosure(void *unitPointer, Value *baseSlot, uint64_t packed)
 {
 	CompiledFrameGuard guard;
-	compiledFrameEnter(&guard, baseSlot, PACKED_SLOT(packed),
+	compiledFrameEnterFromCompiled(&guard, baseSlot, PACKED_SLOT(packed),
 		__builtin_return_address(0));
 
 	CodeUnit *unit = unitPointer;
@@ -1016,7 +1308,7 @@ static Value jitMakeCell(void *unused, Value *valueSlot, uint64_t packed)
 {
 	(void) unused;
 	CompiledFrameGuard guard;
-	compiledFrameEnter(&guard, valueSlot, PACKED_SLOT(packed),
+	compiledFrameEnterFromCompiled(&guard, valueSlot, PACKED_SLOT(packed),
 		__builtin_return_address(0));
 	Value answer = objectTagged(newCell(*valueSlot));
 	compiledFrameLeave(&guard);
@@ -1171,10 +1463,16 @@ static _Bool emitInstruction(JitContext *jit, size_t index, Opcode *unsupported)
 		// A super send is the SAME sequence to a different runtime entry point,
 		// so where the lookup starts costs nothing here and nothing at the site:
 		// it was decided when this method was compiled and it lives in the cell.
-		maCallRuntime3(ma,
-			(Opcode) instruction->op == OP_SEND ? jitDispatch : jitDispatchSuper,
-			&jit->cells[index], instruction->c,
-			(uint64_t) instruction->n | ((uint64_t) instruction->c << 32));
+		MaSendSite site = {
+			.cell = &jit->cells[index],
+			.miss = (Opcode) instruction->op == OP_SEND
+				? jitDispatch : jitDispatchSuper,
+			.receiverSlot = instruction->c,
+			.argumentCount = instruction->n,
+			.missInteger = (uint64_t) instruction->n
+				| ((uint64_t) instruction->c << 32),
+		};
+		maSend(ma, &site);
 		maStoreSlot(ma, instruction->a);
 		return 1;
 	}
@@ -1383,8 +1681,7 @@ NativeCode *jitCompileFor(const MacroAssemblerOps *ops, CodeUnit *unit,
 	// On the root list LAST, once every field the visitor reads is populated: a
 	// collection triggered between the calloc and here would walk a half-built
 	// entry.
-	code->nextCompiled = gCompiledCode;
-	gCompiledCode = code;
+	compiledCodeRegister(code);
 	return code;
 }
 
@@ -1513,13 +1810,7 @@ Value jitCallWide(NativeCode *code, Value *receiverSlot)
 
 void jitFreeNativeCode(NativeCode *code)
 {
-	for (NativeCode **link = &gCompiledCode; *link != NULL;
-			link = &(*link)->nextCompiled) {
-		if (*link == code) {
-			*link = code->nextCompiled;
-			break;
-		}
-	}
+	compiledCodeUnregister(code);
 	// The machine code itself is NOT freed: exec memory is never reclaimed, so
 	// a frame still running inside it stays valid forever.
 	free(code->machineOffsetAt);

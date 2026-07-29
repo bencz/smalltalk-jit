@@ -132,9 +132,8 @@ static void bootstrapMinimal(Heap *heap)
 	Handles.false_.raw = ((Object *) newImmortalObject(&Handles.False, 0))->raw;
 
 	// Immediates have no header, so their classes are found by tag.
-	gImmediateClasses.smallInteger = classIndexOf(&Handles.SmallInteger);
-	gImmediateClasses.character = classIndexOf(&Handles.SmallInteger);
-	gImmediateClasses.smallFloat = classIndexOf(&Handles.SmallInteger);
+	classSetImmediateIndices(classIndexOf(&Handles.SmallInteger),
+		classIndexOf(&Handles.SmallInteger), classIndexOf(&Handles.SmallInteger));
 }
 
 

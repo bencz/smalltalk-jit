@@ -3,7 +3,27 @@
 #include "memory/Heap.h"
 #include "runtime/String.h"
 
-ImmediateClassIndices gImmediateClasses;
+// CLASS_INDEX_INVALID everywhere until bootstrap fills it, VALUE_POINTER's
+// entry for good: a value with that tag is answered from its header and never
+// from here.
+uint32_t gClassIndexByTag[4] = {
+	CLASS_INDEX_INVALID, CLASS_INDEX_INVALID,
+	CLASS_INDEX_INVALID, CLASS_INDEX_INVALID,
+};
+
+
+void classSetImmediateIndices(uint32_t smallInteger, uint32_t character,
+	uint32_t smallFloat)
+{
+	gClassIndexByTag[VALUE_INT] = smallInteger;
+	gClassIndexByTag[VALUE_CHAR] = character;
+	gClassIndexByTag[VALUE_FLOAT] = smallFloat;
+	// Left alone on purpose, and asserted rather than assumed: the emitted
+	// inline cache indexes this table by a tag it has already tested is not
+	// VALUE_POINTER, and this is what makes a mistake there miss instead of
+	// matching a class that happens to sit at index 0.
+	ASSERT(gClassIndexByTag[VALUE_POINTER] == CLASS_INDEX_INVALID);
+}
 
 
 RawClass *classOf(Value value)

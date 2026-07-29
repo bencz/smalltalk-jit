@@ -131,4 +131,11 @@ const char *primitiveName(PrimitiveNumber number);
 // read-AND-CLEAR form is the kernel's takeUnhandledErrorCount.
 size_t primitiveUnhandledErrorCount(void);
 
+// The command line, handed to the primitive that answers it.
+//
+// main() owns argv and tools/Cli.h owns the split between the VM's own flags
+// and the PROGRAM's arguments, so the already-parsed tail is pushed here rather
+// than this layer forming a second opinion about what `-e` means.
+void primitiveSetCommandLine(int count, char **arguments);
+
 #endif

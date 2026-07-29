@@ -56,6 +56,30 @@ typedef enum {
 	MA_TAG_NOT_POINTER,
 } MaTagTest;
 
+struct IcCell;
+
+// Everything a send site is, gathered because emitting one is a single
+// operation and not five.
+//
+// ONE OPERATION AND NOT TWO (a fast path plus a fallback the template compiler
+// branches between), for the same reason callPrimitive folds its own return in:
+// the branch structure between the cache hit and the miss is the backend's, both
+// arms have to leave the answer in the same place, and a template compiler that
+// owned that branch would be naming machine-level facts again (ADR 0009).
+typedef struct {
+	// The site's cache. Its ADDRESS is an immediate: the cell is a C struct the
+	// method owns, so it never moves, and the emitted code reads way 0 out of it
+	// on every execution.
+	struct IcCell *cell;
+	// Where a miss goes. jitDispatch or jitDispatchSuper -- the entire difference
+	// between an ordinary send and a super send, because where the lookup starts
+	// is a compile-time constant that already lives in the cell.
+	MaRuntimeFunction miss;
+	uint16_t receiverSlot;   // bytecode register of the receiver
+	uint16_t argumentCount;  // arguments, which sit in the slots ABOVE it
+	uint64_t missInteger;    // the packed immediate the miss handler reads
+} MaSendSite;
+
 typedef struct MacroAssemblerOps {
 	const char *name;      // "x64", "ppc64", "ppc64le", "arm64"
 	const Abi *abi;
@@ -91,6 +115,10 @@ typedef struct MacroAssemblerOps {
 
 	void (*callRuntime3)(MacroAssembler *, MaRuntimeFunction function,
 		void *pointerArg, uint16_t slotAddressArg, uint64_t integerArg);
+	// A send: the inline-cache fast path and the runtime miss it falls back to.
+	// Leaves the answer where loadSlot would leave a value, so the caller stores
+	// it with storeSlot exactly as before.
+	void (*send)(MacroAssembler *, const MaSendSite *site);
 	// Attempt a primitive; RETURN its answer if it succeeded, fall through if it
 	// failed. One operation and not three, because "try the primitive, otherwise
 	// run the method body" is a single act at the bytecode's level of meaning,
@@ -139,6 +167,18 @@ const Abi *maAbi(MacroAssembler *assembler);
 // narrow for one and wide for the other.
 _Bool maUsesWideArguments(MacroAssembler *assembler);
 
+// The same rule asked about a method this assembler is NOT compiling: would a
+// method taking `argumentCount` arguments be wide under this backend's ABI?
+//
+// A SEND SITE needs it. An inline cache that calls its target directly has to
+// lay the arguments out the way that target's prologue reads them, and the
+// target's arity at a send site is the site's own argument count -- so the site
+// can decide statically what the callee will be, without a runtime test. Both
+// questions go through this one function, because a site and a prologue that
+// could answer differently is a callee reading arguments out of registers
+// nobody wrote.
+_Bool maWideForArity(const Abi *abi, uint16_t argumentCount);
+
 // ---- the neutral vocabulary, thin dispatchers ------------------------------
 
 void maPrologue(MacroAssembler *assembler, Value nilValue);
@@ -161,6 +201,7 @@ void maBranchIfNotClass(MacroAssembler *assembler, uint16_t slot,
 	uint32_t classIndex, MaLabel *label);
 void maCallRuntime3(MacroAssembler *assembler, MaRuntimeFunction function,
 	void *pointerArg, uint16_t slotAddressArg, uint64_t integerArg);
+void maSend(MacroAssembler *assembler, const MaSendSite *site);
 void maCallPrimitive(MacroAssembler *assembler, PrimitiveFunction function,
 	uint64_t argc);
 void maSafepointPoll(MacroAssembler *assembler, volatile int *flag);

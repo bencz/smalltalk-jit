@@ -74,13 +74,53 @@ PRIMITIVE_SOURCES="vm/runtime/Primitive.c vm/runtime/primitives/*.c"
 # It is not untested: it is exercised from level 9 (the whole tree compiles)
 # upward, by the real build, `st -b` and the package images.
 #
+# THE NAME IS NARROWER THAN THE LIST, and that is worth reading twice: Process.c
+# and Socket.c need the SCHEDULER rather than the front end. What the three have
+# in common is the thing that matters -- each sits above a layer these levels
+# deliberately do not link, and pulling that layer in to satisfy one domain file
+# would dissolve the property the level exists to prove. Socket.c is the clearest
+# case: every one of its primitives parks a fiber, so it is the scheduler's
+# client by construction.
+#
 # The table in runtime/Primitive.c names every implemented primitive, so a link
 # that omits this file would still have to resolve its symbols; that is what the
 # WEAK DEFAULTS there are for, and the reasoning is written at them.
 #
 # Named rather than silently dropped, and the levels still GLOB, so a new domain
 # file is picked up everywhere by existing.
-PRIMITIVE_SOURCES_NEEDING_FRONTEND="Reflect.c Process.c"
+PRIMITIVE_SOURCES_NEEDING_FRONTEND="Reflect.c Process.c Socket.c"
+
+# What the primitives themselves are built on: the numeric tower's C half and
+# the closure layout. ONE definition, for the same reason the primitive list has
+# one: a level that lists these by hand is a level that breaks the day a new
+# domain file uses one of them.
+#
+# It broke exactly that way. runtime/primitives/LargeInteger.c arrived, reached
+# levels 3 and 7 through the glob above, and failed to LINK there because only
+# level 8 had listed runtime/BigInt.c -- the kernels it calls. The gate caught
+# it, which is the system working; listing them once is what stops the next one.
+primitiveSupportSources() {
+	printf '%s ' vm/runtime/Number.c vm/runtime/BigInt.c vm/runtime/Closure.c vm/runtime/Json.c vm/runtime/Base64.c
+}
+
+# The OS layer the hand-linked levels need. ONE definition, same reason as the
+# two lists above: a level that spells these out is a level that breaks the day
+# a primitive reaches for an OS call it did not list.
+#
+# It broke exactly that way. `System arguments`, `System cpuCount` and
+# `System randomBytes:` arrived together, and OsCpu.c and OsRandom.c were in
+# CMakeLists but in none of the six hand-linked levels, so three of them stopped
+# linking at once.
+#
+# It is the WHOLE linux directory minus the pieces that need a subsystem the low
+# levels do not have: OsEvents (the poller) and OsSocket belong to the network
+# layer, and OsSignals to the fiber growth handler, which level 1 links on its
+# own terms.
+osSources() {
+	printf '%s ' vm/os/linux/OsFile.c vm/os/linux/OsProcess.c \
+		vm/os/linux/OsMemory.c vm/os/linux/OsThread.c vm/os/linux/OsTime.c \
+		vm/os/linux/OsCpu.c vm/os/linux/OsRandom.c
+}
 
 # The primitives minus the ones above, for the standalone levels.
 standalonePrimitiveSources() {
@@ -134,8 +174,7 @@ level0() {
 		vm/tests/MemoryTest.c vm/memory/Heap.c vm/memory/Collector.c \
 		vm/memory/PageSpace.c vm/memory/Nursery.c vm/memory/RememberedSet.c \
 		vm/memory/Roots.c vm/core/ClassTable.c vm/core/Handle.c \
-		vm/os/linux/OsFile.c vm/os/linux/OsProcess.c \
-		vm/os/linux/OsMemory.c vm/os/linux/OsThread.c vm/os/linux/OsTime.c \
+		$(osSources) \
 		-o "$SCRATCH/memtest" -lpthread || return 1
 	"$SCRATCH/memtest"
 }
@@ -166,8 +205,7 @@ level2() {
 		vm/runtime/String.c vm/runtime/Collection.c \
 		vm/memory/Heap.c vm/memory/Collector.c vm/memory/PageSpace.c \
 		vm/memory/Nursery.c vm/memory/RememberedSet.c vm/memory/Roots.c \
-		vm/os/linux/OsFile.c vm/os/linux/OsProcess.c \
-		vm/os/linux/OsMemory.c vm/os/linux/OsThread.c vm/os/linux/OsTime.c \
+		$(osSources) \
 		-o "$SCRATCH/objtest" -lpthread || return 1
 	"$SCRATCH/objtest"
 }
@@ -181,15 +219,14 @@ level3() {
 		-Ivm -I. -Ivm/os/linux \
 		vm/tests/JitTest.c vm/jit/Jit.c vm/jit/CompiledMethod.c vm/core/Smalltalk.c \
 		vm/jit/MacroAssembler.c vm/jit/Backends.c vm/jit/InlineCache.c \
-		$(standalonePrimitiveSources) vm/runtime/Closure.c \
+		$(standalonePrimitiveSources) $(primitiveSupportSources) \
 		vm/jit/x64/MacroAssemblerX64.c \
 		vm/jit/x64/abi/sysv/AbiSysV.c vm/jit/x64/abi/win64/AbiWin64.c \
 		vm/core/Class.c vm/core/ClassTable.c vm/core/Handle.c \
 		vm/runtime/String.c vm/runtime/Collection.c vm/runtime/Dictionary.c \
 		vm/memory/Heap.c vm/memory/Collector.c vm/memory/PageSpace.c \
 		vm/memory/Nursery.c vm/memory/RememberedSet.c vm/memory/Roots.c \
-		vm/os/linux/OsFile.c vm/os/linux/OsProcess.c \
-		vm/os/linux/OsMemory.c vm/os/linux/OsThread.c vm/os/linux/OsTime.c \
+		$(osSources) \
 		-o "$SCRATCH/jittest" -lpthread -lm || return 1
 	"$SCRATCH/jittest"
 }
@@ -225,8 +262,7 @@ level6() {
 		vm/runtime/String.c vm/runtime/Collection.c \
 		vm/memory/Heap.c vm/memory/Collector.c vm/memory/PageSpace.c \
 		vm/memory/Nursery.c vm/memory/RememberedSet.c vm/memory/Roots.c \
-		vm/os/linux/OsFile.c vm/os/linux/OsProcess.c \
-		vm/os/linux/OsMemory.c vm/os/linux/OsThread.c vm/os/linux/OsTime.c \
+		$(osSources) \
 		-o "$SCRATCH/deopttest" -lpthread || return 1
 	"$SCRATCH/deopttest" >/dev/null
 }
@@ -243,7 +279,8 @@ level6() {
 level7() {
 	gcc $GATE_CFLAGS \
 		-Ivm -I. -Ivm/os/linux \
-		vm/tests/PrimitiveTest.c $(standalonePrimitiveSources) vm/runtime/Closure.c \
+		vm/tests/PrimitiveTest.c $(standalonePrimitiveSources) \
+		$(primitiveSupportSources) \
 		vm/core/Smalltalk.c \
 		vm/jit/Jit.c vm/jit/CompiledMethod.c \
 		vm/jit/MacroAssembler.c vm/jit/Backends.c vm/jit/InlineCache.c \
@@ -253,8 +290,7 @@ level7() {
 		vm/runtime/String.c vm/runtime/Collection.c vm/runtime/Dictionary.c \
 		vm/memory/Heap.c vm/memory/Collector.c vm/memory/PageSpace.c \
 		vm/memory/Nursery.c vm/memory/RememberedSet.c vm/memory/Roots.c \
-		vm/os/linux/OsFile.c vm/os/linux/OsProcess.c \
-		vm/os/linux/OsMemory.c vm/os/linux/OsThread.c vm/os/linux/OsTime.c \
+		$(osSources) \
 		-o "$SCRATCH/primtest" -lpthread -lm || return 1
 	"$SCRATCH/primtest"
 }
@@ -268,9 +304,7 @@ level8() {
 		-Ivm -I. -Ivm/os/linux \
 		vm/tests/CompileTest.c vm/compiler/Compile.c vm/compiler/Parser.c \
 		vm/compiler/Tokenizer.c vm/core/Namespace.c vm/core/Smalltalk.c \
-		$(standalonePrimitiveSources) \
-		vm/runtime/Number.c vm/runtime/BigInt.c \
-		vm/runtime/Closure.c \
+		$(standalonePrimitiveSources) $(primitiveSupportSources) \
 		vm/jit/Jit.c vm/jit/CompiledMethod.c \
 		vm/jit/MacroAssembler.c vm/jit/Backends.c vm/jit/InlineCache.c \
 		vm/jit/x64/MacroAssemblerX64.c \
@@ -279,8 +313,7 @@ level8() {
 		vm/runtime/String.c vm/runtime/Collection.c vm/runtime/Dictionary.c \
 		vm/memory/Heap.c vm/memory/Collector.c vm/memory/PageSpace.c \
 		vm/memory/Nursery.c vm/memory/RememberedSet.c vm/memory/Roots.c \
-		vm/os/linux/OsFile.c vm/os/linux/OsProcess.c \
-		vm/os/linux/OsMemory.c vm/os/linux/OsThread.c vm/os/linux/OsTime.c \
+		$(osSources) \
 		-o "$SCRATCH/compiletest" -lpthread -lm || return 1
 	"$SCRATCH/compiletest"
 }

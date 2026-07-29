@@ -91,7 +91,34 @@ Behavior := Object [
 
 
 	instanceVariables [
-		^instanceVariables isNil ifTrue: [#()] ifFalse: [instanceVariables]
+		"EVERY named variable of an instance, INHERITED FIRST, as an Array of
+		 Strings.
+
+		 THE INDICES LINE UP WITH instVarAt:, and that is the contract the rest
+		 of the kernel is written against: `Json class encodeObject:` pairs
+		 `(names at: i)` with `(anObject instVarAt: i)`, `Object>>basicPrintOn:`
+		 does the same, and `Object>>copy` walks 1 to `instanceSize`. So
+		 `self instanceVariables size = self instanceSize` has to hold, and it
+		 only does if the inherited ones are here and come first.
+
+		 THE FIELD HOLDS ONLY WHAT THIS CLASS DECLARES, and the chain is composed
+		 here rather than stored: the field is the working representation the
+		 compiler's slot numbering walks (vm/compiler/Compile.c, indexOfSymbol),
+		 which repeats nothing, and storing the full list would number every
+		 inherited variable twice.
+
+		 A FRESH ARRAY OF STRINGS, not the field: handing back the collection
+		 that decides where every instance variable lives means one `add:` away
+		 from instances numbered differently from the methods already compiled
+		 against them."
+		| names |
+
+		names := superClass isNil
+			ifTrue: [OrderedCollection new]
+			ifFalse: [superClass instanceVariables asOrderedCollection].
+		instanceVariables isNil ifFalse: [
+			instanceVariables do: [ :each | names add: each asString]].
+		^names asArray
 	]
 
 
@@ -103,7 +130,16 @@ Behavior := Object [
 
 
 	subClasses [
-		^subClasses
+		"The DIRECT subclasses. The class builder appends to this field when it
+		 builds a class, so NIL MEANS NO SUBCLASSES YET and is answered as an
+		 empty collection rather than as nil.
+
+		 It is not stored empty: that would allocate an OrderedCollection for
+		 every leaf class in the image, and every one of the 158 kernel classes
+		 pays for it at bootstrap. Answering the empty case here is what makes
+		 allSubClassesDo: below terminate at a leaf instead of sending #do: to
+		 nil."
+		^subClasses ifNil: [OrderedCollection new]
 	]
 
 

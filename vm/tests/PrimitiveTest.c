@@ -218,9 +218,8 @@ static void bootstrapMinimal(Heap *heap)
 	// Immediates have no header, so their classes are found by tag. Unlike the
 	// level-3 test, these are three DISTINCT classes here, because the whole
 	// point of the argument-class profile is telling an integer from a float.
-	gImmediateClasses.smallInteger = classIndexOf(&Handles.SmallInteger);
-	gImmediateClasses.character = classIndexOf(&Handles.Character);
-	gImmediateClasses.smallFloat = classIndexOf(&Handles.SmallFloat64);
+	classSetImmediateIndices(classIndexOf(&Handles.SmallInteger),
+		classIndexOf(&Handles.Character), classIndexOf(&Handles.SmallFloat64));
 }
 
 
@@ -825,10 +824,23 @@ int main(void)
 
 		size_t implemented = 0, declared = 0;
 		primitiveCoverage(&implemented, &declared);
-		printf("        primitives: %zu of %zu declared by packages/ are implemented\n",
+		printf("        primitives: %zu of %zu the image can name are implemented\n",
 			implemented, declared);
-		check("every name packages/ uses is declared here, plus the one the built-in "
-				"kernel needs and packages/ does not", declared == 175);
+		// THE COUNT IS PINNED, and the point is that it can only move
+		// deliberately: an unknown primitive name is a COMPILE ERROR
+		// (runtime/Primitives.def), so every name any shipped code writes has
+		// to be declared, and a name quietly added or dropped is a file that
+		// stops compiling somewhere far from here.
+		//
+		// 177 = the 173 packages/ declares, PLUS PrintValuePrimitive which only
+		// the built-in kernel needs, PLUS InstrumentMark/InstrumentReport, which
+		// benchmarks/Vec3Boxed.st names and nothing implements: they are no-ops
+		// unless the VM is built with -DST_INSTRUMENT=1. That last pair is why
+		// this check no longer says "packages/" -- packages/ is not the only
+		// shipped code that names a primitive, and pretending otherwise is what
+		// left Vec3Boxed failing to compile.
+		check("every name the shipped image can write is declared here",
+			declared == 177);
 	}
 
 	// ---- closures, at the bytecode level ------------------------------------

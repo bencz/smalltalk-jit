@@ -11,6 +11,7 @@
 // It was removed rather than exported.
 
 #include "runtime/primitives/Shared.h"
+#include <string.h>
 
 
 Value primIdentical(Value *args, uint64_t argc)
@@ -90,4 +91,179 @@ Value primInstanceShape(Value *args, uint64_t argc)
 		| ((uint64_t) shape.pointerWords << 16)
 		| ((uint64_t) shape.fixedSlots << 24);
 	return tagInt((intptr_t) packed);
+}
+
+
+// ---------------------------------------------------------------------------
+// become:
+// ---------------------------------------------------------------------------
+//
+// `a become: b` makes the receiver BE the argument: every reference that named
+// a names b afterwards, and `a identityHash = b identityHash` holds. That is
+// one-way, not a swap, and it is what tests/ObjectTest.st pins in both of its
+// branches -- a two-way exchange would leave the two hashes different, which is
+// exactly what the checks say must not happen.
+//
+// ADR 0003 lists it as R8, "preserve what already works and is not negotiable",
+// and it is a constraint on the COLLECTOR rather than a feature of this file:
+// it is only implementable because the old space does not move (ADR 0005) and
+// because a free chunk is itself a FORMAT_FREE object, so both spaces can be
+// walked in a straight line.
+//
+// TWO CASES, and the size decides:
+//
+//   SAME SIZE   copy the argument OVER the receiver, header included. The
+//               object at the receiver's address then IS the argument in every
+//               observable way, hash included, and not one reference had to be
+//               found. This is the cheap and overwhelmingly common case.
+//   DIFFERENT   there is nowhere to copy to, so every reference is rewritten:
+//               the old space, the young space, and every root.
+//
+// WHAT MAKES THE WALK LEGAL is that nothing else is running. The scheduler is
+// cooperative and single-threaded (concurrency/Scheduler.h), so no peer can
+// allocate underneath it; and heapFillAllTlabTails caps every mutator's TLAB
+// with a free chunk first, because the tail of a TLAB is UNINITIALISED and a
+// linear walk would read a header out of it. v1 needed a stop-the-world
+// handshake here for the same reason; this needs the filler and nothing else.
+
+#include "memory/Collector.h"
+#include "memory/ObjectWalk.h"
+#include "memory/PageSpace.h"
+#include "memory/Nursery.h"
+
+typedef struct {
+	RawObject *from;
+	RawObject *to;
+} BecomeRewrite;
+
+
+// Rewrite one slot, THROUGH THE BARRIER. The new reference may be young and the
+// object holding it old, which is precisely the case the remembered set exists
+// for; a bare store here would lose it and the next young collection would free
+// an object that is still referenced.
+static void becomeSlot(RawObject *owner, Value *slot, BecomeRewrite *rewrite)
+{
+	if (!valueTypeOf(*slot, VALUE_POINTER) || asObject(*slot) != rewrite->from) {
+		return;
+	}
+	if (owner != NULL) {
+		rawObjectStorePtr(owner, slot, rewrite->to);
+	} else {
+		*slot = tagPtr(rewrite->to);
+	}
+}
+
+
+// The root visitor. Roots live outside the heap -- the class table, the
+// well-known handles, C handle scopes, compiled frames, unwind records, every
+// parked fiber -- so there is no owner to remember and a plain store is right.
+static void becomeRoot(void *context, Value *slot)
+{
+	becomeSlot(NULL, slot, (BecomeRewrite *) context);
+}
+
+
+static void becomeInObject(RawObject *object, BecomeRewrite *rewrite,
+	ClassTable *classes)
+{
+	// A free chunk and a forwarded object have no slots to rewrite, and reading
+	// their bodies as pointers is exactly the mistake the FORMAT_FREE design
+	// exists to prevent.
+	uint8_t format = rawObjectFormat(object);
+	if (format == FORMAT_FREE || format == FORMAT_FORWARDED) {
+		return;
+	}
+	size_t count = 0;
+	Value *slots = objectPointerSlots(classes, object, &count);
+	for (size_t i = 0; i < count; i++) {
+		becomeSlot(object, &slots[i], rewrite);
+	}
+}
+
+
+// Object>>become: otherObject
+Value primBecome(Value *args, uint64_t argc)
+{
+	if (argc != 1) {
+		return PRIMITIVE_FAILED;
+	}
+	Value receiver = primitiveReceiver(args);
+	Value other = primitiveArgument(args, 0);
+	// IMMEDIATES CANNOT BECOME ANYTHING. A SmallInteger is not at an address, so
+	// there is no reference to rewrite and no body to copy; failing is the only
+	// honest answer and the kernel's fallback raises.
+	if (!valueTypeOf(receiver, VALUE_POINTER) || !valueTypeOf(other, VALUE_POINTER)) {
+		return PRIMITIVE_FAILED;
+	}
+	RawObject *from = asObject(receiver);
+	RawObject *to = asObject(other);
+	if (from == to) {
+		return other; // already itself; nothing to do and nothing to walk
+	}
+
+	Heap *heap = CurrentThread.heap;
+	ClassTable *classes = &heap->classes;
+	size_t fromSize = objectSizeInBytes(classes, from);
+	size_t toSize = objectSizeInBytes(classes, to);
+
+	if (fromSize == toSize) {
+		memcpy(from, to, fromSize);
+		// THE BARRIER IS RE-ESTABLISHED, and forgetting it is the silent half of
+		// this case: the copy brought the argument's header along, remembered
+		// bit included, so an OLD receiver that now holds YOUNG references would
+		// no longer be in the remembered set. Storing every pointer slot onto
+		// itself re-runs the barrier for exactly the slots that need it.
+		size_t count = 0;
+		Value *slots = objectPointerSlots(classes, from, &count);
+		for (size_t i = 0; i < count; i++) {
+			if (valueTypeOf(slots[i], VALUE_POINTER)) {
+				rawObjectStorePtr(from, &slots[i], asObject(slots[i]));
+			}
+		}
+		return other;
+	}
+
+	// The sizes differ, so every reference has to be found. Nothing may allocate
+	// from here on: the walk reads headers, and an allocation would both extend
+	// the young space under it and carve a fresh uninitialised TLAB.
+	//
+	// THE FRAME IS ANCHORED FIRST, and not because anything allocates -- what
+	// the anchor DOES is link the calling method's compiled frames into the
+	// chain rootsVisitNativeFrames walks (jit/Jit.h). Without it the walk
+	// rewrote the whole heap and every root EXCEPT the frame slots of the
+	// method that asked, so `a become: b` left the caller's own `a` naming the
+	// object nothing else pointed to any more. Measured: the same-size case
+	// passed and this one did not.
+	PRIMITIVE_ALLOCATES(args);
+	heapFillAllTlabTails(heap);
+	BecomeRewrite rewrite = { from, to };
+
+	PageSpaceIterator iterator;
+	pageSpaceIteratorInit(&iterator, &heap->oldSpace, classes);
+	for (RawObject *object = pageSpaceIteratorNext(&iterator); object != NULL;
+			object = pageSpaceIteratorNext(&iterator)) {
+		becomeInObject(object, &rewrite, classes);
+	}
+
+	// The young space is a bump region, so it walks from the base of the
+	// from-space to the cursor. Every gap is a free chunk by now, and
+	// objectSizeInBytes strides over one exactly as it strides over a live
+	// object -- which is the whole reason a free chunk IS an object here.
+	Nursery *nursery = &heap->newSpace;
+	for (uint8_t *cursor = nursery->fromSpace; cursor < nursery->top; ) {
+		RawObject *object = (RawObject *) cursor;
+		size_t size = objectSizeInBytes(classes, object);
+		if (size == 0) {
+			break; // a header that describes nothing: stop rather than loop
+		}
+		becomeInObject(object, &rewrite, classes);
+		cursor += size;
+	}
+
+	collectorVisitRoots(heap, becomeRoot, &rewrite);
+	PRIMITIVE_DONE_ALLOCATING();
+	// Re-read: the argument's own slot was one of the references just rewritten
+	// if anything named it, and answering a Value captured before the walk
+	// would answer an address the walk may have replaced.
+	return primitiveArgument(args, 0);
 }

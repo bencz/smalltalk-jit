@@ -226,6 +226,27 @@ static inline _Bool bothSmallIntegers(Value a, Value b)
 // allocator is about to use. A non-class receiver fails rather than reading
 // instanceShape out of whatever object happened to arrive, which would allocate
 // a garbage size.
+// Is `index` the class of some BEHAVIOR -- that is, of a class or of a
+// metaclass?
+//
+// TWO ANSWERS AND NOT ONE, because there are two kinds. A class is an instance
+// of its metaclass, and a metaclass is an instance of MetaClass; the
+// class-of-classes is still accepted because that is what a class is stamped
+// with before it has a metaclass, which is every class inside the built-in
+// kernel's own bootstrap.
+//
+// MetaClass is checked for existence rather than assumed: the very first
+// classes are created before it, and asking for its index then would read a
+// null handle.
+static inline _Bool isBehaviorClassIndex(uint32_t index)
+{
+	if (Handles.ClassClass.raw != NULL && index == classIndexOf(&Handles.ClassClass)) {
+		return 1;
+	}
+	return Handles.MetaClass.raw != NULL && index == classIndexOf(&Handles.MetaClass);
+}
+
+
 static inline Class *receiverAsClass(Value receiver)
 {
 	if (!valueTypeOf(receiver, VALUE_POINTER) || Handles.ClassClass.raw == NULL) {
@@ -233,12 +254,11 @@ static inline Class *receiverAsClass(Value receiver)
 	}
 	RawObject *object = asObject(receiver);
 	uint32_t classOfObject = rawObjectClassIndex(object);
-	if (classOfObject == classIndexOf(&Handles.ClassClass)) {
+	if (isBehaviorClassIndex(classOfObject)) {
 		return (Class *) scopeHandle(object); // a metaclass, or a class before it has one
 	}
 	RawObject *itsClass = classTableAt(&CurrentThread.heap->classes, classOfObject);
-	if (itsClass == NULL
-			|| rawObjectClassIndex(itsClass) != classIndexOf(&Handles.ClassClass)) {
+	if (itsClass == NULL || !isBehaviorClassIndex(rawObjectClassIndex(itsClass))) {
 		return NULL;
 	}
 	return (Class *) scopeHandle(object); // an instance of a metaclass: a class

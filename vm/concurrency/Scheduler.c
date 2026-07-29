@@ -190,6 +190,112 @@ static int64_t sleepersWake(void)
 
 
 // ---------------------------------------------------------------------------
+// Waiting on a file descriptor
+// ---------------------------------------------------------------------------
+//
+// A SLEEPER WITH AN EVENT INSTEAD OF A DEADLINE, and it reuses the same machine:
+// an fd waiter is SUSPENDED, off the ready queue like any other, and what wakes
+// it is the poller below rather than a clock.
+//
+// WHY THIS IS HERE AT ALL. os/Os.h states the split: the OS layer never blocks
+// on readiness and never calls the scheduler, it answers OS_IO_WOULD_BLOCK, and
+// the caller parks and retries. A fiber that instead blocked in `read` would
+// stop every other fiber on this thread, because they all share it -- so this
+// function is the difference between a VM that can serve two connections and one
+// that cannot.
+//
+// THE COUNT, and not just the loop: `pumpEvents` has to know whether blocking
+// forever is legitimate. With waiters armed it is (something can still arrive);
+// with none it would be a hang, and the suspend loop below is what has to tell
+// the two apart.
+
+static OsEventLoop *gEvents;
+static size_t gArmedWaiters;
+
+
+// The loop, created on first use. A VM that never opens a socket never makes
+// an epoll set.
+static OsEventLoop *eventLoop(void)
+{
+	if (gEvents == NULL) {
+		gEvents = osEventLoopCreate();
+	}
+	return gEvents;
+}
+
+
+// Wake whatever became ready. `timeoutMs` is -1 to block, 0 to poll.
+//
+// ANSWERS WHETHER THE RUNNING FIBER'S OWN DESCRIPTOR FIRED, and that return
+// value is not a convenience -- without it this deadlocks. A fiber that arms an
+// fd and then finds NOTHING ELSE READY never parks: parkAndSwitch answers 0
+// before touching its state, so it stays RUNNING and pumps from here. Its own
+// event then arrives, and resuming a RUNNING fiber is a no-op that answers
+// false -- so the event would be consumed, dropped, and the next call would
+// block forever on readiness that already happened. Measured as exactly that:
+// a client and a server fiber on one thread, both parked, neither woken.
+static _Bool pumpEvents(int timeoutMs)
+{
+	if (gEvents == NULL || gArmedWaiters == 0) {
+		return 0;
+	}
+	uint64_t tags[64];
+	int count = osEventLoopWait(gEvents, tags, (int) (sizeof tags / sizeof tags[0]),
+		timeoutMs);
+	Fiber *self = fiberCurrent();
+	_Bool selfReady = 0;
+	for (int i = 0; i < count; i++) {
+		if (gArmedWaiters > 0) {
+			gArmedWaiters--;
+		}
+		if (self != NULL && (size_t) tags[i] == self->id) {
+			selfReady = 1;
+			continue;
+		}
+		// The tag IS the fiber id, which is why a stale one is harmless: a fiber
+		// that died while armed simply is not there any more, and resume answers
+		// false. An ADDRESS would have found a stranger in the same place, which
+		// is the same argument the home token rests on.
+		schedulerResume((size_t) tags[i]);
+	}
+	return selfReady;
+}
+
+
+_Bool schedulerWaitFd(OsFd fd, _Bool forWrite)
+{
+	schedulerInit();
+	OsEventLoop *loop = eventLoop();
+	Fiber *self = fiberCurrent();
+	if (loop == NULL || self == NULL) {
+		return 0;
+	}
+	// ARM BEFORE PARKING, in that order and with nothing in between. Nothing
+	// else runs on this thread until the park switches away, so the readiness
+	// that arrives between the two cannot be missed: the poller only runs from
+	// the suspend loop, which is downstream of the switch. That is the same
+	// lost-wakeup window parkOnMonitor closes, closed the same way -- by there
+	// being no switch point in the middle.
+	osEventLoopArm(loop, fd, forWrite, (uint64_t) self->id);
+	gArmedWaiters++;
+	schedulerSuspendCurrent();
+	return 1;
+}
+
+
+void schedulerForgetFd(OsFd fd)
+{
+	if (gEvents == NULL) {
+		return;
+	}
+	osEventLoopDisarm(gEvents, fd);
+	if (gArmedWaiters > 0) {
+		gArmedWaiters--;
+	}
+}
+
+
+// ---------------------------------------------------------------------------
 // Thread state, which belongs to the FIBER and not to the OS thread
 // ---------------------------------------------------------------------------
 //
@@ -476,6 +582,10 @@ void schedulerYield(void)
 {
 	schedulerInit();
 	sleepersWake();
+	// A NON-BLOCKING poll, so a loop that yields notices a socket that became
+	// ready without having to park. Blocking here would be wrong: the caller
+	// asked to give others a turn, not to wait for one.
+	pumpEvents(0);
 	parkAndSwitch(PARK_YIELD); // nobody else ready: carry on, having done nothing
 }
 
@@ -485,27 +595,52 @@ void schedulerSuspendCurrent(void)
 	schedulerInit();
 	Fiber *self = fiberCurrent();
 	if (self == gScheduler.main && gScheduler.readyHead == NULL
-			&& gSleeperCount == 0) {
+			&& gSleeperCount == 0 && gArmedWaiters == 0) {
 		// Suspending the last runnable fiber would stop the program with no way
 		// back. Refusing is not a policy choice: there is no fiber left that
 		// could ever resume this one.
+		//
+		// ARMED DESCRIPTORS COUNT AS A WAY BACK, which is why they are in the
+		// test: a server whose main fiber waits on a listening socket has
+		// nothing ready and no sleeper, and returning here would turn `accept`
+		// into a busy loop.
 		return;
 	}
 	while (!parkAndSwitch(PARK_SUSPEND)) {
-		// Nothing ready, but sleepers may be due. If none of them can ever wake
-		// us either, this would spin forever, so it waits for the earliest
-		// deadline instead of burning the CPU.
+		// NOTHING READY, and there are exactly three reasons that can change:
+		// a sleeper's deadline, a descriptor becoming ready, or nothing at all.
+		// The third is a program that has parked its last runnable fiber, and
+		// this has to notice rather than spin or block forever.
 		int64_t earliest = sleepersWake();
 		if (gScheduler.readyHead != NULL) {
 			continue;
 		}
 		if (earliest == 0) {
-			return; // nobody sleeping and nobody ready: see above
+			if (gArmedWaiters == 0) {
+				return; // nobody sleeping, nobody armed, nobody ready
+			}
+			// Descriptors and no clock: BLOCK in the poller. This is the idle
+			// state of a server, and it must not be a spin.
+			if (pumpEvents(-1)) {
+				return; // it was OUR descriptor: stop waiting
+			}
+			continue;
 		}
 		int64_t remaining = earliest - osMonotonicNanos();
-		if (remaining > 0) {
-			osSleepNanos(remaining);
+		if (remaining <= 0) {
+			continue;
 		}
+		if (gArmedWaiters > 0) {
+			// A DEADLINE AND DESCRIPTORS AT ONCE, so the wait has to be the
+			// poller with the deadline as its timeout. Sleeping instead would
+			// hold a ready socket until a timer nobody was waiting for expired.
+			int milliseconds = (int) (remaining / 1000000);
+			if (pumpEvents(milliseconds < 1 ? 1 : milliseconds)) {
+				return;
+			}
+			continue;
+		}
+		osSleepNanos(remaining);
 	}
 }
 

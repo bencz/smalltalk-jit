@@ -375,17 +375,48 @@ typedef struct RawClass {
 } RawClass;
 OBJECT_HANDLE(Class);
 
+// A METACLASS, and it is the SAME OBJECT LAYOUT as a class on purpose.
+//
+// A metaclass is a Behavior like any other: it has a superclass, subclasses, a
+// method dictionary and instance variables, and it stamps a shape onto its
+// instances -- its instance being the CLASS. So it is allocated with the class
+// shape and reaches the same raw trailer at the same offset, which is what lets
+// every reader in the VM (the allocator, the inline-cache guard, the class
+// table) treat it as a Behavior without asking which kind it is.
+//
+// WHAT DIFFERS IS FIELD 4 AND ONLY FIELD 4: a class holds its NAME there and a
+// metaclass holds the class it is the metaclass OF. That is not an overlap that
+// happened, it is the one packages/Core/src/MetaClass.st declares --
+// `| instanceClass |` on top of Behavior's four -- and `MetaClass>>name`
+// answers `instanceClass name`, so the two meanings never meet.
+//
+// The four fields after it are a class's alone (comment, category, class
+// variables, namespace) and are unused here. They are RESERVED rather than
+// removed because removing them would move the trailer, and the trailer's
+// offset is what the paragraph above rests on. The static assertions below are
+// the guard: they fail to COMPILE if the two layouts ever drift.
 typedef struct {
 	OBJECT_HEADER;
 	Value superClass;
 	Value subClasses;
 	Value methodDictionary;
 	Value instanceVariables;
-	Value instanceClass;
+	Value instanceClass;   // where RawClass keeps `name`
+	Value reserved[4];     // a class's comment, category, classVariables, namespace
 	InstanceShape instanceShape;
 	uint32_t classIndex;
 } RawMetaClass;
 OBJECT_HANDLE(MetaClass);
+
+_Static_assert(sizeof(RawMetaClass) == sizeof(struct RawClass),
+	"a metaclass is allocated with the class shape, so the two must be the same size");
+_Static_assert(offsetof(RawMetaClass, instanceClass) == offsetof(struct RawClass, name),
+	"MetaClass.st puts instanceClass where Class.st puts name");
+_Static_assert(offsetof(RawMetaClass, instanceShape)
+		== offsetof(struct RawClass, instanceShape),
+	"the raw trailer must be at one offset for both, or every shape read is wrong");
+_Static_assert(offsetof(RawMetaClass, classIndex) == offsetof(struct RawClass, classIndex),
+	"the class index must be at one offset for both");
 
 typedef struct {
 	OBJECT_HEADER;

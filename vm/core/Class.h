@@ -69,29 +69,31 @@ static inline InstanceShape classShape(Class *class)
 }
 
 
-// Indices of the immediate classes, resolved once at bootstrap. They cannot be
-// found from an object header, because an immediate has no header.
-typedef struct {
-	uint32_t smallInteger;
-	uint32_t character;
-	uint32_t smallFloat;
-} ImmediateClassIndices;
+// The class index of an immediate, INDEXED BY ITS TAG. Resolved once at
+// bootstrap, because an immediate has no header to find it in.
+//
+// A TABLE AND NOT THREE NAMED FIELDS, because the inline cache the JIT emits
+// reads it too, and a shift plus a load is a sequence every backend can emit
+// while a three-way switch on the tag is not. The C path below reads the SAME
+// table: two halves answering "what class is this value" from two different
+// places is precisely the defect this VM keeps paying for.
+//
+// Entry VALUE_POINTER has no answer here and holds CLASS_INDEX_INVALID, so a
+// fast path that indexed it by mistake MISSES rather than matching some class.
+extern uint32_t gClassIndexByTag[4];
 
-extern ImmediateClassIndices gImmediateClasses;
+// Fill the table. One call rather than three assignments at each of the places
+// that bootstrap a heap, so a tag added to the VM breaks one line and not five.
+void classSetImmediateIndices(uint32_t smallInteger, uint32_t character,
+	uint32_t smallFloat);
 
 
 static inline uint32_t classIndexOfValue(Value value)
 {
-	switch (value & 3) {
-	case VALUE_INT:
-		return gImmediateClasses.smallInteger;
-	case VALUE_CHAR:
-		return gImmediateClasses.character;
-	case VALUE_FLOAT:
-		return gImmediateClasses.smallFloat;
-	default:
-		return rawObjectClassIndex(asObject(value));
-	}
+	Value tag = value & 3;
+	return tag == VALUE_POINTER
+		? rawObjectClassIndex(asObject(value))
+		: gClassIndexByTag[tag];
 }
 
 #endif

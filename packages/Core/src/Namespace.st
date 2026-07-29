@@ -21,6 +21,20 @@ Namespace := Object [
 	 namespace compile against. Core until a project image changes it."
 
 	class default [
+		"Core until something chooses otherwise, which is what the comment above
+		 promises and what every caller assumes.
+
+		 The VM answers NIL when nothing has been chosen, because 'nothing has
+		 been chosen' is the only thing it knows: the Core namespace is an
+		 ordinary Smalltalk object built by this file's own class initialize, and
+		 having C reach into Namespaces to find it would put the registry's
+		 layout in two places. So the VM answers what it knows and the default is
+		 applied HERE, in the file that owns what Core is."
+		^self basicDefault ifNil: [Namespaces at: #Core]
+	]
+
+
+	class basicDefault [
 		<primitive: DefaultNamespacePrimitive>
 	]
 

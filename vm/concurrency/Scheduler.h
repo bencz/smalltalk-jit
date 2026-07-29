@@ -22,6 +22,7 @@
 
 #include "core/Object.h"
 #include "concurrency/Fiber.h"
+#include "os/Os.h"
 
 // Bind the OS thread's own stack to a Fiber so it can be switched away from
 // like any other, and make it the running one. Idempotent; every entry point
@@ -62,6 +63,26 @@ _Bool schedulerResume(size_t id);
 // runnable, and it dies the next time it has the CPU, on its own stack, because
 // that is the only place its `ensure:` blocks can run.
 _Bool schedulerTerminate(size_t id);
+
+// ---- waiting on a file descriptor ------------------------------------------
+//
+// Park the running fiber until `fd` is readable (or writable) and then run it
+// again. Answers 0 when there is no event loop or nothing to park.
+//
+// THE SPLIT IS os/Os.h's AND NOT A CHOICE MADE HERE: the OS layer never blocks
+// on readiness and never calls the scheduler, it answers OS_IO_WOULD_BLOCK, and
+// the CALLER parks here and retries. That is what keeps vm/os/ free of the
+// scheduler and lets the same syscalls serve a blocking VM and this one.
+//
+// WHY IT BELONGS TO THE SCHEDULER and not to the socket code: a fiber that
+// blocks in `read` would stop every other fiber on this thread, because they
+// share it. Parking is what turns one thread into a server, and it is the whole
+// reason the socket primitives are not just syscalls.
+_Bool schedulerWaitFd(OsFd fd, _Bool forWrite);
+
+// Forget an armed descriptor. Called when a socket is closed while a fiber is
+// still parked on it, so the poller does not keep an fd nobody will read.
+void schedulerForgetFd(OsFd fd);
 
 // ---- the sync monitor ------------------------------------------------------
 //

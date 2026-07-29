@@ -127,28 +127,31 @@ Class *classMetaclassOf(Class *class)
 	// The metaclass chain PARALLELS the class chain: the metaclass of a class
 	// inherits from the metaclass of its superclass, which is what makes a
 	// class-side method inherited by subclasses. At the root it lands on the
-	// class-of-classes, where the class-side methods every class has (new, new:)
-	// already live.
+	// class-of-classes -- `Object class superClass == Class` -- where the
+	// class-side methods every class has (new, new:) already live.
 	RawClass *super = rawClassSuperclass(held->raw);
 	Class *superMeta = super == NULL
 		? &Handles.ClassClass
 		: classMetaclassOf(scopeHandle((RawObject *) super));
 
-	String *name = NULL;
-	if (valueTypeOf(held->raw->name, VALUE_POINTER)) {
-		String *own = scopeHandle(asObject(held->raw->name));
-		char buffer[256];
-		size_t size = rawStringSize(own->raw);
-		if (size > sizeof(buffer) - sizeof(" class")) {
-			size = sizeof(buffer) - sizeof(" class");
-		}
-		memcpy(buffer, own->raw->contents, size);
-		memcpy(buffer + size, " class", sizeof(" class"));
-		name = asSymbol(stringFromC(buffer));
-	}
-
-	Class *meta = classCreate(superMeta, (union String *) name, CLASS_OF_CLASSES_SHAPE);
+	// NO NAME IS STORED. A metaclass answers `instanceClass name`, which
+	// packages/Core/src/MetaClass.st defines and which is the only spelling that
+	// stays right when a class is renamed. This used to build the Symbol
+	// `#'MetaA class'` and store it, so `MetaA class name` answered that instead
+	// of `#MetaA`, and printing was the only place the difference showed.
+	Class *meta = classCreate(superMeta, NULL, CLASS_OF_CLASSES_SHAPE);
 	methodsOf(meta);
+	// THE METACLASS IS AN INSTANCE OF MetaClass, which is what makes
+	// `MetaA class class == MetaClass` true and what separates the two kinds of
+	// Behavior for `isKindOf:`: a metaclass is a ClassDescription and a Behavior
+	// but NOT a Class. classCreate stamps every new class as an instance of the
+	// class-of-classes, which is right for a class and wrong for this.
+	rawObjectSetClassIndex((RawObject *) meta->raw, classIndexOf(&Handles.MetaClass));
+	// And it points BACK at its class, in the field a class uses for its name
+	// (core/Object.h, RawMetaClass). Through the barrier: the metaclass was just
+	// allocated and the class may already be old.
+	rawObjectStorePtr((RawObject *) meta->raw,
+		&((RawMetaClass *) meta->raw)->instanceClass, (RawObject *) held->raw);
 	// The class is now an instance of its metaclass. Only the class OBJECT's
 	// header changes; the class's own index in the table, which is what every
 	// baked immediate and every inline cache compares, is untouched.
@@ -278,6 +281,20 @@ CompiledMethod *classCompileMethodInto(MethodNode *node, Class *target,
 	String *selector = scopeHandle(asObject(unit->selector));
 	CompiledMethod *method = compiledMethodCreate(unit, selector, target);
 	symbolDictAtPutObject(methodsOf(target), selector, (Object *) method);
+	// INSTALLING A METHOD INVALIDATES EVERY RESOLVED SEND, and removing one
+	// already knew that (primClassRemoveSelector). Installing did not, and got
+	// away with it while the runtime looked the answer up on every send: the
+	// cached target was only ever read by the runtime that had just written it.
+	// A send site with an inline cache reads it in COMPILED CODE, so a class
+	// whose method is replaced -- or one that starts defining a selector it used
+	// to inherit -- keeps calling the old method until something else evicts the
+	// way. Wrong ANSWER, not a crash, and only at sites warm enough to be armed.
+	//
+	// CONSERVATIVE ON PURPOSE. Which sites a definition can affect is "every site
+	// that dispatches to this selector for any class that inherits from this
+	// one", and computing that costs more than flushing does at the frequency
+	// definitions happen.
+	jitFlushSendCaches();
 	return method;
 }
 
@@ -424,6 +441,53 @@ static size_t declaredVariableCount(Class *class)
 static uint16_t inheritedSlots(Class *super)
 {
 	return super == NULL ? 0 : (uint16_t) super->raw->instanceShape.fixedSlots;
+}
+
+
+// Record `class` among its superclass's DIRECT subclasses.
+//
+// Nothing maintained this field before, so `Behavior>>subClasses` answered nil
+// for every class in the system and the whole reflective protocol built on it
+// -- subClasses, allSubClassesDo:, a class browser -- had nothing to walk.
+//
+// DIRECT ONLY, which is what the collection means and what the test that
+// separates a right implementation from a plausible one checks: a grandchild
+// must NOT appear in its grandparent's list. The transitive walk is
+// allSubClassesDo:, and it is already written in Smalltalk on top of this.
+//
+// IDEMPOTENT, because reopening a class is the common case in this system: the
+// built-in kernel defines Object, Array and the rest, and packages/Core defines
+// them again with their real contents. Appending without checking would give
+// Object a second entry for every class in the kernel.
+static void recordSubclass(Class *super, Class *class)
+{
+	if (super == NULL) {
+		return; // Object, whose superclass is nil, is nobody's subclass
+	}
+	HandleScope scope;
+	openHandleScope(&scope);
+	Class *held = scopeHandle((RawObject *) class->raw);
+	Class *parent = scopeHandle((RawObject *) super->raw);
+	Value existing = parent->raw->subClasses;
+	OrderedCollection *list;
+	if (valueTypeOf(existing, VALUE_POINTER) && asObject(existing) != Handles.nil.raw) {
+		list = scopeHandle(asObject(existing));
+		size_t count = ordCollSize(list);
+		for (size_t i = 0; i < count; i++) {
+			if (asObject(ordCollAt(list, i)) == (RawObject *) held->raw) {
+				closeHandleScope(&scope, NULL);
+				return;
+			}
+		}
+	} else {
+		list = newOrdColl(4);
+		// Through the barrier: the collection is young and the superclass may
+		// already have been promoted.
+		rawObjectStorePtr((RawObject *) parent->raw, &parent->raw->subClasses,
+			(RawObject *) list->raw);
+	}
+	ordCollAddObject(list, (Object *) held);
+	closeHandleScope(&scope, NULL);
 }
 
 
@@ -727,6 +791,7 @@ Class *classBuildIn(ClassNode *node, Namespace *namespace,
 	// The built-in classes were made during bootstrap, before there was a nil to
 	// put in them, and this is the pass that reaches every one of them.
 	classFillAbsentSmalltalkFields(class);
+	recordSubclass(super, class);
 	// THE HOME NAMESPACE, which nothing wrote until now: every class in the
 	// system answered nil there, so `Class>>qualifiedName` answered the plain
 	// name for a package class as readily as for a kernel one, and the only

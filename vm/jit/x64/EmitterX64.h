@@ -35,6 +35,7 @@ void x64BranchIfNotClass(MacroAssembler *, uint16_t slot, uint32_t classIndex,
 	MaLabel *);
 void x64CallRuntime3(MacroAssembler *, MaRuntimeFunction, void *pointerArg,
 	uint16_t slotAddressArg, uint64_t integerArg);
+void x64Send(MacroAssembler *, const MaSendSite *site);
 void x64CallPrimitive(MacroAssembler *, PrimitiveFunction, uint64_t argc);
 void x64SafepointPoll(MacroAssembler *, volatile int *flag);
 void x64End(MacroAssembler *);
@@ -59,6 +60,7 @@ void x64End(MacroAssembler *);
 	.branchIfTag = x64BranchIfTag, \
 	.branchIfNotClass = x64BranchIfNotClass, \
 	.callRuntime3 = x64CallRuntime3, \
+	.send = x64Send, \
 	.callPrimitive = x64CallPrimitive, \
 	.safepointPoll = x64SafepointPoll
 
