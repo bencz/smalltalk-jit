@@ -498,6 +498,31 @@ int main(void)
 		"across a store", f0->terminator->args[0] != atBirth);
 	irDestroy(built);
 
+	// ---- two cells holding the same value are two OBJECTS -----------------
+	//
+	// GVN excludes every allocation by name, and a cell is one. Collapsing them
+	// would hand one box to two variables the program keeps apart, which is the
+	// opposite of what a cell exists for.
+	IrFunction *boxes = irCreate(emptyUnit(2));
+	IrBlock *c0 = irNewBlock(boxes, 0);
+	boxes->entry = c0;
+	IrValue *heldValue = emitInto(boxes, c0, IR_PARAM);
+	IrValue *cellA = emitInto(boxes, c0, IR_NEWCELL);
+	irAddArg(boxes, cellA, heldValue);
+	IrValue *cellB = emitInto(boxes, c0, IR_NEWCELL);
+	irAddArg(boxes, cellB, heldValue);
+	IrValue *usesBoth = emitInto(boxes, c0, IR_SEND);
+	irAddArg(boxes, usesBoth, cellA);
+	irAddArg(boxes, usesBoth, cellB);
+	c0->terminator = irNewValue(boxes, IR_RET);
+	irAddArg(boxes, c0->terminator, usesBoth);
+	c0->terminator->block = c0;
+
+	irOptimize(boxes);
+	check("two cells holding the same value stay two cells",
+		countOp(boxes, IR_NEWCELL) == 2);
+	irDestroy(boxes);
+
 	printf("\n%d of %d checks passed\n", gChecks - gFailures, gChecks);
 	return gFailures == 0 ? 0 : 1;
 }

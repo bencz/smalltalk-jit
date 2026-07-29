@@ -76,12 +76,30 @@ typedef enum {
 	IR_NEWV,       // value-class instance, fields are the arguments
 	IR_ANEW,       // Array
 	IR_VNEW,       // flat value array
+	// The two ADR 0008 allocations. They are separate ops rather than IR_NEW
+	// with a class index because the index is a RUNTIME fact -- it comes from the
+	// class table -- and the SSA builder is deliberately linkable with nothing
+	// but the IR (gate levels 4 and 5 do exactly that). What a cell and a closure
+	// ARE is known to the backend and to the materializer, which both already
+	// depend on the runtime.
+	//
+	// NOT ERASED YET. Escape analysis erases IR_NEW and IR_NEWV only, so these
+	// survive every pass, which is the safe direction: erasing without a correct
+	// materialization recipe is a wrong answer at the first failed guard, and a
+	// closure's recipe needs its home token, which the deopt state does not carry
+	// yet. Modelling them at all is what lets the METHOD be built.
+	IR_NEWCELL,    // one argument: the value the cell is born holding
+	IR_CLOSURE,    // arguments are the captures, `extra` = index into unit blocks
 
 	// control and calls
 	IR_SEND,       // residual dispatch, carries a deopt state
 	IR_GUARD_CLASS,// `extra` = class index; carries a deopt state
 	IR_SAFEPOINT,  // ADR 0007, carries a deopt state
 	IR_RET, IR_JUMP, IR_BRANCH,
+	// `^` from inside a block, which leaves the method the block was WRITTEN in
+	// (ADR 0008). A terminator like IR_RET, and a different one because where it
+	// goes is decided by the closure's home token and not by this frame.
+	IR_RETOUTER,
 	IR_PHI,
 
 	IR_OP_COUNT

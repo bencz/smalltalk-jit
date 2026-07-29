@@ -12,6 +12,7 @@
 #include "core/Smalltalk.h"
 #include "runtime/Collection.h"
 #include "memory/Heap.h"
+#include "memory/Roots.h"
 #include "os/Os.h"
 #include <setjmp.h>
 #include <stdio.h>
@@ -312,6 +313,18 @@ NativeCode *jitCodeContaining(const void *address)
 }
 
 
+const FrameMap *jitFrameMapAt(const NativeCode *code, const void *returnAddress)
+{
+	// A tier-1 method has ONE map and it covers everything, so the offset is not
+	// consulted yet. It is taken and checked anyway: when tier 2 brings a map per
+	// safepoint this becomes a search, and every caller already passes what the
+	// search will need.
+	ASSERT(returnAddress >= (const void *) code->entry
+		&& returnAddress < (const void *) (code->entry + code->size));
+	return code->frameMap;
+}
+
+
 // ---------------------------------------------------------------------------
 // Compiled frames as a root set
 // ---------------------------------------------------------------------------
@@ -341,12 +354,28 @@ void rootsVisitNativeFrames(struct Thread *thread, RootVisitor visit, void *ctx)
 			guard = guard->previous) {
 		uint8_t *frame = guard->frame;
 		NativeCode *code = guard->code;
+		const void *at = guard->returnAddress;
 		while (frame != NULL && code != NULL) {
+			// A frame the walk reached and cannot describe is a VM bug, not a
+			// boundary: the boundary is a return address in NO compiled method,
+			// and that ends the loop below. Reaching here with no map would mean
+			// scanning by guesswork, which is the repair ADR 0003 R2 forbids.
+			const FrameMap *map = jitFrameMapAt(code, at);
+			ASSERT(map != NULL);
 			// Slot i is at frame - 8*(i+1). The same expression the backend
 			// emits, and the reason the frame layout is a declared contract
 			// (jit/Jit.h).
 			for (uint16_t i = 0; i < code->frameSlots; i++) {
+				// The MAP decides whether this is a tagged Value at all. A raw
+				// double whose bit pattern happens to satisfy the tag test is
+				// exactly the accident R1 exists to prevent, and no amount of
+				// looking at the contents can tell it from a pointer.
+				if (frameMapKindAt(map, i) != SLOT_POINTER) {
+					continue;
+				}
 				Value *slot = (Value *) (frame - (size_t) (i + 1) * sizeof(Value));
+				// Tagged does not mean POINTER: a slot holding a SmallInteger is
+				// described correctly and simply has nothing to visit.
 				if (valueTypeOf(*slot, VALUE_POINTER)) {
 					visit(ctx, slot);
 				}
@@ -358,6 +387,7 @@ void rootsVisitNativeFrames(struct Thread *thread, RootVisitor visit, void *ctx)
 			void *returnAddress = *(void **) (frame + sizeof(Value));
 			uint8_t *parent = *(uint8_t **) frame;
 			code = jitCodeContaining(returnAddress);
+			at = returnAddress;
 			frame = parent;
 		}
 	}
@@ -371,6 +401,7 @@ void compiledFrameEnter(CompiledFrameGuard *guard, Value *slotAddress,
 	guard->frame = (uint8_t *) slotAddress
 		+ (size_t) (slotIndex + 1) * sizeof(Value);
 	guard->code = jitCodeContaining(returnAddress);
+	guard->returnAddress = returnAddress;
 	guard->previous = CurrentThread.compiledFrames;
 	CurrentThread.compiledFrames = guard;
 }
@@ -1675,6 +1706,21 @@ NativeCode *jitCompileFor(const MacroAssemblerOps *ops, CodeUnit *unit,
 	code->wide = maUsesWideArguments(jit.assembler);
 	code->machineOffsetAt = jit.machineOffsetAt;
 	code->cells = jit.cells;
+	// THE FRAME DESCRIPTION, and for this tier it is one line because the tier
+	// is uniform: every slot holds a tagged Value. Written out rather than
+	// assumed, because "assumed" is what it was -- a sentence in a comment that
+	// the collector had no way to read and no way to check.
+	size_t mapBytes = sizeof(FrameMap) + frameMapByteCount(code->frameSlots);
+	code->frameMap = calloc(1, mapBytes);
+	if (code->frameMap == NULL) {
+		FAIL();
+	}
+	code->frameMap->codeOffset = 0;
+	code->frameMap->slotCount = code->frameSlots;
+	code->frameMap->byteCount = (uint16_t) frameMapByteCount(code->frameSlots);
+	for (uint16_t slot = 0; slot < code->frameSlots; slot++) {
+		frameMapSetKind(code->frameMap, slot, SLOT_POINTER);
+	}
 	if (ops == maHostBackend()) {
 		code->entry = maPublish(jit.assembler, &code->size);
 	} else {
@@ -1827,6 +1873,7 @@ void jitFreeNativeCode(NativeCode *code)
 	// The machine code itself is NOT freed: exec memory is never reclaimed, so
 	// a frame still running inside it stays valid forever.
 	free(code->machineOffsetAt);
+	free(code->frameMap);
 	free(code->cells);
 	free(code);
 }

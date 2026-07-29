@@ -16,6 +16,7 @@
 #include "compiler/Bytecode.h"
 #include "jit/Ir.h"
 #include "jit/SsaBuild.h"
+#include "runtime/Closure.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -184,6 +185,80 @@ int main(void)
 	printf("\n");
 	printf("  the loop's SSA, for the record:\n");
 	irPrint(looping);
+
+	// ---- the ADR 0008 family: cells, closures, captures --------------------
+	//
+	// A CELL IS AN EXPLICIT ALLOCATION and its accesses are ordinary field
+	// operations. That is the whole reason ADR 0008 chose cells over contexts:
+	// escape analysis erases what it can see, and a context was opaque.
+	static Instruction cells[] = {
+		{ OP_LOADI,   0, 1, 7, 0 },
+		{ OP_NEWCELL, 0, 2, 1, 0 },  // r2 := a cell holding r1
+		{ OP_GETCELL, 0, 3, 2, 0 },
+		{ OP_LOADI,   0, 4, 9, 0 },
+		{ OP_SETCELL, 0, 2, 4, 0 },  // r2's value := r4
+		{ OP_GETCELL, 0, 5, 2, 0 },
+		{ OP_RET,     0, 5, 0, 0 },
+	};
+	IrFunction *boxed = ssaBuild(makeUnit(cells, 7, 6, 0), NULL);
+	check("a cell is an explicit allocation", countOp(boxed, IR_NEWCELL) == 1);
+	check("reading one is an ordinary field read", countOp(boxed, IR_FIELD_T) == 2);
+	check("writing one is an ordinary field write",
+		countOp(boxed, IR_SETFIELD_T) == 1);
+	IrValue *cellRead = findOp(boxed, IR_FIELD_T);
+	check("at the cell's value field",
+		cellRead != NULL && cellRead->extra == CELL_VALUE_FIELD);
+	irDestroy(boxed);
+
+	// A CAPTURE is a field of the closure in register 0, which is what replaced
+	// the old VM's walk up a chain of contexts.
+	static Instruction upvalue[] = {
+		{ OP_GETUP, 0, 1, 2, 0 },
+		{ OP_RET,   0, 1, 0, 0 },
+	};
+	IrFunction *captured = ssaBuild(makeUnit(upvalue, 2, 2, 0), NULL);
+	check("a captured value is one field read", countOp(captured, IR_FIELD_T) == 1);
+	IrValue *upRead = findOp(captured, IR_FIELD_T);
+	check("at the capture's own index",
+		upRead != NULL && upRead->extra == CLOSURE_CAPTURE_FIELD(2));
+	irDestroy(captured);
+
+	static Instruction made[] = {
+		{ OP_LOADI,   0, 1, 5, 0 },
+		{ OP_LOADI,   0, 2, 6, 0 },
+		{ OP_CLOSURE, 2, 3, 0, 1 },  // over blocks[0], capturing r1 and r2
+		{ OP_RET,     0, 3, 0, 0 },
+	};
+	IrFunction *closed = ssaBuild(makeUnit(made, 4, 4, 0), NULL);
+	check("a closure is an allocation", countOp(closed, IR_CLOSURE) == 1);
+	IrValue *closure = findOp(closed, IR_CLOSURE);
+	check("with one operand per capture", closure != NULL && closure->argCount == 2);
+	check("naming the block it closes over", closure != NULL && closure->extra == 0);
+	irDestroy(closed);
+
+	static Instruction nonLocal[] = {
+		{ OP_LOADI,    0, 1, 3, 0 },
+		{ OP_RETOUTER, 0, 1, 0, 0 },
+	};
+	IrFunction *outer = ssaBuild(makeUnit(nonLocal, 2, 2, 0), NULL);
+	check("a non-local return is a terminator of its own",
+		countOp(outer, IR_RETOUTER) == 1);
+	irDestroy(outer);
+
+	// ---- and an opcode nobody modelled is REFUSED, by name -----------------
+	//
+	// It used to be skipped in silence, which for a method with a block meant IR
+	// with the closure operations simply missing. OP_SETUP is the opcode to test
+	// it with precisely because nothing emits it: it is declared, dead, and
+	// therefore never going to be modelled by accident.
+	static Instruction unmodelled[] = {
+		{ OP_SETUP, 0, 0, 1, 0 },
+		{ OP_RET,   0, 1, 0, 0 },
+	};
+	Opcode refused = OP_COUNT;
+	check("an unmodelled opcode is refused, not skipped",
+		ssaBuild(makeUnit(unmodelled, 2, 2, 0), &refused) == NULL);
+	check("and the refusal names it", refused == OP_SETUP);
 
 	printf("\n%d of %d checks passed\n", gChecks - gFailures, gChecks);
 	return gFailures == 0 ? 0 : 1;

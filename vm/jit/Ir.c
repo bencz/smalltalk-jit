@@ -70,6 +70,8 @@ static const struct {
 	[IR_NEWV]      = { "newv",      REPR_TAGGED, 1 },
 	[IR_ANEW]      = { "anew",      REPR_TAGGED, 1 },
 	[IR_VNEW]      = { "vnew",      REPR_TAGGED, 1 },
+	[IR_NEWCELL]   = { "newcell",   REPR_TAGGED, 1 },
+	[IR_CLOSURE]   = { "closure",   REPR_TAGGED, 1 },
 
 	[IR_SEND]      = { "send",      REPR_TAGGED, 0 },
 	[IR_GUARD_CLASS]={ "guard_class",REPR_VOID,  0 },
@@ -77,6 +79,7 @@ static const struct {
 	[IR_RET]       = { "ret",       REPR_VOID,   0 },
 	[IR_JUMP]      = { "jump",      REPR_VOID,   0 },
 	[IR_BRANCH]    = { "branch",    REPR_VOID,   0 },
+	[IR_RETOUTER]  = { "retouter",  REPR_VOID,   0 },
 	[IR_PHI]       = { "phi",       REPR_TAGGED, 1 },
 };
 
@@ -129,7 +132,8 @@ const char *irOpName(IrOp op) { return gOps[op].name; }
 
 _Bool irOpIsTerminator(IrOp op)
 {
-	return op == IR_RET || op == IR_JUMP || op == IR_BRANCH;
+	return op == IR_RET || op == IR_JUMP || op == IR_BRANCH
+		|| op == IR_RETOUTER;
 }
 
 

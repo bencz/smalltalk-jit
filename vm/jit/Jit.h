@@ -75,6 +75,18 @@ typedef struct NativeCode {
 	// deoptimization, OSR and backtraces all read, and fixed-width bytecode is
 	// what lets it be indexed rather than searched (docs/jit-v2/04-bytecode.md).
 	uint32_t *machineOffsetAt;
+	// What each frame slot HOLDS, which the collector needs and cannot guess
+	// (memory/Roots.h, requirement R1 of ADR 0003).
+	//
+	// ONE MAP for a whole tier-1 method, and that is a property of THIS tier
+	// rather than a simplification: the template compiler never puts a raw
+	// double or a raw integer in a slot and the prologue nils every slot it does
+	// not receive an argument in, so the description is the same at every point
+	// in the method. Tier 2 keeps raw values in slots and its description
+	// changes from safepoint to safepoint, which is what FrameMap.codeOffset is
+	// for -- so the collector already asks "the map at this point" and gains
+	// nothing new to learn when that day comes.
+	struct FrameMap *frameMap;
 	uint16_t frameSlots;
 	// Which of the two calling conventions the prologue emitted, decided by the
 	// arity against the Abi being compiled for. Written once, here, and read by
@@ -248,6 +260,10 @@ typedef struct CompiledFrameGuard {
 	struct CompiledFrameGuard *previous;
 	uint8_t *frame;
 	NativeCode *code;
+	// Where inside `code` execution was when this frame called out. The frame
+	// map is looked up by it, which costs nothing today (a tier-1 method has one
+	// map) and is what stops the walk needing to change for tier 2.
+	void *returnAddress;
 } CompiledFrameGuard;
 
 // `slotAddress` is the address the runtime call was handed, and `slotIndex` is
@@ -262,6 +278,12 @@ void compiledFrameLeave(const CompiledFrameGuard *guard);
 // How the walk decides whether a return address belongs to a compiled frame or
 // to the C code that entered one.
 NativeCode *jitCodeContaining(const void *address);
+
+// The frame description in force at `returnAddress`, which must lie inside
+// `code`. Never NULL for a method this JIT compiled.
+struct FrameMap;
+const struct FrameMap *jitFrameMapAt(const NativeCode *code,
+	const void *returnAddress);
 
 // Forget every RESOLVED TARGET at every send site, keeping the profile. What
 // any change to a method dictionary has to do, or a warm site keeps calling the

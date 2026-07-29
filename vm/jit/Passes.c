@@ -526,9 +526,14 @@ static uint32_t globalValueNumbering(PassContext *context)
 			// Allocations are pure but must NOT be numbered together: two
 			// `new` instructions produce two distinct objects, and collapsing
 			// them would give one identity where the program expects two.
+			// EVERY allocation is excluded, and the cell and the closure are
+			// allocations: two of either are two OBJECTS, and two cells holding
+			// the same value are exactly the case where collapsing them would
+			// give one box to variables the program keeps apart.
 			_Bool numberable = irOpIsPure((IrOp) value->op)
 				&& value->op != IR_NEW && value->op != IR_NEWV
 				&& value->op != IR_ANEW && value->op != IR_VNEW
+				&& value->op != IR_NEWCELL && value->op != IR_CLOSURE
 				&& value->op != IR_PARAM && value->op != IR_PHI;
 			if (numberable) {
 				uint32_t hash = gvnHash(value, &memory);

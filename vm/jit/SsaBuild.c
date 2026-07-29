@@ -75,6 +75,26 @@ static void instructionUseDef(const Instruction *instruction, uint16_t *uses,
 		uses[(*useCount)++] = 0;
 		*define = instruction->a;
 		break;
+	case OP_NEWCELL:
+		uses[(*useCount)++] = instruction->b;
+		*define = instruction->a;
+		break;
+	case OP_GETCELL:
+		uses[(*useCount)++] = instruction->b;
+		*define = instruction->a;
+		break;
+	case OP_SETCELL:
+		uses[(*useCount)++] = instruction->a; // the cell
+		uses[(*useCount)++] = instruction->b; // the value
+		break;
+	case OP_CLOSURE:
+		// The captures are consecutive registers starting at c, gathered there
+		// by the front end for the same reason a send's arguments are.
+		for (uint16_t i = 0; i < instruction->n; i++) {
+			uses[(*useCount)++] = (uint16_t) (instruction->c + i);
+		}
+		*define = instruction->a;
+		break;
 	case OP_JUMP: case OP_SAFEPOINT:
 		break;
 	default:
@@ -433,6 +453,44 @@ static void lower(Builder *builder, uint16_t bci)
 		break;
 	}
 
+	case OP_NEWCELL: {
+		// AN EXPLICIT ALLOCATION, which is the whole reason ADR 0008 chose cells
+		// over contexts: escape analysis can only erase what it can see. It does
+		// not erase this one yet -- that needs a materialization recipe -- but
+		// the shape is here for when it does.
+		IrValue *value = emit(builder, IR_NEWCELL);
+		irAddArg(function, value, readVariable(builder, instruction->b, block));
+		writeVariable(builder, instruction->a, block, value);
+		break;
+	}
+
+	case OP_GETCELL: {
+		IrValue *value = emit(builder, IR_FIELD_T);
+		irAddArg(function, value, readVariable(builder, instruction->b, block));
+		value->extra = CELL_VALUE_FIELD;
+		writeVariable(builder, instruction->a, block, value);
+		break;
+	}
+
+	case OP_SETCELL: {
+		IrValue *value = emit(builder, IR_SETFIELD_T);
+		irAddArg(function, value, readVariable(builder, instruction->a, block));
+		irAddArg(function, value, readVariable(builder, instruction->b, block));
+		value->extra = CELL_VALUE_FIELD;
+		break;
+	}
+
+	case OP_CLOSURE: {
+		IrValue *value = emit(builder, IR_CLOSURE);
+		for (uint16_t i = 0; i < instruction->n; i++) {
+			irAddArg(function, value,
+				readVariable(builder, (uint16_t) (instruction->c + i), block));
+		}
+		value->extra = instruction->b;
+		writeVariable(builder, instruction->a, block, value);
+		break;
+	}
+
 	case OP_GETGLOBAL: {
 		// The Association's VALUE, and the association itself never becomes an IR
 		// operand: it is a heap object that moves, so the backend reaches it the
@@ -489,6 +547,14 @@ static void lower(Builder *builder, uint16_t bci)
 
 	case OP_RET: {
 		IrValue *value = irNewValue(function, IR_RET);
+		irAddArg(function, value, readVariable(builder, instruction->a, block));
+		value->block = block;
+		block->terminator = value;
+		break;
+	}
+
+	case OP_RETOUTER: {
+		IrValue *value = irNewValue(function, IR_RETOUTER);
 		irAddArg(function, value, readVariable(builder, instruction->a, block));
 		value->block = block;
 		block->terminator = value;
@@ -552,6 +618,8 @@ static _Bool ssaModels(Opcode op)
 	case OP_LOADTRUE: case OP_LOADFALSE:
 	case OP_GETIVAR: case OP_SETIVAR:
 	case OP_GETUP:
+	case OP_NEWCELL: case OP_GETCELL: case OP_SETCELL: case OP_CLOSURE:
+	case OP_RETOUTER:
 	case OP_GETGLOBAL: case OP_SETGLOBAL:
 	case OP_SEND: case OP_SENDSUPER:
 	case OP_JUMP: case OP_JUMPFALSE: case OP_JUMPTRUE: case OP_GUARDCLASS:

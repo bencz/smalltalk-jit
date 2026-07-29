@@ -39,7 +39,10 @@ typedef enum {
 
 // A safepoint's frame description: two bits per frame slot, packed.
 // `slotCount` is the number of DESCRIBED slots; anything beyond it is dead.
-typedef struct {
+// TAGGED, so a header that must not include this one can still forward-declare
+// it. jit/Jit.h holds a FrameMap on every compiled method and is included in
+// places the collector is not.
+typedef struct FrameMap {
 	uint32_t codeOffset; // byte offset into the method's native code
 	uint16_t slotCount;
 	uint16_t byteCount;  // ceil(slotCount / SLOT_KINDS_PER_BYTE)
