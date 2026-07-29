@@ -94,6 +94,55 @@ int main(void)
 	check("the return is a terminator", countOp(simple, IR_RET) == 1);
 	check("no phi where control never merges", countOp(simple, IR_PHI) == 0);
 
+	// ---- a literal load KEEPS ITS INDEX ------------------------------------
+	// This used to share IR_CONST with nil, true and false, with `extra` naming
+	// the OPCODE, so the literal index went nowhere at all. Nothing noticed
+	// because the only consumer of the IR threw it away; a backend cannot, and
+	// the optimizer had already been merging literal loads (level 5 checks that
+	// half). Two literals, so a builder that recorded a constant rather than an
+	// index fails here rather than looking plausible.
+	static Instruction literals[] = {
+		{ OP_LOADK, 0, 1, 0, 0 },
+		{ OP_LOADK, 0, 2, 7, 0 },
+		{ OP_RET, 0, 2, 0, 0 },
+	};
+	IrFunction *literal = ssaBuild(makeUnit(literals, 3, 3, 0), NULL);
+	check("two literal loads are two values", countOp(literal, IR_LITERAL) == 2);
+	IrValue *firstLiteral = findOp(literal, IR_LITERAL);
+	check("a literal load carries its literal index",
+		firstLiteral != NULL && firstLiteral->extra == 0
+			&& firstLiteral->next != NULL && firstLiteral->next->extra == 7);
+	check("a literal load is not an IR_CONST", countOp(literal, IR_CONST) == 0);
+
+	// ---- a send REMEMBERS ITS SITE, AND WHETHER IT IS SUPER ----------------
+	// Both opcodes used to share one arm and produce an indistinguishable
+	// IR_SEND, so a backend would have emitted an ordinary send for `super foo`
+	// and started the lookup at the receiver's class -- which, for a receiver
+	// that is an instance of a subclass, finds the running method again. That is
+	// the infinite recursion lookupStart exists to prevent, so it is a wrong
+	// answer and not a missed optimization.
+	//
+	// The bytecode INDEX is checked in the same breath because it is lost the
+	// same way and needed for the same reason: a send's cache cell is indexed by
+	// it, and without it every send in a method would share one site's profile.
+	static Instruction sends[] = {
+		{ OP_SEND, 0, 1, 3, 0 },
+		{ OP_SENDSUPER, 0, 2, 4, 1 },
+		{ OP_RET, 0, 2, 0, 0 },
+	};
+	IrFunction *sent = ssaBuild(makeUnit(sends, 3, 4, 0), NULL);
+	IrValue *ordinary = findOp(sent, IR_SEND);
+	check("an ordinary send is not marked super",
+		ordinary != NULL && (ordinary->flags & IR_FLAG_SUPER) == 0);
+	check("a super send is marked super",
+		ordinary != NULL && ordinary->next != NULL
+			&& (ordinary->next->flags & IR_FLAG_SUPER) != 0);
+	check("each send carries its own bytecode index",
+		ordinary != NULL && ordinary->bci == 0
+			&& ordinary->next != NULL && ordinary->next->bci == 1);
+	check("an op with no site says so rather than naming bci 0",
+		findOp(literal, IR_LITERAL)->bci == BYTECODE_NO_TARGET);
+
 	// ---- a merge, which is where a phi belongs ----------------------------
 	static Instruction merge[] = {
 		{ OP_JUMPFALSE, 0, 1, 3, 0 },

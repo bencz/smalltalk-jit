@@ -19,6 +19,22 @@ typedef enum {
 	NO_REGISTER = -1,
 } Register;
 
+// The SSE register file, numbered from zero IN ITS OWN SPACE.
+//
+// A SEPARATE ENUM and not more entries in the one above, because they are a
+// separate BANK: the SSA backend allocates the two independently, so register 3
+// means RBX in one and XMM3 in the other, and jit/Abi.h says exactly that where
+// it calls the numbers backend-local. Folding them into one enum would make the
+// overlap look like a collision and tempt a reader to renumber one of them,
+// which is the sort of change that produces code that assembles and computes
+// with the wrong file.
+typedef enum {
+	XMM0 = 0, XMM1 = 1, XMM2 = 2, XMM3 = 3,
+	XMM4 = 4, XMM5 = 5, XMM6 = 6, XMM7 = 7,
+	XMM8 = 8, XMM9 = 9, XMM10 = 10, XMM11 = 11,
+	XMM12 = 12, XMM13 = 13, XMM14 = 14, XMM15 = 15,
+} XmmRegister;
+
 typedef enum {
 	COND_OVERFLOW = 0x0, COND_NO_OVERFLOW = 0x1,
 	COND_BELOW = 0x2, COND_ABOVE_EQUAL = 0x3,
@@ -346,6 +362,196 @@ static inline void asmCallReg(CodeBuffer *buffer, Register reg)
 
 
 // ---- labels and branches ---------------------------------------------------
+
+// ---- what the SSA backend needs and the template compiler never did --------
+//
+// Tier 1 computes nothing: every bytecode is a load, a store, a compare or a
+// call. Tier 2 keeps values in registers and does arithmetic on them, so it
+// needs the instructions that do arithmetic.
+
+// dst = dst * src. Signed, and the two-operand form, so the overflow flags are
+// set from the low 64 bits -- which is all this backend looks at, because a
+// SmallInteger result that does not fit is the Smalltalk fallback's problem.
+static inline void asmImulRegReg(CodeBuffer *buffer, Register dst, Register src)
+{
+	emitRexW(buffer, dst, src);
+	emit8(buffer, 0x0F);
+	emit8(buffer, 0xAF);
+	emitModRmReg(buffer, dst, src);
+}
+
+
+// Sign-extend RAX into RDX:RAX. The instruction idiv REQUIRES this first, and
+// forgetting it is not a crash: it divides by whatever RDX held and answers a
+// plausible wrong number.
+static inline void asmCqo(CodeBuffer *buffer)
+{
+	emit8(buffer, 0x48);
+	emit8(buffer, 0x99);
+}
+
+
+// RDX:RAX / src, quotient in RAX and remainder in RDX. Both are clobbered,
+// which is why the allocator is told about them (jit/RegAlloc.c addClobbers).
+static inline void asmIdivReg(CodeBuffer *buffer, Register src)
+{
+	emitRexW(buffer, (Register) 0, src);
+	emit8(buffer, 0xF7);
+	emitModRmReg(buffer, (Register) 7, src);
+}
+
+
+static inline void asmNegReg(CodeBuffer *buffer, Register dst)
+{
+	emitRexW(buffer, (Register) 0, dst);
+	emit8(buffer, 0xF7);
+	emitModRmReg(buffer, (Register) 3, dst);
+}
+
+
+static inline void asmXorRegReg(CodeBuffer *buffer, Register dst, Register src)
+{
+	emitRexW(buffer, src, dst);
+	emit8(buffer, 0x31);
+	emitModRmReg(buffer, src, dst);
+}
+
+
+static inline void asmAndRegReg(CodeBuffer *buffer, Register dst, Register src)
+{
+	emitRexW(buffer, src, dst);
+	emit8(buffer, 0x21);
+	emitModRmReg(buffer, src, dst);
+}
+
+
+// Set the low byte of `reg` to 0 or 1 by condition, then widen it.
+//
+// THE REX PREFIX IS NOT OPTIONAL HERE even when no extended register is
+// involved. Without it, encoding 4 to 7 in the byte-register space means AH,
+// CH, DH and BH rather than SPL, BPL, SIL and DIL, so `setcc sil` silently
+// becomes `setcc dh` and writes the wrong half of a different register. That is
+// the exact family of bug this repository already caught once, in asmTestbImm
+// encoding BH for RDI.
+static inline void asmSetcc(CodeBuffer *buffer, Condition condition, Register reg)
+{
+	if (reg >= 4) {
+		emit8(buffer, (uint8_t) (0x40 | (reg >= R8 ? 0x01 : 0x00)));
+	}
+	emit8(buffer, 0x0F);
+	emit8(buffer, (uint8_t) (0x90 + condition));
+	emit8(buffer, (uint8_t) (0xC0 | (reg & 7)));
+}
+
+
+// Zero-extend the low byte, which is what turns a setcc into a 0 or a 1 that
+// the rest of the backend can do arithmetic with.
+static inline void asmMovzxByte(CodeBuffer *buffer, Register dst, Register src)
+{
+	uint8_t rex = 0x48;
+	if (dst >= R8) { rex |= 0x04; }
+	if (src >= R8) { rex |= 0x01; }
+	emit8(buffer, rex);
+	emit8(buffer, 0x0F);
+	emit8(buffer, 0xB6);
+	emitModRmReg(buffer, dst, src);
+}
+
+
+// ---- SSE, scalar double ----------------------------------------------------
+//
+// The mandatory prefix comes FIRST and REX comes after it, before the 0F. The
+// other order assembles into something else entirely, and it is the single
+// easiest thing to get wrong in SSE encoding.
+static inline void emitSseRex(CodeBuffer *buffer, uint8_t prefix, _Bool wide,
+	uint8_t reg, uint8_t rm)
+{
+	emit8(buffer, prefix);
+	uint8_t rex = (uint8_t) (0x40 | (wide ? 0x08 : 0x00)
+		| (reg >= 8 ? 0x04 : 0x00) | (rm >= 8 ? 0x01 : 0x00));
+	if (rex != 0x40) {
+		emit8(buffer, rex);
+	}
+	emit8(buffer, 0x0F);
+}
+
+
+static inline void asmSseRegReg(CodeBuffer *buffer, uint8_t prefix,
+	uint8_t opcode, XmmRegister dst, XmmRegister src)
+{
+	emitSseRex(buffer, prefix, 0, (uint8_t) dst, (uint8_t) src);
+	emit8(buffer, opcode);
+	emitModRmReg(buffer, (Register) dst, (Register) src);
+}
+
+
+#define asmMovsdRegReg(b, d, s) asmSseRegReg((b), 0xF2, 0x10, (d), (s))
+#define asmAddsd(b, d, s)       asmSseRegReg((b), 0xF2, 0x58, (d), (s))
+#define asmMulsd(b, d, s)       asmSseRegReg((b), 0xF2, 0x59, (d), (s))
+#define asmSubsd(b, d, s)       asmSseRegReg((b), 0xF2, 0x5C, (d), (s))
+#define asmDivsd(b, d, s)       asmSseRegReg((b), 0xF2, 0x5E, (d), (s))
+#define asmSqrtsd(b, d, s)      asmSseRegReg((b), 0xF2, 0x51, (d), (s))
+// UNORDERED compare, which is the right one for IEEE doubles: it sets the
+// parity flag for NaN instead of raising, so a comparison against NaN answers
+// false rather than trapping.
+#define asmUcomisd(b, a, x)     asmSseRegReg((b), 0x66, 0x2E, (a), (x))
+
+
+static inline void asmMovsdRegMem(CodeBuffer *buffer, XmmRegister dst,
+	Register base, int32_t displacement)
+{
+	emitSseRex(buffer, 0xF2, 0, (uint8_t) dst, (uint8_t) base);
+	emit8(buffer, 0x10);
+	emitModRmMem(buffer, (Register) dst, base, displacement);
+}
+
+
+static inline void asmMovsdMemReg(CodeBuffer *buffer, Register base,
+	int32_t displacement, XmmRegister src)
+{
+	emitSseRex(buffer, 0xF2, 0, (uint8_t) src, (uint8_t) base);
+	emit8(buffer, 0x11);
+	emitModRmMem(buffer, (Register) src, base, displacement);
+}
+
+
+// Integer to double, and double to integer. NUMERIC conversions: 1 becomes 1.0.
+// Not to be confused with the two below, which reinterpret the same bits.
+static inline void asmCvtsi2sd(CodeBuffer *buffer, XmmRegister dst, Register src)
+{
+	emitSseRex(buffer, 0xF2, 1, (uint8_t) dst, (uint8_t) src);
+	emit8(buffer, 0x2A);
+	emitModRmReg(buffer, (Register) dst, src);
+}
+
+
+static inline void asmCvttsd2si(CodeBuffer *buffer, Register dst, XmmRegister src)
+{
+	emitSseRex(buffer, 0xF2, 1, (uint8_t) dst, (uint8_t) src);
+	emit8(buffer, 0x2C);
+	emitModRmReg(buffer, dst, (Register) src);
+}
+
+
+// The same eight bytes, moved between the files. BIT REINTERPRETATION, which is
+// what boxing a double is: 1.0 becomes 4607182418800017408, not 1.
+static inline void asmMovqXmmFromGpr(CodeBuffer *buffer, XmmRegister dst,
+	Register src)
+{
+	emitSseRex(buffer, 0x66, 1, (uint8_t) dst, (uint8_t) src);
+	emit8(buffer, 0x6E);
+	emitModRmReg(buffer, (Register) dst, src);
+}
+
+
+static inline void asmMovqGprFromXmm(CodeBuffer *buffer, Register dst,
+	XmmRegister src)
+{
+	emitSseRex(buffer, 0x66, 1, (uint8_t) src, (uint8_t) dst);
+	emit8(buffer, 0x7E);
+	emitModRmReg(buffer, (Register) src, dst);
+}
+
 
 static inline void asmInitLabel(X64Label *label)
 {

@@ -65,7 +65,7 @@ PRIMITIVE_SOURCES="vm/runtime/Primitive.c vm/runtime/primitives/*.c"
 #
 # This is not a build accident, it is the shape of the system. The hand-linked
 # levels exist to prove a subsystem with nothing above it (docs/jit-v2/01-gate.md):
-# level 3 has no front end at all, level 7 has no compiler, and level 8 brings
+# level 3 has no front end at all, level 8 has no compiler, and level 9 brings
 # its own stubs for the globals table. Reflect.c is the reflective compiler --
 # parsing and class building driven FROM Smalltalk -- so it sits above all
 # three, and linking the compiler and the class builder into them to satisfy one
@@ -267,7 +267,47 @@ level6() {
 	"$SCRATCH/deopttest" >/dev/null
 }
 
-# ---- level 7: primitives, still standalone ----------------------------------
+# ---- level 7: the SSA backend emits machine code that runs ------------------
+# THE ORACLE IS TIER 1. Every method is compiled by BOTH code generators, both
+# are EXECUTED, and what is checked is that they agree. Under a dry cut
+# (ADR 0002) the external oracle is gone and --deopt-stress does not exist yet;
+# this is the internal one that does, and it is available precisely because
+# tier 1 is a complete, independently proved implementation of the same
+# language. A value check would pass on an answer that is right for the wrong
+# reason; two code generators arriving at it by different routes would not.
+#
+# RUN AT SEVERAL REGISTER-POOL SIZES, because ST_SSA_REGS is what makes an
+# ordinary method spill. The spill and split paths are the code a twelve
+# register file never reaches, so they are the least likely to have executed and
+# the most likely to be wrong; at a pool of 2 every method goes through them.
+level7() {
+	gcc $GATE_CFLAGS \
+		-Ivm -I. -Ivm/os/linux \
+		vm/tests/BackendTest.c \
+		vm/jit/Jit.c vm/jit/CompiledMethod.c vm/jit/MacroAssembler.c \
+		vm/jit/Backends.c vm/jit/InlineCache.c vm/core/Smalltalk.c \
+		vm/jit/Ir.c vm/jit/SsaBuild.c vm/jit/Passes.c vm/jit/Lir.c \
+		vm/jit/Lower.c vm/jit/RegAlloc.c vm/jit/SsaRuntime.c \
+		vm/jit/SsaEmitter.c vm/jit/SsaBackends.c vm/jit/SsaBackend.c \
+		vm/jit/Deopt.c vm/jit/DeoptResume.c vm/jit/x64/abi/sysv/ResumeSysV.c \
+		$(standalonePrimitiveSources) $(primitiveSupportSources) \
+		vm/jit/x64/MacroAssemblerX64.c vm/jit/x64/SsaEmitterX64.c \
+		vm/jit/x64/abi/sysv/AbiSysV.c vm/jit/x64/abi/win64/AbiWin64.c \
+		vm/core/Class.c vm/core/ClassTable.c vm/core/Handle.c \
+		vm/runtime/String.c vm/runtime/Collection.c vm/runtime/Dictionary.c \
+		vm/memory/Heap.c vm/memory/Collector.c vm/memory/PageSpace.c \
+		vm/memory/Nursery.c vm/memory/RememberedSet.c vm/memory/Roots.c \
+		$(osSources) \
+		-o "$SCRATCH/backendtest" -lpthread -lm || return 1
+	"$SCRATCH/backendtest" >/dev/null || return 1
+	local pool
+	for pool in 8 4 2; do
+		ST_SSA_REGS=$pool "$SCRATCH/backendtest" >/dev/null || return 1
+	done
+}
+
+
+# ---- level 8: primitives, still standalone ----------------------------------
 # The other side of a send. Until this level, `3 + 4` compiled to a SEND with
 # nothing at the far end of it, so no real program could run.
 #
@@ -276,7 +316,7 @@ level6() {
 # inline cache, and are NEVER resolved statically. The old VM resolved them at
 # the call site, and when its fast path HIT it jumped over the cache, so the
 # profile at exactly the hottest sites recorded only the cases that MISSED.
-level7() {
+level8() {
 	gcc $GATE_CFLAGS \
 		-Ivm -I. -Ivm/os/linux \
 		vm/tests/PrimitiveTest.c $(standalonePrimitiveSources) \
@@ -295,11 +335,11 @@ level7() {
 	"$SCRATCH/primtest"
 }
 
-# ---- level 8: the front end, source to a running method ---------------------
+# ---- level 9: the front end, source to a running method ---------------------
 # The first level whose bytecode is not written by hand. Tokenizer, Parser and
 # Ast are the ORIGINAL ones; name resolution and emission are new, because the
 # bytecode they targeted is gone.
-level8() {
+level9() {
 	gcc $GATE_CFLAGS \
 		-Ivm -I. -Ivm/os/linux \
 		vm/tests/CompileTest.c vm/compiler/Compile.c vm/compiler/Parser.c \
@@ -318,13 +358,13 @@ level8() {
 	"$SCRATCH/compiletest"
 }
 
-# ---- level 9: the whole tree compiles and links -----------------------------
-level9() {
+# ---- level 10: the whole tree compiles and links -----------------------------
+level10() {
 	cmake -S . -B "$BUILD" >/dev/null 2>&1 || return 1
 	cmake --build "$BUILD" -j"$(nproc)" >/dev/null 2>&1
 }
 
-level10() { "$BUILD/st" -s "$BUILD/gate.img" -e '(3 + 4) printNl' </dev/null | grep -qx 7; }
+level11() { "$BUILD/st" -s "$BUILD/gate.img" -e '(3 + 4) printNl' </dev/null | grep -qx 7; }
 # Writing an image is only half the level: the criterion is that it RELOADS.
 # Three checks, because each one fails for a different reason.
 #
@@ -335,7 +375,7 @@ level10() { "$BUILD/st" -s "$BUILD/gate.img" -e '(3 + 4) printNl' </dev/null | g
 #   3. save-load-save is a FIXPOINT, byte for byte. This is the only check that
 #      catches a field the writer persists and the reader drops: the image still
 #      loads and still runs, and the loss shows up nowhere else.
-level11() {
+level12() {
 	"$BUILD/st" -s "$SCRATCH/gate.img" -b packages/Core </dev/null >/dev/null || return 1
 	"$BUILD/st" -s "$SCRATCH/gate.img" -e '(3 + 4) printNl' </dev/null \
 		| grep -qx 7 || return 1
@@ -343,7 +383,7 @@ level11() {
 		</dev/null >/dev/null || return 1
 	cmp -s "$SCRATCH/gate.img" "$SCRATCH/gate2.img"
 }
-# ---- level 12: the packages build and the project image is generated --------
+# ---- level 13: the packages build and the project image is generated --------
 # The criterion from docs/jit-v2/01-gate.md: the four packages compile and the
 # project image is generated. It goes through `st build`, which is the real
 # path -- the manifest is evaluated IN the image, the sources are parsed by the
@@ -358,7 +398,7 @@ level11() {
 # samples/ is built last and is not one of the four: it REQUIRES the Std.*
 # packages by name, so it only builds when the package path resolves and the
 # graph loads, which is the end-to-end of the whole arrangement.
-level12() {
+level13() {
 	rm -rf packages/*/.stbuild samples/.stbuild
 	"$BUILD/st" -s "$SCRATCH/core.img" -b packages/Core </dev/null >/dev/null 2>&1 \
 		|| return 1
@@ -377,14 +417,14 @@ level12() {
 			|| { echo "$project: no program.img was written"; return 1; }
 	done
 }
-level13() { ./run_tests.sh --no-build 2>&1 | grep -q "ALL PASSED"; }
-level14() { echo "level 14 (deopt-stress) has no runner yet"; return 1; }
-level15() { echo "level 15 (performance) has no runner yet"; return 1; }
+level14() { ./run_tests.sh --no-build 2>&1 | grep -q "ALL PASSED"; }
+level15() { echo "level 15 (deopt-stress) has no runner yet"; return 1; }
+level16() { echo "level 16 (performance) has no runner yet"; return 1; }
 
 NAMES=("aloca e coleta" "troca de fiber" "objetos e colecoes" "JIT executa" \
-       "constroi SSA" "otimiza" "escapa e materializa" "primitivas" \
-       "front end" "compila" "executa 3 + 4" "bootstrap" "pacotes" \
-       "paridade" "deopt-stress" "performance")
+       "constroi SSA" "otimiza" "escapa e materializa" "backend de SSA" \
+       "primitivas" "front end" "compila" "executa 3 + 4" "bootstrap" \
+       "pacotes" "paridade" "deopt-stress" "performance")
 
 echo "${B}gate: running levels 0..$TARGET${Z}"
 for n in $(seq 0 "$TARGET"); do

@@ -1,4 +1,4 @@
-// Gate level 7: primitives, and what happens when one fails.
+// Gate level 8: primitives, and what happens when one fails.
 //
 // Until this level `3 + 4` compiled to a SEND with nothing at the far end of
 // it. This is the far end.
@@ -373,7 +373,7 @@ int main(void)
 	CurrentThread.nextMutator = NULL;
 	initHandles();
 
-	printf("gate level 7: primitives, and what happens when one fails\n\n");
+	printf("gate level 8: primitives, and what happens when one fails\n\n");
 
 	HandleScope outer;
 	openHandleScope(&outer);

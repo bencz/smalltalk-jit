@@ -31,10 +31,21 @@ typedef struct {
 	// What a callee must preserve. The SSA backend's allocator reads this to
 	// decide what it may use across a call without spilling; the fiber switch
 	// reads it to know what a context switch has to carry.
+	//
+	// PER BANK, because the two number independently: register 6 is RSI in the
+	// integer file and XMM6 in the float file, and under Win64 one of those is
+	// callee-saved and the other is not. One list could not say that, and the
+	// allocator asking it would get an answer about the wrong file.
+	//
+	// An EMPTY float list is a real answer and not an unfinished one: under
+	// System V every SSE register is caller-saved, so a double never survives a
+	// call there.
 	const uint8_t *calleeSaved;
 	uint8_t calleeSavedCount;
 	const uint8_t *callerSaved;
 	uint8_t callerSavedCount;
+	const uint8_t *calleeSavedFloat;
+	uint8_t calleeSavedFloatCount;
 
 	// Registers the allocator may hand out, excluding the stack and frame
 	// pointers and whatever the macro assembler reserves for itself.

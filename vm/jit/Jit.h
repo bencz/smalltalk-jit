@@ -60,6 +60,7 @@
 #define JIT_MAX_NARROW_ARGS 5
 
 struct IcCell;
+struct DeoptSite;
 
 typedef struct NativeCode {
 	CodeUnit *unit;
@@ -87,6 +88,10 @@ typedef struct NativeCode {
 	// for -- so the collector already asks "the map at this point" and gains
 	// nothing new to learn when that day comes.
 	struct FrameMap *frameMap;
+	// The points this code can be LEFT at speculatively, each keyed by the code
+	// offset of its guard. Empty for tier 1, which speculates about nothing.
+	struct DeoptSite **deoptSites;
+	uint32_t deoptSiteCount;
 	uint16_t frameSlots;
 	// Which of the two calling conventions the prologue emitted, decided by the
 	// arity against the Abi being compiled for. Written once, here, and read by
@@ -274,6 +279,12 @@ void compiledFrameEnter(CompiledFrameGuard *guard, Value *slotAddress,
 	uint16_t slotIndex, void *returnAddress);
 void compiledFrameLeave(const CompiledFrameGuard *guard);
 
+// Put a finished NativeCode on the list the collector and jitCodeContaining
+// read. Called LAST, once every field the visitor reads is populated: a
+// collection between the allocation and this call would walk a half-built
+// entry. Both code generators end here, because there is one list.
+void compiledCodeRegister(NativeCode *code);
+
 // The compiled method containing `address`, or NULL when it is not inside any.
 // How the walk decides whether a return address belongs to a compiled frame or
 // to the C code that entered one.
@@ -312,5 +323,29 @@ Value jitDispatch(void *cell, Value *receiverSlot, uint64_t argc);
 // It cannot be derived here, because the receiver may be an instance of a
 // subclass and starting from its class would find the running method again.
 Value jitDispatchSuper(void *cell, Value *receiverSlot, uint64_t argc);
+
+// The rest of the runtime entry points compiled code calls. They were static
+// while the template compiler was the only caller; the SSA backend is a SECOND
+// code generator and needs the same ones, so they are declared rather than
+// duplicated.
+//
+// EVERY ONE HAS THE SAME SHAPE, and the narrowness is deliberate: an object
+// pointer, the ADDRESS of a frame slot, and a packed integer that says WHICH
+// slot that was plus whatever else the helper needs. The slot index is what
+// turns the address back into a frame pointer (compiledFrameEnter), which is how
+// a collection underneath any of these finds the compiled frames beneath it.
+// A second code generator that laid its frame out differently would hand these
+// an index meaning something else and the reconstruction would be silently
+// wrong, which is why jit/Lir.h keeps tier 1's frame law.
+Value jitStoreGlobal(void *unit, Value *valueSlot, uint64_t literalIndex);
+Value jitMakeClosure(void *unit, Value *baseSlot, uint64_t packed);
+Value jitMakeCell(void *unused, Value *valueSlot, uint64_t packed);
+Value jitSetCell(void *unused, Value *cellSlot, uint64_t packed);
+Value jitReturnOuter(void *unused, Value *valueSlot, uint64_t packed);
+// A barriered store into ANY tagged field, which tier 1 has no caller for: its
+// OP_SETIVAR is an inline store and its cell store goes through jitSetCell. The
+// SSA backend needs the general one because the SSA IR models both as
+// IR_SETFIELD_T and cannot tell them apart. See the definition.
+Value jitStoreField(void *unused, Value *objectSlot, uint64_t packed);
 
 #endif

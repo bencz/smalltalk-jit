@@ -22,6 +22,12 @@ static const struct {
 	_Bool pure;
 } gOps[IR_OP_COUNT] = {
 	[IR_CONST]     = { "const",     REPR_TAGGED, 1 },
+	// PURE, and it is a load: the unit's literal frame is an Array the collector
+	// moves, so the backend reaches an element through the address of the unit's
+	// own field. What makes it pure anyway is that the CONTENTS never change --
+	// a literal frame is written once, when the method is compiled -- so the
+	// value read is stable even though the address it was read from is not.
+	[IR_LITERAL]   = { "literal",   REPR_TAGGED, 1 },
 	[IR_FCONST]    = { "fconst",    REPR_F64,    1 },
 	[IR_ICONST]    = { "iconst",    REPR_I64,    1 },
 	[IR_PARAM]     = { "param",     REPR_TAGGED, 1 },
@@ -200,6 +206,10 @@ IrValue *irNewValue(IrFunction *function, IrOp op)
 	value->repr = (uint8_t) irOpRepr(op);
 	value->id = function->valueCounter++;
 	value->klass = CLASS_INDEX_INVALID;
+	// Not zero, which is a perfectly ordinary bytecode index: an op that has no
+	// site has to be distinguishable from one whose site is the first
+	// instruction, or a backend reading it finds the cache cell of bci 0.
+	value->bci = BYTECODE_NO_TARGET;
 	return value;
 }
 
@@ -345,7 +355,8 @@ static void printValue(IrValue *value)
 	}
 	if (value->op == IR_GUARD_CLASS || value->op == IR_NEW || value->op == IR_NEWV
 			|| value->op == IR_FIELD_T || value->op == IR_FIELD_F
-			|| value->op == IR_PARAM) {
+			|| value->op == IR_PARAM || value->op == IR_LITERAL
+			|| value->op == IR_GLOBAL || value->op == IR_SETGLOBAL) {
 		printf(" {%lld}", (long long) value->extra);
 	}
 	if (value->argCount > 0) {

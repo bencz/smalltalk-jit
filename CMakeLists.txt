@@ -66,7 +66,8 @@ if(ST_ARCH STREQUAL "x64")
 	# more: the tier speaks only of frame slots and the backend is the only thing
 	# that knows what a register is (ADR 0009).
 	set(vmArchSources
-		vm/jit/x64/MacroAssemblerX64.c)
+		vm/jit/x64/MacroAssemblerX64.c
+		vm/jit/x64/SsaEmitterX64.c)
 	set(vmArchTestSources)
 elseif(ST_ARCH STREQUAL "ppc64" OR ST_ARCH STREQUAL "ppc64le")
 	# The POWER backend has not been ported to the v2 macro assembler yet. It
@@ -142,6 +143,7 @@ if(ST_ARCH STREQUAL "x64" AND ST_ABI STREQUAL "sysv")
 	# execute it, which is what an ops-struct buys and #ifdef does not (ADR 0009).
 	set(vmAbiSources
 		vm/jit/x64/abi/sysv/AbiSysV.c
+		vm/jit/x64/abi/sysv/ResumeSysV.c
 		vm/jit/x64/abi/win64/AbiWin64.c)
 else()
 	message(FATAL_ERROR
@@ -176,12 +178,20 @@ set(vmSources
 	vm/jit/Backends.c
 	vm/jit/CompiledMethod.c
 	vm/jit/Deopt.c
+	vm/jit/DeoptResume.c
 	vm/jit/InlineCache.c
 	vm/jit/Ir.c
 	vm/jit/Jit.c
+	vm/jit/Lir.c
+	vm/jit/Lower.c
 	vm/jit/MacroAssembler.c
 	vm/jit/Passes.c
+	vm/jit/RegAlloc.c
+	vm/jit/SsaBackend.c
+	vm/jit/SsaBackends.c
 	vm/jit/SsaBuild.c
+	vm/jit/SsaEmitter.c
+	vm/jit/SsaRuntime.c
 	vm/jit/Tier2DryRun.c
 	vm/memory/Collector.c
 	vm/memory/Heap.c

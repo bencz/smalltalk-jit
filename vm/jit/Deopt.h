@@ -19,6 +19,79 @@
 #include "compiler/Bytecode.h"
 #include "core/Object.h"
 #include "jit/Ir.h"
+#include "memory/Roots.h"
+
+// ---------------------------------------------------------------------------
+// THE STATE AT RUN TIME, WHICH IS NOT THE STATE AT COMPILE TIME
+// ---------------------------------------------------------------------------
+//
+// DeoptState above names `IrValue *`: pointers into the IR arena, which is
+// freed the moment compilation ends. It is a description of the state in terms
+// the OPTIMIZER understands, and it is unusable from running code -- not
+// inconvenient, unusable, because the memory is gone.
+//
+// So the backend translates it, once, into terms the RUNTIME understands:
+// for each live bytecode register, WHERE its value is in the optimized frame.
+// That translation can only happen after register allocation, because before
+// then there is no answer, and it must happen before the LIR is destroyed,
+// because after then the question cannot be asked.
+//
+// This is the same shape of mistake the FrameMap avoided by existing before the
+// JIT did: a description the producer can write and the consumer cannot read is
+// not a description.
+
+typedef enum {
+	DEOPT_IN_REGISTER,  // a physical register of the optimized frame
+	DEOPT_IN_SLOT,      // a frame slot of the optimized frame
+	DEOPT_CONSTANT,     // known at compile time and in neither
+} DeoptWhere;
+
+typedef struct {
+	uint16_t bytecodeRegister; // which tier-1 register this reconstructs
+	uint8_t where;             // DeoptWhere
+	uint8_t kind;              // SlotKind: raw values are re-boxed on the way out
+	uint8_t bank;              // LirBank, for DEOPT_IN_REGISTER
+	int32_t location;          // physical register number, or frame slot index
+	Value constant;            // DEOPT_CONSTANT
+} DeoptSlot;
+
+struct NativeCode;
+
+// How many physical registers the guard sequence spills before calling out, one
+// per register number the backend can hand out.
+//
+// IN THE FRAME and not in a thread-local, and the reason is mechanical rather
+// than a preference: a __thread address is not a link-time constant, so emitted
+// code cannot bake one without also knowing the platform's TLS model. The frame
+// it is already standing in needs no such knowledge.
+#define DEOPT_SAVED_REGISTERS 16
+
+typedef struct {
+	CodeUnit *unit;
+	// The TIER-1 compilation to resume into. Carried rather than derived: a
+	// CodeUnit does not name its native code, the CompiledMethod does, and the
+	// method is not reachable from here.
+	struct NativeCode *baseline;
+	uint16_t bci;
+	uint16_t destRegister;
+	_Bool innermost;
+	uint16_t slotCount;
+	DeoptSlot *slots;
+	// Where in the optimized frame the guard spilled the physical registers.
+	// Recorded per site rather than derived, so reading one back never depends
+	// on recomputing a layout the emitter already decided.
+	uint16_t saveBase;
+} DeoptRuntimeFrame;
+
+// Everything needed to leave optimized code at ONE point in it.
+//
+// Keyed by CODE OFFSET, the same coordinate the frame maps use, because the
+// only thing running code knows about where it is is its own return address.
+typedef struct DeoptSite {
+	uint32_t codeOffset;
+	uint16_t frameCount;
+	DeoptRuntimeFrame *frames;
+} DeoptSite;
 
 // Rebuild an object that escape analysis erased. Called at the moment a guard
 // fails, with the field values read out of the optimized frame.
@@ -42,5 +115,19 @@ _Bool deoptStateIsWellFormed(const DeoptState *state);
 // optimization is built on top of it, which is the whole reason phase 3 comes
 // before phase 4.
 _Bool deoptStressEnabled(void);
+
+// A guard failed: rebuild the tier-1 frame from `site` and continue in it.
+// Answers what the method answers, because the resumed tier-1 code returns
+// straight past this. See DeoptResume.c for why it stacks a frame rather than
+// replacing one.
+Value jitDeoptimize(void *site, Value *slotZero, uint64_t packed);
+
+// Enter compiled code at `target` with a prebuilt register file, `registers[i]`
+// becoming frame slot i. Answers what that code answers.
+//
+// The ONE piece of this that names a register, so it is implemented per ABI in
+// vm/jit/<arch>/abi/<abi>/ and only declared here (ADR 0009).
+Value jitResumeAt(const void *target, const Value *registers, uint64_t count,
+	uint64_t frameBytes);
 
 #endif

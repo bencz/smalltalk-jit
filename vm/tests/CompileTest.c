@@ -1,6 +1,6 @@
-// Gate level 8: the front end, from Smalltalk source to a running method.
+// Gate level 9: the front end, from Smalltalk source to a running method.
 //
-// Everything below level 7 was proved on bytecode written by hand. This is the
+// Everything below level 9 was proved on bytecode written by hand. This is the
 // level where the bytecode comes from SOURCE, which is what closes the gap
 // between "the JIT works" and "a program runs":
 //
@@ -12,7 +12,7 @@
 //
 // Three things are being checked, and only the first is obvious:
 //
-//   * the arithmetic in `^a + b` is a SEND, reaching the primitives of level 7
+//   * the arithmetic in `^a + b` is a SEND, reaching the primitives of level 8
 //     through an inline cache. Nothing is constant-folded and nothing is
 //     open-coded (ADR 0006). The profile section at the end reads the caches
 //     back to prove it;
@@ -410,7 +410,7 @@ int main(void)
 	CurrentThread.nextMutator = NULL;
 	initHandles();
 
-	printf("gate level 8: Smalltalk source, compiled and run\n\n");
+	printf("gate level 9: Smalltalk source, compiled and run\n\n");
 
 	HandleScope outer;
 	openHandleScope(&outer);

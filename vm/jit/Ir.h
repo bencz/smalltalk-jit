@@ -42,6 +42,22 @@ typedef enum {
 typedef enum {
 	// constants and inputs
 	IR_CONST,      // tagged constant
+	// literals[k], `extra` is the literal index. A SEPARATE OP FROM IR_CONST, and
+	// the separation is not taxonomy: it was one op and that was a wrong answer.
+	//
+	// Two reasons, and either alone is enough. The literal INDEX has to survive
+	// into the backend, and folded into IR_CONST there was nowhere to put it --
+	// `extra` was already spelling which opcode produced the constant, so the
+	// index was simply dropped and no backend could have emitted the right load.
+	// And GVN compares `op` and `extra`: two IR_CONSTs naming different literals
+	// agreed on both, so the pass MERGED them and the method then read one
+	// literal everywhere it should have read several. Measured, on two literals
+	// in a straight line, before this split existed.
+	//
+	// nil, true and false stay IR_CONST and SHOULD collapse together, which is
+	// the other half of why one op could not serve both: for those, equal-looking
+	// means equal.
+	IR_LITERAL,
 	IR_FCONST,
 	IR_ICONST,
 	IR_PARAM,      // incoming argument, `extra` is the register
@@ -126,7 +142,17 @@ typedef struct IrValue {
 	// guard-established knowledge here is the bug that removes the guard.
 	uint32_t klass;
 	struct DeoptState *deopt;
-	RawObject *selector;          // IR_SEND
+	// The bytecode index this came from, for the ops that have a SITE: a send's
+	// inline-cache cell is indexed by it, and a safepoint or a guard resumes at
+	// it. BYTECODE_NO_TARGET on everything else.
+	//
+	// NOT read out of the deopt state, though today it could be. The state's
+	// frames are documented outermost first, so frames[0].bci is this
+	// instruction's index only while there is exactly one frame; the day
+	// inlining puts a caller there, every reader that took frames[0] would
+	// quietly start naming the caller's site and looking up the caller's cache.
+	// Site identity and resumption state are different facts.
+	uint16_t bci;
 	struct Materialize *recipe;   // IR_FLAG_MATERIALIZE
 	struct IrValue *next;
 } IrValue;
@@ -188,6 +214,24 @@ typedef struct Materialize {
 // object that escape analysis erased. It appears only inside deoptimization
 // states, and only ever as a slot's contents.
 #define IR_FLAG_MATERIALIZE 1
+
+// A SUPER send. The whole content of the keyword is WHERE THE LOOKUP STARTS: at
+// the class above the one that DEFINED the running method, which the compiler
+// resolved into the site's cache cell, and not at anything the receiver names.
+//
+// A FLAG rather than a second opcode, and the reason is the risk of the change
+// rather than taste: every pass that reasons about calls tests `op == IR_SEND`
+// -- memory effects, purity, what a deopt state has to survive -- and a second
+// opcode would need each of those found and updated, with a missed one silently
+// treating a super send as something that cannot write memory. A flag leaves all
+// of them right and is read by the backend alone.
+//
+// Losing it is not a slow path, it is a wrong answer: an ordinary send starts
+// the lookup at the receiver's class, which for a receiver that is an instance
+// of a subclass finds the RUNNING METHOD again, and recurses until the stack
+// runs out. That is the exact failure lookupStart exists to prevent
+// (docs/jit-v2/01-gate.md).
+#define IR_FLAG_SUPER 2
 
 typedef struct IrFunction {
 	CodeUnit *unit;

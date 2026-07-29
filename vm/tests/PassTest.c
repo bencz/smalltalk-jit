@@ -523,6 +523,35 @@ int main(void)
 		countOp(boxes, IR_NEWCELL) == 2);
 	irDestroy(boxes);
 
+	// ---- two DIFFERENT literals are not one value --------------------------
+	//
+	// The same disease as the two cells above, in the pass that numbers values
+	// rather than the one that erases allocations, and it was real rather than
+	// hypothetical: a literal load used to be an IR_CONST whose `extra` named
+	// the OPCODE, so every literal load in a method agreed with every other on
+	// op, extra, konst, argCount and repr -- which is the whole of gvnEqual. One
+	// dominating the other was enough, and a straight line is enough for that.
+	// The method then read one literal everywhere it should have read several.
+	//
+	// MEASURED before the split existed: two in, one out.
+	static Instruction twoLiterals[] = {
+		{ OP_LOADK, 0, 1, 0, 0 },
+		{ OP_LOADK, 0, 2, 1, 0 },
+		{ OP_MOVE,  0, 4, 2, 0 },   // an argument sits right above its receiver
+		{ OP_MOVE,  0, 3, 1, 0 },
+		{ OP_SEND,  1, 5, 0, 3 },   // both used, so neither dies for other reasons
+		{ OP_RET,   0, 5, 0, 0 },
+	};
+	CodeUnit *literalUnit = calloc(1, sizeof(CodeUnit));
+	literalUnit->code = twoLiterals;
+	literalUnit->instructionCount = 6;
+	literalUnit->registerCount = 8;
+	IrFunction *literals = ssaBuild(literalUnit, NULL);
+	irOptimize(literals);
+	check("two different literals stay two values",
+		countOp(literals, IR_LITERAL) == 2);
+	irDestroy(literals);
+
 	printf("\n%d of %d checks passed\n", gChecks - gFailures, gChecks);
 	return gFailures == 0 ? 0 : 1;
 }

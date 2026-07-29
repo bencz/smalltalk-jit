@@ -20,41 +20,45 @@ e escrever por que, no commit.
 | 4 | constroi SSA | bytecode vira SSA, com estado de deopt anexado |
 | 5 | otimiza | os passes, incluindo promocao de representacao de phi |
 | 6 | escapa e materializa | objeto apagado e RECONSTRUIDO a partir da receita |
-| 7 | primitivas | aritmetica por SEND, e o fallback quando a primitiva falha |
-| 8 | front end | fonte Smalltalk vira bytecode, compila e RODA |
-| 9 | compila | `cmake --build build` limpo, com `-Werror`, sem avisos |
-| 10 | executa | `st -e '(3 + 4) printNl'` imprime `7` |
-| 11 | bootstrap | `st -s snap -b packages/Core` completa e a imagem recarrega |
-| 12 | pacotes | os quatro pacotes compilam e a imagem do projeto e gerada |
-| 13 | paridade | `run_tests.sh` verde, **158 ok**, TUDO |
-| 14 | deopt-stress | a suite inteira verde com `ST_DEOPT_STRESS=1`, resultado identico |
-| 15 | performance | `vec3_flat`: zero alocacao, zero unbox, zero send no laco |
+| 7 | backend de SSA | SSA otimizado vira codigo de maquina que RODA, e o tier 1 e o oraculo |
+| 8 | primitivas | aritmetica por SEND, e o fallback quando a primitiva falha |
+| 9 | front end | fonte Smalltalk vira bytecode, compila e RODA |
+| 10 | compila | `cmake --build build` limpo, com `-Werror`, sem avisos |
+| 11 | executa | `st -e '(3 + 4) printNl'` imprime `7` |
+| 12 | bootstrap | `st -s snap -b packages/Core` completa e a imagem recarrega |
+| 13 | pacotes | os quatro pacotes compilam e a imagem do projeto e gerada |
+| 14 | paridade | `run_tests.sh` verde, **158 ok**, TUDO |
+| 15 | deopt-stress | a suite inteira verde com `ST_DEOPT_STRESS=1`, resultado identico |
+| 16 | performance | `vec3_flat`: zero alocacao, zero unbox, zero send no laco |
 
-Os niveis 0 a 8 sao subsistemas provados SOZINHOS, cada um linkado a mao com meia
+Os niveis 0 a 9 sao subsistemas provados SOZINHOS, cada um linkado a mao com meia
 duzia de arquivos e nenhum CMake. Isso e deliberado: eles tem que continuar
 passando enquanto o resto do VM ainda nem compila, que e precisamente a janela
 que o corte seco abriu, e memoria, fibers, objetos, JIT, SSA, otimizador,
 materializacao, primitivas e front end sao justamente os subsistemas que nao
 dependem de um VM inteiro para serem verificados.
 
-Os niveis 9 a 13 sao o VM voltando a existir e alcancando PARIDADE COMPLETA com
-o v1. O 14 e o que torna a especulacao confiavel. O 15 e o alvo de performance.
+Os niveis 10 a 14 sao o VM voltando a existir e alcancando PARIDADE COMPLETA
+com o v1. O 15 e o que torna a especulacao confiavel. O 16 e o alvo de
+performance.
 
-### Os niveis 7 e 8 foram INSERIDOS, e o que isso custou
+### Os niveis 7, 8 e 9 foram INSERIDOS, e o que isso custou
 
 A escada original ia de "escapa e materializa" direto para "compila". Dois
 subsistemas faltavam ali, e os dois pela mesma razao: a fase 0 os tratou como
 itens de inventario e nao como coisas que dava para provar sozinhas.
 
-**7, primitivas.** `3 + 4` compilava para um SEND com **nada do outro lado**.
+**8, primitivas.** `3 + 4` compilava para um SEND com **nada do outro lado**.
 Nenhum programa real roda assim.
 
-**8, front end.** Tudo abaixo dele foi provado com bytecode escrito a mao. O
-nivel 8 e onde o bytecode passa a vir de FONTE, e ele e provavel sozinho pelo
+**9, front end.** Tudo abaixo dele foi provado com bytecode escrito a mao. O
+nivel 9 e onde o bytecode passa a vir de FONTE, e ele e provavel sozinho pelo
 mesmo motivo que os outros: parser mais emissor mais JIT mais primitivas nao
 precisam de um VM inteiro, precisam de um heap e de um kernel minimo.
 
-Inserir os dois custou renumerar de 7 para cima. Nao apagou historia nenhuma: o
+Inserir os dois custou renumerar de 7 para cima, e o **7, backend de SSA**
+custou a mesma renumeracao uma segunda vez, pela mesma regra e pelo mesmo
+motivo: nenhum nivel deslocado tinha sido alcancado. Nao apagou historia nenhuma: o
 registro abaixo so tinha linhas ate o 6, e nenhum dos niveis deslocados havia
 sido alcancado. Se algum tivesse, a insercao teria ido para o fim da escada em
 vez do meio.
@@ -181,7 +185,9 @@ Apendar, nunca reescrever. Data, commit, o que destravou.
 | 2026-07-28 | 11 | (nao commitado) | `-Wall -Wextra -Werror` de verdade nos dois builds: 93 erros, um deles `classVariableScope` implicito em main.c |
 | 2026-07-28 | 11 | (nao commitado) | filesystem + `StreamOpen` (10 prims) no seam de OS; `st build` ligado ao ProjectTool |
 | 2026-07-28 | 11 | (nao commitado) | compilador reflexivo (5 prims) + classes de AST NOMEADAS: o Core reabre as do bootstrap em vez de criar segundas |
-| 2026-07-28 | **12** | (nao commitado) | namespaces (cadeia propria -> imports -> Core), `Namespaces`/`Smalltalk`, `MethodSend`, `GetEnv`: os 4 pacotes E samples geram imagem, 88 de 175 |
+| 2026-07-29 | **7** | (nao commitado) | backend de SSA INSERIDO, renumerando de 7 para cima: LIR, lowering, linear scan com splitting, emissor x64; 10 de 10 contra o tier 1 como oraculo, em pool 12, 8, 6, 4, 3 e 2 |
+| 2026-07-29 | 7 | (nao commitado) | o backend achou 3 defeitos de RESPOSTA ERRADA na IR e o verificador achou 3 no alocador, ver abaixo |
+| 2026-07-28 | **13** | (nao commitado) | namespaces (cadeia propria -> imports -> Core), `Namespaces`/`Smalltalk`, `MethodSend`, `GetEnv`: os 4 pacotes E samples geram imagem, 88 de 175 |
 
 ## O que o nivel 7 encontrou, e por que so ele podia encontrar
 
@@ -1123,3 +1129,92 @@ que um slot de stackmap faltando nao produz teste vermelho. A guarda certa nao e
 teste, e `ASSERT` no codegen, e esse e o requisito R2 do ADR 0003. Todo `ASSERT`
 novo que codifique uma invariante do mapa de deopt ou do stackmap vale mais que
 um teste, porque roda em toda compilacao de toda execucao da suite.
+
+## O nivel 7: o backend de SSA, e o oraculo que ele usa
+
+`SSA otimizado -> codigo de maquina` era a linha que dizia NAO EXISTE. Existe:
+LIR neutro, lowering, linear scan com splitting e bancos separados, emissor x64.
+
+**O ORACULO E O TIER 1.** Cada metodo e compilado pelos DOIS geradores de codigo,
+os dois sao EXECUTADOS, e o que se confere e que concordam. Sob corte seco o
+oraculo externo se foi e o interno, `--deopt-stress`, ainda nao existe; este
+existe agora, e existe precisamente porque o tier 1 e uma implementacao completa
+e provada sozinha da mesma linguagem. Uma checagem de valor passa numa resposta
+certa pelo motivo errado; dois geradores chegando nela por caminhos diferentes,
+nao.
+
+**E RODA EM VARIOS TAMANHOS DE POOL.** `ST_SSA_REGS=n` finge que o banco tem so
+os n primeiros registradores. Spill e split sao o codigo que um arquivo de doze
+registradores nunca alcanca, logo o menos provavel de ter executado e o mais
+provavel de estar errado; em pool 2 todo metodo passa por eles. O nivel roda em
+12, 8, 4 e 2.
+
+### O que o backend achou na IR, e o modo de falha de cada um
+
+Tres defeitos de RESPOSTA ERRADA, todos invisiveis ate alguem CONSUMIR a IR: o
+dry run a construia e jogava fora.
+
+- **`OP_LOADK` perdia o indice do literal.** Virava `IR_CONST` com `extra`
+  nomeando o OPCODE, entao o indice nao era gravado em lugar nenhum e nenhum
+  backend poderia emitir a carga certa. Pior: `gvnEqual` compara `op`, `extra`,
+  `konst`, `argCount` e `repr`, e duas cargas de literais DIFERENTES concordavam
+  nos cinco, entao o GVN as FUNDIA e o metodo passava a ler um literal onde
+  deveria ler varios. Medido: dois entram, um sai. Agora `IR_LITERAL` e op
+  proprio, e nil/true/false continuam `IR_CONST` porque para esses fundir esta
+  certo.
+- **`OP_SENDSUPER` era indistinguivel de `OP_SEND`.** Os dois opcodes dividiam um
+  braco e produziam o mesmo `IR_SEND`. Um backend emitiria send comum, a busca
+  comecaria na classe do receptor, e para um receptor que e instancia de
+  subclasse isso acha o metodo em execucao de novo: a recursao infinita que
+  `lookupStart` existe para impedir. Agora e `IR_FLAG_SUPER`, flag e nao opcode
+  novo, porque todo passe testa `op == IR_SEND` e um opcode novo exigiria achar
+  cada um deles.
+- **O bci nao existia na IR.** A celula de cache de um sitio e indexada por ele,
+  entao sem ele todo send de um metodo compartilharia um sitio. Lido do estado
+  de deopt funcionaria hoje e pararia de funcionar no dia do inlining, porque os
+  frames sao documentados de fora para dentro.
+
+### O que o verificador achou no alocador
+
+O modo de falha de um alocador de registradores e dois valores vivos no mesmo
+registrador, e o que isso produz e resposta errada em outro metodo, arbitrariamente
+longe da compilacao que a causou. Nenhum teste ponta a ponta acha isso. Conferir
+a SAIDA contra as proprias invariantes acha na compilacao que causou, em todo
+metodo que o sistema compilar, que e o mesmo argumento que este repositorio ja
+faz para ASSERT de stackmap no codegen em vez de teste.
+
+Tres, e os tres so apareceram porque ele roda:
+
+- **intervalos fixos varridos por ordem de inicio** em vez de pre-semeados em
+  `inactive`. `tryAllocateFree` consulta so `active` e `inactive`, entao um valor
+  que nasce antes da primeira chamada pegava registrador caller-saved e o mantinha
+  atravessando a chamada;
+- **despejo derramava o intervalo INTEIRO**, definicao inclusa, e um valor
+  derramado por completo nao tem onde escrever o proprio resultado;
+- **dono INATIVO tratado como algo contra o que cortar** em vez de bloqueio.
+  Inativo significa buraco de vida, e este alocador nunca derrama um intervalo
+  inativo, entao o registrador dele e inutilizavel a partir do encontro. Medido
+  sobre 17977 metodos reais: 14 alocacoes erradas em pool 4 e 47 em pool 3,
+  todas em posicao IMPAR, que e ponto de split, e foi isso que apontou o lugar.
+
+Depois dos tres: **17977 de 17977 alocados e verificados em pool 12, 8 e 4**, e
+em pool 3 sao 12 RECUSAS limpas em vez de alocacao errada, porque tres
+registradores de fato nao bastam para alguns metodos e isso agora e dito em voz
+alta.
+
+### Onde o backend para hoje
+
+`canLower` recusa POR NOME o que nao sabe selecionar, e a lista de recusas e a
+lista de trabalho:
+
+- **`IR_GUARD_CLASS`**, porque um guard que falha tem que desotimizar e o runtime
+  de deopt nao existe. Nao custa nada hoje: o front end nao emite `GUARDCLASS`,
+  a checagem de booleano dele e um par `JUMPTRUE`/`JUMPFALSE`;
+- **as alocacoes e os acessos indexados** (`IR_NEW`, `IR_ANEW`, `IR_ALOAD` e
+  companhia), porque nenhum produtor os cria e seriam codigo nao exercitado;
+- **`IR_FIELD_F` e `IR_SETFIELD_F`**, que sao das classes de valor da fase 7.
+
+E duas coisas que sao primeiro corte declarado, nao desenho: o send do tier 2 vai
+por `jitDispatch` SEM caminho rapido de cache (correto e mais lento, e o perfil
+continua sendo gravado, que e o que o ADR 0006 exige), e box/unbox sao CHAMADAS
+em vez de sequencia inline.

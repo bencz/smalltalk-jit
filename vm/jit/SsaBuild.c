@@ -411,9 +411,23 @@ static void lower(Builder *builder, uint16_t bci)
 		break;
 	}
 
-	case OP_LOADNIL: case OP_LOADTRUE: case OP_LOADFALSE: case OP_LOADK: {
+	case OP_LOADNIL: case OP_LOADTRUE: case OP_LOADFALSE: {
+		// The three singletons. Their ADDRESSES are runtime facts, so the value
+		// is not known here, but WHICH singleton is -- and that is all GVN needs
+		// to be right about collapsing two of them together.
 		IrValue *value = emit(builder, IR_CONST);
 		value->extra = instruction->op;
+		writeVariable(builder, instruction->a, block, value);
+		break;
+	}
+
+	case OP_LOADK: {
+		// The literal INDEX, which is the thing that has to survive. It used to
+		// share IR_CONST with the three above and set `extra` to the opcode, so
+		// the index went nowhere and every literal load in a method looked
+		// identical to GVN. See IR_LITERAL in jit/Ir.h.
+		IrValue *value = emit(builder, IR_LITERAL);
+		value->extra = instruction->b;
 		writeVariable(builder, instruction->a, block, value);
 		break;
 	}
@@ -516,6 +530,15 @@ static void lower(Builder *builder, uint16_t bci)
 				readVariable(builder, (uint16_t) (instruction->c + i), block));
 		}
 		value->extra = instruction->b;
+		// WHICH SITE, so the backend finds this send's cache cell, which is
+		// indexed by bytecode index; and WHETHER IT IS SUPER, which used to be
+		// dropped here because both opcodes shared this arm. See IR_FLAG_SUPER
+		// in jit/Ir.h for why dropping it is a wrong answer and not a missed
+		// optimization.
+		value->bci = bci;
+		if ((Opcode) instruction->op == OP_SENDSUPER) {
+			value->flags |= IR_FLAG_SUPER;
+		}
 		// A send can leave optimized code, so it carries the state to resume
 		// with. Attached at construction, not retrofitted later: a state added
 		// after the optimizer has run describes a frame that no longer exists.
@@ -529,6 +552,7 @@ static void lower(Builder *builder, uint16_t bci)
 		IrValue *guard = emit(builder, IR_GUARD_CLASS);
 		irAddArg(function, guard, receiver);
 		guard->extra = instruction->b;
+		guard->bci = bci;
 		guard->deopt = captureDeopt(builder, bci);
 		// The established fact goes in the builder's `known` map, NEVER on the
 		// value. See Ir.h: on the value it would make the redundant-guard pass
@@ -541,6 +565,7 @@ static void lower(Builder *builder, uint16_t bci)
 
 	case OP_SAFEPOINT: {
 		IrValue *value = emit(builder, IR_SAFEPOINT);
+		value->bci = bci;
 		value->deopt = captureDeopt(builder, bci);
 		break;
 	}

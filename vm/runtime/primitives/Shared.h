@@ -44,7 +44,7 @@
 // is PRIMITIVE_ABSENT, and the reasoning is written at its line in the .def.
 //
 // AND IT COSTS A BUILD-LIST EDIT. Three gate levels link Primitive.c BY HAND
-// with no CMake (levels 3, 7 and 8 of scripts/gate.sh), so a new domain file has
+// with no CMake (levels 3, 7, 8 and 9 of scripts/gate.sh), so a new domain file has
 // to reach four build lists, not one. Forgetting has already broken this gate
 // twice. scripts/gate.sh therefore globs this directory instead of listing it;
 // CMakeLists.txt still lists the files, because a glob there is not re-evaluated

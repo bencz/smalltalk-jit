@@ -122,7 +122,10 @@ static size_t compiledCodeUpperBound(const uint8_t *pointer)
 }
 
 
-static void compiledCodeRegister(NativeCode *code)
+// Not static: the SSA backend produces NativeCode too, and there is ONE place
+// to register in for the reason written at gCompiledCode above -- a second
+// registration a caller can forget is a live frame the collector cannot find.
+void compiledCodeRegister(NativeCode *code)
 {
 	// A zero-length range would let two entries share a start address, and then
 	// "the last one that starts at or below" stops naming one entry.
@@ -549,7 +552,7 @@ static _Bool sendDoesNotUnderstand(IcCell *cell, Value *receiverSlot,
 
 
 // The tier-2 dry run (jit/Tier2DryRun.c), reached through a WEAK no-op for the
-// same reason rootsVisitNativeFrames is: gate levels 3, 7 and 8 hand-link this
+// same reason rootsVisitNativeFrames is: gate levels 3, 8 and 9 hand-link this
 // file with half a dozen others and no optimizer at all, and a hard reference to
 // SsaBuild from here would make those levels stop linking. That is not
 // hypothetical -- it is what happened the first time this was wired.
@@ -1211,7 +1214,7 @@ Value jitSignalException(Value exception)
 
 // RETOUTER: return `*valueSlot` from the home of the closure in slot 0. Never
 // returns to its caller.
-static Value jitReturnOuter(void *unused, Value *valueSlot, uint64_t packed)
+Value jitReturnOuter(void *unused, Value *valueSlot, uint64_t packed)
 {
 	(void) unused;
 	// The value's register is what turns its slot address back into the frame
@@ -1271,7 +1274,7 @@ static Value jitReturnOuter(void *unused, Value *valueSlot, uint64_t packed)
 
 // Store into a global's Association. `valueSlot` points at the frame slot
 // holding the value; `literalIndex` says which literal is the Association.
-static Value jitStoreGlobal(void *unitPointer, Value *valueSlot,
+Value jitStoreGlobal(void *unitPointer, Value *valueSlot,
 	uint64_t literalIndex)
 {
 	CodeUnit *unit = unitPointer;
@@ -1302,7 +1305,7 @@ static Value jitStoreGlobal(void *unitPointer, Value *valueSlot,
 // Build a closure over `blocks[index]`, capturing the values in the `count`
 // registers starting at the base. Consecutive registers are consecutive slots
 // at DESCENDING addresses, so capture i is baseSlot[-i].
-static Value jitMakeClosure(void *unitPointer, Value *baseSlot, uint64_t packed)
+Value jitMakeClosure(void *unitPointer, Value *baseSlot, uint64_t packed)
 {
 	CompiledFrameGuard guard;
 	compiledFrameEnterFromCompiled(&guard, baseSlot, PACKED_SLOT(packed),
@@ -1347,7 +1350,7 @@ static Value jitMakeClosure(void *unitPointer, Value *baseSlot, uint64_t packed)
 }
 
 
-static Value jitMakeCell(void *unused, Value *valueSlot, uint64_t packed)
+Value jitMakeCell(void *unused, Value *valueSlot, uint64_t packed)
 {
 	(void) unused;
 	CompiledFrameGuard guard;
@@ -1359,10 +1362,42 @@ static Value jitMakeCell(void *unused, Value *valueSlot, uint64_t packed)
 }
 
 
+// Store into ANY tagged field of any object, through the write barrier.
+//
+// The generalisation of jitSetCell below, and it exists because the SSA backend
+// cannot tell a cell store from an instance-variable store: the SSA IR models
+// both as IR_SETFIELD_T, and CELL_VALUE_FIELD is 0, which is also a perfectly
+// ordinary instance-variable index. So the two are indistinguishable in the IR,
+// and the only safe reading of an indistinguishable pair is the conservative
+// one -- barrier both.
+//
+// Which is also STRICTLY MORE CORRECT than what tier 1 does. OP_SETIVAR there
+// is an inline store with `PENDING: the write barrier` written at it, so an old
+// object receiving a young one in an instance variable is not remembered. That
+// is a real hole; it is simply not this file's to close today, and closing it
+// for tier 2 costs a call that tier 1 does not pay.
+//
+// The packed integer carries the value's register and the object's, exactly as
+// jitSetCell's does, because the same two slots have to be found.
+Value jitStoreField(void *unused, Value *objectSlot, uint64_t packed)
+{
+	(void) unused;
+	uint16_t objectRegister = PACKED_SLOT(packed);
+	uint16_t valueRegister = PACKED_LOW(packed);
+	uint16_t fieldIndex = PACKED_MID(packed);
+	// Slot i sits at frame - 8*(i+1), so a higher register is a LOWER address.
+	Value *valueSlot = objectSlot
+		- ((intptr_t) valueRegister - (intptr_t) objectRegister);
+	RawObject *object = asObject(*objectSlot);
+	rawObjectStoreValue(object, &((Value *) object->body)[fieldIndex], *valueSlot);
+	return *valueSlot;
+}
+
+
 // Store into a cell, through the write barrier. A cell outlives the frame that
 // made it (that is the whole point of having one), so it is routinely old while
 // what goes into it is young.
-static Value jitSetCell(void *unused, Value *cellSlot, uint64_t packed)
+Value jitSetCell(void *unused, Value *cellSlot, uint64_t packed)
 {
 	(void) unused;
 	uint16_t cellRegister = PACKED_SLOT(packed);
