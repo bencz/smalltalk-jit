@@ -67,6 +67,16 @@ typedef struct {
 	// It has to be DETECTED rather than left to happen, because the shape it
 	// takes otherwise is a scan that hands an interval back to itself forever.
 	_Bool infeasible;
+	// One frame slot for breaking a CYCLE of resolution moves, allocated the
+	// first time one is found and LIR_NO_SLOT otherwise, so a method with no
+	// cycle pays nothing for the possibility.
+	//
+	// It never needs to appear in a frame map, and that is a property of where it
+	// is used rather than luck: the store into it and the load out of it are
+	// emitted as consecutive instructions at ONE insertion point, with nothing
+	// between them but other resolution moves. No safepoint can fall inside that
+	// window, so no collector ever sees the slot occupied.
+	int32_t exchangeSlot;
 } Allocator;
 
 
@@ -1001,6 +1011,67 @@ static LirInterval *locationAt(Allocator *allocator, uint32_t vreg,
 }
 
 
+// ---------------------------------------------------------------------------
+// THE RESOLUTION MOVES ARE A PARALLEL COPY, NOT A SEQUENCE
+// ---------------------------------------------------------------------------
+//
+// Several values can change location at ONE point, and every one of those moves
+// is supposed to happen simultaneously. Emitted one at a time in whatever order
+// the loop that found them ran, they do not: a move that writes a register
+// destroys what a later move was going to read out of it.
+//
+// Measured, and it took the tier-1 oracle to see it, twice. A loop's counter was
+// stored to its spill slot AFTER another value had been loaded into the register
+// it lived in, so the slot received the wrong value; and one iteration earlier a
+// reload had overwritten a register a pending spill still had to read. Both are
+// silent: the allocation is internally consistent, the intervals do not overlap,
+// and the verifier is right to pass. Only the ORDER is wrong, and the answer is
+// simply different.
+//
+// So the moves at a point are COLLECTED and then emitted in an order that cannot
+// clobber:
+//
+//   1. every SPILL first        -- they read registers and write memory only
+//   2. then the register-to-register moves, topologically ordered
+//   3. then every RELOAD        -- they write registers and read memory only
+//
+// A true CYCLE among the register-to-register moves (r1 to r2 while r2 goes to
+// r1) needs a scratch register this allocator has already handed out, so it is a
+// NAMED REFUSAL rather than a guess. Tier 1's code stands, which is always
+// correct; emitting the moves in some order and hoping is what produced the two
+// bugs above.
+typedef struct {
+	LirBlock *block;
+	LirInstruction *before;
+	const LirInterval *from;
+	const LirInterval *to;
+} PendingMove;
+
+typedef struct {
+	PendingMove *moves;
+	uint32_t count, capacity;
+} MoveList;
+
+
+static void pendMove(MoveList *list, LirBlock *block, LirInstruction *before,
+	const LirInterval *from, const LirInterval *to)
+{
+	if (from->reg == to->reg && from->spillSlot == to->spillSlot) {
+		return;
+	}
+	if (list->count == list->capacity) {
+		list->capacity = list->capacity == 0 ? 16 : list->capacity * 2;
+		list->moves = realloc(list->moves, list->capacity * sizeof(PendingMove));
+		ASSERT(list->moves != NULL);
+	}
+	PendingMove *pending = &list->moves[list->count++];
+	pending->block = block;
+	pending->before = before;
+	pending->from = from;
+	pending->to = to;
+}
+
+
 // A move between two LOCATIONS of the same virtual register: register to
 // register, register to slot, or slot to register.
 //
@@ -1051,6 +1122,128 @@ static void insertLocationMove(Allocator *allocator, LirBlock *block,
 }
 
 
+// One raw spill or reload, with the slot given rather than taken from an
+// interval. What breaking a cycle needs: the value goes to a slot that is not
+// its own.
+static void emitSlotMove(Allocator *allocator, LirBlock *block,
+	LirInstruction *before, LirOp op, uint32_t vreg, int16_t reg, int32_t slot)
+{
+	LirInstruction *move = lirInsertBefore(allocator->function, block, before, op);
+	move->position = before != NULL ? before->position : block->to;
+	move->imm = slot;
+	if (op == LIR_STORE_SLOT) {
+		move->args[0] = vreg;
+		move->argCount = 1;
+		move->argReg[0] = reg;
+	} else {
+		move->dst = vreg;
+		move->dstReg = reg;
+	}
+	allocator->stats.resolutionMoves++;
+}
+
+
+// Emit every collected move, grouped by insertion point and ordered inside a
+// group.
+static void emitPendingMoves(Allocator *allocator, MoveList *list)
+{
+	_Bool *done = calloc(list->count == 0 ? 1 : list->count, sizeof(_Bool));
+	ASSERT(done != NULL);
+	for (uint32_t i = 0; i < list->count; i++) {
+		if (done[i]) {
+			continue;
+		}
+		// The group is every move at this same insertion point. Found by scanning
+		// rather than by sorting: the list is short and a comparison over pointers
+		// would not be a meaningful order anyway.
+		LirInstruction *before = list->moves[i].before;
+		LirBlock *block = list->moves[i].block;
+		// The one member of a cycle that was broken through the frame, whose
+		// reload has to come after every other move in the group.
+		uint32_t broken = list->count;
+
+		// 1. THE SPILLS, which read registers and write memory only, so no move
+		// after them can destroy what they were going to read.
+		for (uint32_t k = i; k < list->count; k++) {
+			PendingMove *m = &list->moves[k];
+			if (done[k] || m->before != before || m->block != block) { continue; }
+			if (m->from->reg >= 0 && m->to->reg < 0) {
+				insertLocationMove(allocator, block, before, m->from, m->to);
+				done[k] = 1;
+			}
+		}
+
+		// 2. THE REGISTER-TO-REGISTER MOVES, one at a time, and only ever one
+		// whose destination register nothing still pending has to read.
+		for (;;) {
+			_Bool progress = 0;
+			uint32_t stuck = list->count;
+			for (uint32_t k = i; k < list->count; k++) {
+				PendingMove *m = &list->moves[k];
+				if (done[k] || m->before != before || m->block != block) { continue; }
+				if (m->from->reg < 0 || m->to->reg < 0) { continue; }
+				_Bool blocked = 0;
+				for (uint32_t j = i; j < list->count && !blocked; j++) {
+					PendingMove *other = &list->moves[j];
+					if (j == k || done[j] || other->before != before
+							|| other->block != block || other->from->reg < 0) {
+						continue;
+					}
+					blocked = other->from->reg == m->to->reg
+						&& other->from->bank == m->to->bank;
+				}
+				if (blocked) {
+					stuck = k;
+					continue;
+				}
+				insertLocationMove(allocator, block, before, m->from, m->to);
+				done[k] = 1;
+				progress = 1;
+			}
+			if (progress) {
+				continue;
+			}
+			if (stuck == list->count) {
+				break;
+			}
+			// A CYCLE (r1 to r2 while r2 goes to r1), and it is broken THROUGH THE
+			// FRAME rather than through a scratch register, because the allocator
+			// has already handed every register out. One member's source is stored
+			// to a slot of its own; the register it held is then free, so the rest
+			// of the cycle proceeds; and that member finishes as a RELOAD out of
+			// the slot, emitted after everything else in the group.
+			//
+			// Measured over 17977 real methods: 7 contain one. Refusing instead
+			// would cost seven compilations to avoid two instructions.
+			ASSERT(broken == list->count);
+			if (allocator->exchangeSlot == LIR_NO_SLOT) {
+				allocator->exchangeSlot = allocator->function->frameSlots++;
+			}
+			PendingMove *m = &list->moves[stuck];
+			emitSlotMove(allocator, block, before, LIR_STORE_SLOT, m->from->vreg,
+				m->from->reg, allocator->exchangeSlot);
+			done[stuck] = 1;
+			broken = stuck;
+		}
+
+		// 3. THE RELOADS, which write registers and read memory only, so nothing
+		// they overwrite was still needed as a source.
+		for (uint32_t k = i; k < list->count; k++) {
+			PendingMove *m = &list->moves[k];
+			if (done[k] || m->before != before || m->block != block) { continue; }
+			insertLocationMove(allocator, block, before, m->from, m->to);
+			done[k] = 1;
+		}
+		if (broken != list->count) {
+			PendingMove *m = &list->moves[broken];
+			emitSlotMove(allocator, block, before, LIR_LOAD_SLOT, m->to->vreg,
+				m->to->reg, allocator->exchangeSlot);
+		}
+	}
+	free(done);
+}
+
+
 // The instruction at a given even position, so a split point can be turned into
 // a place in the instruction stream.
 typedef struct {
@@ -1082,7 +1275,8 @@ static void buildPositionIndex(LirFunction *function, PositionIndex *index)
 
 
 // Where a value's location CHANGES inside a block, put the move there.
-static void resolveSplits(Allocator *allocator, PositionIndex *index)
+static void resolveSplits(Allocator *allocator, PositionIndex *index,
+	MoveList *pending)
 {
 	for (uint32_t vreg = 0; vreg < allocator->function->vregCount; vreg++) {
 		for (LirInterval *it = allocator->byVreg[vreg]; it != NULL;
@@ -1103,32 +1297,81 @@ static void resolveSplits(Allocator *allocator, PositionIndex *index)
 			if (slot >= index->count || index->byPosition[slot] == NULL) {
 				continue;
 			}
-			insertLocationMove(allocator, index->blockByPosition[slot],
-				index->byPosition[slot], it, next);
+			LirBlock *block = index->blockByPosition[slot];
+			LirInstruction *before = index->byPosition[slot];
+			// A SPLIT AT A BLOCK'S FIRST INSTRUCTION IS A BLOCK-BOUNDARY
+			// TRANSITION, and ONE move at the top of the block is the wrong answer
+			// for it. The block may be reached from several predecessors that do
+			// not agree about where the value is, and a move placed inside it runs
+			// on every one of them: at a LOOP HEADER that means the entry edge's
+			// spill executes again on every iteration, reading a register that by
+			// then belongs to something else and writing it over the value in the
+			// spill slot.
+			//
+			// Measured, and only an ORACLE found it: a float accumulator loop
+			// answered 32.0 where tier 1 answered 3.0, because the loop's step was
+			// overwritten by the accumulator on the second iteration. No assertion
+			// fired and the allocation verifier was right to pass -- the intervals
+			// were consistent, the PLACEMENT was not. It is not float-specific and
+			// it is not new; it needed a loop whose header spills a loop-carried
+			// value, which nothing had built before.
+			//
+			// So it goes to resolveEdges below, which asks the question per edge.
+			if (before == block->first && block->predCount > 0) {
+				continue;
+			}
+			pendMove(pending, block, before, it, next);
 		}
 	}
 }
 
 
-// And where it differs ACROSS AN EDGE, put the move at the end of the
-// predecessor. Safe because critical edges were split during lowering: a
-// predecessor with several successors always has a block of its own per edge.
-static void resolveEdges(Allocator *allocator)
+// And where it differs ACROSS AN EDGE, put the move ON THE EDGE -- which is
+// either the end of the predecessor or the head of the successor, and choosing
+// wrong is a wrong answer twice over.
+//
+// The predecessor's end serves only when it has ONE successor. With several, a
+// move placed there runs on every one of them, and it runs BEFORE the terminator
+// -- so it can also overwrite the register the conditional branch is about to
+// read. Measured: a loop's exit edge needed its answer in a callee-saved
+// register, the reload was placed before the branch, and the branch then tested
+// the reloaded value instead of its condition. The loop ran exactly one
+// iteration and answered 2.0 where tier 1 answered 3.0.
+//
+// With several successors the head of the SUCCESSOR is the edge, and it is safe
+// for a reason the lowering already established: critical edges were split, so a
+// successor reached from a multi-successor block has exactly one predecessor.
+// That is asserted rather than assumed, because a lowering that stopped
+// splitting them would make this silently wrong again.
+static void resolveEdges(Allocator *allocator, MoveList *pending)
 {
 	LirFunction *function = allocator->function;
 	for (LirBlock *block = function->blocks; block != NULL; block = block->next) {
+		// THE PREDECESSOR'S LAST INSTRUCTION, not block->to - 1. The latter is the
+		// ODD position between this block's last instruction and the successor's
+		// first, which is exactly where a split at the boundary starts -- so
+		// reading the location there answers where the value will be AFTER the
+		// edge, and the move that has to happen ON the edge looks unnecessary.
+		// Asking at the terminator's own position keeps the question inside this
+		// block, which is where the move is going to be placed.
+		int32_t exit = block->last != NULL ? block->last->position : block->to - 1;
 		for (uint8_t s = 0; s < block->succCount; s++) {
 			LirBlock *successor = block->succs[s];
+			LirBlock *target = block;
+			LirInstruction *before = block->last;
+			if (block->succCount > 1) {
+				ASSERT(successor->predCount <= 1);
+				target = successor;
+				before = successor->first;
+			}
 			for (uint32_t vreg = 0; vreg < function->vregCount; vreg++) {
-				LirInterval *atEnd = locationAt(allocator, vreg, block->to - 1);
+				LirInterval *atEnd = locationAt(allocator, vreg, exit);
 				LirInterval *atStart = locationAt(allocator, vreg,
 					successor->from);
 				if (atEnd == NULL || atStart == NULL || atEnd == atStart) {
 					continue;
 				}
-				// Before the terminator, so the branch itself is still last.
-				LirInstruction *terminator = block->last;
-				insertLocationMove(allocator, block, terminator, atEnd, atStart);
+				pendMove(pending, target, before, atEnd, atStart);
 			}
 		}
 	}
@@ -1362,6 +1605,10 @@ RegAllocStats lirAllocateRegisters(LirFunction *function)
 {
 	Allocator allocator;
 	memset(&allocator, 0, sizeof(allocator));
+	// NOT the zero memset gave it: slot 0 is the receiver, and a cycle break that
+	// wrote there would overwrite `self` -- which every runtime helper reaches
+	// through frame[-1] (jit/Lir.h).
+	allocator.exchangeSlot = LIR_NO_SLOT;
 	allocator.function = function;
 	allocator.byVreg = calloc(function->vregCount == 0 ? 1 : function->vregCount,
 		sizeof(LirInterval *));
@@ -1404,8 +1651,16 @@ RegAllocStats lirAllocateRegisters(LirFunction *function)
 	if (!allocator.infeasible) {
 		PositionIndex index;
 		buildPositionIndex(function, &index);
-		resolveSplits(&allocator, &index);
-		resolveEdges(&allocator);
+		// COLLECTED FIRST, EMITTED AFTER. The moves at one point are a parallel
+		// copy and the order they are emitted in decides whether they compute it;
+		// see the header above PendingMove for the two wrong answers that came
+		// from emitting them as they were found.
+		MoveList pending;
+		memset(&pending, 0, sizeof(pending));
+		resolveSplits(&allocator, &index, &pending);
+		resolveEdges(&allocator, &pending);
+		emitPendingMoves(&allocator, &pending);
+		free(pending.moves);
 		free(index.byPosition);
 		free(index.blockByPosition);
 		allocator.stats.failed = !rewriteOperands(&allocator);

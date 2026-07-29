@@ -158,7 +158,7 @@ int main(void)
 	check("before: and unboxes once per iteration",
 		countOp(function, IR_UNBOX_F) == 1);
 
-	PassStats stats = irOptimize(function);
+	PassStats stats = irOptimize(function, NULL);
 
 	printf("\n  passes: phis triviais=%u  tipos=%u  guards=%u  simplificados=%u"
 		"  escalarizados=%u  gvn=%u  hoisted=%u  phis promovidos=%u"
@@ -214,7 +214,7 @@ int main(void)
 	irAddArg(guards, g0->terminator, subject);
 	g0->terminator->block = g0;
 
-	PassStats guardStats = irOptimize(guards);
+	PassStats guardStats = irOptimize(guards, NULL);
 	check("the redundant second guard is removed", guardStats.guardsRemoved == 1);
 	check("the FIRST guard survives, having established the fact",
 		countOp(guards, IR_GUARD_CLASS) == 2);
@@ -265,7 +265,7 @@ int main(void)
 
 	check("before: the invariant read is inside the loop",
 		invariantRead->block == l1);
-	PassStats licmStats = irOptimize(invariant);
+	PassStats licmStats = irOptimize(invariant, NULL);
 	check("LICM moved it to the preheader", invariantRead->block == l0);
 	check("and reports what it moved", licmStats.hoisted >= 1);
 	_Bool storeStayed = 0;
@@ -301,7 +301,7 @@ int main(void)
 	irAddArg(guarded, m2->terminator, subjectValue);
 	m2->terminator->block = m2;
 
-	irOptimize(guarded);
+	irOptimize(guarded, NULL);
 	check("a guard is NOT hoisted out of a loop", loopGuard->block == m1);
 	irDestroy(guarded);
 
@@ -323,7 +323,7 @@ int main(void)
 	irAddArg(repeated, r0->terminator, use);
 	r0->terminator->block = r0;
 
-	PassStats gvnStats = irOptimize(repeated);
+	PassStats gvnStats = irOptimize(repeated, NULL);
 	check("two identical field loads become one", gvnStats.gvnRemoved == 1);
 	check("and both uses now name the survivor",
 		use->args[0] == use->args[1] && use->args[0] == loadA);
@@ -358,7 +358,7 @@ int main(void)
 	irAddArg(stored, w0->terminator, pair);
 	w0->terminator->block = w0;
 
-	irOptimize(stored);
+	irOptimize(stored, NULL);
 	check("a field read is NOT reused across a store to that field",
 		pair->args[0] != pair->args[1]);
 	irDestroy(stored);
@@ -391,7 +391,7 @@ int main(void)
 	irAddArg(elsewhere, e0->terminator, otherPair);
 	e0->terminator->block = e0;
 
-	irOptimize(elsewhere);
+	irOptimize(elsewhere, NULL);
 	check("a read IS still reused across a store to a different field",
 		otherPair->args[0] == otherPair->args[1]);
 	irDestroy(elsewhere);
@@ -430,7 +430,7 @@ int main(void)
 	irAddArg(arms, aRight->terminator, rightRead);
 	aRight->terminator->block = aRight;
 
-	irOptimize(arms);
+	irOptimize(arms, NULL);
 	check("a value in a sibling block is NOT reused across it",
 		countOp(arms, IR_FIELD_T) == 2);
 	irDestroy(arms);
@@ -463,7 +463,7 @@ int main(void)
 	irAddArg(written, n2->terminator, held);
 	n2->terminator->block = n2;
 
-	irOptimize(written);
+	irOptimize(written, NULL);
 	check("a read of a field the loop WRITES stays in the loop",
 		loopRead->block == n1);
 	irDestroy(written);
@@ -493,7 +493,7 @@ int main(void)
 	irAddArg(built, f0->terminator, readBack);
 	f0->terminator->block = f0;
 
-	irOptimize(built);
+	irOptimize(built, NULL);
 	check("a fresh object's field is NOT answered from the allocation "
 		"across a store", f0->terminator->args[0] != atBirth);
 	irDestroy(built);
@@ -518,7 +518,7 @@ int main(void)
 	irAddArg(boxes, c0->terminator, usesBoth);
 	c0->terminator->block = c0;
 
-	irOptimize(boxes);
+	irOptimize(boxes, NULL);
 	check("two cells holding the same value stay two cells",
 		countOp(boxes, IR_NEWCELL) == 2);
 	irDestroy(boxes);
@@ -547,10 +547,195 @@ int main(void)
 	literalUnit->instructionCount = 6;
 	literalUnit->registerCount = 8;
 	IrFunction *literals = ssaBuild(literalUnit, NULL);
-	irOptimize(literals);
+	irOptimize(literals, NULL);
 	check("two different literals stay two values",
 		countOp(literals, IR_LITERAL) == 2);
 	irDestroy(literals);
+
+	// ---- ARITHMETIC SPECIALIZATION FROM THE PROFILE -------------------------
+	//
+	// The pass that gives every pass above it something to do. Arithmetic
+	// reaches the IR as an opaque send (ADR 0006), so until this existed, GVN,
+	// LICM and phi promotion all ran over calls and moved nothing.
+	//
+	// Class indices here are ARBITRARY: this level links the IR and the passes
+	// and nothing else, so there is no class table and no bootstrap. That is the
+	// point of the table being data -- the pass never asks what class 7 is, it
+	// only puts 7 in a guard.
+	enum { CLASS_SMALLINT = 7, CLASS_SMALLFLOAT = 9 };
+
+	// `^a + b`, with the site profiled as SmallInteger on both operands.
+	static Instruction onePlus[] = {
+		{ OP_MOVE, 0, 3, 0, 0 },   // r3 := self
+		{ OP_MOVE, 0, 4, 1, 0 },   // r4 := arg, one register above its receiver
+		{ OP_SEND, 1, 5, 0, 3 },   // r5 := r3 + r4
+		{ OP_RET,  0, 5, 0, 0 },
+	};
+	CodeUnit *plusUnit = calloc(1, sizeof(CodeUnit));
+	plusUnit->code = onePlus;
+	plusUnit->instructionCount = 4;
+	plusUnit->registerCount = 8;
+	plusUnit->argumentCount = 1;
+
+	SiteSpecialization *table = calloc(plusUnit->instructionCount,
+		sizeof(SiteSpecialization));
+	for (uint16_t i = 0; i < plusUnit->instructionCount; i++) {
+		table[i].op = IR_OP_COUNT;
+	}
+	IrProfile profile = { table, plusUnit->instructionCount, CLASS_SMALLINT };
+	table[2].op = IR_IADD;
+	table[2].receiverClass = CLASS_SMALLINT;
+	table[2].argumentClass = CLASS_SMALLINT;
+	table[2].checkOverflow = 1;
+
+	IrFunction *plus = ssaBuild(plusUnit, NULL);
+	check("before: `a + b` is an opaque send", countOp(plus, IR_SEND) == 1);
+	PassStats plusStats = irOptimize(plus, &profile);
+	check("the send became raw arithmetic", countOp(plus, IR_SEND) == 0);
+	check("specialization is reported", plusStats.sendsSpecialized == 1);
+	check("and nothing was declined", plusStats.specializationsDeclined == 0);
+	check("BOTH operands are guarded, not just the receiver",
+		countOp(plus, IR_GUARD_CLASS) == 2);
+	check("the addition is there", countOp(plus, IR_IADD) == 1);
+	// THE CHECK IS ON THE ARITHMETIC, and this is the assertion that matters
+	// most in this block: `+` on two SmallIntegers can leave the 62-bit payload
+	// and the kernel's answer is a LargeInteger, which optimized code cannot
+	// build. A specialization without it is a silent wrap at 64 bits.
+	IrValue *addition = findOp(plus, IR_IADD);
+	check("the addition is marked as overflow-checked",
+		addition != NULL
+			&& (addition->flags & IR_FLAG_CHECK_OVERFLOW) != 0);
+	check("and it carries the state to leave with",
+		addition != NULL && addition->deopt != NULL);
+	check("the guards resume at the SEND, so tier 1 re-executes it",
+		addition != NULL && addition->deopt->frames[0].bci == 2
+			&& addition->deopt->frames[0].innermost);
+	irDestroy(plus);
+
+	// THE CONTROL, and it is the one that proves the pass is driven by the
+	// table rather than by the opcode: the same method with no entry for the
+	// site keeps its send. Without this, a pass that specialized every binary
+	// send it saw would pass every check above.
+	for (uint16_t i = 0; i < plusUnit->instructionCount; i++) {
+		table[i].op = IR_OP_COUNT;
+	}
+	IrFunction *unprofiled = ssaBuild(plusUnit, NULL);
+	PassStats coldStats = irOptimize(unprofiled, &profile);
+	check("a site with no profile keeps its send",
+		countOp(unprofiled, IR_SEND) == 1);
+	check("and no guard is emitted for it",
+		countOp(unprofiled, IR_GUARD_CLASS) == 0
+			&& coldStats.sendsSpecialized == 0);
+	irDestroy(unprofiled);
+	free(table);
+
+	// ---- IT COMPOSES, which is the entire claim -----------------------------
+	//
+	// `(a + b) + c`. Specialization alone would emit FOUR guards, two boxes and
+	// two unboxes; what makes the result worth having is that the passes already
+	// in this file then eat the middle. The intermediate box_i is known to
+	// answer a SmallInteger, so the second site's guard on it is redundant and
+	// goes; the unbox of that box collapses by the same local rule that collapses
+	// any other. Three guards for three operands, one box for one answer.
+	static Instruction chained[] = {
+		{ OP_MOVE, 0, 4, 0, 0 },   // r4 := self
+		{ OP_MOVE, 0, 5, 1, 0 },   // r5 := arg1
+		{ OP_SEND, 1, 6, 0, 4 },   // r6 := r4 + r5
+		{ OP_MOVE, 0, 7, 2, 0 },   // r7 := arg2, above the next receiver
+		{ OP_MOVE, 0, 6, 6, 0 },
+		{ OP_SEND, 1, 8, 0, 6 },   // r8 := r6 + r7
+		{ OP_RET,  0, 8, 0, 0 },
+	};
+	CodeUnit *chainUnit = calloc(1, sizeof(CodeUnit));
+	chainUnit->code = chained;
+	chainUnit->instructionCount = 7;
+	chainUnit->registerCount = 12;
+	chainUnit->argumentCount = 2;
+
+	SiteSpecialization *chainTable = calloc(chainUnit->instructionCount,
+		sizeof(SiteSpecialization));
+	for (uint16_t i = 0; i < chainUnit->instructionCount; i++) {
+		chainTable[i].op = IR_OP_COUNT;
+	}
+	for (uint16_t bci = 2; bci <= 5; bci += 3) {
+		chainTable[bci].op = IR_IADD;
+		chainTable[bci].receiverClass = CLASS_SMALLINT;
+		chainTable[bci].argumentClass = CLASS_SMALLINT;
+		chainTable[bci].checkOverflow = 1;
+	}
+
+	IrFunction *chain = ssaBuild(chainUnit, NULL);
+	IrProfile chainProfile = { chainTable, chainUnit->instructionCount,
+		CLASS_SMALLINT };
+	PassStats chainStats = irOptimize(chain, &chainProfile);
+	check("two chained adds are both specialized",
+		chainStats.sendsSpecialized == 2 && countOp(chain, IR_SEND) == 0);
+	check("three operands, THREE guards and not four",
+		countOp(chain, IR_GUARD_CLASS) == 3);
+	// ONE unbox per OPERAND and one box for the one answer. Three unboxes is
+	// the right number and two would be wrong: a + b + c reads three tagged
+	// values. What had to disappear is the pair in the MIDDLE, where the first
+	// addition's answer was boxed only to be unboxed again by the second.
+	check("the intermediate box and unbox are gone: one box for one answer",
+		countOp(chain, IR_BOX_I) == 1 && countOp(chain, IR_UNBOX_I) == 3
+			&& chainStats.boxesSunk == 1);
+	irDestroy(chain);
+	free(chainTable);
+
+	// ---- AND IT REACHES THE LOOP, which is what the whole tier is for -------
+	//
+	//   sum := 0. [ ... ] whileTrue: [ sum := sum + step ]
+	//
+	// Specialization makes the accumulator a box feeding a phi feeding an unbox,
+	// which is exactly the shape phi promotion exists to break. After it, the
+	// loop body holds a raw add and NO conversion at all: the accumulator lives
+	// in a register across the back edge. That is the level-16 target in
+	// miniature, reached by the passes that were already here.
+	static Instruction accumulate[] = {
+		{ OP_LOADI,    0, 3, 0, 0 },   // 0: sum := 0
+		{ OP_LOADI,    0, 4, 1, 0 },   // 1: step := 1
+		{ OP_SAFEPOINT,0, 0, 0, 0 },   // 2: loop head
+		{ OP_SEND,     1, 3, 0, 3 },   // 3: sum := sum + step
+		{ OP_JUMPTRUE, 0, 1, 6, 0 },   // 4: if arg -> 6
+		{ OP_JUMP,     0, 2, 0, 0 },   // 5: -> 2
+		{ OP_RET,      0, 3, 0, 0 },   // 6
+	};
+	CodeUnit *loopUnit = calloc(1, sizeof(CodeUnit));
+	loopUnit->code = accumulate;
+	loopUnit->instructionCount = 7;
+	loopUnit->registerCount = 8;
+	loopUnit->argumentCount = 1;
+
+	SiteSpecialization *loopTable = calloc(loopUnit->instructionCount,
+		sizeof(SiteSpecialization));
+	for (uint16_t i = 0; i < loopUnit->instructionCount; i++) {
+		loopTable[i].op = IR_OP_COUNT;
+	}
+	loopTable[3].op = IR_IADD;
+	loopTable[3].receiverClass = CLASS_SMALLINT;
+	loopTable[3].argumentClass = CLASS_SMALLINT;
+	loopTable[3].checkOverflow = 1;
+
+	IrFunction *accumulator = ssaBuild(loopUnit, NULL);
+	IrProfile loopProfile = { loopTable, loopUnit->instructionCount,
+		CLASS_SMALLINT };
+	PassStats loopStats = irOptimize(accumulator, &loopProfile);
+	check("the accumulator's send became an addition",
+		loopStats.sendsSpecialized == 1 && countOp(accumulator, IR_IADD) == 1);
+	check("the loop-carried phi was promoted to a raw integer",
+		loopStats.phisPromoted >= 1);
+	// The pair of numbers, not one of them: ONE box survives, on the way out to
+	// the return, and ZERO unboxes remain because there is nothing left to
+	// unbox. One number alone would not distinguish this from a loop the
+	// optimizer simply deleted.
+	printf("\n  the specialized loop after optimization:\n");
+	irPrint(accumulator);
+	check("the loop body carries no conversion at all",
+		countOp(accumulator, IR_UNBOX_I) == 0);
+	check("and exactly one box remains, for the answer",
+		countOp(accumulator, IR_BOX_I) == 1);
+	irDestroy(accumulator);
+	free(loopTable);
 
 	printf("\n%d of %d checks passed\n", gChecks - gFailures, gChecks);
 	return gFailures == 0 ? 0 : 1;

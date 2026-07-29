@@ -13,6 +13,8 @@
 #include "jit/Deopt.h"
 #include "jit/Lower.h"
 #include "jit/RegAlloc.h"
+#include "jit/Specialize.h"
+#include "core/Class.h"
 #include "jit/MacroAssembler.h"
 #include "core/Assert.h"
 #include <stdio.h>
@@ -54,6 +56,21 @@ typedef struct {
 	uint64_t frameMaps;
 	uint64_t deoptSites;
 	uint64_t deoptIncomplete;
+	// THE WARM SWEEP, which is a different question from everything above.
+	//
+	// Every count above is taken when a method COMPILES, and at that moment its
+	// caches are empty -- a method has not run yet. So the front half above can
+	// never see a profile, and "how much arithmetic would specialize" is exactly
+	// the number this campaign exists to produce. The sweep runs at exit, over
+	// every method the run compiled, with the caches those runs filled.
+	uint64_t warmMethods;
+	uint64_t warmSites;          // sends the bridge decided on
+	uint64_t warmSpecialized;    // and sends the optimizer then rewrote
+	uint64_t warmDeclined;
+	uint64_t warmSends;          // sends in those methods, in total
+	uint64_t warmGuards;
+	uint64_t warmBoxesSunk;
+	uint64_t warmPhisPromoted;
 	const char *refusedName[REFUSAL_NAMES];
 	uint64_t refusedNameCount[REFUSAL_NAMES];
 } Tier2DryRun;
@@ -121,6 +138,79 @@ static void tier2DryRunReport(void)
 }
 
 
+// ---------------------------------------------------------------------------
+// The WARM sweep
+// ---------------------------------------------------------------------------
+//
+// Rebuild and optimize every compiled method again, at exit, with the profile
+// its executions actually left in the cache cells. It answers the one question
+// the compile-time dry run structurally cannot: of the arithmetic sends in real
+// code, how many are monomorphic enough to specialize.
+//
+// NOTHING IS EMITTED and nothing is installed. The IR is destroyed before each
+// method is done with, exactly as the compile-time run does, so this remains a
+// measurement and not a second compiler running behind the first.
+static void tier2WarmSweep(void)
+{
+	size_t count = jitCompiledCount();
+	for (size_t index = 0; index < count; index++) {
+		NativeCode *code = jitCompiledAt(index);
+		if (code == NULL || code->unit == NULL || code->cells == NULL) {
+			continue;
+		}
+		Opcode unsupported = OP_COUNT;
+		IrFunction *ir = ssaBuild(code->unit, &unsupported);
+		if (ir == NULL) {
+			continue;
+		}
+		uint32_t offered = 0;
+		SiteSpecialization *sites = specializeFor(code, &offered);
+		IrProfile profile;
+		memset(&profile, 0, sizeof(profile));
+		profile.sites = sites;
+		profile.siteCount = sites != NULL ? code->unit->instructionCount : 0;
+		profile.smallIntegerClass = gClassIndexByTag[VALUE_INT];
+
+		// The sends BEFORE the optimizer runs, because after it the specialized
+		// ones are gone. The denominator has to be counted where it still exists.
+		uint64_t sends = 0;
+		for (IrBlock *block = ir->blocks; block != NULL; block = block->next) {
+			for (IrValue *value = block->first; value != NULL; value = value->next) {
+				sends += value->op == IR_SEND;
+			}
+		}
+
+		PassStats stats = irOptimize(ir, &profile);
+		gTier2DryRun.warmMethods++;
+		gTier2DryRun.warmSends += sends;
+		gTier2DryRun.warmSites += offered;
+		gTier2DryRun.warmSpecialized += stats.sendsSpecialized;
+		gTier2DryRun.warmDeclined += stats.specializationsDeclined;
+		gTier2DryRun.warmBoxesSunk += stats.boxesSunk;
+		gTier2DryRun.warmPhisPromoted += stats.phisPromoted;
+		for (IrBlock *block = ir->blocks; block != NULL; block = block->next) {
+			for (IrValue *value = block->first; value != NULL; value = value->next) {
+				gTier2DryRun.warmGuards += value->op == IR_GUARD_CLASS;
+			}
+		}
+		free(sites);
+		irDestroy(ir);
+	}
+	fprintf(stderr, "tier2: warm methods=%llu sends=%llu offered=%llu"
+		" specialized=%llu declined=%llu\n",
+		(unsigned long long) gTier2DryRun.warmMethods,
+		(unsigned long long) gTier2DryRun.warmSends,
+		(unsigned long long) gTier2DryRun.warmSites,
+		(unsigned long long) gTier2DryRun.warmSpecialized,
+		(unsigned long long) gTier2DryRun.warmDeclined);
+	fprintf(stderr, "tier2: warm guards=%llu boxesSunk=%llu phisPromoted=%llu\n",
+		(unsigned long long) gTier2DryRun.warmGuards,
+		(unsigned long long) gTier2DryRun.warmBoxesSunk,
+		(unsigned long long) gTier2DryRun.warmPhisPromoted);
+	fflush(NULL);
+}
+
+
 static _Bool tier2DryRunEnabled(void)
 {
 	static int enabled = -1;
@@ -128,6 +218,10 @@ static _Bool tier2DryRunEnabled(void)
 		enabled = getenv("ST_TIER2_DRYRUN") != NULL;
 		if (enabled) {
 			atexit(tier2DryRunReport);
+			// AFTER the report in registration order, so it runs BEFORE it: atexit
+			// handlers run last-registered-first, and the sweep has to have added
+			// its numbers before anything prints them.
+			atexit(tier2WarmSweep);
 		}
 	}
 	return enabled != 0;
@@ -166,7 +260,7 @@ void tier2DryRun(CodeUnit *unit)
 		return;
 	}
 	gTier2DryRun.built++;
-	irOptimize(function);
+	irOptimize(function, NULL);
 	gTier2DryRun.optimized++;
 	tier2CheckDeoptStates(function);
 

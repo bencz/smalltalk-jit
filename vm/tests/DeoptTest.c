@@ -165,7 +165,7 @@ int main(void)
 	check("before: the deopt state is well formed",
 		deoptStateIsWellFormed(state));
 
-	PassStats stats = irOptimize(function);
+	PassStats stats = irOptimize(function, NULL);
 	printf("\n  passes: simplificados=%u  escalarizados=%u  receitas=%u  mortos=%u\n\n",
 		stats.simplified, stats.scalarReplaced, stats.materializations,
 		stats.deadRemoved);
@@ -235,7 +235,7 @@ int main(void)
 	irAddArg(escaping, e0->terminator, kept);
 	e0->terminator->block = e0;
 
-	PassStats escapeStats = irOptimize(escaping);
+	PassStats escapeStats = irOptimize(escaping, NULL);
 	check("an object that ESCAPES is not erased",
 		countOp(escaping, IR_NEW) == 1 && escapeStats.scalarReplaced == 0);
 

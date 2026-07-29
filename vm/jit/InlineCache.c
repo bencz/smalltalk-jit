@@ -34,19 +34,29 @@ IcWay *icRecord(IcCell *cell, uint32_t receiverClass, uint32_t argumentClass)
 }
 
 
-uint32_t icDominantClass(const IcCell *cell, double *fraction)
+const IcWay *icDominantWay(const IcCell *cell)
 {
-	if (fraction != NULL) {
-		*fraction = 0.0;
-	}
-	if (cell->megamorphic || cell->wayCount == 0 || cell->sends == 0) {
-		return CLASS_INDEX_INVALID;
+	if (cell->megamorphic || cell->wayCount == 0) {
+		return NULL;
 	}
 	const IcWay *best = &cell->ways[0];
 	for (uint8_t i = 1; i < cell->wayCount; i++) {
 		if (cell->ways[i].count > best->count) {
 			best = &cell->ways[i];
 		}
+	}
+	return best;
+}
+
+
+uint32_t icDominantClass(const IcCell *cell, double *fraction)
+{
+	if (fraction != NULL) {
+		*fraction = 0.0;
+	}
+	const IcWay *best = icDominantWay(cell);
+	if (best == NULL || cell->sends == 0) {
+		return CLASS_INDEX_INVALID;
 	}
 	if (fraction != NULL) {
 		*fraction = (double) best->count / (double) cell->sends;
@@ -57,16 +67,8 @@ uint32_t icDominantClass(const IcCell *cell, double *fraction)
 
 uint32_t icDominantArgumentClass(const IcCell *cell)
 {
-	if (cell->megamorphic || cell->wayCount == 0) {
-		return CLASS_INDEX_INVALID;
-	}
-	const IcWay *best = &cell->ways[0];
-	for (uint8_t i = 1; i < cell->wayCount; i++) {
-		if (cell->ways[i].count > best->count) {
-			best = &cell->ways[i];
-		}
-	}
-	return best->argClassIndex;
+	const IcWay *best = icDominantWay(cell);
+	return best != NULL ? best->argClassIndex : CLASS_INDEX_INVALID;
 }
 
 

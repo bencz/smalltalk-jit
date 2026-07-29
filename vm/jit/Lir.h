@@ -150,6 +150,18 @@ typedef enum {
 	LIR_SHL, LIR_SAR,     // b is a register
 	LIR_ADDI, LIR_ANDI, LIR_SHLI, LIR_SARI,  // imm forms, which every target has
 	LIR_NEG,
+	// The same three, plus "the result MUST fit a SmallInteger, and leaving
+	// optimized code is what happens when it does not". The operands are the
+	// UNBOXED 62-bit payloads, so the range that has to hold is the tagging
+	// range and not the machine's 64-bit one.
+	//
+	// ONE OPCODE EACH and not an add followed by a separate range test, for the
+	// reason LIR_GUARD_CLASS is one: the branch structure between the check and
+	// the failure is the backend's, and how a target learns that an addition
+	// overflowed is the most machine-specific fact there is -- x86 has a flag,
+	// and a target without one has to compute the answer. An LIR that spelled
+	// the test out would be spelling out one machine's.
+	LIR_GUARDED_ADD, LIR_GUARDED_SUB, LIR_GUARDED_MUL,
 
 	// ---- floating point ----------------------------------------------------
 	LIR_FADD, LIR_FSUB, LIR_FMUL, LIR_FDIV, LIR_FNEG, LIR_FSQRT,

@@ -92,6 +92,13 @@ typedef struct IcCell {
 // other and that equality breaks.
 IcWay *icRecord(IcCell *cell, uint32_t receiverClass, uint32_t argumentClass);
 
+// The way with the most executions, or NULL when the site is megamorphic or has
+// never run. THE ONE WALK, which the three questions below are written in terms
+// of: "which class", "which argument class" and "which method did it resolve
+// to" are three readings of the same way, and three loops finding it separately
+// is three places for the answer to differ.
+const IcWay *icDominantWay(const IcCell *cell);
+
 // The dominant receiver class and the fraction of executions it accounts for.
 // Answers CLASS_INDEX_INVALID when the site is megamorphic or cold, which is
 // exactly the case where speculating is not justified.

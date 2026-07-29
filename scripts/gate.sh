@@ -289,6 +289,7 @@ level7() {
 		vm/jit/Ir.c vm/jit/SsaBuild.c vm/jit/Passes.c vm/jit/Lir.c \
 		vm/jit/Lower.c vm/jit/RegAlloc.c vm/jit/SsaRuntime.c \
 		vm/jit/SsaEmitter.c vm/jit/SsaBackends.c vm/jit/SsaBackend.c \
+		vm/jit/Specialize.c \
 		vm/jit/Deopt.c vm/jit/DeoptResume.c vm/jit/x64/abi/sysv/ResumeSysV.c \
 		$(standalonePrimitiveSources) $(primitiveSupportSources) \
 		vm/jit/x64/MacroAssemblerX64.c vm/jit/x64/SsaEmitterX64.c \

@@ -301,6 +301,13 @@ const struct FrameMap *jitFrameMapAt(const NativeCode *code,
 // method that was there before. Details at the definition.
 void jitFlushSendCaches(void);
 
+// Every method this JIT has compiled, for a caller that wants to ask a question
+// of all of them. Exposed for ONE reason and it is a measurement one: the tier-2
+// dry run has to be able to run over methods whose caches are WARM, and a method
+// is cold at the moment it compiles -- so the sweep happens later, over this.
+size_t jitCompiledCount(void);
+NativeCode *jitCompiledAt(size_t index);
+
 // Run the front half of tier 2 (SsaBuild plus the passes) over a unit and throw
 // the result away, under ST_TIER2_DRYRUN=1. Weakly no-op when the optimizer is
 // not linked; the real one is jit/Tier2DryRun.c.

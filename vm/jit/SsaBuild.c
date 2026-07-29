@@ -406,6 +406,12 @@ static void lower(Builder *builder, uint16_t bci)
 
 	case OP_LOADI: {
 		IrValue *value = emit(builder, IR_CONST);
+		// WHICH KIND of constant, written down rather than left as the zero the
+		// allocator gave it. The three singletons below set this field, so a
+		// reader that wants to tell an integer literal from nil has to have it
+		// here too: `konst` is zero for nil and zero is a valid tagged
+		// SmallInteger, so the value alone cannot answer.
+		value->extra = OP_LOADI;
 		value->konst = tagInt((int16_t) instruction->b);
 		writeVariable(builder, instruction->a, block, value);
 		break;

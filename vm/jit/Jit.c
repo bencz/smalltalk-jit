@@ -245,6 +245,15 @@ void rootsVisitCompiledCode(RootVisitor visit, void *ctx)
 // a stale target would stay armed inside compiled code and keep calling the
 // method that was just replaced. Same wrong ANSWER this function exists to
 // prevent, reached by the half of the system that was added after the comment.
+size_t jitCompiledCount(void) { return gCompiledCount; }
+
+
+NativeCode *jitCompiledAt(size_t index)
+{
+	return index < gCompiledCount ? gCompiledCode[index] : NULL;
+}
+
+
 void jitFlushSendCaches(void)
 {
 	for (size_t index = 0; index < gCompiledCount; index++) {

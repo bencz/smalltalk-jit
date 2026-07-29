@@ -188,6 +188,9 @@ Apendar, nunca reescrever. Data, commit, o que destravou.
 | 2026-07-29 | **7** | (nao commitado) | backend de SSA INSERIDO, renumerando de 7 para cima: LIR, lowering, linear scan com splitting, emissor x64; 10 de 10 contra o tier 1 como oraculo, em pool 12, 8, 6, 4, 3 e 2 |
 | 2026-07-29 | 7 | (nao commitado) | o backend achou 3 defeitos de RESPOSTA ERRADA na IR e o verificador achou 3 no alocador, ver abaixo |
 | 2026-07-28 | **13** | (nao commitado) | namespaces (cadeia propria -> imports -> Core), `Namespaces`/`Smalltalk`, `MethodSend`, `GetEnv`: os 4 pacotes E samples geram imagem, 88 de 175 |
+| 2026-07-29 | 7 | (nao commitado) | **especializacao de aritmetica pelo perfil**: 21 de 21 no nivel 7 e 46 de 46 no nivel 5, em pool 12, 8, 4 e 2 |
+| 2026-07-29 | 5 | (nao commitado) | o otimizador ganhou tres passes que a especializacao exigiu, ver abaixo |
+| 2026-07-29 | 7 | (nao commitado) | a especializacao achou UM bug de resposta errada no guard, TRES no alocador e um latente na desotimizacao, ver abaixo |
 
 ## O que o nivel 7 encontrou, e por que so ele podia encontrar
 
@@ -1207,9 +1210,6 @@ alta.
 `canLower` recusa POR NOME o que nao sabe selecionar, e a lista de recusas e a
 lista de trabalho:
 
-- **`IR_GUARD_CLASS`**, porque um guard que falha tem que desotimizar e o runtime
-  de deopt nao existe. Nao custa nada hoje: o front end nao emite `GUARDCLASS`,
-  a checagem de booleano dele e um par `JUMPTRUE`/`JUMPFALSE`;
 - **as alocacoes e os acessos indexados** (`IR_NEW`, `IR_ANEW`, `IR_ALOAD` e
   companhia), porque nenhum produtor os cria e seriam codigo nao exercitado;
 - **`IR_FIELD_F` e `IR_SETFIELD_F`**, que sao das classes de valor da fase 7.
@@ -1218,3 +1218,185 @@ E duas coisas que sao primeiro corte declarado, nao desenho: o send do tier 2 va
 por `jitDispatch` SEM caminho rapido de cache (correto e mais lento, e o perfil
 continua sendo gravado, que e o que o ADR 0006 exige), e box/unbox sao CHAMADAS
 em vez de sequencia inline.
+
+## Especializacao de aritmetica pelo perfil
+
+`3 + 4` chega na IR como SEND opaco, e o ADR 0006 exige que chegue: resolver `+`
+no front end faz o perfil de tipos deixar de existir. A consequencia era que GVN,
+LICM e promocao de phi rodavam sobre chamadas e nao moviam nada, e as operacoes
+cruas em volta das quais a IR foi desenhada nao tinham PRODUTOR nenhum.
+
+Agora tem. Onde o sitio e monomorfico o bastante, o otimizador troca
+
+```
+send #+ (r, a)      ->      guard_class r, SmallInteger
+                            guard_class a, SmallInteger
+                            box_i(iadd(unbox_i r, unbox_i a))   [checado]
+```
+
+**A ORDEM E O ARGUMENTO INTEIRO**: o perfil existe porque aritmetica passou por
+cache; a troca e legal porque esta atras de guard; o guard e legal porque falhar
+da para desotimizar. Cada peca precisa da anterior, e e por isso que esta e a
+ultima e nao a primeira.
+
+### Tres coisas que a especializacao NAO decide
+
+**Nao decide pelo SELETOR.** Um sitio que manda `+` para SmallInteger so e
+especializado quando o metodo que aquele sitio RESOLVEU carrega
+`IntAddPrimitive`, achado pela via do cache que ele resolveu. Decidir pelo nome
+compilaria `+` como soma num programa que redefiniu `SmallInteger>>+`, e a
+resposta seria errada sem nada para notar: o guard continua valendo, porque o
+receptor de fato E um SmallInteger. Quem sabe o que um numero de primitiva
+significa e UM arquivo, `jit/Specialize.c`, porque isso e um fato sobre
+`packages/Core` e este VM ja pagou varias vezes por fatos sobre `packages/`
+escritos em duas metades.
+
+**Nao decide dentro do otimizador.** O passe recebe uma TABELA por indice de
+bytecode, ja decidida. O nivel 5 linka `Passes.c` com a IR e mais nada, entao um
+passe que lesse uma `IcCell` nao poderia ser provado la.
+
+**Nao decide sobre aritmetica MISTA.** `3 + 4.0` chega em `PRIM_IntAdd` com
+argumento Float e responde Float; especializar esse par como soma inteira
+desempacotaria um SmallFloat64 como se fosse SmallInteger, que e resposta errada
+e nao guard que falha. Os dois operandos sao conferidos contra a representacao
+que a operacao consome, e o par misto continua send. E o primeiro corte, dito
+como corte: e exatamente o caso que um `i2f` mais operacao de float serviria.
+
+### O overflow vai na ARITMETICA, nao no box
+
+`+`, `-` e `*` de dois SmallIntegers podem sair da carga de 62 bits, e a resposta
+do kernel para isso e um LargeInteger construido pelo Smalltalk do proprio
+metodo, que codigo otimizado nao constroi. Entao a operacao carrega
+`IR_FLAG_CHECK_OVERFLOW` e desotimiza.
+
+**No box a checagem nao serve**, e isso parece detalhe e e a corretude toda:
+`sum := sum + i` num laco tem o box e o unbox removidos pela promocao de phi, que
+e o objetivo do passe, entao uma checagem que morasse no box desapareceria com
+ele e o acumulador daria a volta em 64 bits em silencio. Verificado desligando: a
+checagem fora, `maxVal + 1` nao responde diferente, ele ABORTA o processo no
+assert de `jitBoxInteger`.
+
+### O guard nao sabia checar classe IMEDIATA, e isso era perda total
+
+`LIR_GUARD_CLASS` testava a tag contra `VALUE_POINTER` e so depois lia o indice
+de classe do cabecalho. Um SmallInteger nao tem cabecalho: a classe dele vem de
+uma tabela indexada pela TAG (`core/Class.h`). Entao o guard respondia NAO para
+todo SmallInteger que existe.
+
+**E o modo de falha e o pior possivel: a resposta continua CERTA.** Desotimizar e
+correto por construcao, entao um guard que falha em toda execucao entrega
+exatamente o que o tier 1 entrega. Nenhuma checagem de valor ve isso. O que ve e
+um CONTADOR de desotimizacoes, e a checagem que o le e "uma chamada dentro do
+perfil desotimiza ZERO vezes". Medido desligando o conserto: as 21 respostas
+continuam certas e SEIS checagens quebram, todas por contagem.
+
+O que o guard emite agora e exatamente `classIndexOfValue(v) == imm`, com os
+bracos de imediato lidos da mesma tabela que o C le.
+
+### O que a especializacao encontrou no ALOCADOR: tres, e todos de ORDEM
+
+Os tres sao a mesma doenca e nenhum e novo: **os moves de resolucao sao uma COPIA
+PARALELA e estavam sendo emitidos como sequencia.** Faltava um laco que carregasse
+valor derramado no cabecalho, e nada tinha construido um. Os tres foram achados
+pelo ORACULO (tier 1), nao pelo verificador, e o verificador estava certo em
+passar: os intervalos eram consistentes, so a COLOCACAO estava errada.
+
+1. **Split no cabecalho de bloco resolvido com UM move dentro do bloco.** Um
+   bloco com dois predecessores nao concorda sobre onde o valor esta, e o move
+   roda nos dois: no cabecalho de laco o derrame da aresta de entrada re-executa
+   a cada iteracao, lendo um registrador que ja e de outro e escrevendo isso no
+   slot. Medido: laco com acumulador float respondeu 32.0 onde o tier 1 respondeu
+   3.0, porque o PASSO foi sobrescrito pelo acumulador na segunda iteracao. Agora
+   split no cabecalho vai para as arestas.
+2. **A pergunta da aresta era feita em `block->to - 1`**, que e a posicao IMPAR
+   entre o ultimo instrucao do bloco e a primeira do sucessor, ou seja exatamente
+   onde um split de fronteira COMECA. Ler ali responde onde o valor vai estar
+   DEPOIS da aresta, e o move que tem que acontecer NELA parece desnecessario.
+3. **Move de aresta colocado antes de um terminador CONDICIONAL.** Ele roda nas
+   duas saidas e pode sobrescrever o registrador que o branch esta prestes a ler.
+   Medido: o laco rodou UMA iteracao e respondeu 2.0. Com varios sucessores a
+   aresta e a CABECA DO SUCESSOR, e isso e seguro porque o lowering ja corta
+   aresta critica, o que esta ASSERTado em vez de assumido.
+
+E a copia paralela passou a ser ordenada: primeiro os DERRAMES (leem registrador,
+escrevem memoria), depois os moves registrador-a-registrador em ordem
+topologica, depois as RECARGAS (escrevem registrador, leem memoria). **Ciclo
+verdadeiro** (r1 para r2 enquanto r2 vai para r1) e quebrado PELO FRAME, com um
+slot alocado na primeira vez que aparece, porque o alocador ja distribuiu todo
+registrador. Medido: 7 dos 17977 metodos tem um, entao recusar custaria sete
+compilacoes para evitar duas instrucoes.
+
+### E um bug latente na desotimizacao, que so a aritmetica de float alcanca
+
+A area onde o guard derrama o banco de registradores cobria so o banco INTEIRO.
+Um `DeoptSlot` grava o banco em que foi alocado, e ler um de volta de uma area
+que so guardou registrador inteiro pega os oito bytes de qualquer inteiro que
+divida o numero: um double plausivel, de um valor sem relacao nenhuma.
+
+**Achar um caso que alcanca isso custou uma tentativa errada, e ela vale
+registro**: `(a + b) < c` em float NAO alcanca, porque o receptor da comparacao e
+a soma BOXED, entao o registrador de bytecode que o estado nomeia guarda o box e
+o valor cru nao e de ninguem. So a PROMOCAO DE PHI torna um registrador de
+bytecode cru. O teste que ficou tem acumulador float semeado por uma soma (para
+os dois operandos do phi serem box, que e o que a promocao exige) e um contador
+inteiro que estoura; verificado tirando os saves de float e vendo esse, e so
+esse, responder diferente.
+
+### Tres passes que a especializacao exigiu do otimizador
+
+Nenhum e enfeite: sem eles a especializacao nao paga.
+
+- **classe de literal inteiro.** Sem saber que indice de classe um SmallInteger
+  tagueado tem, `x + 1` guarda a constante em runtime e um acumulador semeado com
+  `0` tem phi cujos operandos nao concordam em classe, o que impede a remocao do
+  guard, o que deixa um box na aresta do laco, que e exatamente o custo que a
+  promocao de phi existe para tirar. Um indice recupera tudo isso, e ele entra
+  como DADO (`IrProfile`) porque o nivel 5 nao tem tabela de classes.
+- **semente de constante na promocao de phi.** A promocao exigia que TODO operando
+  do phi fosse um box. Todo acumulador inteiro da linguagem se escreve
+  `sum := 0` e depois `sum := sum + x`, ou seja o operando da aresta de entrada e
+  uma CONSTANTE tagueada. Exigir box rejeita essa forma, que e A forma.
+- **box que so um estado de deopt ainda quer.** `a + b + c` deixa um box
+  intermediario sem usuario ordinario nenhum: o que o mantem vivo e o estado do
+  segundo sitio. Esse estado nao precisa do box, porque um `DeoptSlot` carrega o
+  KIND e o `DeoptResume` re-empacota na saida. E o MESMO argumento que a
+  substituicao escalar faz sobre uma alocacao, e reusa o mesmo predicado.
+
+Junto entrou `unbox_i` de constante virando `iconst`, que hoje remove uma CHAMADA
+de todo `x + 1` e do preheader de todo laco contado.
+
+### Os numeros
+
+Sobre 17977 metodos reais (todos os `tests/*.st` contra a imagem do Core), com o
+perfil que a propria execucao deixou:
+
+| | |
+|---|---|
+| metodos | 17977 |
+| sitios que o perfil ofereceu | **2091** |
+| sitios que o otimizador trocou | **2091** |
+| ofertas que o passe recusou | **0** |
+| guards depois da remocao de redundante | 2009 de 4182 emitidos |
+| boxes afundados no estado de deopt | 632 |
+| phis promovidos | 315 |
+
+`lowered 17977, allocated 17977, allocFailed 0, verifyFailed 0, deoptSites 63651,
+deoptIncomplete 0`, identico ao registrado antes desta sessao.
+
+E por benchmark, contando SITIOS e nao execucoes:
+
+| | metodos | sends | especializados | guards | boxes afundados | phis |
+|---|---|---|---|---|---|---|
+| Richards | 125 | 393 | 17 | 20 | 4 | 2 |
+| DeltaBlue | 201 | 737 | 60 | 57 | 15 | 8 |
+| MixedArith | 52 | 199 | 11 | 15 | 3 | 2 |
+| FloatBench | 44 | 169 | 16 | 23 | 4 | 3 |
+
+**NENHUM DESSES NUMEROS E UM GANHO DE PERFORMANCE, e nao pode ser**: o tier 2
+continua desligado, e ligado hoje seria mais lento pelos dois cortes declarados
+(send por `jitDispatch` sem caminho rapido, box/unbox como chamada). Sao contagem
+ESTATICA de sitios, nao fracao de sends executados. O que eles dizem e que a
+maquina que ja estava verificada passou a ter o que otimizar, que era o bloqueio.
+
+E o `--deopt-stress` (nivel 15) vem ANTES de qualquer ganho reivindicado, porque
+sem ele a especulacao e promessa sem oraculo.

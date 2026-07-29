@@ -17,6 +17,7 @@
 #include "jit/Jit.h"
 #include "jit/Deopt.h"
 #include "core/Assert.h"
+#include "core/Class.h"
 #include "core/Thread.h"
 #include "memory/Heap.h"
 #include <stdio.h>
@@ -260,6 +261,59 @@ static void emitReturn(SsaEmitter *emitter)
 	asmMovRegReg(buffer, RSP, X64_FRAME);
 	asmPop(buffer, X64_FRAME);
 	asmRet(buffer);
+}
+
+
+// LEAVING OPTIMIZED CODE, which is the failure arm of every speculation this
+// backend emits: the class guard and the checked arithmetic.
+//
+// ONE FUNCTION and not one copy per speculation. The sequence has to agree with
+// DeoptResume.c about where the registers were put and with the epilogue about
+// how the method ends, and a second copy is where those two agreements start
+// diverging one at a time.
+static void emitDeoptExit(SsaEmitter *emitter, const LirInstruction *it)
+{
+	CodeBuffer *buffer = ssaEmitterBuffer(emitter);
+	const LirFunction *function = ssaEmitterFunction(emitter);
+	const Abi *abi = ssaEmitterAbi(emitter);
+
+	// SPILL THE WHOLE REGISTER FILE first, BOTH BANKS. A deopt state can name a
+	// value living in any register, and by the time the C helper runs every
+	// register belongs to the helper; the save area is what it reads instead.
+	// Uniform rather than per-site, because the alternative is a per-site list
+	// the emitter and the reader both have to agree about.
+	//
+	// The float half is at the second DEOPT_SAVED_REGISTERS slots, which is the
+	// layout jit/Deopt.h states and DeoptResume.c reads. Without it a float in a
+	// register deoptimized to the contents of the integer register with the same
+	// number: a plausible double, from an unrelated value.
+	for (uint8_t r = 0; r < DEOPT_SAVED_REGISTERS; r++) {
+		asmMovMemReg(buffer, X64_FRAME,
+			slotOffset((uint16_t) (function->deoptSaveBase + r)), (Register) r);
+		asmMovsdMemReg(buffer, X64_FRAME,
+			slotOffset((uint16_t) (function->deoptSaveBase
+				+ DEOPT_SAVED_REGISTERS + r)), (XmmRegister) r);
+	}
+	asmMovRegImm64(buffer, (Register) abi->argumentRegisters[0],
+		(uint64_t) (uintptr_t) it->deoptSite);
+	asmLeaRegMem(buffer, (Register) abi->argumentRegisters[1], X64_FRAME,
+		slotOffset(0));
+	asmMovRegImm64(buffer, (Register) abi->argumentRegisters[2], 0);
+	if (abi->shadowSpaceBytes != 0) {
+		asmSubRegImm32(buffer, RSP, abi->shadowSpaceBytes);
+	}
+	uint64_t helper;
+	MaRuntimeFunction deoptimize = jitDeoptimize;
+	memcpy(&helper, &deoptimize, sizeof(helper));
+	asmMovRegImm64(buffer, X64_SCRATCH_A, helper);
+	asmCallReg(buffer, X64_SCRATCH_A);
+	if (abi->shadowSpaceBytes != 0) {
+		asmAddRegImm32(buffer, RSP, abi->shadowSpaceBytes);
+	}
+	// The rest of the method ran in tier 1 and its answer is already in the
+	// result register, so this method is finished. Falling through into the
+	// tier-2 code below would run it a SECOND time.
+	emitReturn(emitter);
 }
 
 
@@ -516,58 +570,90 @@ static void x64SsaInstruction(SsaEmitter *emitter, const LirInstruction *it,
 		// lowering because the branch structure between the check and the
 		// failure is the backend's (ADR 0009).
 		//
-		// THE TAG IS CHECKED AGAINST VALUE_POINTER, not merely against
-		// SmallInteger. An immediate has no header at all, so reading a class
-		// index out of one reads whatever lies at address (value - 1); testing
-		// only for tag 00 would let a Character and a SmallFloat64 through, and
-		// those are exactly the receivers a test is least likely to try.
+		// WHAT IT HAS TO COMPUTE IS classIndexOfValue(v) == imm, exactly, and
+		// "exactly" is the whole of it. A tagged immediate has no header, so its
+		// class comes from a table indexed by its TAG (core/Class.h), and a guard
+		// that only knew the heap path answered NO for every SmallInteger there
+		// is. That was not a missed case: it made the arithmetic specialization
+		// this guard exists to protect deoptimize on every single execution.
 		X64Label *fail = (X64Label *) x64SsaNewLabel(emitter);
 		X64Label *done = (X64Label *) x64SsaNewLabel(emitter);
 		Register value = intReg(it->argReg[0]);
+		uint32_t wanted = (uint32_t) it->imm & (uint32_t) OBJ_CLASS_MASK;
+
+		// The immediate tags whose class IS the wanted one, read from the same
+		// table core/Class.h reads. Baking it is legal for the reason a class
+		// index is bakeable at all (ADR 0005): the table is written once at
+		// bootstrap and an index never moves.
 		asmMovRegReg(buffer, X64_SCRATCH_A, value);
 		asmAnd32RegImm32(buffer, X64_SCRATCH_A, 3);
+		for (uint32_t tag = 0; tag < 4; tag++) {
+			if (tag == (uint32_t) VALUE_POINTER
+					|| gClassIndexByTag[tag] != wanted) {
+				continue;
+			}
+			asmCmp32RegImm32(buffer, X64_SCRATCH_A, tag);
+			asmJcc(buffer, COND_EQUAL, done);
+		}
+		// And the heap path, emitted UNCONDITIONALLY rather than only when the
+		// wanted class has no immediate tag. Deciding it away would require
+		// proving no heap object carries that index, which is a fact about the
+		// whole running image and not about this instruction.
 		asmCmp32RegImm32(buffer, X64_SCRATCH_A, (uint32_t) VALUE_POINTER);
 		asmJcc(buffer, COND_NOT_EQUAL, fail);
 		asmMovRegReg(buffer, X64_SCRATCH_A, value);
 		asmSubRegImm32(buffer, X64_SCRATCH_A, (int32_t) VALUE_POINTER);
 		asmMov32RegMem(buffer, X64_SCRATCH_B, X64_SCRATCH_A, 0);
 		asmAnd32RegImm32(buffer, X64_SCRATCH_B, (uint32_t) OBJ_CLASS_MASK);
-		asmCmp32RegImm32(buffer, X64_SCRATCH_B,
-			(uint32_t) it->imm & (uint32_t) OBJ_CLASS_MASK);
+		asmCmp32RegImm32(buffer, X64_SCRATCH_B, wanted);
 		asmJcc(buffer, COND_EQUAL, done);
 
 		asmBind(buffer, fail);
-		// SPILL THE WHOLE REGISTER FILE first. A deopt state can name a value
-		// living in any register, and by the time the C helper runs every
-		// register belongs to the helper; the save area is what it reads
-		// instead. Uniform rather than per-site, because the alternative is a
-		// per-site list the emitter and the reader both have to agree about.
-		for (uint8_t r = 0; r < DEOPT_SAVED_REGISTERS; r++) {
-			asmMovMemReg(buffer, X64_FRAME,
-				slotOffset((uint16_t) (function->deoptSaveBase + r)),
-				(Register) r);
-		}
-		asmMovRegImm64(buffer, (Register) abi->argumentRegisters[0],
-			(uint64_t) (uintptr_t) it->deoptSite);
-		asmLeaRegMem(buffer, (Register) abi->argumentRegisters[1], X64_FRAME,
-			slotOffset(0));
-		asmMovRegImm64(buffer, (Register) abi->argumentRegisters[2], 0);
-		if (abi->shadowSpaceBytes != 0) {
-			asmSubRegImm32(buffer, RSP, abi->shadowSpaceBytes);
-		}
-		uint64_t helper;
-		MaRuntimeFunction deoptimize = jitDeoptimize;
-		memcpy(&helper, &deoptimize, sizeof(helper));
-		asmMovRegImm64(buffer, X64_SCRATCH_A, helper);
-		asmCallReg(buffer, X64_SCRATCH_A);
-		if (abi->shadowSpaceBytes != 0) {
-			asmAddRegImm32(buffer, RSP, abi->shadowSpaceBytes);
-		}
-		// The rest of the method ran in tier 1 and its answer is already in the
-		// result register, so this method is finished. Falling through into the
-		// tier-2 code below would run it a SECOND time.
-		emitReturn(emitter);
+		emitDeoptExit(emitter, it);
 		asmBind(buffer, done);
+		break;
+	}
+
+	case LIR_GUARDED_ADD: case LIR_GUARDED_SUB: case LIR_GUARDED_MUL: {
+		// Raw arithmetic that MUST stay inside the SmallInteger range, and
+		// deoptimizes when it does not, because the kernel's answer for an
+		// overflowed sum is a LargeInteger that optimized code cannot build.
+		//
+		// The operands are UNBOXED payloads, each in [-2^61, 2^61-1], so for the
+		// add and the subtract the 64-bit result cannot wrap: what has to be
+		// checked is only that it still fits 62 bits, and shifting it up by two
+		// and back answers that exactly. The multiply CAN wrap 64 bits, so it
+		// needs the overflow flag as well; both failures land on one label.
+		X64Label *fail = (X64Label *) x64SsaNewLabel(emitter);
+		X64Label *done = (X64Label *) x64SsaNewLabel(emitter);
+		asmMovRegReg(buffer, X64_SCRATCH_A, intReg(it->argReg[0]));
+		switch ((LirOp) it->op) {
+		case LIR_GUARDED_ADD:
+			asmAddRegReg(buffer, X64_SCRATCH_A, intReg(it->argReg[1]));
+			break;
+		case LIR_GUARDED_SUB:
+			asmSubRegReg(buffer, X64_SCRATCH_A, intReg(it->argReg[1]));
+			break;
+		default:
+			asmImulRegReg(buffer, X64_SCRATCH_A, intReg(it->argReg[1]));
+			asmJcc(buffer, COND_OVERFLOW, fail);
+			break;
+		}
+		// Does it still fit the 62-bit payload? Shift up and arithmetic-shift
+		// back: the round trip is the identity for exactly the values tagInt
+		// accepts, which is the same predicate jitBoxInteger asserts and the
+		// same one DeoptResume's tagInt would abort on. One test, three readers,
+		// no third definition of "fits".
+		asmMovRegReg(buffer, X64_SCRATCH_B, X64_SCRATCH_A);
+		asmShlRegImm8(buffer, X64_SCRATCH_B, 2);
+		asmSarRegImm8(buffer, X64_SCRATCH_B, 2);
+		asmCmpRegReg(buffer, X64_SCRATCH_B, X64_SCRATCH_A);
+		asmJcc(buffer, COND_EQUAL, done);
+
+		asmBind(buffer, fail);
+		emitDeoptExit(emitter, it);
+		asmBind(buffer, done);
+		asmMovRegReg(buffer, intReg(it->dstReg), X64_SCRATCH_A);
 		break;
 	}
 

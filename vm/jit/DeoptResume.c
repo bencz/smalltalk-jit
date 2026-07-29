@@ -53,9 +53,13 @@ static Value readSlot(const DeoptSlot *slot, const uint8_t *frame,
 	case DEOPT_CONSTANT:
 		return slot->constant;
 	case DEOPT_IN_REGISTER:
-		// The save area descends like every other run of slots, so register r
-		// is at saveBase + r, which is a LOWER address than saveBase.
-		raw = saved[-slot->location];
+		// The save area descends like every other run of slots, so register r of
+		// bank b is at saveBase + b*DEOPT_SAVED_REGISTERS + r, which is a LOWER
+		// address than saveBase. THE BANK IS PART OF THE ADDRESS: the two files
+		// number independently, so register 3 of the float bank and register 3 of
+		// the integer bank are different values with the same number.
+		raw = saved[-(slot->location
+			+ slot->bank * (int32_t) DEOPT_SAVED_REGISTERS)];
 		break;
 	default:
 		// Slot i sits at frame - 8*(i+1), the one law both tiers share.
@@ -79,6 +83,13 @@ static Value readSlot(const DeoptSlot *slot, const uint8_t *frame,
 }
 
 
+// See jit/Deopt.h for why a COUNT is the only observable a working speculation
+// has: the answer is the same either way.
+static uint64_t gDeoptimizations;
+
+uint64_t jitDeoptimizationCount(void) { return gDeoptimizations; }
+
+
 // A guard failed. Rebuild and continue.
 //
 // ONE FRAME ONLY for now, and it is checked rather than assumed: outer frames
@@ -88,6 +99,7 @@ static Value readSlot(const DeoptSlot *slot, const uint8_t *frame,
 Value jitDeoptimize(void *sitePointer, Value *slotZero, uint64_t packed)
 {
 	(void) packed;
+	gDeoptimizations++;
 	const DeoptSite *site = sitePointer;
 	ASSERT(site != NULL && site->frameCount == 1);
 	const DeoptRuntimeFrame *frame = &site->frames[0];

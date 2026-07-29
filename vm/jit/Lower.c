@@ -48,7 +48,6 @@ typedef struct {
 	// the block inserted to split a critical edge. Indexed [blockId][predIndex].
 	LirBlock ***edgeBlock;
 	LirBlock *current;
-	const char *refused;
 } Lowering;
 
 
@@ -90,6 +89,24 @@ static _Bool canLower(IrOp op)
 		return 1;
 	default:
 		return 0;
+	}
+}
+
+
+// The checked form of a raw operation, or LIR_OP_COUNT when it has none.
+//
+// THE ONE PLACE the correspondence is written. The up-front refusal and the
+// instruction selection both read it, so "which operations can be checked" has
+// a single answer; two copies of this list would let a producer set the flag on
+// an operation the selection then lowered UNCHECKED, and a dropped overflow
+// check is a silent wrong answer rather than a refusal.
+static LirOp checkedFormOf(IrOp op)
+{
+	switch (op) {
+	case IR_IADD: return LIR_GUARDED_ADD;
+	case IR_ISUB: return LIR_GUARDED_SUB;
+	case IR_IMUL: return LIR_GUARDED_MUL;
+	default: return LIR_OP_COUNT;
 	}
 }
 
@@ -196,23 +213,29 @@ static void layoutFrame(Lowering *lowering)
 		}
 	}
 	lir->outgoingSlots = widest;
-	// The register save area, reserved ONLY when the method has a guard. A
-	// method with none pays no slots and no instructions for deoptimization,
-	// which is the same rule the non-local return already follows.
+	// The register save area, reserved ONLY when the method can actually leave
+	// speculatively. A method that cannot pays no slots and no instructions for
+	// deoptimization, which is the same rule the non-local return already
+	// follows.
+	//
+	// "CAN LEAVE" IS A PREDICATE AND NOT A LIST OF OPCODES, because it grew one:
+	// checked arithmetic deoptimizes on overflow, and a layout that only looked
+	// for IR_GUARD_CLASS would leave deoptSaveBase at zero while the emitter
+	// spilled the register file over the receiver and the arguments.
 	uint16_t afterOutgoing = (uint16_t) (lir->outgoingBase + lir->outgoingSlots);
-	_Bool hasGuard = 0;
-	for (IrBlock *block = lowering->ir->blocks; block != NULL && !hasGuard;
+	_Bool canDeoptimize = 0;
+	for (IrBlock *block = lowering->ir->blocks; block != NULL && !canDeoptimize;
 			block = block->next) {
 		for (IrValue *value = block->first; value != NULL; value = value->next) {
-			if (value->op == IR_GUARD_CLASS) {
-				hasGuard = 1;
+			if (irValueCanDeoptimize(value)) {
+				canDeoptimize = 1;
 				break;
 			}
 		}
 	}
-	if (hasGuard) {
+	if (canDeoptimize) {
 		lir->deoptSaveBase = afterOutgoing;
-		afterOutgoing = (uint16_t) (afterOutgoing + DEOPT_SAVED_REGISTERS);
+		afterOutgoing = (uint16_t) (afterOutgoing + DEOPT_SAVE_SLOTS);
 	}
 	lir->spillBase = afterOutgoing;
 	// The allocator raises this as it spills. It starts at the spill base rather
@@ -271,12 +294,12 @@ static Value constantValue(IrValue *value)
 
 static LirCondition conditionOfIcmp(int64_t kind)
 {
-	switch (kind) {
-	case 0: return LIR_CMP_EQ;
-	case 1: return LIR_CMP_NE;
-	case 2: return LIR_CMP_LT;
-	case 3: return LIR_CMP_LE;
-	case 4: return LIR_CMP_GT;
+	switch ((IrCompare) kind) {
+	case IR_CMP_EQ: return LIR_CMP_EQ;
+	case IR_CMP_NE: return LIR_CMP_NE;
+	case IR_CMP_LT: return LIR_CMP_LT;
+	case IR_CMP_LE: return LIR_CMP_LE;
+	case IR_CMP_GT: return LIR_CMP_GT;
 	default: return LIR_CMP_GE;
 	}
 }
@@ -589,11 +612,24 @@ static void lowerValue(Lowering *lowering, IrValue *value)
 			[IR_IADD] = LIR_ADD, [IR_ISUB] = LIR_SUB,
 			[IR_IMUL] = LIR_MUL, [IR_IDIV] = LIR_DIV, [IR_IMOD] = LIR_MOD,
 		};
-		LirInstruction *arithmetic = emit(lowering, map[value->op]);
+		// THE CHECKED FORM IS A DIFFERENT OPCODE, chosen here from the flag, so
+		// that everything downstream -- the frame maps, the deopt sites, the
+		// clobber question -- reads it off `op` like every other instruction
+		// rather than re-deriving it from a flag the LIR does not carry.
+		//
+		// An operation carrying the flag with no checked form was already
+		// refused by name up in lirLower, off the SAME function, so reaching the
+		// selection means one exists.
+		_Bool check = (value->flags & IR_FLAG_CHECK_OVERFLOW) != 0;
+		LirInstruction *arithmetic = emit(lowering,
+			check ? checkedFormOf((IrOp) value->op) : map[value->op]);
 		arithmetic->dst = vregFor(lowering, value);
 		arithmetic->args[0] = vregFor(lowering, value->args[0]);
 		arithmetic->args[1] = vregFor(lowering, value->args[1]);
 		arithmetic->argCount = 2;
+		if (check) {
+			arithmetic->deopt = value->deopt;
+		}
 		break;
 	}
 
@@ -887,6 +923,15 @@ LirFunction *lirLower(IrFunction *ir, const Abi *abi, NativeCode *tier1,
 		}
 		for (IrValue *value = block->first; value != NULL; value = value->next) {
 			if (!canLower((IrOp) value->op)) {
+				if (refusedOp != NULL) { *refusedOp = irOpName((IrOp) value->op); }
+				return NULL;
+			}
+			// A checked operation with no checked form, refused BY NAME like any
+			// other thing this backend cannot select. Lowering it unchecked would
+			// be the one failure this file must never produce: not a refusal, a
+			// wrong answer with the overflow silently dropped.
+			if ((value->flags & IR_FLAG_CHECK_OVERFLOW) != 0
+					&& checkedFormOf((IrOp) value->op) == LIR_OP_COUNT) {
 				if (refusedOp != NULL) { *refusedOp = irOpName((IrOp) value->op); }
 				return NULL;
 			}

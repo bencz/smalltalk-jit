@@ -121,6 +121,22 @@ typedef enum {
 	IR_OP_COUNT
 } IrOp;
 
+// The comparison an IR_ICMP or IR_FCMP carries in `extra`.
+//
+// NAMED, and it was a bare integer until the specialization pass became a
+// SECOND producer of these nodes. With one producer and one consumer a private
+// numbering is merely terse; with two it is somewhere for them to disagree, and
+// a comparison that disagrees answers correctly for half its inputs, which is
+// the hardest kind of wrong to notice.
+typedef enum {
+	IR_CMP_EQ = 0,
+	IR_CMP_NE = 1,
+	IR_CMP_LT = 2,
+	IR_CMP_LE = 3,
+	IR_CMP_GT = 4,
+	IR_CMP_GE = 5,
+} IrCompare;
+
 struct IrBlock;
 struct IrFunction;
 struct DeoptState;
@@ -233,6 +249,23 @@ typedef struct Materialize {
 // (docs/jit-v2/01-gate.md).
 #define IR_FLAG_SUPER 2
 
+// This raw integer operation MUST NOT leave the SmallInteger range, and leaving
+// it deoptimizes. Carried by IR_IADD, IR_ISUB and IR_IMUL when they came from
+// specializing a send, together with that send's deopt state.
+//
+// IT IS ON THE ARITHMETIC AND NOT ON THE BOX, which looks like a detail and is
+// the whole of the correctness. `sum := sum + i` in a loop has its box and its
+// unbox removed by phi promotion -- that is the point of the pass -- so a check
+// living on the box disappears with it and the accumulator silently wraps at 64
+// bits. The kernel's answer for an overflowed sum is a LargeInteger built by the
+// method's own Smalltalk (packages/Core, SmallInteger>>+), which optimized code
+// cannot build, so the only correct move is to leave and let tier 1 do it.
+//
+// A FLAG rather than three more opcodes, for the reason IR_FLAG_SUPER is one:
+// every pass tests `op == IR_IADD` and a second opcode would need each of them
+// found, with a missed one treating checked arithmetic as something else.
+#define IR_FLAG_CHECK_OVERFLOW 4
+
 typedef struct IrFunction {
 	CodeUnit *unit;
 	IrBlock *entry;
@@ -270,6 +303,16 @@ _Bool irOperandIsRaw(IrOp op, uint16_t index);
 // into a wrong answer only when a guard fails, which is the hardest possible
 // place to notice it.
 void irReplaceAllUses(IrFunction *function, IrValue *from, IrValue *to);
+
+// Can execution leave optimized code SPECULATIVELY here -- that is, because a
+// guess about a value turned out wrong? A class guard, and any raw arithmetic
+// carrying IR_FLAG_CHECK_OVERFLOW.
+//
+// ONE PREDICATE, because the answer decides two things far apart from each
+// other: whether the frame needs a register save area, and whether an
+// instruction needs a deoptimization site. Two readers spelling out their own
+// list of opcodes is how one of them silently misses the third member.
+_Bool irValueCanDeoptimize(const IrValue *value);
 
 Repr irOpRepr(IrOp op);
 _Bool irOpIsPure(IrOp op);

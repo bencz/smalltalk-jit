@@ -58,13 +58,26 @@ typedef struct {
 struct NativeCode;
 
 // How many physical registers the guard sequence spills before calling out, one
-// per register number the backend can hand out.
+// per register number the backend can hand out, PER BANK.
 //
 // IN THE FRAME and not in a thread-local, and the reason is mechanical rather
 // than a preference: a __thread address is not a link-time constant, so emitted
 // code cannot bake one without also knowing the platform's TLS model. The frame
 // it is already standing in needs no such knowledge.
+//
+// BOTH BANKS, and the integer half alone was a wrong answer waiting for the
+// first float value to live in a register. A DeoptSlot records the bank it was
+// allocated in, and reading one back out of a save area that only ever held
+// integer registers would take the eight bytes of whatever integer register
+// happens to share the number -- a plausible double, from a completely
+// unrelated value. Nothing produced float-bank values before arithmetic
+// specialization existed, which is exactly why it stayed invisible.
 #define DEOPT_SAVED_REGISTERS 16
+// The integer bank first, then the float bank, so register r of bank b is at
+// saveBase + b * DEOPT_SAVED_REGISTERS + r. Spelled here and read by the
+// emitter and by DeoptResume.c, because two layouts that have to agree are one
+// layout or they are a bug.
+#define DEOPT_SAVE_SLOTS (2 * DEOPT_SAVED_REGISTERS)
 
 typedef struct {
 	CodeUnit *unit;
@@ -121,6 +134,18 @@ _Bool deoptStressEnabled(void);
 // straight past this. See DeoptResume.c for why it stacks a frame rather than
 // replacing one.
 Value jitDeoptimize(void *site, Value *slotZero, uint64_t packed);
+
+// How many times optimized code has been left this way.
+//
+// IT EXISTS BECAUSE THE ANSWER CANNOT BE CHECKED. Deoptimizing is correct by
+// construction: a guard that fails on every single execution still produces
+// exactly the answer tier 1 produces, so a differential test cannot tell a
+// working speculation from one that never holds -- and "never holds" is the
+// failure mode of a guard that mis-decodes a class, which is a total loss of
+// everything this tier is for, reported as success. This counter is what makes
+// that visible, and the check that reads it is "an in-profile call deoptimizes
+// ZERO times".
+uint64_t jitDeoptimizationCount(void);
 
 // Enter compiled code at `target` with a prebuilt register file, `registers[i]`
 // becoming frame slot i. Answers what that code answers.

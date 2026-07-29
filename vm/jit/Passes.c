@@ -9,16 +9,24 @@
 // what makes them compose:
 //
 //   1. trivial phis        clears the noise SSA construction leaves behind
-//   2. type propagation    guards make types exact
-//   3. redundant guards    a guard dominated by an equivalent one goes
-//   4. scalar replacement  objects that do not escape become registers
-//   5. GVN                 where box(unbox(x)) disappears
-//   6. LICM                loop-invariant work leaves the loop
-//   7. phi promotion       takes the boxing OFF the loop-carried edge
-//   8. DCE                 removes the allocation that now has no users
-//   9. block merging       makes the result readable
+//   2. specialization      arithmetic sends become raw operations behind guards
+//   3. type propagation    guards make types exact
+//   4. redundant guards    a guard dominated by an equivalent one goes
+//   5. scalar replacement  objects that do not escape become registers
+//   6. GVN                 where box(unbox(x)) disappears
+//   7. LICM                loop-invariant work leaves the loop
+//   8. phi promotion       takes the boxing OFF the loop-carried edge
+//   9. DCE                 removes the allocation that now has no users
+//  10. block merging       makes the result readable
 //
-// Step 7 is the one most implementations omit, and it is the difference between
+// Step 2 is what gives the other nine anything to work on. Before it existed
+// every one of them ran over opaque sends and moved nothing, because ADR 0006
+// requires arithmetic to reach the IR as a send so that the type profile can
+// exist at all. It is placed FIRST among the rewrites and not last for the same
+// reason: everything below is expressed in terms of boxes and raw operations,
+// and until this pass runs there are none.
+//
+// Step 8 is the one most implementations omit, and it is the difference between
 // a lukewarm result and a good one. An accumulator `total := total + x` is born
 // as a TAGGED phi whose only producer is a box and whose only consumer is an
 // unbox. Without promoting the phi to F64, boxing elimination stops at the loop
@@ -122,17 +130,202 @@ static uint32_t removeTrivialPhis(PassContext *context)
 }
 
 
+// Is this value a compile-time SmallInteger?
+//
+// THE `extra` TEST IS NOT OPTIONAL. nil, true and false are also IR_CONST, and
+// their `konst` is ZERO because their addresses are runtime facts the IR does
+// not carry -- and zero is a perfectly valid tagged SmallInteger. Reading one of
+// the three as the integer 0 would turn `x := nil` into `x := 0`, silently.
+// Which singleton it is lives in `extra`, and OP_LOADI is what an integer
+// literal sets there.
+static _Bool isIntegerConstant(const IrValue *value)
+{
+	return value->op == IR_CONST && value->extra == OP_LOADI
+		&& valueTypeOf(value->konst, VALUE_INT);
+}
+
+
 // ---------------------------------------------------------------------------
-// 2. Type propagation
+// 2. Arithmetic specialization from the profile
+// ---------------------------------------------------------------------------
+//
+// THE PASS THAT GIVES EVERY OTHER PASS SOMETHING TO DO. Arithmetic reaches the
+// IR as an opaque IR_SEND, because ADR 0006 says it must: resolve `+` in the
+// front end and the type profile the whole design rests on stops existing. So
+// GVN, LICM and phi promotion were running over opaque calls and moving nothing,
+// and the raw operations the IR was built around had no producer at all.
+//
+// Here is where that turns around, and the ORDER is the argument: the profile
+// exists because arithmetic went through a cache; the specialization is legal
+// because it sits behind a guard; the guard is legal because a failure can
+// deoptimize. Each one needs the one before it, which is why this is the last
+// piece rather than the first.
+//
+//     send #+ (r, a)      ->      guard_class r, SmallInteger
+//                                 guard_class a, SmallInteger
+//                                 box_i(iadd(unbox_i r, unbox_i a))   [checked]
+//
+// The box and the unbox are ordinary instructions, so nothing downstream needs
+// to know this pass ran: simplify collapses adjacent pairs, GVN collapses them
+// across blocks, and phi promotion takes the pair off a loop-carried edge. That
+// is the entire reason the conversions are IR nodes (jit/Ir.h) instead of a
+// decision the backend makes.
+//
+// WHAT IS NOT DECIDED HERE. Which sites, which operation and which classes all
+// arrive as data (SiteSpecialization). A pass that read the caches itself would
+// be a second place that knows what a primitive number means.
+
+// The unbox that produces `repr`, and the box that consumes it. Two lookups
+// rather than a field on the table, so a site can name any raw operation and
+// the conversions follow from the operation's own representation.
+static IrOp unboxFor(Repr repr) { return repr == REPR_F64 ? IR_UNBOX_F : IR_UNBOX_I; }
+static IrOp boxFor(Repr repr) { return repr == REPR_F64 ? IR_BOX_F : IR_BOX_I; }
+
+
+static IrValue *insertBefore(PassContext *context, IrValue *before, IrOp op,
+	IrValue *a, IrValue *b)
+{
+	IrValue *value = irNewValue(context->function, op);
+	if (a != NULL) { irAddArg(context->function, value, a); }
+	if (b != NULL) { irAddArg(context->function, value, b); }
+	irInsertBefore(before->block, before, value);
+	return value;
+}
+
+
+static uint32_t specializeSends(PassContext *context, const IrProfile *profile,
+	uint32_t *declined)
+{
+	if (profile == NULL || profile->sites == NULL) {
+		return 0;
+	}
+	const SiteSpecialization *sites = profile->sites;
+	uint16_t siteCount = profile->siteCount;
+	IrFunction *function = context->function;
+	uint32_t specialized = 0;
+	for (uint32_t i = 0; i < context->rpoCount; i++) {
+		IrBlock *block = context->rpo[i];
+		IrValue *value = block->first;
+		while (value != NULL) {
+			IrValue *next = value->next;
+			if (value->op != IR_SEND || value->bci >= siteCount) {
+				value = next;
+				continue;
+			}
+			const SiteSpecialization *site = &sites[value->bci];
+			if (site->op >= IR_OP_COUNT) {
+				value = next;
+				continue;
+			}
+			// EVERY OFFER THE PASS DECLINES IS COUNTED, because the bridge and
+			// this pass have to agree about what a specializable site looks like
+			// and a silent skip is how they would stop agreeing. A binary send
+			// with a deopt state is the whole contract; a super send is excluded
+			// because its whole content is where the lookup STARTS, which no
+			// class guard on the receiver can stand in for.
+			if (value->argCount != 2 || value->deopt == NULL
+					|| (value->flags & IR_FLAG_SUPER) != 0) {
+				(*declined)++;
+				value = next;
+				continue;
+			}
+
+			IrOp op = (IrOp) site->op;
+			Repr operandRepr = op == IR_FADD || op == IR_FSUB || op == IR_FMUL
+				|| op == IR_FDIV || op == IR_FCMP ? REPR_F64 : REPR_I64;
+
+			// THE SAME DEOPT STATE AS THE SEND, shared rather than copied. It
+			// describes the tier-1 frame just BEFORE the send ran, and that is
+			// exactly the state every instruction of this sequence needs: the
+			// unboxes are pure, so nothing observable has happened yet, and
+			// resuming re-executes the send, which recomputes all of it.
+			DeoptState *state = value->deopt;
+			IrValue *receiver = value->args[0];
+			IrValue *argument = value->args[1];
+
+			IrValue *guard = insertBefore(context, value, IR_GUARD_CLASS,
+				receiver, NULL);
+			guard->extra = (int64_t) site->receiverClass;
+			guard->bci = value->bci;
+			guard->deopt = state;
+			guard = insertBefore(context, value, IR_GUARD_CLASS, argument, NULL);
+			guard->extra = (int64_t) site->argumentClass;
+			guard->bci = value->bci;
+			guard->deopt = state;
+
+			IrValue *left = insertBefore(context, value, unboxFor(operandRepr),
+				receiver, NULL);
+			IrValue *right = insertBefore(context, value, unboxFor(operandRepr),
+				argument, NULL);
+			IrValue *raw = insertBefore(context, value, op, left, right);
+			raw->bci = value->bci;
+			if (op == IR_ICMP || op == IR_FCMP) {
+				raw->extra = site->compare;
+			}
+			if (site->checkOverflow) {
+				raw->flags |= IR_FLAG_CHECK_OVERFLOW;
+				raw->deopt = state;
+			}
+
+			IrValue *tagged;
+			if (raw->repr == REPR_BOOL) {
+				tagged = insertBefore(context, value, IR_BOOL2TAG, raw, NULL);
+			} else {
+				tagged = insertBefore(context, value, boxFor(operandRepr), raw,
+					NULL);
+				// UNCONDITIONAL class knowledge, and only for the integer box:
+				// a CHECKED box_i answers a SmallInteger no matter what, so a
+				// later guard on the result is genuinely redundant -- which is
+				// what makes `a + b + c` cost one guard on each of the three
+				// operands and not five. box_f is NOT given one, because a
+				// double outside the SmallFloat64 window becomes a BoxedFloat64
+				// and claiming otherwise would delete a guard doing real work
+				// (jit/Ir.h). Tied to the overflow check rather than to the
+				// representation, because an UNCHECKED box_i is exactly the one
+				// that could be handed a value no SmallInteger can hold.
+				if (operandRepr == REPR_I64 && site->checkOverflow) {
+					tagged->klass = site->receiverClass;
+				}
+			}
+
+			irRemove(value);
+			irReplaceAllUses(function, value, tagged);
+			specialized++;
+			value = next;
+		}
+	}
+	return specialized;
+}
+
+
+// ---------------------------------------------------------------------------
+// 3. Type propagation
 // ---------------------------------------------------------------------------
 //
 // Only UNCONDITIONAL knowledge is propagated here. A box produces its class by
 // construction; a phi whose operands all agree produces that class. Guards do
 // NOT write here, for the reason spelled out in Ir.h.
 
-static uint32_t propagateTypes(PassContext *context)
+static uint32_t propagateTypes(PassContext *context, const IrProfile *profile)
 {
 	uint32_t learned = 0;
+	// A TAGGED INTEGER LITERAL KNOWS ITS CLASS, once something has told this
+	// file which index that is. Unconditional in the strict sense Ir.h means:
+	// the value came out of a constant, so no guard established it and removing
+	// a guard on it removes nothing that was doing work.
+	if (profile != NULL && profile->smallIntegerClass != CLASS_INDEX_INVALID) {
+		for (IrBlock *block = context->function->blocks; block != NULL;
+				block = block->next) {
+			for (IrValue *value = block->first; value != NULL;
+					value = value->next) {
+				if (isIntegerConstant(value)
+						&& value->klass != profile->smallIntegerClass) {
+					value->klass = profile->smallIntegerClass;
+					learned++;
+				}
+			}
+		}
+	}
 	_Bool changed = 1;
 	while (changed) {
 		changed = 0;
@@ -161,7 +354,7 @@ static uint32_t propagateTypes(PassContext *context)
 
 
 // ---------------------------------------------------------------------------
-// 3. Redundant guards
+// 4. Redundant guards
 // ---------------------------------------------------------------------------
 //
 // A guard is redundant when the class it checks is already known
@@ -205,7 +398,7 @@ static uint32_t removeRedundantGuards(PassContext *context)
 
 
 // ---------------------------------------------------------------------------
-// 3b. Local simplification, including the box/unbox pairs
+// 4b. Local simplification, including the box/unbox pairs
 // ---------------------------------------------------------------------------
 //
 // Not a numbered pass of its own: it is the local rewriting that scalar
@@ -243,7 +436,20 @@ static uint32_t simplify(PassContext *context)
 				if (source != NULL && source->op == IR_BOX_F) { replacement = source->args[0]; }
 				break;
 			case IR_UNBOX_I:
-				if (source != NULL && source->op == IR_BOX_I) { replacement = source->args[0]; }
+				if (source != NULL && source->op == IR_BOX_I) {
+					replacement = source->args[0];
+				} else if (source != NULL && isIntegerConstant(source)) {
+					// UNBOXING A CONSTANT IS A CONSTANT, and today unboxing is a
+					// CALL (jit/SsaRuntime.c), so this is a call removed from
+					// every `x + 1` and from the preheader of every counted
+					// loop. Written here rather than at the specialization,
+					// because the constant may only become the operand of an
+					// unbox after other rewrites have run.
+					IrValue *raw = irNewValue(context->function, IR_ICONST);
+					raw->ikonst = (int64_t) asCInt(source->konst);
+					irInsertBefore(block, value, raw);
+					replacement = raw;
+				}
 				break;
 			case IR_BOX_F:
 				if (source != NULL && source->op == IR_UNBOX_F) { replacement = source->args[0]; }
@@ -293,7 +499,7 @@ static uint32_t simplify(PassContext *context)
 
 
 // ---------------------------------------------------------------------------
-// 4. Scalar replacement, and the materialization recipe that makes it legal
+// 5. Scalar replacement, and the materialization recipe that makes it legal
 // ---------------------------------------------------------------------------
 //
 // An object whose only remaining references are DEOPTIMIZATION STATES does not
@@ -393,7 +599,7 @@ static uint32_t scalarReplacement(PassContext *context, uint32_t *recipes)
 
 
 // ---------------------------------------------------------------------------
-// 5. Global value numbering
+// 6. Global value numbering
 // ---------------------------------------------------------------------------
 //
 // Over pure operations, in reverse post-order so a definition is numbered
@@ -479,6 +685,7 @@ static uint32_t gvnHash(IrValue *value, const MemoryVersion *memory)
 	uint32_t hash = (uint32_t) value->op * 2654435761u;
 	hash ^= (uint32_t) value->extra * 40503u;
 	hash ^= (uint32_t) value->konst;
+	hash ^= (uint32_t) value->flags * 2246822519u;
 	for (uint16_t i = 0; i < value->argCount; i++) {
 		hash = hash * 31u + (value->args[i] != NULL ? value->args[i]->id : 0);
 	}
@@ -492,8 +699,15 @@ static uint32_t gvnHash(IrValue *value, const MemoryVersion *memory)
 
 static _Bool gvnEqual(IrValue *a, IrValue *b)
 {
+	// THE FLAGS ARE PART OF THE IDENTITY. An IR_IADD that must not overflow and
+	// an IR_IADD that may agree on op, extra, konst, argCount and repr, and
+	// merging them keeps whichever came FIRST -- so an unchecked one earlier in
+	// the method would swallow a checked one and the overflow would go silently
+	// unnoticed. Same family as the two IR_CONSTs that named different literals
+	// and were merged for agreeing on everything this function used to compare.
 	if (a->op != b->op || a->extra != b->extra || a->konst != b->konst
-			|| a->argCount != b->argCount || a->repr != b->repr) {
+			|| a->argCount != b->argCount || a->repr != b->repr
+			|| a->flags != b->flags) {
 		return 0;
 	}
 	if (a->op == IR_FCONST && a->fkonst != b->fkonst) { return 0; }
@@ -584,7 +798,7 @@ static uint32_t globalValueNumbering(PassContext *context)
 
 
 // ---------------------------------------------------------------------------
-// 6. Loop-invariant code motion
+// 7. Loop-invariant code motion
 // ---------------------------------------------------------------------------
 //
 // Without this, a field read like `data` is performed once per iteration and
@@ -774,7 +988,57 @@ static uint32_t hoistLoopInvariants(PassContext *context)
 
 
 // ---------------------------------------------------------------------------
-// 8. Dead code
+// 8b. Boxes that only a deoptimization state still wants
+// ---------------------------------------------------------------------------
+//
+// `a + b + c` leaves an intermediate box with no ordinary users at all: the
+// second addition consumes the raw value directly, because simplify collapsed
+// the unbox against it. What keeps the box alive is the second site's deopt
+// state, which names the bytecode register holding the intermediate.
+//
+// That state does not need the box. A DeoptSlot carries the KIND of what it
+// describes, and DeoptResume re-boxes a SLOT_I64 with tagInt and a SLOT_F64
+// with jitBoxFloat on the way out (jit/DeoptResume.c). So the state can name
+// the RAW value and the box becomes dead.
+//
+// WHY THIS IS EXACTLY AS SAFE AS THE BOX WAS. Re-boxing on the way out and
+// boxing here compute the same Value from the same bits -- tagInt is what
+// jitBoxInteger does, and jitBoxFloat is what the deopt path calls. The one
+// input either would reject is a raw integer outside the SmallInteger range,
+// and the only producer of a raw integer is checked arithmetic, which
+// deoptimizes rather than producing one.
+//
+// It is the SAME ARGUMENT scalar replacement makes about an allocation, and it
+// reuses the same predicate: an object no ordinary instruction reads does not
+// need to exist, because the state that names it can rebuild it.
+static uint32_t sinkBoxesIntoStates(PassContext *context)
+{
+	uint32_t sunk = 0;
+	for (uint32_t i = 0; i < context->rpoCount; i++) {
+		IrBlock *block = context->rpo[i];
+		IrValue *value = block->first;
+		while (value != NULL) {
+			IrValue *next = value->next;
+			if ((value->op == IR_BOX_I || value->op == IR_BOX_F)
+					&& value->argCount == 1
+					&& !hasNonDeoptUsers(context, value)) {
+				// Replacing EVERY use is the same as replacing only the
+				// deoptimization ones, because there are no others left. That
+				// equality is what lets this reuse irReplaceAllUses instead of
+				// growing a second walk over the states.
+				irRemove(value);
+				irReplaceAllUses(context->function, value, value->args[0]);
+				sunk++;
+			}
+			value = next;
+		}
+	}
+	return sunk;
+}
+
+
+// ---------------------------------------------------------------------------
+// 9. Dead code
 // ---------------------------------------------------------------------------
 //
 // Mark from the effectful operations and from the DEOPTIMIZATION STATES, then
@@ -860,7 +1124,7 @@ static uint32_t eliminateDeadCode(PassContext *context)
 
 
 // ---------------------------------------------------------------------------
-// 7. Representation promotion of loop-carried phis
+// 8. Representation promotion of loop-carried phis
 // ---------------------------------------------------------------------------
 //
 // Written below dead code in this file and RUN BEFORE it in the pipeline: the
@@ -936,26 +1200,51 @@ static uint32_t promotePhis(PassContext *context)
 			if (phi->repr != REPR_TAGGED || phi->argCount == 0) {
 				continue;
 			}
-			// Every operand must be a box of the SAME representation, or the
-			// phi itself. Mixed producers mean the value genuinely has to be
-			// tagged somewhere, and promoting would just move the conversion.
+			// Every operand must be a box of the SAME representation, the phi
+			// itself, or a SEED THE PASS CAN UNBOX FOR FREE. Mixed producers
+			// mean the value genuinely has to be tagged somewhere, and promoting
+			// would just move the conversion.
+			//
+			// THE SEED IS NOT A REFINEMENT, it is the difference between this
+			// pass firing on real code and never firing at all. Every integer
+			// accumulator in the language is written `sum := 0` and then
+			// `sum := sum + x`, so the phi's operands are a boxed sum on the back
+			// edge and a TAGGED CONSTANT on the entry edge. Requiring both to be
+			// boxes rejects that shape, which is the shape.
 			IrOp boxOp = IR_OP_COUNT;
 			_Bool uniform = 1;
+			uint16_t seeds = 0;
 			for (uint16_t i = 0; i < phi->argCount && uniform; i++) {
 				IrValue *arg = phi->args[i];
 				if (arg == phi) { continue; }
+				if (isIntegerConstant(arg)) { seeds++; continue; }
 				if (arg->op != IR_BOX_F && arg->op != IR_BOX_I) { uniform = 0; break; }
 				if (boxOp == IR_OP_COUNT) { boxOp = (IrOp) arg->op; }
 				else if (boxOp != arg->op) { uniform = 0; }
 			}
-			if (!uniform || boxOp == IR_OP_COUNT) {
+			// A seed only agrees with the INTEGER representation: the constant
+			// carries a tagged SmallInteger, and handing its bit pattern to a
+			// float phi would read it as a double. All-seeds and no box is not
+			// promotable either -- there would be nothing raw to promote toward.
+			if (!uniform || boxOp == IR_OP_COUNT
+					|| (seeds > 0 && boxOp != IR_BOX_I)) {
 				continue;
 			}
 			phi->repr = boxOp == IR_BOX_F ? REPR_F64 : REPR_I64;
 			for (uint16_t i = 0; i < phi->argCount; i++) {
-				if (phi->args[i] != phi) {
-					phi->args[i] = phi->args[i]->args[0]; // through the box
+				IrValue *arg = phi->args[i];
+				if (arg == phi) { continue; }
+				if (isIntegerConstant(arg)) {
+					// The same constant, in the representation the phi now has.
+					// Placed beside the tagged one, which already dominates the
+					// phi because it was an operand of it.
+					IrValue *raw = irNewValue(context->function, IR_ICONST);
+					raw->ikonst = (int64_t) asCInt(arg->konst);
+					irInsertBefore(arg->block, arg, raw);
+					phi->args[i] = raw;
+					continue;
 				}
+				phi->args[i] = arg->args[0]; // through the box
 			}
 			// AND THE CONSUMERS. Rewiring only the producers is not merely
 			// incomplete, it is WRONG: every use that expects a tagged value
@@ -972,7 +1261,7 @@ static uint32_t promotePhis(PassContext *context)
 
 
 // ---------------------------------------------------------------------------
-// 9. Block merging
+// 10. Block merging
 // ---------------------------------------------------------------------------
 
 static uint32_t mergeBlocks(PassContext *context)
@@ -1026,7 +1315,7 @@ static uint32_t mergeBlocks(PassContext *context)
 // The pipeline
 // ---------------------------------------------------------------------------
 
-PassStats irOptimize(IrFunction *function)
+PassStats irOptimize(IrFunction *function, const IrProfile *profile)
 {
 	PassStats stats;
 	memset(&stats, 0, sizeof(stats));
@@ -1036,7 +1325,14 @@ PassStats irOptimize(IrFunction *function)
 	collectRpo(&context);
 
 	stats.trivialPhis += removeTrivialPhis(&context);
-	stats.typesLearned += propagateTypes(&context);
+	// BEFORE everything else, because everything else is written in terms of the
+	// boxes and raw operations this produces. It runs once rather than inside the
+	// fixed point below: a send it declined will not become specializable because
+	// some other send was, and re-running it would rewrite nothing at a cost paid
+	// on every method the system compiles.
+	stats.sendsSpecialized += specializeSends(&context, profile,
+		&stats.specializationsDeclined);
+	stats.typesLearned += propagateTypes(&context, profile);
 
 	// Fixed point: simplification exposes GVN opportunities and GVN exposes
 	// more simplification, and both expose dead code.
@@ -1049,7 +1345,7 @@ PassStats irOptimize(IrFunction *function)
 		// with no non-deopt users to begin with.
 		stats.scalarReplaced += scalarReplacement(&context, &stats.materializations);
 		stats.gvnRemoved += globalValueNumbering(&context);
-		stats.typesLearned += propagateTypes(&context);
+		stats.typesLearned += propagateTypes(&context, profile);
 		stats.trivialPhis += removeTrivialPhis(&context);
 		if (stats.simplified + stats.gvnRemoved + stats.guardsRemoved == before) {
 			break;
@@ -1070,6 +1366,10 @@ PassStats irOptimize(IrFunction *function)
 		stats.trivialPhis += removeTrivialPhis(&context);
 	}
 
+	// LAST, and after the conversions have settled: a box only becomes
+	// deopt-only once everything that consumed it has been collapsed against it,
+	// which is what the rounds above finish doing.
+	stats.boxesSunk += sinkBoxesIntoStates(&context);
 	stats.deadRemoved += eliminateDeadCode(&context);
 	stats.blocksMerged += mergeBlocks(&context);
 

@@ -192,6 +192,7 @@ set(vmSources
 	vm/jit/SsaBuild.c
 	vm/jit/SsaEmitter.c
 	vm/jit/SsaRuntime.c
+	vm/jit/Specialize.c
 	vm/jit/Tier2DryRun.c
 	vm/memory/Collector.c
 	vm/memory/Heap.c

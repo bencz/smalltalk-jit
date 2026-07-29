@@ -26,6 +26,8 @@
 #include "jit/RegAlloc.h"
 #include "jit/SsaEmitter.h"
 #include "jit/InlineCache.h"
+#include "jit/Specialize.h"
+#include "core/Class.h"
 #include "jit/Deopt.h"
 #include "core/Assert.h"
 #include "core/Handle.h"
@@ -35,7 +37,7 @@
 
 
 NativeCode *ssaCompile(const SsaEmitterOps *ops, CodeUnit *unit,
-	NativeCode *tier1, const char **refused)
+	NativeCode *tier1, const char **refused, PassStats *stats)
 {
 	const char *reason = NULL;
 	Opcode unsupported = OP_COUNT;
@@ -44,7 +46,26 @@ NativeCode *ssaCompile(const SsaEmitterOps *ops, CodeUnit *unit,
 		reason = opcodeName(unsupported);
 		goto refuse;
 	}
-	irOptimize(ir);
+	// THE PROFILE, read once and handed to the optimizer as data. It comes from
+	// TIER 1's cells, which is the only place it exists: this compilation is
+	// happening because those sites ran. A method compiled with no tier 1 -- the
+	// dry run does exactly that -- gets no table and every send stays a send,
+	// which is correct and is what "the profile has not happened yet" means.
+	SiteSpecialization *sites = specializeFor(tier1, NULL);
+	IrProfile profile;
+	memset(&profile, 0, sizeof(profile));
+	profile.sites = sites;
+	// The LENGTH comes from the same unit that sized the array, which is tier
+	// 1's and not this compilation's: they are the same bytecode, and taking the
+	// count from the other one would be an array length derived from a second
+	// source that merely happens to agree.
+	profile.siteCount = sites != NULL ? tier1->unit->instructionCount : 0;
+	profile.smallIntegerClass = gClassIndexByTag[VALUE_INT];
+	PassStats passes = irOptimize(ir, &profile);
+	if (stats != NULL) {
+		*stats = passes;
+	}
+	free(sites);
 
 	LirFunction *lir = lirLower(ir, ops->abi, tier1, &reason);
 	if (lir == NULL) {

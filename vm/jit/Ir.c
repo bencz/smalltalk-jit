@@ -143,6 +143,13 @@ _Bool irOpIsTerminator(IrOp op)
 }
 
 
+_Bool irValueCanDeoptimize(const IrValue *value)
+{
+	return value->op == IR_GUARD_CLASS
+		|| (value->flags & IR_FLAG_CHECK_OVERFLOW) != 0;
+}
+
+
 void *irAlloc(IrFunction *function, size_t bytes)
 {
 	bytes = (bytes + 15) & ~(size_t) 15;

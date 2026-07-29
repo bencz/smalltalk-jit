@@ -51,6 +51,12 @@ static const struct {
 	[LIR_SHLI]        = { "shli",        0, 0 },
 	[LIR_SARI]        = { "sari",        0, 0 },
 	[LIR_NEG]         = { "neg",         0, 0 },
+	// canLeave, which is what earns them a frame map and a deoptimization site
+	// from the allocator with nothing else added: the same two mechanisms the
+	// class guard already uses, reached by the same field.
+	[LIR_GUARDED_ADD] = { "guarded_add", 0, 1 },
+	[LIR_GUARDED_SUB] = { "guarded_sub", 0, 1 },
+	[LIR_GUARDED_MUL] = { "guarded_mul", 0, 1 },
 
 	[LIR_FADD]        = { "fadd",        0, 0 },
 	[LIR_FSUB]        = { "fsub",        0, 0 },
@@ -105,7 +111,23 @@ _Bool lirOpCanLeave(LirOp op)
 
 _Bool lirOpClobbers(LirOp op)
 {
-	return lirOpCanLeave(op) || op == LIR_DIV || op == LIR_MOD;
+	switch (op) {
+	// A GUARD LEAVES, it does not call and come back. Its failure path spills the
+	// register file into the frame, calls out and RETURNS THE METHOD; nothing
+	// rejoins the fall-through. So a value sitting in a caller-saved register
+	// across a guard is not destroyed by it, and saying otherwise is not merely
+	// conservative -- it would make every guard evict the caller-saved half of
+	// the file, which is most of it, on the hot path, to describe a call that the
+	// hot path never makes. The specialized arithmetic would then cost more than
+	// the send it replaced.
+	case LIR_GUARD_CLASS:
+	case LIR_GUARDED_ADD: case LIR_GUARDED_SUB: case LIR_GUARDED_MUL:
+		return 0;
+	case LIR_DIV: case LIR_MOD:
+		return 1;
+	default:
+		return lirOpCanLeave(op);
+	}
 }
 
 
