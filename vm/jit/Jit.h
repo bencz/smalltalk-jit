@@ -97,6 +97,17 @@ typedef struct NativeCode {
 	// arity against the Abi being compiled for. Written once, here, and read by
 	// every caller: see the header comment.
 	_Bool wide;
+	// Which code generator produced this, and whether the other one has been
+	// tried on the same method.
+	//
+	// ON THE NativeCode and not on the CodeUnit, and that is not a preference: a
+	// CodeUnit is written into the IMAGE, so a field here would be an image
+	// format change for a fact that is meaningless across processes anyway --
+	// loaded code has no native code at all (docs/jit-v2/01-gate.md, level 11).
+	// APPENDED, because generated code reads `entry` by offsetof and every field
+	// before it has to keep its place.
+	_Bool optimized;
+	_Bool tier2Attempted;
 } NativeCode;
 
 // Compile one unit. Returns NULL only if the unit uses an opcode this tier does
@@ -312,6 +323,16 @@ NativeCode *jitCompiledAt(size_t index);
 // the result away, under ST_TIER2_DRYRUN=1. Weakly no-op when the optimizer is
 // not linked; the real one is jit/Tier2DryRun.c.
 void tier2DryRun(CodeUnit *unit);
+
+// Compile `tier1`'s method with tier 2 and answer the result, or NULL to leave
+// tier 1's code standing. Off unless ST_TIER2_ALL or ST_DEOPT_STRESS asked for
+// it, and weakly no-op when tier 2 is not linked.
+//
+// A TESTING MODE AND NOT THE TIER POLICY: it upgrades everything it can, at the
+// first send that reaches the method, which is the crudest possible rule. See
+// jit/Tier2Stress.c for why the timing is what it is and why a stress mode with
+// no optimized code running would be a green that means nothing.
+NativeCode *tier2StressUpgrade(NativeCode *tier1);
 
 // The unconditional send path, called by compiled code. `receiverSlot` points
 // at the receiver's frame slot; arguments are at DESCENDING addresses from it,

@@ -173,6 +173,10 @@ typedef struct {
 	IrFunction *function;
 	CodeUnit *unit;
 	IrBlock **blockAt;   // bytecode index -> block starting there, or NULL
+	// bytecode index -> is it covered by a block at all. Unreachable bytecode
+	// gets no block (see buildCfg), and without this the fill walk would lower
+	// its instructions into whichever block happened to be current.
+	_Bool *reachableAt;
 	uint64_t *live;
 	uint16_t liveWords;
 	IrBlock *current;
@@ -284,11 +288,46 @@ static void addPredecessor(IrFunction *function, IrBlock *block, IrBlock *pred)
 }
 
 
+// Where the block starting at `start` ends: the next leader, or the end of the
+// code. Derived from the LEADER array rather than from which blocks exist,
+// because unreachable leaders get no block and the span walk still has to stop
+// at them.
+static uint16_t blockEndAt(const _Bool *leader, uint16_t count, uint16_t start)
+{
+	uint16_t end = (uint16_t) (start + 1);
+	while (end < count && !leader[end]) {
+		end++;
+	}
+	return end;
+}
+
+
+// The successors of the block starting at `start`, in the order the rest of the
+// backend relies on: the BRANCH TARGET first, so succs[0] stays the taken arm
+// all the way to the emitter.
+static uint8_t successorsOf(const CodeUnit *unit, const _Bool *leader,
+	uint16_t count, uint16_t start, uint16_t *out)
+{
+	uint16_t end = blockEndAt(leader, count, start);
+	const Instruction *last = &unit->code[end - 1];
+	uint8_t found = 0;
+	uint16_t target = opcodeBranchTarget(last);
+	if (target != BYTECODE_NO_TARGET && target < count) {
+		out[found++] = target;
+	}
+	if (opcodeFallsThrough((Opcode) last->op) && end < count) {
+		out[found++] = end;
+	}
+	return found;
+}
+
+
 static void buildCfg(Builder *builder)
 {
 	CodeUnit *unit = builder->unit;
 	uint16_t count = unit->instructionCount;
 	_Bool *leader = calloc(count, sizeof(_Bool));
+	ASSERT(leader != NULL);
 	leader[0] = 1;
 	for (uint16_t i = 0; i < count; i++) {
 		uint16_t target = opcodeBranchTarget(&unit->code[i]);
@@ -300,30 +339,67 @@ static void buildCfg(Builder *builder)
 		}
 	}
 
+	// REACHABILITY, decided over the leaders and BEFORE a single block exists.
+	//
+	// UNREACHABLE BYTECODE IS NOT A CURIOSITY HERE, the front end emits it in the
+	// most ordinary shape there is. `expr ifTrue: [^x]` compiles to both senses of
+	// the test, the true arm, and a JUMP over the false arm (compiler/Compile.c);
+	// when the true arm RETURNS, that JUMP is left with nothing branching to it.
+	//
+	// Building a block for it would be harmless. Giving its SUCCESSOR a
+	// predecessor for it is not, and the reason is readVariableRecursive above: a
+	// block with no predecessors of its own answers every register as "the
+	// register is nil here", a fresh constant. So every phi at the merge gains an
+	// operand from a path control never takes, which both keeps an otherwise
+	// TRIVIAL phi alive and hands it a value it must never carry.
+	//
+	// Measured, and only the internal oracle could see it: `1 to: n do:` whose
+	// body ends in `ifTrue: [^x]` built phi(counter, 0, counter) at the merge, the
+	// phi survived because its operands disagreed, and the loop never terminated.
+	_Bool *reachable = calloc(count, sizeof(_Bool));
+	uint16_t *worklist = calloc(count, sizeof(uint16_t));
+	ASSERT(reachable != NULL && worklist != NULL);
+	uint16_t pending = 0;
+	reachable[0] = 1;
+	worklist[pending++] = 0;
+	while (pending > 0) {
+		uint16_t start = worklist[--pending];
+		uint16_t next[2];
+		uint8_t found = successorsOf(unit, leader, count, start, next);
+		for (uint8_t s = 0; s < found; s++) {
+			if (!reachable[next[s]]) {
+				reachable[next[s]] = 1;
+				worklist[pending++] = next[s];
+			}
+		}
+	}
+
 	for (uint16_t i = 0; i < count; i++) {
-		if (leader[i]) {
+		if (leader[i] && reachable[i]) {
 			builder->blockAt[i] = irNewBlock(builder->function, i);
+			// Every instruction the block covers, so the fill walk below knows
+			// which bytecode has a block to be lowered into and which has none.
+			uint16_t end = blockEndAt(leader, count, i);
+			for (uint16_t j = i; j < end; j++) {
+				builder->reachableAt[j] = 1;
+			}
 		}
 	}
 	builder->function->entry = builder->blockAt[0];
 
-	// Successors: walk each block to its terminator or to the next leader.
 	for (uint16_t i = 0; i < count; i++) {
 		IrBlock *block = builder->blockAt[i];
 		if (block == NULL) {
 			continue;
 		}
-		uint16_t end = (uint16_t) (i + 1);
-		while (end < count && builder->blockAt[end] == NULL) {
-			end++;
-		}
-		Instruction *last = &unit->code[end - 1];
-		uint16_t target = opcodeBranchTarget(last);
-		if (target != BYTECODE_NO_TARGET && target < count) {
-			block->succs[block->succCount++] = builder->blockAt[target];
-		}
-		if (opcodeFallsThrough((Opcode) last->op) && end < count) {
-			block->succs[block->succCount++] = builder->blockAt[end];
+		uint16_t next[2];
+		uint8_t found = successorsOf(unit, leader, count, i, next);
+		for (uint8_t s = 0; s < found; s++) {
+			// Reachable by construction: a successor of a reachable block was
+			// walked above. Checked rather than assumed, because a successor with
+			// no block is a null edge the whole backend would dereference.
+			ASSERT(builder->blockAt[next[s]] != NULL);
+			block->succs[block->succCount++] = builder->blockAt[next[s]];
 		}
 	}
 	for (IrBlock *block = builder->function->blocks; block != NULL;
@@ -332,6 +408,8 @@ static void buildCfg(Builder *builder)
 			addPredecessor(builder->function, block->succs[s], block);
 		}
 	}
+	free(worklist);
+	free(reachable);
 	free(leader);
 }
 
@@ -680,6 +758,8 @@ IrFunction *ssaBuild(CodeUnit *unit, Opcode *unsupported)
 	builder.function = irCreate(unit);
 	builder.unit = unit;
 	builder.blockAt = calloc(unit->instructionCount, sizeof(IrBlock *));
+	builder.reachableAt = calloc(unit->instructionCount, sizeof(_Bool));
+	ASSERT(builder.blockAt != NULL && builder.reachableAt != NULL);
 	builder.live = computeLiveness(unit);
 	builder.liveWords = (uint16_t) ((unit->registerCount + 63) / 64);
 	builder.knownCapacity = 4096;
@@ -701,6 +781,11 @@ IrFunction *ssaBuild(CodeUnit *unit, Opcode *unsupported)
 	// seen: that is precisely the case Braun's incomplete phis exist for.
 	uint16_t count = unit->instructionCount;
 	for (uint16_t i = 0; i < count; i++) {
+		// Bytecode no block covers is bytecode control never reaches, so there is
+		// nothing to lower and nowhere to lower it to.
+		if (!builder.reachableAt[i]) {
+			continue;
+		}
 		if (builder.blockAt[i] != NULL) {
 			builder.current = builder.blockAt[i];
 			_Bool ready = 1;
@@ -712,7 +797,11 @@ IrFunction *ssaBuild(CodeUnit *unit, Opcode *unsupported)
 			}
 		}
 		lower(&builder, i);
-		if (i + 1 == count || builder.blockAt[i + 1] != NULL) {
+		// The last instruction OF THIS BLOCK, which is not simply "the next index
+		// starts a block": the next index may start no block at all, because an
+		// unreachable region follows.
+		if (i + 1 == count || builder.blockAt[i + 1] != NULL
+				|| !builder.reachableAt[i + 1]) {
 			builder.current->filled = 1;
 		}
 	}
@@ -726,6 +815,7 @@ IrFunction *ssaBuild(CodeUnit *unit, Opcode *unsupported)
 
 	IrFunction *function = builder.function;
 	free(builder.blockAt);
+	free(builder.reachableAt);
 	free(builder.live);
 	free(builder.known);
 	return function;

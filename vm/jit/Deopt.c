@@ -77,3 +77,17 @@ _Bool deoptStressEnabled(void)
 	}
 	return enabled;
 }
+
+
+uint16_t deoptStressSkip(void)
+{
+	static int skip = -1;
+	if (skip < 0) {
+		const char *text = getenv("ST_DEOPT_STRESS_SKIP");
+		skip = text != NULL ? atoi(text) : 0;
+		if (skip < 0) {
+			skip = 0;
+		}
+	}
+	return (uint16_t) skip;
+}

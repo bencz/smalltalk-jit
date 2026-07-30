@@ -101,6 +101,11 @@ static size_t gCompiledCount;
 static size_t gCompiledCapacity;
 static CodeUnit *gRegisteredUnits;
 
+// Defined beside jitCompileFor, which is where the locking it depends on is
+// explained, and declared here because both send paths above it call it.
+static NativeCode *jitEnsureCompiled(RawCompiledMethod *method,
+	Opcode *unsupported);
+
 
 // The number of entries whose code starts at or below `pointer`. Both the
 // search and the insertion point come from this, because the ranges are
@@ -245,26 +250,62 @@ void rootsVisitCompiledCode(RootVisitor visit, void *ctx)
 // a stale target would stay armed inside compiled code and keep calling the
 // method that was just replaced. Same wrong ANSWER this function exists to
 // prevent, reached by the half of the system that was added after the comment.
+//
+// AND THE WAY COUNT IS NOT TOUCHED, which is where this function and its own
+// comment disagreed. It said the counts are kept and then set `wayCount = 0`,
+// which is not a smaller version of keeping them: `icDominantClass` answers
+// CLASS_INDEX_INVALID at a site with no ways, and the next `icRecord` starts over
+// at way 0 with a count of one. So every profile in the system was discarded on
+// every change to any method dictionary, which during a bootstrap is constantly.
+//
+// That is precisely the amnesia jit/InlineCache.h says the 22-bit class index of
+// ADR 0005 was chosen to end. The old line was correct when the runtime was the
+// only reader and clearing the count WAS the way to disarm a site; the emitted
+// fast path made target-clearing necessary, and removing the count reset is the
+// other half of that same change.
+//
+// Measured over the suite: the sites the optimizer can specialize went from 2091
+// to 2171, and it is the same code compiled either way -- the difference is only
+// how much of what the program did the caches still remembered.
+// UNDER THE CODEGEN LOCK, because this walks gCompiledCode and a peer thread
+// compiling grows it by realloc and shifts it by memmove. Reading the array while
+// that happens follows a pointer into freed storage, and the walk is over every
+// method the system has compiled, so the window is not small.
+//
+// Measured: the multi-worker extend/remove hammer, whose whole point is one
+// worker replacing a method while three others send to it, died here. It is the
+// same lock and the same reason as jitCompileFor -- one shared structure, several
+// mutators of one heap.
+//
+// Clearing a target is left as a plain store rather than made atomic, and that is
+// a decision rather than an omission: an aligned word store cannot tear, and the
+// only thing a peer can read is the value before or the value after. Before is
+// the target it was already entitled to call, after is NULL, and NULL sends it
+// down jitDispatch, which re-resolves. Neither is stale dispatch.
+void jitFlushSendCaches(void)
+{
+	Heap *heap = CurrentThread.heap;
+	heapCodegenLockEnter(heap);
+	for (size_t index = 0; index < gCompiledCount; index++) {
+		NativeCode *code = gCompiledCode[index];
+		for (uint16_t i = 0; i < code->unit->instructionCount; i++) {
+			for (uint8_t way = 0; way < IC_MAX_WAYS; way++) {
+				code->cells[i].ways[way].target = NULL;
+			}
+		}
+	}
+	heapCodegenLockLeave(heap);
+}
+
+
+// Every method this JIT has compiled, so a caller can ask a question of all of
+// them. See jit/Jit.h for the one reason it is exposed.
 size_t jitCompiledCount(void) { return gCompiledCount; }
 
 
 NativeCode *jitCompiledAt(size_t index)
 {
 	return index < gCompiledCount ? gCompiledCode[index] : NULL;
-}
-
-
-void jitFlushSendCaches(void)
-{
-	for (size_t index = 0; index < gCompiledCount; index++) {
-		NativeCode *code = gCompiledCode[index];
-		for (uint16_t i = 0; i < code->unit->instructionCount; i++) {
-			code->cells[i].wayCount = 0;
-			for (uint8_t way = 0; way < IC_MAX_WAYS; way++) {
-				code->cells[i].ways[way].target = NULL;
-			}
-		}
-	}
 }
 
 
@@ -572,6 +613,16 @@ void tier2DryRun(CodeUnit *unit)
 }
 
 
+// The same seam, for the same reason. NULL means "tier 1's code stands", which is
+// both the answer when tier 2 is not linked and the answer when it refuses.
+__attribute__((weak))
+NativeCode *tier2StressUpgrade(NativeCode *tier1)
+{
+	(void) tier1;
+	return NULL;
+}
+
+
 // ST_IC_STATS=1 reports, at exit, how many sends the inline cache served itself
 // and how many reached the runtime.
 //
@@ -772,15 +823,24 @@ static Value dispatchFrom(IcCell *cell, Value *receiverSlot, uint64_t packed,
 		fflush(NULL);
 		abort();
 	}
-	if (method->native == NULL) {
-		Opcode unsupported;
-		method->native = jitCompile(method->unit, &unsupported);
-		if (method->native == NULL) {
-			fprintf(stderr, "jit: unsupported opcode %s\n", opcodeName(unsupported));
-			abort();
-		}
+	Opcode unsupported;
+	NativeCode *code = jitEnsureCompiled(method, &unsupported);
+	if (code == NULL) {
+		fprintf(stderr, "jit: unsupported opcode %s\n", opcodeName(unsupported));
+		abort();
 	}
-	NativeCode *code = method->native;
+	// AND, IF ASKED, REPLACE IT WITH TIER 2'S, before the site below arms to it.
+	//
+	// The order is the whole reason this call is HERE. The emitted fast path
+	// enters `way->target` and never re-reads `method->native`, so a site armed
+	// to tier 1 stays on tier 1 forever; arming after the upgrade is what makes
+	// every site follow. Off unless a testing knob asked for it, and NOT the tier
+	// policy -- see jit/Tier2Stress.c.
+	NativeCode *upgraded = tier2StressUpgrade(code);
+	if (upgraded != NULL) {
+		method->native = upgraded;
+		code = upgraded;
+	}
 	// ARM THE INLINE CACHE, but only for a target whose calling convention is the
 	// one the SITE emitted for, and only for one compiled code may enter at all.
 	//
@@ -929,16 +989,13 @@ Value jitSend(Value receiver, const char *selector, uint64_t argc,
 	if (understood != NULL) {
 		*understood = 1;
 	}
-	if (method->native == NULL) {
-		Opcode unsupported;
-		method->native = jitCompile(method->unit, &unsupported);
-		if (method->native == NULL) {
-			fprintf(stderr, "jit: %s uses %s, which the tier does not implement\n",
-				selector, opcodeName(unsupported));
-			fflush(NULL);
-			closeHandleScope(&scope, NULL);
-			return tagPtr(Handles.nil.raw);
-		}
+	Opcode unsupported;
+	if (jitEnsureCompiled(method, &unsupported) == NULL) {
+		fprintf(stderr, "jit: %s uses %s, which the tier does not implement\n",
+			selector, opcodeName(unsupported));
+		fflush(NULL);
+		closeHandleScope(&scope, NULL);
+		return tagPtr(Handles.nil.raw);
 	}
 	Value self = held != NULL ? tagPtr(held->raw) : receiver;
 	Value a0 = heldArgs[0] != NULL ? tagPtr(heldArgs[0]->raw) : rawArgs[0];
@@ -1653,7 +1710,77 @@ static void assertSingletonsAreImmortal(void)
 }
 
 
+static NativeCode *jitCompileLocked(const MacroAssemblerOps *ops, CodeUnit *unit,
+	Opcode *unsupported);
+
+
+// The code for `method`, compiling it if this is the first send that reaches it.
+//
+// DOUBLE-CHECKED UNDER THE CODEGEN LOCK. The fast path is the bare load, which is
+// what almost every send does and which must stay free of any lock; only the
+// first one pays. The second check inside is not belt-and-braces: several
+// mutators of one heap (`Worker parallel:`) routinely send to the same
+// not-yet-compiled method at the same instant, and with one check both of them
+// compile it. That leaks one NativeCode, registers two overlapping entries for
+// one method, and leaves whichever store landed second naming code that frames
+// already entered through the first are not running.
+//
+// The store is a RELEASE and the fast-path load an ACQUIRE, so a peer that sees
+// `native` non-NULL is guaranteed to see a NativeCode whose fields are all
+// written. Publishing it with a plain store would let another core observe the
+// pointer before the entry address it points at.
+static NativeCode *jitEnsureCompiled(RawCompiledMethod *method,
+	Opcode *unsupported)
+{
+	NativeCode *code = __atomic_load_n(&method->native, __ATOMIC_ACQUIRE);
+	if (code != NULL) {
+		return code;
+	}
+	Heap *heap = CurrentThread.heap;
+	heapCodegenLockEnter(heap);
+	code = method->native;
+	if (code == NULL) {
+		code = jitCompile(method->unit, unsupported);
+		if (code != NULL) {
+			__atomic_store_n(&method->native, code, __ATOMIC_RELEASE);
+		}
+	}
+	heapCodegenLockLeave(heap);
+	return code;
+}
+
+
 NativeCode *jitCompileFor(const MacroAssemblerOps *ops, CodeUnit *unit,
+	Opcode *unsupported)
+{
+	// COMPILATION IS SERIALIZED, because more than one OS thread reaches it.
+	//
+	// `Worker parallel:` puts several mutators on one heap and every one of them
+	// compiles what it sends to, and everything this function touches on the way
+	// is SHARED: the executable-page allocator, and gCompiledCode -- a sorted
+	// array that grows by realloc and shifts by memmove. Two threads inside that
+	// at once corrupt it, and what it is FOR is answering which method owns a
+	// return address, so the collector then walks the wrong method's frame map.
+	//
+	// It is not hypothetical. With this lock absent the two multi-worker hammer
+	// tests aborted on the registry's own ordering assertion, which is the one
+	// place that could still see it (jit/Jit.c, compiledCodeRegister).
+	//
+	// The lock this takes is the one memory/Heap.c already has for exactly this,
+	// and it was going unused: the only caller left was core/Lookup.c, which the
+	// dry cut took out of the build. It is RE-ENTRANT per thread, so generating a
+	// stub while compiling a method still works, and a thread waiting for it is
+	// published as GC-blocked -- so a peer that needs the world stopped does not
+	// wait for a thread that is waiting for this.
+	Heap *heap = CurrentThread.heap;
+	heapCodegenLockEnter(heap);
+	NativeCode *compiled = jitCompileLocked(ops, unit, unsupported);
+	heapCodegenLockLeave(heap);
+	return compiled;
+}
+
+
+static NativeCode *jitCompileLocked(const MacroAssemblerOps *ops, CodeUnit *unit,
 	Opcode *unsupported)
 {
 	assertSingletonsAreImmortal();

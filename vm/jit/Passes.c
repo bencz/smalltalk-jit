@@ -299,6 +299,88 @@ static uint32_t specializeSends(PassContext *context, const IrProfile *profile,
 
 
 // ---------------------------------------------------------------------------
+// 2b. --deopt-stress: make every speculation fail
+// ---------------------------------------------------------------------------
+//
+// The INTERNAL ORACLE the dry cut left us (ADR 0002). With the external oracle
+// gone, the way to know that leaving optimized code is correct is to leave it
+// EVERYWHERE: every guard fails, so every optimized activation reconstructs a
+// tier-1 frame and continues in it, and every test and every benchmark has to
+// produce the identical answer.
+//
+// It does two things, and both are needed:
+//
+//   * POISONS every existing guard, by giving it a class index no value can
+//     have. The instruction sequence is the production one, unchanged, which is
+//     the point: what is being proved is the guard the system really emits.
+//   * ADDS a guard at every send site that has none, so a method whose profile
+//     offered nothing is stressed too. A send already carries the state to
+//     resume with, which is exactly what the added guard needs, so this costs no
+//     new machinery at all.
+//
+// WHAT IT CANNOT REACH, said plainly: only the FIRST guard a path arrives at
+// ever fires, because after it the rest of the activation belongs to tier 1. So
+// one run stresses the first site of every method on every executed path, and
+// `stressSkip` is what walks it deeper.
+// The class index a stress guard demands, and the choice is not arbitrary.
+//
+// CLASS_INDEX_INVALID would be wrong twice over: it is ZERO, which some class
+// really has, and it is also what `irNewValue` writes into every value's `klass`
+// to mean "unknown" -- so the redundant-guard pass reads `subject->klass ==
+// wanted`, finds it true for every value in the program, and deletes every
+// stress guard. Measured: the first stress run reported that nothing had ever
+// left optimized code, which is the vacuous green this whole mode exists to
+// avoid.
+//
+// OBJ_CLASS_MASK is one PAST the largest index the header field can hold
+// (CLASS_INDEX_MAX, which core/ClassTable.c enforces), so no object anywhere can
+// carry it, and it survives the emitter masking the immediate down to the field.
+#define STRESS_POISON_CLASS ((uint32_t) OBJ_CLASS_MASK)
+
+static uint32_t stressGuards(PassContext *context, const IrProfile *profile,
+	uint32_t *added)
+{
+	if (profile == NULL || !profile->stressGuards) {
+		return 0;
+	}
+	IrFunction *function = context->function;
+	uint32_t poisoned = 0;
+	uint16_t skipped = 0;
+	for (uint32_t i = 0; i < context->rpoCount; i++) {
+		IrBlock *block = context->rpo[i];
+		IrValue *value = block->first;
+		while (value != NULL) {
+			IrValue *next = value->next;
+			if (value->op == IR_GUARD_CLASS) {
+				// No object can have this index, so the compare cannot match on
+				// either the immediate arm or the header arm of the emitted guard.
+				value->extra = (int64_t) STRESS_POISON_CLASS;
+				poisoned++;
+			} else if (value->op == IR_SEND && value->deopt != NULL
+					&& value->argCount > 0) {
+				if (skipped < profile->stressSkip) {
+					skipped++;
+				} else {
+					IrValue *guard = insertBefore(context, value, IR_GUARD_CLASS,
+						value->args[0], NULL);
+					guard->extra = (int64_t) STRESS_POISON_CLASS;
+					guard->bci = value->bci;
+					// THE SEND'S OWN STATE, shared. It describes the frame just
+					// before the send ran, which is precisely where a guard
+					// standing in front of the send has to resume.
+					guard->deopt = value->deopt;
+					(*added)++;
+				}
+			}
+			value = next;
+		}
+	}
+	(void) function;
+	return poisoned;
+}
+
+
+// ---------------------------------------------------------------------------
 // 3. Type propagation
 // ---------------------------------------------------------------------------
 //
@@ -1161,8 +1243,7 @@ static void fixPromotedConsumers(PassContext *context, IrValue *phi,
 			} else if (usesPhi) {
 				for (uint16_t i = 0; i < value->argCount; i++) {
 					if (value->args[i] == phi
-							&& !irOperandIsRaw((IrOp) value->op, i)
-							&& value->op != IR_PHI) {
+							&& !irOperandIsRaw((IrOp) value->op, i)) {
 						IrValue *box = irNewValue(function, boxOp);
 						irAddArg(function, box, phi);
 						irInsertBefore(block, value, box);
@@ -1171,6 +1252,44 @@ static void fixPromotedConsumers(PassContext *context, IrValue *phi,
 				}
 			}
 			value = next;
+		}
+		// AND A PHI CONSUMER, which the walk above cannot reach: a phi is not in
+		// `block->first`, it is in `block->phis`, so that loop never sees one
+		// however it is tested. It used to be excluded there BY NAME, which read
+		// as a decision and was in fact unreachable code.
+		//
+		// A promoted phi feeding a still-tagged phi would be a wrong answer, not a
+		// missed optimization: the consumer would receive a RAW integer and the
+		// guard and unbox that follow it would read that as a tagged value. The box
+		// belongs at the END OF THE PREDECESSOR the operand arrives from, because a
+		// phi's operand is evaluated on its EDGE and there is no "before a phi".
+		//
+		// HONEST STATUS: this fires on NO method in the current suite. Measured over
+		// all 143 files in tests/ under ST_TIER2_ALL=1: zero firings. Every tagged
+		// phi that reaches a promoted one today is trivial and already gone, because
+		// the only producer of a non-trivial one was the unreachable-predecessor bug
+		// buildCfg now prevents. It is kept because the shape is legal SSA that a
+		// second producer would reach, and exercised by gate level 5 rather than by
+		// the suite. Do not read it as the fix for anything that was failing.
+		for (IrValue *consumer = block->phis; consumer != NULL;
+				consumer = consumer->next) {
+			if (consumer == phi || consumer->repr != REPR_TAGGED) {
+				continue;
+			}
+			// One operand per predecessor, which is what makes operand i's edge
+			// preds[i]. Asserted rather than assumed, because reading the wrong
+			// edge would put the box on a path the value does not arrive by.
+			ASSERT(consumer->argCount == block->predCount);
+			for (uint16_t i = 0; i < consumer->argCount; i++) {
+				if (consumer->args[i] != phi) {
+					continue;
+				}
+				IrBlock *edge = block->preds[i];
+				IrValue *box = irNewValue(function, boxOp);
+				irAddArg(function, box, phi);
+				irInsertBefore(edge, edge->terminator, box);
+				consumer->args[i] = box;
+			}
 		}
 		// The terminator too: `ret` and `branch` both take tagged values, and
 		// forgetting them is how a promoted accumulator gets returned as a
@@ -1274,8 +1393,19 @@ static uint32_t mergeBlocks(PassContext *context)
 			continue;
 		}
 		IrBlock *successor = block->succs[0];
-		if (successor == block || successor->predCount != 1
-				|| successor->phis != NULL) {
+		// NEVER THE ENTRY, and `predCount` does not say so on its own. Control
+		// arrives at the entry block from OUTSIDE the function, and nothing in the
+		// CFG records that, so a loop whose header IS the entry has a header with
+		// exactly one predecessor -- its own latch. Merging it away leaves
+		// `function->entry` naming an empty, edgeless block and the whole method
+		// unreachable from its own entry point.
+		//
+		// Measured, on the first real method tier 2 was ever asked to compile: a
+		// `whileTrue:` at the top of a method. The lowering produced a function
+		// whose entry held one instruction, a jump with nowhere to go, and the
+		// emitter dereferenced the null label of a successor that did not exist.
+		if (successor == block || successor == context->function->entry
+				|| successor->predCount != 1 || successor->phis != NULL) {
 			continue;
 		}
 		for (IrValue *value = successor->first; value != NULL; value = value->next) {
@@ -1307,6 +1437,27 @@ static uint32_t mergeBlocks(PassContext *context)
 		successor->succCount = 0;
 		merged++;
 	}
+	// AND THE ABSORBED BLOCKS LEAVE THE LIST. An emptied block has no
+	// instructions, no terminator and no successors, and leaving it in is not
+	// harmless: the lowering makes a LIR block for it, terminateSplitBlocks gives
+	// that block a JUMP because it has no terminator, and the emitter then asks
+	// for the label of a successor it does not have.
+	//
+	// The ids are NOT renumbered. Everything downstream indexes by id into arrays
+	// sized by `blockCount`, so renumbering would be a second mapping to keep in
+	// step for no gain; a hole in the id space costs one unused array slot.
+	IrBlock **link = &context->function->blocks;
+	for (IrBlock *block = context->function->blocks; block != NULL;) {
+		IrBlock *next = block->next;
+		if (block != context->function->entry && block->first == NULL
+				&& block->terminator == NULL && block->succCount == 0
+				&& block->phis == NULL) {
+			*link = next;
+		} else {
+			link = &block->next;
+		}
+		block = next;
+	}
 	return merged;
 }
 
@@ -1332,6 +1483,11 @@ PassStats irOptimize(IrFunction *function, const IrProfile *profile)
 	// on every method the system compiles.
 	stats.sendsSpecialized += specializeSends(&context, profile,
 		&stats.specializationsDeclined);
+	// AFTER specialization, so the guards it just created are poisoned too, and
+	// BEFORE the redundant-guard pass, so a poisoned guard dominated by another
+	// poisoned one still goes: the stress mode must not change how many guards
+	// the method would have had, only whether they hold.
+	stats.guardsPoisoned += stressGuards(&context, profile, &stats.guardsAdded);
 	stats.typesLearned += propagateTypes(&context, profile);
 
 	// Fixed point: simplification exposes GVN opportunities and GVN exposes

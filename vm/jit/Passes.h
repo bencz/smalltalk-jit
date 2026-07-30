@@ -54,6 +54,9 @@ typedef struct {
 	// Boxes whose only remaining reader was a deoptimization state, which can
 	// name the raw value instead and re-box on the way out.
 	uint32_t boxesSunk;
+	// Guards that --deopt-stress made unsatisfiable, and guards it added.
+	uint32_t guardsPoisoned;
+	uint32_t guardsAdded;
 } PassStats;
 
 // Everything the optimizer is told about the RUNNING system, which is a small
@@ -76,6 +79,19 @@ typedef struct {
 	// should not be. CLASS_INDEX_INVALID means "not known", which is what every
 	// caller without a running heap passes.
 	uint32_t smallIntegerClass;
+	// --deopt-stress (ADR 0002 calls it the internal oracle): every speculation
+	// in the method is made to FAIL, so every execution leaves optimized code and
+	// has to arrive at the answer tier 1 alone gives.
+	//
+	// It is a flag on the profile rather than a getenv in the pass for the same
+	// reason the site table is data: gate level 5 has to be able to ask for it.
+	_Bool stressGuards;
+	// How many send sites to leave alone before the first stress guard. Zero is
+	// the mode itself; a higher value walks the stress DEEPER into a method,
+	// because only the first guard a path reaches ever fires -- after it, the
+	// rest of that activation is tier 1's. A sweep over this is what turns "the
+	// first site of every method" into measurable coverage.
+	uint16_t stressSkip;
 } IrProfile;
 
 // `profile` may be NULL, which is the whole of "nothing is known": every send

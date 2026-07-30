@@ -20,6 +20,7 @@
 #include "core/Assert.h"
 #include "core/Handle.h"
 #include "runtime/Closure.h"
+#include "runtime/Primitive.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -960,6 +961,40 @@ LirFunction *lirLower(IrFunction *ir, const Abi *abi, NativeCode *tier1,
 
 	layoutFrame(&lowering);
 	buildCfg(&lowering);
+
+	// THE PRIMITIVE ATTEMPT, and it goes in the PROLOGUE exactly as tier 1's
+	// does, before a single bytecode has been selected.
+	//
+	// It is not an IR node, and that is the same decision tier 1 made: trying the
+	// method's primitive is a property of the METHOD, not an instruction inside
+	// it, and no pass would take a different decision because of it. LIR_CALL_
+	// PRIMITIVE exists for it and had no producer until now.
+	//
+	// LEAVING IT OUT WAS NOT A MISSING OPTIMIZATION. `packages/Core` writes most
+	// of the kernel as a pragma plus a Smalltalk fallback, and 65 of those
+	// methods have NO fallback body at all, so the compiler gives them
+	// `self primitiveFailed: #Name` (docs/jit-v2/01-gate.md). Tier-2 code that
+	// skipped the attempt ran straight into that, and `primitiveFailed:` is
+	// implemented by nobody: the first thing tier 2 did when it was finally
+	// allowed to RUN was doesNotUnderstand on the receiver's own arithmetic.
+	//
+	// A DECLARED but unimplemented primitive emits nothing, which is the same
+	// rule tier 1 follows and what lets the whole kernel compile while the
+	// primitives arrive a few at a time.
+	PrimitiveFunction primitive = ir->unit->primitive != PRIM_NONE
+		? primitiveFunctionAt((PrimitiveNumber) ir->unit->primitive) : NULL;
+	if (primitive != NULL) {
+		lowering.current = lowering.lir->entry;
+		LirInstruction *attempt = emit(&lowering, LIR_CALL_PRIMITIVE);
+		attempt->primitive = primitive;
+		attempt->imm = ir->unit->argumentCount;
+		// THE RECEIVER AND ITS ARGUMENTS ARE THE ARGUMENT LIST, in the parameter
+		// slots the prologue just wrote, so the collector has to be told they are
+		// pointers at this call: a primitive allocates.
+		attempt->outgoingBase = 0;
+		attempt->outgoingCount = lowering.lir->parameterSlots;
+		attempt->outgoingKind = SLOT_POINTER;
+	}
 
 	for (IrBlock *block = ir->blocks; block != NULL; block = block->next) {
 		lowering.current = lowering.blockOf[block->id];

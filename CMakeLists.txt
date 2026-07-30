@@ -193,6 +193,7 @@ set(vmSources
 	vm/jit/SsaEmitter.c
 	vm/jit/SsaRuntime.c
 	vm/jit/Specialize.c
+	vm/jit/Tier2Stress.c
 	vm/jit/Tier2DryRun.c
 	vm/memory/Collector.c
 	vm/memory/Heap.c
@@ -238,6 +239,7 @@ set(vmSources
 	vm/runtime/primitives/System.c
 	vm/runtime/primitives/Strings.c
 	vm/runtime/primitives/Time.c
+	vm/runtime/primitives/Worker.c
 	vm/runtime/String.c
 	vm/thirdparty/cityhash/city.c
 	vm/tools/Bootstrap.c

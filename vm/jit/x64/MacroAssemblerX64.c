@@ -496,6 +496,20 @@ void x64Send(MacroAssembler *a, const MaSendSite *site)
 		emitClassIndexOfSlot(a, (uint16_t) (site->receiverSlot + 1));
 		asmMov32MemReg(buffer, X64_WAY, WAY_OFF_ARG, X64_SCRATCH);
 		asmMovRegMem(buffer, X64_ACCUMULATOR, X64_WAY, WAY_OFF_TARGET);
+		// AND TESTED AGAIN, because the re-read is a SECOND read of a word another
+		// thread may have cleared in between. jitFlushSendCaches nulls every
+		// target, it runs whenever any method dictionary changes, and it runs on
+		// whichever thread made the change -- so on a shared heap the window
+		// between the first test above and this re-read is real. What follows this
+		// is `mov acc, [acc + entry]`, so a target nulled inside that window is a
+		// load through zero: the send crashes rather than missing.
+		//
+		// Measured: the multi-worker extend/remove hammer, three workers sending
+		// while a fourth replaces the method, segfaulted INSIDE compiled code here.
+		// One test, on the path that already re-reads, and only for sites that
+		// carry an argument -- a unary send never re-reads and never needed it.
+		asmCmpRegImm32(buffer, X64_ACCUMULATOR, 0);
+		asmJcc(buffer, COND_EQUAL, (X64Label *) miss);
 	}
 
 	// The entry point, in the ACCUMULATOR, where it survives the marshalling

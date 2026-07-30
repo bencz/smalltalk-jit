@@ -167,6 +167,26 @@ static void scavengeSlot(void *ctx, Value *slot)
 }
 
 
+// Is this thread in the heap's mutator list?
+//
+// Asked so the heap's own thread's log is drained EXACTLY ONCE: it is normally a
+// mutator like any other, but during an image load and in the self-tests that
+// drive the collector directly it is not in the list at all. Draining a set twice
+// is not merely wasteful -- scavengeRememberedSet DETACHES the chain and re-adds
+// what is still young, so the second pass would walk objects whose slots have
+// already been forwarded and re-add them against a set that no longer describes
+// them.
+static _Bool threadIsMutatorOf(Heap *heap, struct Thread *thread)
+{
+	for (struct Thread *t = heap->mutators; t != NULL; t = t->nextMutator) {
+		if (t == thread) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+
 // Drain the old-to-young log: every old object that a write barrier recorded is
 // scanned, and drops out of the set when it turns out to hold nothing young any
 // more.
@@ -234,7 +254,32 @@ void collectorScavenge(Heap *heap)
 
 	ScavengeContext sc = { .heap = heap, .nursery = nursery };
 	collectorVisitRoots(heap, scavengeSlot, &sc);
-	if (heap->thread != NULL) {
+	// EVERY MUTATOR'S LOG, not just the heap thread's.
+	//
+	// The barrier is per-mutator (core/Thread.h) because making it shared would
+	// put a lock on every pointer store in the system. The consequence is that the
+	// old-to-young edges a WORKER recorded live in that worker's set, and reading
+	// only heap->thread's means a collection cannot see them.
+	//
+	// What that costs is not a slow path, it is a reclaimed live object: an old
+	// object holding the only reference to a young one is exactly what the barrier
+	// exists to record, so an unread log means the young object has no root, is
+	// evacuated as garbage, and the old object keeps pointing where it used to be.
+	//
+	// Measured: the multi-worker Atomics stress builds a Treiber stack whose cell
+	// is old and whose nodes are young, pushed from several workers at once. It
+	// reported lost and duplicated nodes -- a wrong sum and a wrong count, never a
+	// crash, which is why nothing else in the suite could see it.
+	//
+	// Safe to walk the mutator list here: the world is stopped for the duration of
+	// a collection, so no mutator is joining, leaving or logging.
+	for (struct Thread *t = heap->mutators; t != NULL; t = t->nextMutator) {
+		scavengeRememberedSet(&sc, &t->rememberedSet);
+	}
+	// And the heap's own thread when it is not a mutator in that list, which is
+	// the case during a load and in the self-tests that drive the collector
+	// without ever registering.
+	if (heap->thread != NULL && !threadIsMutatorOf(heap, heap->thread)) {
 		scavengeRememberedSet(&sc, &heap->thread->rememberedSet);
 	}
 

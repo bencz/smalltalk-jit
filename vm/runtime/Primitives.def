@@ -168,7 +168,7 @@ PRIMITIVE(LargeIntCompare, "LargeIntComparePrimitive", primLargeIntCompare)  // 
 PRIMITIVE(LargeIntFromString, "LargeIntFromStringPrimitive", primLargeIntFromString)  // String>>largeIntegerBase: anInteger negative: aBoolean classes: classPair
 PRIMITIVE(LargeIntPrintString, "LargeIntPrintStringPrimitive", primLargeIntPrintString)  // LargeInteger>>digitsStringBase: anInteger
 PRIMITIVE(LargeIntShift, "LargeIntShiftPrimitive", primLargeIntShift)  // Integer>>primLargeShift: anInteger classes: classPair
-PRIMITIVE_ABSENT(LastGCStats, "LastGCStatsPrimitive")  // GarbageCollector>>class lastStats
+PRIMITIVE(LastGCStats, "LastGCStatsPrimitive", primLastGCStats)  // GarbageCollector>>class lastStats
 PRIMITIVE(LastIoError, "LastIoErrorPrimitive", primLastIoError)  // IoError>>class last
 PRIMITIVE(LocalUtcOffset, "LocalUtcOffsetPrimitive", primLocalUtcOffset)  // DateTime>>class localUtcOffsetAt: epochSeconds
 PRIMITIVE(MemoryReleaseFence, "MemoryReleaseFencePrimitive", primMemoryReleaseFence)  // Atomic>>class releaseFence
@@ -222,4 +222,4 @@ PRIMITIVE(StringToInteger, "StringToIntegerPrimitive", primStringToInteger)  // 
 PRIMITIVE(StringTrimSeparators, "StringTrimSeparatorsPrimitive", primStringTrimSeparators)  // String>>trimSeparators
 PRIMITIVE(UnhandledErrorNote, "UnhandledErrorNotePrimitive", primUnhandledErrorNote)  // Exception>>noteUnhandled
 PRIMITIVE(UnhandledErrorTake, "UnhandledErrorTakePrimitive", primUnhandledErrorTake)  // ProcessorScheduler>>takeUnhandledErrorCount
-PRIMITIVE_ABSENT(WorkerParallel, "WorkerParallelPrimitive")  // Worker>>class parallel: anArrayOfBlocks
+PRIMITIVE(WorkerParallel, "WorkerParallelPrimitive", primWorkerParallel)  // Worker>>class parallel: anArrayOfBlocks

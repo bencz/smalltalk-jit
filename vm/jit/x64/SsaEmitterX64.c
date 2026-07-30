@@ -20,6 +20,7 @@
 #include "core/Class.h"
 #include "core/Thread.h"
 #include "memory/Heap.h"
+#include "runtime/Primitive.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -562,6 +563,52 @@ static void x64SsaInstruction(SsaEmitter *emitter, const LirInstruction *it,
 			asmMovRegReg(buffer, intReg(it->dstReg),
 				(Register) abi->integerResult);
 		}
+		break;
+	}
+
+	case LIR_CALL_PRIMITIVE: {
+		// The method's primitive: return its answer if it succeeded, fall through
+		// to the method's own bytecode if it failed. ONE operation and not three
+		// for the reason tier 1's is one -- the branch between the attempt and the
+		// fallthrough is the backend's, and the fallthrough target is always the
+		// very next instruction.
+		//
+		// The argument list is the ADDRESS of slot 0. The receiver and its
+		// arguments are already there, in consecutive slots at descending
+		// addresses, which is what the primitive reads: the SAME contract tier 1
+		// hands it, so the runtime needs nothing new.
+		asmLeaRegMem(buffer, (Register) abi->argumentRegisters[0], X64_FRAME,
+			slotOffset(0));
+		asmMovRegImm64(buffer, (Register) abi->argumentRegisters[1],
+			(uint64_t) it->imm);
+		if (abi->shadowSpaceBytes != 0) {
+			asmSubRegImm32(buffer, RSP, abi->shadowSpaceBytes);
+		}
+		// Through the ACCUMULATOR (RAX) and not the other scratch, for the reason
+		// tier 1 gives at the same place: the other scratch is RCX, which is SysV's
+		// fourth argument register and Win64's FIRST, so staging the address there
+		// would overwrite an argument set up two instructions ago, on one ABI only.
+		uint64_t target;
+		PrimitiveFunction function = it->primitive;
+		memcpy(&target, &function, sizeof(target));
+		asmMovRegImm64(buffer, X64_SCRATCH_A, target);
+		asmCallReg(buffer, X64_SCRATCH_A);
+		if (abi->shadowSpaceBytes != 0) {
+			asmAddRegImm32(buffer, RSP, abi->shadowSpaceBytes);
+		}
+		// One compare decides it: PRIMITIVE_FAILED is tagPtr(NULL), which no legal
+		// Value equals, so failure needs no out-parameter.
+		X64Label *failed = (X64Label *) x64SsaNewLabel(emitter);
+		asmCmpRegImm32(buffer, (Register) abi->integerResult,
+			(int32_t) PRIMITIVE_FAILED);
+		asmJcc(buffer, COND_EQUAL, failed);
+		// THROUGH THE EPILOGUE and not a bare leave-and-return, which is where
+		// tier 2 differs from tier 1: this frame may hold callee-saved registers
+		// the prologue saved, and returning without restoring them corrupts the
+		// CALLER. The answer is already in the result register and the epilogue
+		// touches only the callee-saved set, so it survives.
+		emitReturn(emitter);
+		asmBind(buffer, failed);
 		break;
 	}
 

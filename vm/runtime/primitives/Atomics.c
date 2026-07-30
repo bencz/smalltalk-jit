@@ -68,18 +68,75 @@ static _Bool atomicCell(Value receiver, Value **slot, RawObject **object)
 }
 
 
+// Log an old-to-young edge WITHOUT performing the store.
+//
+// The barrier in core/Thread.h remembers and stores together, which is right
+// everywhere a store is a plain assignment. Here it is not: the store IS the
+// atomic instruction, and it cannot also be an assignment without stopping being
+// atomic. So the two halves are separated and the remembering happens FIRST.
+//
+// FIRST, and conservatively, on purpose. Remembering an edge that the compare
+// then declines to install costs one entry that the next collection drops again
+// (scavengeRememberedSet re-adds only what still points young). Remembering
+// afterwards would leave a window in which the edge exists and no log names it,
+// and a peer collecting inside that window reclaims a live object -- the failure
+// this barrier exists to prevent, reintroduced by the ordering.
+static void atomicRemember(RawObject *object, Value value)
+{
+	if (valueTypeOf(value, VALUE_POINTER) && isOldObject(object)
+			&& isNewObject(asObject(value))
+			&& !rawObjectHasGcBit(object, GC_REMEMBERED)) {
+		rememberedSetAdd(&CurrentThread.rememberedSet, object);
+	}
+}
+
+
 // Store through the generational barrier when the value is a heap pointer, and
 // plainly when it is an immediate. One place, because every store below needs
 // exactly this and getting it wrong is a young object an old cell holds that
 // the collector never hears about.
+//
+// The store itself is a RELEASE store rather than a fence and an assignment: on
+// this side the two are equivalent, and writing it as one operation is what keeps
+// it obviously indivisible next to the compare-and-set below.
 static void atomicStore(RawObject *object, Value *slot, Value value)
 {
-	__atomic_thread_fence(__ATOMIC_RELEASE);
-	if (valueTypeOf(value, VALUE_POINTER)) {
-		rawObjectStorePtr(object, slot, asObject(value));
-	} else {
-		*slot = value;
-	}
+	atomicRemember(object, value);
+	__atomic_store_n(slot, value, __ATOMIC_RELEASE);
+}
+
+
+// Install `desired` only if the slot still holds `expected`, as ONE indivisible
+// operation. Answers whether it did.
+//
+// A REAL COMPARE-AND-EXCHANGE, which is the whole point of the facility and which
+// this file did not have: it compared, and then stored, as two separate accesses
+// with nothing joining them. Two threads that both saw `expected` therefore both
+// stored, and the second silently overwrote the first.
+//
+// A fence does not fix that and there was one here. A fence orders the accesses
+// one thread makes; it does not stop another thread from getting between them. The
+// symptom is not a crash: a Treiber stack built on this loses and duplicates
+// nodes, so the count and the sum come out wrong. Measured, by the multi-worker
+// Atomics stress -- which is also the only thing in the suite that could see it,
+// since a single thread never has a competitor to lose to.
+static _Bool atomicCompareAndSet(RawObject *object, Value *slot, Value expected,
+	Value desired)
+{
+	atomicRemember(object, desired);
+	Value witness = expected;
+	return __atomic_compare_exchange_n(slot, &witness, desired, 0,
+		__ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+}
+
+
+// Replace the slot and answer what it held, indivisibly. Same defect as above,
+// same reason it matters: a read followed by a store lets a value written between
+// the two vanish without ever being answered to anybody.
+static Value atomicExchange(RawObject *object, Value *slot, Value value)
+{
+	atomicRemember(object, value);
+	return __atomic_exchange_n(slot, value, __ATOMIC_ACQ_REL);
 }
 
 
@@ -116,21 +173,42 @@ static _Bool atomicElement(Value receiver, Value indexValue, Value **slot,
 // pedantry: this is the counter path, and a counter that silently wrapped into
 // a negative at 2^61 would be a wrong answer nobody looks for. Overflow fails
 // into the Smalltalk fallback, which says so.
+// A CAS LOOP and not __atomic_fetch_add, because the range check has to be part
+// of the operation. A tagged SmallInteger is a shifted payload, so adding the two
+// tagged words would give the right answer for every pair that fits and a wrapped
+// one for every pair that does not -- and "wrapped silently at 2^61" is the exact
+// wrong answer the check below exists to refuse. The check has to be re-evaluated
+// against the value the exchange actually observed, which is what a loop does and
+// what a single fetch-add cannot.
+//
+// It was a plain read-modify-write with a fence in the middle. That is not atomic
+// at all: two threads both read the same `before`, both compute the same sum, and
+// one increment is simply gone. Measured on the contended AtomicArray slot.
 static _Bool atomicAdd(RawObject *object, Value *slot, Value delta, Value *previous)
 {
-	if (!valueTypeOf(*slot, VALUE_INT) || !valueTypeOf(delta, VALUE_INT)) {
+	if (!valueTypeOf(delta, VALUE_INT)) {
 		return 0;
 	}
-	intptr_t before = asCInt(*slot);
-	intptr_t sum = (intptr_t) ((uintptr_t) before + (uintptr_t) asCInt(delta));
-	if (!smallIntFits(sum)) {
-		return 0;
+	(void) object; // the result is an immediate, so no edge to remember
+	intptr_t step = asCInt(delta);
+	Value before = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
+	for (;;) {
+		if (!valueTypeOf(before, VALUE_INT)) {
+			return 0;
+		}
+		intptr_t sum = (intptr_t) ((uintptr_t) asCInt(before) + (uintptr_t) step);
+		if (!smallIntFits(sum)) {
+			return 0;
+		}
+		// On failure the witness is updated with what the slot really held, so the
+		// next attempt re-checks the range against that rather than against a value
+		// no longer there.
+		if (__atomic_compare_exchange_n(slot, &before, tagInt(sum), 0,
+				__ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+			*previous = before;
+			return 1;
+		}
 	}
-	*previous = *slot;
-	(void) object; // an immediate store needs no barrier
-	__atomic_thread_fence(__ATOMIC_ACQ_REL);
-	*slot = tagInt(sum);
-	return 1;
 }
 
 
@@ -142,9 +220,11 @@ Value primAtomicLoad(Value *args, uint64_t argc)
 	if (argc != 0 || !atomicCell(primitiveReceiver(args), &slot, &object)) {
 		return PRIMITIVE_FAILED;
 	}
-	Value value = *slot;
-	__atomic_thread_fence(__ATOMIC_ACQUIRE);
-	return value;
+	// An ACQUIRE LOAD rather than a plain read followed by a fence. The fence
+	// gives the ordering, but the read it is meant to order is an ordinary C load
+	// that the compiler is free to move, split or repeat; spelling the whole thing
+	// as one atomic operation is what makes the guarantee the facility promises.
+	return __atomic_load_n(slot, __ATOMIC_ACQUIRE);
 }
 
 
@@ -172,11 +252,8 @@ Value primAtomicCompareAndSet(Value *args, uint64_t argc)
 	if (argc != 2 || !atomicCell(primitiveReceiver(args), &slot, &object)) {
 		return PRIMITIVE_FAILED;
 	}
-	if (*slot != primitiveArgument(args, 0)) {
-		return booleanResult(0);
-	}
-	atomicStore(object, slot, primitiveArgument(args, 1));
-	return booleanResult(1);
+	return booleanResult(atomicCompareAndSet(object, slot,
+		primitiveArgument(args, 0), primitiveArgument(args, 1)));
 }
 
 
@@ -188,9 +265,7 @@ Value primAtomicGetAndSet(Value *args, uint64_t argc)
 	if (argc != 1 || !atomicCell(primitiveReceiver(args), &slot, &object)) {
 		return PRIMITIVE_FAILED;
 	}
-	Value previous = *slot;
-	atomicStore(object, slot, primitiveArgument(args, 0));
-	return previous;
+	return atomicExchange(object, slot, primitiveArgument(args, 0));
 }
 
 
@@ -220,9 +295,11 @@ Value primAtomicArrayAt(Value *args, uint64_t argc)
 				&slot, &array)) {
 		return PRIMITIVE_FAILED;
 	}
-	Value value = *slot;
-	__atomic_thread_fence(__ATOMIC_ACQUIRE);
-	return value;
+	// An ACQUIRE LOAD rather than a plain read followed by a fence. The fence
+	// gives the ordering, but the read it is meant to order is an ordinary C load
+	// that the compiler is free to move, split or repeat; spelling the whole thing
+	// as one atomic operation is what makes the guarantee the facility promises.
+	return __atomic_load_n(slot, __ATOMIC_ACQUIRE);
 }
 
 
@@ -251,11 +328,8 @@ Value primAtomicArrayCompareAndSet(Value *args, uint64_t argc)
 				&slot, &array)) {
 		return PRIMITIVE_FAILED;
 	}
-	if (*slot != primitiveArgument(args, 1)) {
-		return booleanResult(0);
-	}
-	atomicStore(array, slot, primitiveArgument(args, 2));
-	return booleanResult(1);
+	return booleanResult(atomicCompareAndSet(array, slot,
+		primitiveArgument(args, 1), primitiveArgument(args, 2)));
 }
 
 
@@ -269,9 +343,7 @@ Value primAtomicArrayGetAndSet(Value *args, uint64_t argc)
 				&slot, &array)) {
 		return PRIMITIVE_FAILED;
 	}
-	Value previous = *slot;
-	atomicStore(array, slot, primitiveArgument(args, 1));
-	return previous;
+	return atomicExchange(array, slot, primitiveArgument(args, 1));
 }
 
 

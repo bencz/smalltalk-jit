@@ -289,7 +289,7 @@ level7() {
 		vm/jit/Ir.c vm/jit/SsaBuild.c vm/jit/Passes.c vm/jit/Lir.c \
 		vm/jit/Lower.c vm/jit/RegAlloc.c vm/jit/SsaRuntime.c \
 		vm/jit/SsaEmitter.c vm/jit/SsaBackends.c vm/jit/SsaBackend.c \
-		vm/jit/Specialize.c \
+		vm/jit/Specialize.c vm/jit/Tier2Stress.c \
 		vm/jit/Deopt.c vm/jit/DeoptResume.c vm/jit/x64/abi/sysv/ResumeSysV.c \
 		$(standalonePrimitiveSources) $(primitiveSupportSources) \
 		vm/jit/x64/MacroAssemblerX64.c vm/jit/x64/SsaEmitterX64.c \
@@ -419,7 +419,7 @@ level13() {
 	done
 }
 level14() { ./run_tests.sh --no-build 2>&1 | grep -q "ALL PASSED"; }
-level15() { echo "level 15 (deopt-stress) has no runner yet"; return 1; }
+level15() { ./scripts/deopt-stress.sh; }
 level16() { echo "level 16 (performance) has no runner yet"; return 1; }
 
 NAMES=("aloca e coleta" "troca de fiber" "objetos e colecoes" "JIT executa" \

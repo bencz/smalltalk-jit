@@ -1299,6 +1299,36 @@ static void resolveSplits(Allocator *allocator, PositionIndex *index,
 			}
 			LirBlock *block = index->blockByPosition[slot];
 			LirInstruction *before = index->byPosition[slot];
+			// A REGISTER IS TAKEN WHEN AN INSTRUCTION EXECUTES, NOT WHEN AN
+			// INTERVAL BEGINS, and the two are one position apart on purpose: a
+			// definition's interval starts at position + 1 so that it cannot be
+			// confused with the OPERANDS of the very instruction that produces it.
+			//
+			// The consequence for a spill is not a detail. A split at the odd gap
+			// after instruction p means "leave the register here", and placing the
+			// store before the instruction at p + 2 puts it AFTER instruction p has
+			// already overwritten that register, so the store writes the new value
+			// into the old value's slot.
+			//
+			// Measured: `a + b` answered 8 instead of 300 in a method whose send
+			// needed ten outgoing argument slots. The spill of a local read a
+			// register that an `imm` two instructions earlier had been given.
+			//
+			// So when the instruction immediately BEFORE the split point defines a
+			// value that was handed this very register, the store goes ahead of it.
+			int32_t taken = at - 1;
+			if (taken >= 0 && taken % 2 == 0 && taken / 2 < index->count) {
+				LirInstruction *prior = index->byPosition[taken / 2];
+				if (prior != NULL && prior->dst != LIR_NO_VREG) {
+					LirInterval *owner = locationAt(allocator, prior->dst,
+						prior->position + 1);
+					if (owner != NULL && owner->reg == it->reg
+							&& owner->bank == it->bank) {
+						before = prior;
+						block = index->blockByPosition[taken / 2];
+					}
+				}
+			}
 			// A SPLIT AT A BLOCK'S FIRST INSTRUCTION IS A BLOCK-BOUNDARY
 			// TRANSITION, and ONE move at the top of the block is the wrong answer
 			// for it. The block may be reached from several predecessors that do

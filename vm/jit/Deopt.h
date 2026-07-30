@@ -129,6 +129,15 @@ _Bool deoptStateIsWellFormed(const DeoptState *state);
 // before phase 4.
 _Bool deoptStressEnabled(void);
 
+// How many send sites --deopt-stress leaves alone before its first guard, from
+// ST_DEOPT_STRESS_SKIP. Zero unless asked.
+//
+// It exists because only the FIRST guard a path reaches ever fires: after it the
+// rest of that activation is tier 1's. One run therefore stresses the first site
+// of every method, and sweeping this walks the stress deeper into them, which is
+// the difference between a claim and a measured one.
+uint16_t deoptStressSkip(void);
+
 // A guard failed: rebuild the tier-1 frame from `site` and continue in it.
 // Answers what the method answers, because the resumed tier-1 code returns
 // straight past this. See DeoptResume.c for why it stacks a frame rather than

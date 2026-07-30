@@ -61,6 +61,11 @@ NativeCode *ssaCompile(const SsaEmitterOps *ops, CodeUnit *unit,
 	// source that merely happens to agree.
 	profile.siteCount = sites != NULL ? tier1->unit->instructionCount : 0;
 	profile.smallIntegerClass = gClassIndexByTag[VALUE_INT];
+	// --deopt-stress, the internal oracle of ADR 0002: every speculation in this
+	// method is made unsatisfiable, so every execution of it leaves optimized
+	// code and has to arrive at tier 1's answer.
+	profile.stressGuards = deoptStressEnabled();
+	profile.stressSkip = deoptStressSkip();
 	PassStats passes = irOptimize(ir, &profile);
 	if (stats != NULL) {
 		*stats = passes;

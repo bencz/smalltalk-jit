@@ -77,6 +77,7 @@
 // the helpers tier 1 does -- and two names for one type is how the two halves of
 // a system start disagreeing about it.
 #include "jit/MacroAssembler.h"
+#include "runtime/Primitive.h"
 #include "memory/Roots.h"
 #include "core/Object.h"
 #include <stdint.h>
@@ -255,6 +256,14 @@ typedef struct LirInstruction {
 	// void*, because ISO C does not let those convert, which is the same reason
 	// MaRuntimeFunction is one.
 	MaRuntimeFunction function;
+	// LIR_CALL_PRIMITIVE: the primitive to attempt. A SECOND field and not the one
+	// above, because the two signatures genuinely differ -- a primitive takes the
+	// argument block and a count, a runtime helper takes a pointer, a slot address
+	// and a packed word. Casting between them is undefined and the compiler says
+	// so; sharing one field would mean one of the two calls being made through the
+	// wrong prototype, which is exactly the class of thing an ABI seam exists to
+	// prevent.
+	PrimitiveFunction primitive;
 	// LIR_CALL_RUNTIME3: its first argument, a CodeUnit or an inline-cache cell.
 	// LIR_LOAD_ABS: the fixed address to read. Never both, and never an object:
 	// a runtime-owned address is what makes it legal to bake at all.

@@ -710,6 +710,26 @@ static uint16_t selectorIndex(Emitter *e, String *selector)
 }
 
 
+// How many body words come BEFORE the first instance variable of `self`.
+//
+// Zero for every class the language declares, because their instances are all
+// tagged slots. Non-zero exactly for a class that MIRRORS A C STRUCT with raw
+// words in front of the tagged ones, which the `<shape: ...>` pragma is how a
+// class says out loud (vm/tools/ClassBuilder.c).
+//
+// The shape asked for is the one this class stamps on its INSTANCES, because that
+// is what `self` is. For a class-side method the owner is the metaclass, whose
+// instance is the class, and its stamped shape describes a class object -- which
+// is right for the same reason.
+static uint16_t instanceVarRawPrefix(Emitter *e)
+{
+	if (e->context == NULL || e->context->ownerClass == NULL) {
+		return 0;
+	}
+	return classShape(e->context->ownerClass).rawWords;
+}
+
+
 // Where does this identifier live? Innermost scope outward, then the captures of
 // the running closure, then instance variables, then globals. The order IS
 // Smalltalk's shadowing rule, with the captures sitting exactly where an
@@ -756,7 +776,30 @@ static Place resolveName(Emitter *e, String *name)
 		int index = indexOfSymbol(e->instanceVariables, symbol);
 		if (index >= 0) {
 			place.kind = PLACE_INSTANCE_VAR;
-			place.index = (uint16_t) index;
+			// BIASED BY THE RAW PREFIX, and this is where the bias belongs.
+			//
+			// `index` is the position among the DECLARED instance variables. What
+			// the emitted load wants is a body WORD, and for a class whose shape
+			// carries `rawWords` those two differ by exactly that many: the raw
+			// words come first and the tagged run starts after them, which is the
+			// same arithmetic memory/ObjectWalk.h does to find the slots the
+			// collector may follow (`body + rawWords`).
+			//
+			// It is zero for every ordinary class, so nothing changes for them. It
+			// is NOT zero for a class that MIRRORS A C STRUCT with a raw prefix,
+			// and CompiledMethod is one: three raw words (the bytecode size, the
+			// CodeUnit, the machine code) and then `selector` and `ownerClass`.
+			// Unbiased, `selector` read body word 0 -- the bytecode size, read as
+			// though it were tagged. Measured: `aMethod selector` answered the
+			// SmallInteger 10 for a method of 40 bytecode bytes and 22 for one of
+			// 88, which is that word shifted, and 34 checks in CompiledMethodTest
+			// were reading fields one struct away from the ones they named.
+			//
+			// HERE and not in the macro assembler, because the class of `self` is
+			// known at COMPILE time and its shape with it, so the bias folds into
+			// the offset the load already carries and costs no instruction. Doing
+			// it at run time would mean reading the class on every field access.
+			place.index = (uint16_t) (index + instanceVarRawPrefix(e));
 			return place;
 		}
 	}

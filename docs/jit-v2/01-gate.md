@@ -1400,3 +1400,131 @@ maquina que ja estava verificada passou a ter o que otimizar, que era o bloqueio
 
 E o `--deopt-stress` (nivel 15) vem ANTES de qualquer ganho reivindicado, porque
 sem ele a especulacao e promessa sem oraculo.
+
+## O nivel 15: o oraculo interno, e o que ele achou no primeiro dia
+
+`scripts/deopt-stress.sh` roda a suite inteira em TRES configuracoes e exige
+saida IDENTICA, arquivo por arquivo, byte por byte, codigo de saida incluso:
+
+| | |
+|---|---|
+| baseline | so tier 1. A referencia. |
+| `ST_TIER2_ALL=1` | tier 2 compila e RODA todo metodo que consegue, especulacoes intactas |
+| `ST_DEOPT_STRESS=1` | idem, e toda especulacao FALHA |
+
+### A primeira coisa que o modo precisou nao era o modo
+
+**`ST_DEOPT_STRESS=1` sobre um sistema onde nenhum codigo otimizado executa
+reporta que todos os testes passam, o que e verdade e nao significa nada**: nao
+havia de onde sair. Um modo de stress tem que ser capaz de FALHAR para o fato de
+ele passar ser evidencia.
+
+Entao entrou tambem `jit/Tier2Stress.c`, e ele e dito pelo que e: **modo de
+TESTE, nao politica de tier**. Politica (quando um metodo esta quente, o que
+invalida codigo otimizado quando um dicionario de metodos muda, como um laco em
+execucao transfere para codigo otimizado) e trabalho proprio e nada disso esta
+la. O que esta e a regra mais crua possivel: todo metodo que tier 2 consegue
+compilar e compilado e instalado, NO PRIMEIRO SEND que chega nele.
+
+**O primeiro send e nao quando esquenta, e a razao e onde o sitio guarda a
+resposta.** O caminho rapido emitido entra em `way->target` e nunca rele
+`method->native`, entao um sitio armado enquanto o metodo era tier 1 continua
+entrando em tier 1 para sempre. Fazer o upgrade no primeiro dispatch evita isso
+inteiro: nenhum sitio armou ainda. O preco e que o perfil esta VAZIO nesse
+instante, entao nada especializa e o codigo nao carrega guard proprio, e e por
+isso que o stress ADICIONA um guard em todo sitio de send em vez de depender de o
+perfil ter produzido um.
+
+### O poison, e por que `CLASS_INDEX_INVALID` estava errado duas vezes
+
+Um guard de stress exige um indice de classe que nenhum objeto tem. A primeira
+escolha, `CLASS_INDEX_INVALID`, falha por dois motivos ao mesmo tempo: ele e
+ZERO, que alguma classe de fato tem, e e tambem o que `irNewValue` escreve em
+`klass` para dizer "desconhecido". O passe de guard redundante le
+`subject->klass == wanted`, acha verdadeiro para TODO valor do programa, e apaga
+todos os guards de stress. **Medido: a primeira execucao com stress reportou que
+nada nunca saiu de codigo otimizado**, que e exatamente o verde vazio acima.
+
+O certo e `OBJ_CLASS_MASK`, um passo ALEM do maior indice que o cabecalho aceita
+(`CLASS_INDEX_MAX`, que `core/ClassTable.c` impoe), entao nenhum objeto pode
+carregar ele e ele sobrevive ao mascaramento do imediato no emissor.
+
+### O que faltava para tier 2 rodar: a PRIMITIVA
+
+Tier 2 nao tentava a primitiva do metodo. `LIR_CALL_PRIMITIVE` existia para isso
+e nao tinha produtor nenhum.
+
+Nao era otimizacao faltando. `packages/Core` escreve a maior parte do kernel como
+pragma mais fallback Smalltalk, e **65 desses metodos nao tem corpo de fallback
+nenhum**, entao o compilador da a eles `self primitiveFailed: #Nome` (ver a
+varredura acima). Codigo de tier 2 que pulava a tentativa caia direto nisso, e
+`primitiveFailed:` ninguem implementa: a primeira coisa que tier 2 fez quando foi
+finalmente deixado RODAR foi `doesNotUnderstand` na aritmetica do proprio
+receptor. Agora ele emite a tentativa no PROLOGO, como tier 1, e pela mesma razao
+de desenho: tentar a primitiva e propriedade do METODO e nenhum passe decide
+diferente por causa dela.
+
+### E o perfil estava sendo JOGADO FORA a cada mudanca de dicionario
+
+`jitFlushSendCaches` dizia no proprio comentario que as contagens sao mantidas e
+em seguida fazia `wayCount = 0`, que nao e uma versao menor de manter:
+`icDominantClass` responde `CLASS_INDEX_INVALID` num sitio sem ways, e o
+`icRecord` seguinte comeca de novo na way 0. Todo perfil do sistema era descartado
+em toda mudanca de qualquer dicionario de metodos, o que num bootstrap e
+constantemente. E precisamente a amnesia que `jit/InlineCache.h` diz que o indice
+de classe de 22 bits do ADR 0005 existe para acabar.
+
+Medido: os sitios especializaveis foram de **2091 para 2171**, mesmo codigo, so
+mais do que o programa fez lembrado.
+
+### Tres bugs de RESPOSTA ERRADA que so o oraculo achou
+
+Os tres estavam em codigo anterior a esta sessao. Nenhum foi achado pelo
+verificador, e o verificador estava certo em passar nos tres: os intervalos eram
+consistentes, a COLOCACAO nao era.
+
+1. **`mergeBlocks` absorvia o BLOCO DE ENTRADA no proprio predecessor de
+   back-edge.** `predCount` nao diz que a entrada tem uma entrada de fora: controle
+   chega nela de FORA da funcao e nada no CFG registra isso, entao um laco cujo
+   cabecalho E a entrada tem cabecalho com exatamente um predecessor, o proprio
+   latch. Fundir deixa `function->entry` nomeando um bloco vazio e sem arestas e o
+   metodo inteiro inalcancavel da propria entrada. Achado no PRIMEIRO metodo real
+   que tier 2 foi mandado compilar: um `whileTrue:` no topo de um metodo.
+2. **E os blocos absorvidos ficavam na lista.** Vazios, sem terminador e sem
+   sucessor: o lowering cria um bloco LIR para eles, `terminateSplitBlocks` lhes
+   da um JUMP porque nao tem terminador, e o emissor derreferencia o label nulo de
+   um sucessor que nao existe.
+3. **Um derrame emitido DEPOIS da instrucao que ja tomou o registrador.** Um
+   registrador e tomado quando a instrucao EXECUTA, mas um intervalo que comeca
+   numa definicao comeca uma posicao DEPOIS dessa instrucao, pela convencao de
+   slot impar. Cortar o dono anterior na posicao inicial poe o store depois de o
+   registrador ter sido sobrescrito. Medido: `a + b` respondeu 8 em vez de 300 num
+   metodo cujo send precisava de dez slots de argumento de saida.
+
+### O numero, e ele NAO e verde
+
+| | |
+|---|---|
+| arquivos comparados | 143 |
+| execucoes comparadas | 143 x 4 (baseline, tier2all, stress em 3 profundidades) |
+| diferentes no primeiro dia | **196** |
+| diferentes depois dos tres consertos | **56** |
+| desotimizacoes numa execucao com stress | 101, com 45 metodos promovidos |
+
+Das 56: **7 em `tier2all`**, ou seja o backend discordando do tier 1 com as
+especulacoes intactas, que e a familia mais fundamental; **49 em stress**. As 7
+estao caracterizadas e cada uma reproduz em um arquivo pequeno:
+excecao de classe errada, `false is not a Number`, shift de LargeInteger,
+tamanho de colecao lido como zero (`1 to: 0`), e um LACO INFINITO num
+`to:do:` cujo corpo tem retorno antecipado dentro de `ifTrue:` (reduzido a um
+metodo de dez linhas).
+
+**O nivel do gate NAO subiu e nao podia**: o nivel 14 e paridade
+(`run_tests.sh` verde) e nao foi alcancado, e o proprio nivel 15 nao esta verde.
+O que existe agora e o RUNNER e a medicao. `gate.sh` nivel 15 chama
+`scripts/deopt-stress.sh`.
+
+E a limitacao do modo, dita: **so o PRIMEIRO guard que um caminho alcanca
+dispara**, porque depois dele o resto da ativacao e do tier 1. Uma execucao
+estressa o primeiro sitio de cada metodo em cada caminho executado, e
+`ST_DEOPT_STRESS_SKIP` e o que anda mais fundo; o runner varre 0, 1 e 2.

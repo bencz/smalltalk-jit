@@ -582,7 +582,11 @@ int main(void)
 	for (uint16_t i = 0; i < plusUnit->instructionCount; i++) {
 		table[i].op = IR_OP_COUNT;
 	}
-	IrProfile profile = { table, plusUnit->instructionCount, CLASS_SMALLINT };
+	// DESIGNATED INITIALIZERS, so a field added to IrProfile does not become a
+	// build error in every test that mentions one.
+	IrProfile profile = { .sites = table,
+		.siteCount = plusUnit->instructionCount,
+		.smallIntegerClass = CLASS_SMALLINT };
 	table[2].op = IR_IADD;
 	table[2].receiverClass = CLASS_SMALLINT;
 	table[2].argumentClass = CLASS_SMALLINT;
@@ -665,8 +669,9 @@ int main(void)
 	}
 
 	IrFunction *chain = ssaBuild(chainUnit, NULL);
-	IrProfile chainProfile = { chainTable, chainUnit->instructionCount,
-		CLASS_SMALLINT };
+	IrProfile chainProfile = { .sites = chainTable,
+		.siteCount = chainUnit->instructionCount,
+		.smallIntegerClass = CLASS_SMALLINT };
 	PassStats chainStats = irOptimize(chain, &chainProfile);
 	check("two chained adds are both specialized",
 		chainStats.sendsSpecialized == 2 && countOp(chain, IR_SEND) == 0);
@@ -680,7 +685,9 @@ int main(void)
 		countOp(chain, IR_BOX_I) == 1 && countOp(chain, IR_UNBOX_I) == 3
 			&& chainStats.boxesSunk == 1);
 	irDestroy(chain);
-	free(chainTable);
+	// chainTable outlives this block: the stress checks at the end of the file
+	// reuse the same method and the same table, and freeing it here would make
+	// them read freed memory.
 
 	// ---- AND IT REACHES THE LOOP, which is what the whole tier is for -------
 	//
@@ -717,8 +724,9 @@ int main(void)
 	loopTable[3].checkOverflow = 1;
 
 	IrFunction *accumulator = ssaBuild(loopUnit, NULL);
-	IrProfile loopProfile = { loopTable, loopUnit->instructionCount,
-		CLASS_SMALLINT };
+	IrProfile loopProfile = { .sites = loopTable,
+		.siteCount = loopUnit->instructionCount,
+		.smallIntegerClass = CLASS_SMALLINT };
 	PassStats loopStats = irOptimize(accumulator, &loopProfile);
 	check("the accumulator's send became an addition",
 		loopStats.sendsSpecialized == 1 && countOp(accumulator, IR_IADD) == 1);
@@ -736,6 +744,69 @@ int main(void)
 		countOp(accumulator, IR_BOX_I) == 1);
 	irDestroy(accumulator);
 	free(loopTable);
+
+	// ---- --deopt-stress: every speculation made to FAIL --------------------
+	//
+	// The internal oracle of ADR 0002, and this level is where its REWRITE can be
+	// proved: that every guard is left unsatisfiable and that a send with none
+	// gains one, so a method whose profile offered nothing is stressed too.
+	//
+	// Whether it then produces identical ANSWERS is a question for a running
+	// system and lives in scripts/deopt-stress.sh. What is checked here is the
+	// shape, which is what that script would have no way of localizing.
+	IrFunction *stressed = ssaBuild(chainUnit, NULL);
+	IrProfile stressProfile = { .sites = chainTable,
+		.siteCount = chainUnit->instructionCount,
+		.smallIntegerClass = CLASS_SMALLINT,
+		.stressGuards = 1 };
+	PassStats stressStats = irOptimize(stressed, &stressProfile);
+	check("stress poisons the guards specialization created",
+		stressStats.guardsPoisoned > 0);
+	// EVERY REMAINING GUARD IS UNSATISFIABLE, which is the property, and it is
+	// checked on the guards themselves rather than on the count: a poisoned guard
+	// that kept a real class index would hold, and the run would report success
+	// having stressed nothing.
+	uint32_t satisfiable = 0, stressGuardCount = 0;
+	for (IrBlock *block = stressed->blocks; block != NULL; block = block->next) {
+		for (IrValue *value = block->first; value != NULL; value = value->next) {
+			if (value->op != IR_GUARD_CLASS) { continue; }
+			stressGuardCount++;
+			satisfiable += (uint32_t) value->extra != (uint32_t) OBJ_CLASS_MASK;
+		}
+	}
+	check("every guard demands a class no object can have",
+		stressGuardCount > 0 && satisfiable == 0);
+	// AND THE POISON IS NOT CLASS_INDEX_INVALID, which is the trap this cost a
+	// run to find: that value is ZERO, and zero is also what `irNewValue` writes
+	// into `klass` to mean "unknown", so the redundant-guard pass would read
+	// `subject->klass == wanted` as true for every value and delete the lot.
+	check("the poison is not the sentinel that means `unknown`",
+		(uint32_t) OBJ_CLASS_MASK != CLASS_INDEX_INVALID);
+	irDestroy(stressed);
+
+	// A method with NO profile is stressed too, which is the half that matters
+	// for real code: at the moment a method is first compiled its caches are
+	// empty, so nothing specializes and there is no guard to poison. The added
+	// guards are what make that method leave optimized code anyway.
+	IrFunction *unprofiledStress = ssaBuild(chainUnit, NULL);
+	IrProfile bare = { .stressGuards = 1 };
+	PassStats bareStats = irOptimize(unprofiledStress, &bare);
+	check("with no profile at all, stress still adds guards",
+		bareStats.sendsSpecialized == 0 && bareStats.guardsAdded == 2);
+	check("and they are on the sends that were left alone",
+		countOp(unprofiledStress, IR_SEND) == 2
+			&& countOp(unprofiledStress, IR_GUARD_CLASS) == 2);
+	// ST_DEOPT_STRESS_SKIP, which is what walks the stress deeper: only the FIRST
+	// guard a path reaches ever fires, because after it the rest of the activation
+	// is tier 1's, so one run stresses one site per method and this is how the
+	// others are reached.
+	IrFunction *skipped = ssaBuild(chainUnit, NULL);
+	IrProfile deeper = { .stressGuards = 1, .stressSkip = 1 };
+	PassStats skipStats = irOptimize(skipped, &deeper);
+	check("skipping one site guards one fewer", skipStats.guardsAdded == 1);
+	irDestroy(unprofiledStress);
+	irDestroy(skipped);
+	free(chainTable);
 
 	printf("\n%d of %d checks passed\n", gChecks - gFailures, gChecks);
 	return gFailures == 0 ? 0 : 1;
