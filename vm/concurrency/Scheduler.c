@@ -1,1198 +1,850 @@
-#define _GNU_SOURCE
 #include "concurrency/Scheduler.h"
-#include "core/Thread.h"
-#include "memory/Heap.h"
-#include "os/OsThread.h"
-#include "core/Handle.h"
-#include "core/Entry.h"
-#include "core/Smalltalk.h"
-#include "core/Exception.h"
-#include "core/StackFrame.h"
-#include "os/Os.h"
 #include "core/Assert.h"
+#include "core/Handle.h"
+#include "core/Thread.h"
+#include "jit/Jit.h"
+#include "memory/Roots.h"
+#include "os/Os.h"
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <time.h>
-#include <errno.h>
-#include <signal.h>
-#include "os/Os.h"
-#include <sched.h>
 
 // ---------------------------------------------------------------------------
-// Cooperative single-OS-thread fiber scheduler.
+// The state
+// ---------------------------------------------------------------------------
 //
-// The original OS-thread stack is the "scheduler context": schedulerRun() loops
-// there, switching into ready fibers. A fiber returns control by switching back
-// to the scheduler (yield / block / finish). Because only one fiber runs at a
-// time and the heap is never touched by the scheduler itself, the GC and all VM
-// data structures stay single-threaded and lock-free.
+// One ready queue, one registry, one running fiber. All of it is per-process
+// because the scheduler is single-threaded (Scheduler.h); the day workers
+// arrive this becomes per-worker and the registry stays shared for the
+// collector.
+
+typedef struct {
+	Fiber *readyHead;
+	Fiber *readyTail;
+	// EVERY live fiber, running or not. The ready queue is not enough: the
+	// collector has to reach suspended and sleeping ones too, and an id lookup
+	// has to find a fiber that is on no queue at all.
+	Fiber **all;
+	size_t count;
+	size_t capacity;
+	Fiber *main;
+	// The fiber that just switched off and whose park has NOT been committed.
+	// The commit runs on the NEXT fiber's stack, never on the parking fiber's
+	// own, which is the rule Fiber.h states: a peer must not be able to pop and
+	// run a stack that is still switching off.
+	Fiber *parking;
+	// Who holds the sync monitor, or NULL. IN HERE and not a file-static of its
+	// own, because this struct IS the per-process scheduler state named at the
+	// top of this section: when it becomes per-worker, the monitor has to travel
+	// with the ready queue rather than be found later as a stray global.
+	Fiber *monitorOwner;
+	size_t nextId;
+	_Bool started;
+} Scheduler;
+
+static Scheduler gScheduler;
+
+
+// ---------------------------------------------------------------------------
+// The registry
 // ---------------------------------------------------------------------------
 
-// ---- what stays TLS (one copy per worker OS thread) -----------------------
-// gScheduler is this worker's OWN OS-thread stack context (must not be shared);
-// gCurrent is the fiber running on THIS worker; gActive/gExitResult track this
-// worker's scheduler status. Everything else moved into the shared per-heap
-// `struct Scheduler` below so a pool of workers shares ONE ready queue/registry.
-static PER_ISOLATE Fiber gScheduler;          // scheduler context (stackBase == NULL)
-static PER_ISOLATE Fiber *gCurrent = NULL;    // running fiber, NULL while in the scheduler
-static PER_ISOLATE _Bool gActive = 0;
-static PER_ISOLATE Value gExitResult = 0;
-
-// Process-wide (NOT per-worker TLS: any worker's fiber can die) count of
-// unhandled errors: Exception>>defaultAction bumps it just before terminating
-// the signaling fiber. main() folds a nonzero count into the process exit code
-// in non-interactive mode, so a test can no longer print a backtrace and still
-// exit 0 (the historical false-pass). Atomic: fibers on different workers can
-// fail simultaneously.
-static int gUnhandledErrors = 0;
-
-void schedulerNoteUnhandledError(void)
+static void registryAdd(Fiber *fiber)
 {
-	__atomic_add_fetch(&gUnhandledErrors, 1, __ATOMIC_RELAXED);
-}
-
-int schedulerUnhandledErrors(void)
-{
-	return __atomic_load_n(&gUnhandledErrors, __ATOMIC_RELAXED);
-}
-
-// Read-and-clear, for tests that deliberately drive an error into
-// defaultAction (e.g. the unhandled-in-fiber probe in UnwindTest) and must
-// then both ASSERT it fired and keep the run's exit code clean.
-int schedulerTakeUnhandledErrors(void)
-{
-	return __atomic_exchange_n(&gUnhandledErrors, 0, __ATOMIC_RELAXED);
-}
-
-// timer min-heap entry: a fiber sleeping until a deadline (Delay wait)
-typedef struct {
-	int64_t deadline; // absolute microseconds
-	size_t fiberId;
-} Timer;
-
-// Fiber registry id layout: ids handed to Smalltalk pack a generation counter in
-// the high bits so a stale Process referring to a recycled slot cannot act on the
-// fiber that replaced it. 24 bits of slot (16M concurrent fibers) + 38 bits of
-// generation, fitting the 62-bit SmallInteger budget with room to spare.
-#define ID_SLOT_BITS 24
-#define ID_SLOT_MASK ((((size_t) 1) << ID_SLOT_BITS) - 1)
-#define idSlot(id)   ((id) & ID_SLOT_MASK)
-
-// ---- shared per-heap scheduler state (was PER_ISOLATE TLS) -----------------
-// One instance per heap, reachable as heap->sched, allocated by schedulerInit.
-// Migrating this out of TLS is what lets M worker OS threads share ONE fiber
-// registry, timer heap and epoll instance over one heap. (Isolates keep
-// independent schedulers because they have independent heaps.)
-struct Scheduler {
-	// Per-worker ready queues (intrusive FIFO through Fiber.queueNext). Fibers are
-	// PINNED to a home worker (Fiber.homeWorker): a fiber only ever runs on, and is
-	// re-queued to, its home worker's queue — it NEVER migrates OS threads. This
-	// deliberately trades dynamic load-balancing (a deferred perf item: work-stealing)
-	// for eliminating a fiber-migration corruption bug and keeping each fiber's C
-	// stack + roots on a single OS thread its whole life. Real parallelism is kept:
-	// distinct fibers run on distinct workers (round-robin home assignment at spawn).
-	// Both arrays are workerCount long, allocated by schedulerInit.
-	Fiber **readyHead;
-	Fiber **readyTail;
-	int nextHome; // round-robin cursor for assigning a new fiber's home worker
-	// timer min-heap: fibers sleeping until a deadline
-	Timer *timers;
-	size_t timerCount;
-	size_t timerCap;
-	// I/O readiness multiplexer + poller wakeup (see vm/os/Os.h)
-	OsEventLoop *events;
-	size_t armedWaiters; // fibers currently parked on an fd
-	// registry: a slot array with a free-list for reuse
-	Fiber **fibers;
-	size_t *slotGeneration; // per-slot generation, bumped on free
-	size_t fiberSlots;
-	size_t fiberCap;
-	size_t *freeIds;
-	size_t freeCount;
-	size_t freeCap;
-	// GC dirty-fiber list head (fibers that may hold a young root directly)
-	Fiber *dirtyHead;
-	// --- worker pool coordination (all under `lock`) ---
-	size_t runningCount;   // fibers currently RUNNING or mid-commit on some worker
-	int idleWorkers;       // workers parked on `work` waiting for something to run
-	int pollerActive;      // 1 while some worker owns epoll_wait (exactly one at a time)
-	int shutdown;          // set when all work drained; tells every worker to exit
-	int workerCount;       // OS-thread workers running the run loop (ST_SCHED_WORKERS)
-	size_t workerStackSize; // per-fiber stack reservation for schedulerSpawnBlock
-	size_t initialCommit;   // initial committed stack window (for helper fiberInitStackGrowth)
-	SmalltalkHandles handles; // well-known-symbol snapshot replicated into helper workers
-	OsCond work;           // signalled when a fiber becomes ready / on shutdown
-	// Guards ALL of the above so M worker OS threads can share this one scheduler.
-	// A LEAF lock: no code path allocates or hits a GC safepoint while holding it, so
-	// it never nests under heap->gcLock and cannot deadlock the STW handshake. Never
-	// held across a fiber context switch (the park handoff releases it before the
-	// switch and re-takes it in the run loop's commit).
-	OsMutex lock;
-};
-
-// The current heap's shared scheduler. Only reached from scheduler code, which runs
-// after schedulerInit allocated heap->sched. The `g*` names below stay so the rest
-// of this file reads unchanged; each now resolves to a field of heap->sched.
-static inline struct Scheduler *curSched(void) { return CurrentThread.heap->sched; }
-
-// This worker's index (0 = the schedulerRun thread, 1..N-1 = helpers). Selects which
-// per-worker ready queue this thread pops from. A fiber's home worker selects which
-// queue it is pushed to (Fiber.homeWorker). Both indices are < sched->workerCount.
-static PER_ISOLATE int gWorkerIndex = 0;
-#define gTimers         (curSched()->timers)
-#define gTimerCount     (curSched()->timerCount)
-#define gTimerCap       (curSched()->timerCap)
-#define gEvents         (curSched()->events)
-#define gArmedWaiters   (curSched()->armedWaiters)
-#define gFibers         (curSched()->fibers)
-#define gSlotGeneration (curSched()->slotGeneration)
-#define gFiberSlots     (curSched()->fiberSlots)
-#define gFiberCap       (curSched()->fiberCap)
-#define gFreeIds        (curSched()->freeIds)
-#define gFreeCount      (curSched()->freeCount)
-#define gFreeCap        (curSched()->freeCap)
-#define gDirtyHead      (curSched()->dirtyHead)
-
-static inline void schedLock(void)   { osMutexLock(&curSched()->lock); }
-static inline void schedUnlock(void) { osMutexUnlock(&curSched()->lock); }
-
-// Make a fiber runnable; caller holds sched->lock. Forward-declared because the timer
-// sweep (defined earlier) resumes through it.
-static void schedulerResumeLocked(size_t id);
-static void signalWork(void); // wake one idle worker; caller holds sched->lock
-
-#define MAIN_STACK_SIZE   (8 * 1024 * 1024)
-#define WORKER_STACK_SIZE (512 * 1024)
-
-// Per-worker-fiber stack RESERVATION (PROT_NONE address space, tunable via
-// ST_FIBER_STACK_KB, default 1 MB). Only a small window (ST_FIBER_COMMIT_KB,
-// default 64 KB — see fiberInitStackGrowth) is committed RW; the SIGSEGV handler
-// grows it downward on demand up to this reservation, then aborts at the floor.
-static PER_ISOLATE size_t gWorkerStackSize = 1024 * 1024;
-
-
-// ---- GC dirty-fiber list --------------------------------------------------
-// Fibers that may hold a young pointer directly on their roots. The scavenger
-// walks ONLY these (a fiber whose direct roots are all old is covered by the
-// remembered set and skipped). A fiber becomes dirty when registered or run, and
-// is cleaned by the scavenger once its walk finds no young direct root. Doubly
-// linked so the scavenger can unlink a cleaned fiber in O(1). (gDirtyHead now lives
-// in the shared per-heap struct Scheduler, above.)
-
-static void schedulerMarkFiberDirty(Fiber *fiber)
-{
-	if (fiber->dirty) {
-		return;
+	if (gScheduler.count == gScheduler.capacity) {
+		size_t capacity = gScheduler.capacity == 0 ? 8 : gScheduler.capacity * 2;
+		Fiber **grown = realloc(gScheduler.all, capacity * sizeof *grown);
+		// Out of memory here is not recoverable in a useful way: the fiber
+		// exists and its stack is reserved, and losing it from the registry
+		// would lose it from the COLLECTOR, which is silent corruption rather
+		// than a failed spawn.
+		ASSERT(grown != NULL);
+		gScheduler.all = grown;
+		gScheduler.capacity = capacity;
 	}
-	fiber->dirty = 1;
-	fiber->dirtyPrev = NULL;
-	fiber->dirtyNext = gDirtyHead;
-	if (gDirtyHead != NULL) {
-		gDirtyHead->dirtyPrev = fiber;
-	}
-	gDirtyHead = fiber;
-}
-
-void schedulerMarkFiberClean(Fiber *fiber)
-{
-	if (!fiber->dirty) {
-		return;
-	}
-	fiber->dirty = 0;
-	if (fiber->dirtyPrev != NULL) {
-		fiber->dirtyPrev->dirtyNext = fiber->dirtyNext;
-	} else {
-		gDirtyHead = fiber->dirtyNext;
-	}
-	if (fiber->dirtyNext != NULL) {
-		fiber->dirtyNext->dirtyPrev = fiber->dirtyPrev;
-	}
-	fiber->dirtyNext = fiber->dirtyPrev = NULL;
-}
-
-Fiber *schedulerDirtyHead(void)
-{
-	return gDirtyHead;
-}
-
-Fiber *schedulerCurrentFiber(void)
-{
-	return gCurrent;
+	gScheduler.all[gScheduler.count++] = fiber;
 }
 
 
-// ---- registry -------------------------------------------------------------
-
-static size_t registerFiber(Fiber *fiber)
+// There is no registryRemove. A fiber leaves the registry in exactly one place,
+// reapFinished below, which is walking the array anyway and so drops it by INDEX
+// instead of searching for it. A second way out is what a terminate that
+// reclaimed the victim's stack directly would have needed, and terminating is
+// now an unwind the victim performs on itself (schedulerTerminate).
+static Fiber *fiberWithId(size_t id)
 {
-	size_t slot;
-	if (gFreeCount > 0) {
-		slot = gFreeIds[--gFreeCount];
-	} else {
-		if (gFiberSlots == gFiberCap) {
-			gFiberCap = gFiberCap ? gFiberCap * 2 : 16;
-			gFibers = realloc(gFibers, gFiberCap * sizeof(Fiber *));
-			gSlotGeneration = realloc(gSlotGeneration, gFiberCap * sizeof(size_t));
+	for (size_t i = 0; i < gScheduler.count; i++) {
+		if (gScheduler.all[i]->id == id) {
+			return gScheduler.all[i];
 		}
-		slot = gFiberSlots++;
-		gSlotGeneration[slot] = 0;
 	}
-	gFibers[slot] = fiber;
-	fiber->id = (gSlotGeneration[slot] << ID_SLOT_BITS) | slot;
-	// Pin to a home worker, round-robin, so fibers spread across all workers for real
-	// parallelism while each stays on ONE OS thread for life (no migration). Under
-	// sched->lock (registerFiber's caller holds it), so nextHome needs no atomic.
-	struct Scheduler *s = curSched();
-	fiber->homeWorker = s->nextHome;
-	s->nextHome = (s->nextHome + 1) % s->workerCount;
-	// Dirty from birth — before initFiberContext (which allocates and can
-	// scavenge) could otherwise skip this fiber and drop its young entryBlock.
-	schedulerMarkFiberDirty(fiber);
-	return fiber->id;
+	return NULL;
 }
 
 
-static void unregisterFiber(Fiber *fiber)
-{
-	schedulerMarkFiberClean(fiber); // unlink before the struct is freed
-	size_t slot = idSlot(fiber->id);
-	gFibers[slot] = NULL;
-	gSlotGeneration[slot]++;
-	if (gFreeCount == gFreeCap) {
-		gFreeCap = gFreeCap ? gFreeCap * 2 : 16;
-		gFreeIds = realloc(gFreeIds, gFreeCap * sizeof(size_t));
-	}
-	gFreeIds[gFreeCount++] = slot;
-}
-
-
-// Resolve a Smalltalk-visible id back to its fiber, honouring the generation
-// tag: returns NULL if the slot was recycled for a different fiber.
-static Fiber *fiberFromId(size_t id)
-{
-	size_t slot = idSlot(id);
-	if (slot >= gFiberSlots) {
-		return NULL;
-	}
-	Fiber *fiber = gFibers[slot];
-	return (fiber != NULL && fiber->id == id) ? fiber : NULL;
-}
-
-
-// ---- ready queue ----------------------------------------------------------
+// ---------------------------------------------------------------------------
+// The ready queue
+// ---------------------------------------------------------------------------
+//
+// FIFO, which is the whole fairness policy. Round-robin is what `yield` means
+// to the code written against it: a fiber that yields goes to the BACK, so a
+// tight `[...] whileTrue: [Processor yield]` cannot starve its peers.
 
 static void readyPush(Fiber *fiber)
 {
-	// Enqueue on the fiber's HOME worker's queue (pinning): it will only ever be popped
-	// and run by that one worker, never migrating OS threads.
-	int w = fiber->homeWorker;
-	struct Scheduler *s = curSched();
 	fiber->queueNext = NULL;
-	if (s->readyTail[w] == NULL) {
-		s->readyHead[w] = s->readyTail[w] = fiber;
+	if (gScheduler.readyTail == NULL) {
+		gScheduler.readyHead = fiber;
 	} else {
-		s->readyTail[w]->queueNext = fiber;
-		s->readyTail[w] = fiber;
+		gScheduler.readyTail->queueNext = fiber;
 	}
+	gScheduler.readyTail = fiber;
 }
 
 
-// Pop the next ready fiber from THIS worker's own queue (gWorkerIndex).
 static Fiber *readyPop(void)
 {
-	struct Scheduler *s = curSched();
-	int w = gWorkerIndex;
-	Fiber *fiber = s->readyHead[w];
-	if (fiber != NULL) {
-		s->readyHead[w] = fiber->queueNext;
-		if (s->readyHead[w] == NULL) {
-			s->readyTail[w] = NULL;
-		}
-		fiber->queueNext = NULL;
+	Fiber *fiber = gScheduler.readyHead;
+	if (fiber == NULL) {
+		return NULL;
 	}
+	gScheduler.readyHead = fiber->queueNext;
+	if (gScheduler.readyHead == NULL) {
+		gScheduler.readyTail = NULL;
+	}
+	fiber->queueNext = NULL;
 	return fiber;
 }
 
 
-static void readyRemove(Fiber *fiber)
+// ---------------------------------------------------------------------------
+// Sleeping
+// ---------------------------------------------------------------------------
+//
+// A sleeper is SUSPENDED with a deadline, not a separate state: it is off the
+// ready queue exactly like any other suspended fiber, and what distinguishes it
+// is a wake time nothing else reads. Adding a FIBER_SLEEPING state would have
+// every switch site learn about it for no gain.
+//
+// The deadline lives HERE and not in the Fiber, because it is scheduling policy
+// and Fiber.h is the machine layer.
+
+typedef struct {
+	Fiber *fiber;
+	int64_t wakeAtNanos;
+} Sleeper;
+
+static Sleeper *gSleepers;
+static size_t gSleeperCount;
+static size_t gSleeperCapacity;
+
+
+static void sleepersAdd(Fiber *fiber, int64_t wakeAtNanos)
 {
-	struct Scheduler *s = curSched();
-	int w = fiber->homeWorker;
-	Fiber *prev = NULL;
-	Fiber *node = s->readyHead[w];
-	while (node != NULL) {
-		if (node == fiber) {
-			if (prev == NULL) {
-				s->readyHead[w] = node->queueNext;
-			} else {
-				prev->queueNext = node->queueNext;
-			}
-			if (s->readyTail[w] == node) {
-				s->readyTail[w] = prev;
-			}
-			node->queueNext = NULL;
+	if (gSleeperCount == gSleeperCapacity) {
+		size_t capacity = gSleeperCapacity == 0 ? 8 : gSleeperCapacity * 2;
+		Sleeper *grown = realloc(gSleepers, capacity * sizeof *grown);
+		ASSERT(grown != NULL);
+		gSleepers = grown;
+		gSleeperCapacity = capacity;
+	}
+	gSleepers[gSleeperCount].fiber = fiber;
+	gSleepers[gSleeperCount].wakeAtNanos = wakeAtNanos;
+	gSleeperCount++;
+}
+
+
+static void sleepersDrop(Fiber *fiber)
+{
+	for (size_t i = 0; i < gSleeperCount; i++) {
+		if (gSleepers[i].fiber == fiber) {
+			gSleepers[i] = gSleepers[--gSleeperCount];
 			return;
 		}
-		prev = node;
-		node = node->queueNext;
 	}
 }
 
 
-// ---- timer heap -----------------------------------------------------------
-
-static void timerPush(int64_t deadline, size_t fiberId)
+// Move every sleeper whose deadline has passed back to the ready queue.
+// Answers the earliest remaining deadline, or 0 when nobody is sleeping.
+static int64_t sleepersWake(void)
 {
-	if (gTimerCount == gTimerCap) {
-		gTimerCap = gTimerCap ? gTimerCap * 2 : 16;
-		gTimers = realloc(gTimers, gTimerCap * sizeof(Timer));
-	}
-	size_t i = gTimerCount++;
-	gTimers[i].deadline = deadline;
-	gTimers[i].fiberId = fiberId;
-	while (i > 0) {
-		size_t parent = (i - 1) / 2;
-		if (gTimers[parent].deadline <= gTimers[i].deadline) {
-			break;
+	int64_t now = osMonotonicNanos();
+	int64_t earliest = 0;
+	for (size_t i = 0; i < gSleeperCount;) {
+		if (gSleepers[i].wakeAtNanos <= now) {
+			Fiber *fiber = gSleepers[i].fiber;
+			gSleepers[i] = gSleepers[--gSleeperCount];
+			if (fiber->state == FIBER_SUSPENDED) {
+				fiber->state = FIBER_READY;
+				readyPush(fiber);
+			}
+			continue; // the slot now holds a different sleeper
 		}
-		Timer tmp = gTimers[parent];
-		gTimers[parent] = gTimers[i];
-		gTimers[i] = tmp;
-		i = parent;
-	}
-}
-
-
-static void timerPop(void)
-{
-	gTimers[0] = gTimers[--gTimerCount];
-	size_t i = 0;
-	for (;;) {
-		size_t left = 2 * i + 1;
-		size_t right = 2 * i + 2;
-		size_t smallest = i;
-		if (left < gTimerCount && gTimers[left].deadline < gTimers[smallest].deadline) {
-			smallest = left;
+		if (earliest == 0 || gSleepers[i].wakeAtNanos < earliest) {
+			earliest = gSleepers[i].wakeAtNanos;
 		}
-		if (right < gTimerCount && gTimers[right].deadline < gTimers[smallest].deadline) {
-			smallest = right;
-		}
-		if (smallest == i) {
-			break;
-		}
-		Timer tmp = gTimers[smallest];
-		gTimers[smallest] = gTimers[i];
-		gTimers[i] = tmp;
-		i = smallest;
+		i++;
 	}
+	return earliest;
 }
 
 
-// Wake every fiber whose deadline has passed; returns how many were woken. Caller
-// holds sched->lock (called from waitForEvents), so it resumes via the locked leaf.
-static size_t wakeExpiredTimers(void)
+// ---------------------------------------------------------------------------
+// Waiting on a file descriptor
+// ---------------------------------------------------------------------------
+//
+// A SLEEPER WITH AN EVENT INSTEAD OF A DEADLINE, and it reuses the same machine:
+// an fd waiter is SUSPENDED, off the ready queue like any other, and what wakes
+// it is the poller below rather than a clock.
+//
+// WHY THIS IS HERE AT ALL. os/Os.h states the split: the OS layer never blocks
+// on readiness and never calls the scheduler, it answers OS_IO_WOULD_BLOCK, and
+// the caller parks and retries. A fiber that instead blocked in `read` would
+// stop every other fiber on this thread, because they all share it -- so this
+// function is the difference between a VM that can serve two connections and one
+// that cannot.
+//
+// THE COUNT, and not just the loop: `pumpEvents` has to know whether blocking
+// forever is legitimate. With waiters armed it is (something can still arrive);
+// with none it would be a hang, and the suspend loop below is what has to tell
+// the two apart.
+
+static OsEventLoop *gEvents;
+static size_t gArmedWaiters;
+
+
+// The loop, created on first use. A VM that never opens a socket never makes
+// an epoll set.
+static OsEventLoop *eventLoop(void)
 {
-	int64_t now = osCurrentMicroTime();
-	size_t woken = 0;
-	while (gTimerCount > 0 && gTimers[0].deadline <= now) {
-		size_t id = gTimers[0].fiberId;
-		timerPop();
-		schedulerResumeLocked(id); // no-op if the fiber was terminated meanwhile
-		woken++;
+	if (gEvents == NULL) {
+		gEvents = osEventLoopCreate();
 	}
-	return woken;
+	return gEvents;
 }
 
 
-// ---- root save / restore --------------------------------------------------
-
-static void saveRoots(Fiber *fiber)
+// Wake whatever became ready. `timeoutMs` is -1 to block, 0 to poll.
+//
+// ANSWERS WHETHER THE RUNNING FIBER'S OWN DESCRIPTOR FIRED, and that return
+// value is not a convenience -- without it this deadlocks. A fiber that arms an
+// fd and then finds NOTHING ELSE READY never parks: parkAndSwitch answers 0
+// before touching its state, so it stays RUNNING and pumps from here. Its own
+// event then arrives, and resuming a RUNNING fiber is a no-op that answers
+// false -- so the event would be consumed, dropped, and the next call would
+// block forever on readiness that already happened. Measured as exactly that:
+// a client and a server fiber on one thread, both parked, neither woken.
+static _Bool pumpEvents(int timeoutMs)
 {
-	fiber->roots.stackFramesTail = CurrentThread.stackFramesTail;
-	fiber->roots.handleScopes = CurrentThread.handleScopes;
-	fiber->roots.context = CurrentThread.context;
-	fiber->roots.exceptionHandler = CurrentExceptionHandler;
-	fiber->roots.unwindHandler = CurrentThread.unwindHandler;
-}
-
-
-static void loadRoots(Fiber *fiber)
-{
-	CurrentThread.stackFramesTail = fiber->roots.stackFramesTail;
-	CurrentThread.handleScopes = fiber->roots.handleScopes;
-	CurrentThread.context = fiber->roots.context;
-	CurrentExceptionHandler = fiber->roots.exceptionHandler;
-	CurrentThread.unwindHandler = fiber->roots.unwindHandler;
-	// No context->thread rebind needed: JIT-generated code reaches per-mutator state
-	// (TLAB, remembered set, stackFramesTail, the dummy context, on:do: chain) via the
-	// running worker's TLS (%fs, see asmLoadTls), so a fiber that migrates OS threads
-	// automatically uses whichever worker is executing it now.
-}
-
-
-// Give each fiber its own root MethodContext so the entry trampoline and the
-// lazy context-reification machinery have somewhere to hang off.
-static void initFiberContext(Fiber *fiber)
-{
-	RawContext *context = (RawContext *) allocateObject(
-		CurrentThread.heap, Handles.MethodContext->raw, 0);
-	context->thread = &CurrentThread;
-	fiber->roots.stackFramesTail = NULL;
-	fiber->roots.handleScopes = NULL;
-	fiber->roots.context = tagPtr(context);
-	fiber->roots.exceptionHandler = 0;
-	fiber->roots.unwindHandler = 0;
-}
-
-
-// ---- context switching ----------------------------------------------------
-
-// From within a fiber: save its live roots and return control to the scheduler.
-static void yieldToScheduler(void)
-{
-	Fiber *self = gCurrent;
-	saveRoots(self);
-	TSAN_SWITCH_TO_FIBER(gScheduler.tsanFiber); // tell TSan we're back on the scheduler stack
-	fiberSwitchAsm(&self->sp, gScheduler.sp);
-	// Resumed later: the scheduler has already reloaded our roots and set
-	// gCurrent back to us before switching in.
-}
-
-
-// From the scheduler: make `fiber` current and run it until it yields back.
-static void runFiber(Fiber *fiber)
-{
-	gCurrent = fiber;
-	fiber->state = FIBER_RUNNING;
-	loadRoots(fiber);
-	TSAN_SWITCH_TO_FIBER(fiber->tsanFiber); // tell TSan we're switching onto this fiber's stack
-	fiberSwitchAsm(&gScheduler.sp, fiber->sp);
-	gCurrent = NULL;
-}
-
-
-// ---- fiber body -----------------------------------------------------------
-
-static void runBlock(Fiber *fiber)
-{
-	HandleScope scope;
-	openHandleScope(&scope);
-
-	// GC-safe: hold the block in a scope handle (which the GC updates), NOT a raw Value in
-	// EntryArgs. sendMessage allocates (entry frame / context, and any scavenge triggered by
-	// a peer at a safepoint) before consuming args[0]; a raw copy would go stale when the
-	// block moves, sending #value to a moved/reclaimed object. Under many workers a peer
-	// scavenge lands in that window on essentially every fiber, so this must be a handle.
-	Object *block = scopeHandle(asObject(fiber->entryBlock));
-	String *valueSelector = getSymbol("value");
-	EntryArgs args = { .size = 0 };
-	entryArgsAddObject(&args, block);
-	sendMessage(valueSelector, &args);
-
-	closeHandleScope(&scope, NULL);
-}
-
-
-void schedulerFiberMain(void)
-{
-	Fiber *self = gCurrent;
-	if (self->cEntry != NULL) {
-		self->cEntry(self->cArg);
-	} else {
-		runBlock(self);
-	}
-
-	self->state = FIBER_DONE;
-	// Return to the scheduler for good; it will destroy us. Never comes back.
-	TSAN_SWITCH_TO_FIBER(gScheduler.tsanFiber);
-	fiberSwitchAsm(&self->sp, gScheduler.sp);
-	abort();
-}
-
-
-// ---- public API -----------------------------------------------------------
-
-// ---- growable-stack SIGSEGV handler --------------------------------------
-// A downward stack overflow into a fiber's reserved-but-uncommitted window
-// faults; this handler (running on a per-thread sigaltstack, since the fault
-// happens with RSP at the guard) grows the committed window and retries. A fault
-// outside the current fiber's window / below the floor is a genuine bug → restore
-// the default handler and re-raise for a core dump at the real PC.
-
-// Growth callback for the OS-installed SIGSEGV handler: async-signal-safe
-// (an initial-exec TLS load + mprotect inside fiberGrowStack). Returns 1 when
-// the fault was a guard fault on the current fiber's reserved window and the
-// committed span grew — the faulting instruction is then retried.
-static _Bool fiberSegvGrowCallback(uintptr_t faultAddr)
-{
-	Fiber *fiber = gCurrent;
-	if (fiber == NULL) {
+	if (gEvents == NULL || gArmedWaiters == 0) {
 		return 0;
 	}
-	// qemu-user (the ppc64 bring-up vehicle) delivers si_addr = NULL for
-	// guard faults, so the fault cannot be attributed to an address. Fall
-	// back to growing the RUNNING fiber's window one chunk — by far the
-	// likeliest fault source. A non-stack fault then re-faults after each
-	// growth until the reserve floor is hit and the fatal path still fires
-	// (bounded). Real kernels always fill si_addr and never take this branch.
-	if (faultAddr == 0) {
-		uintptr_t clow = (uintptr_t) fiber->committedLow;
-		uintptr_t floor = (uintptr_t) fiber->reserveFloor;
-		if (clow <= floor) {
-			return 0; // fully grown already: a genuine wild access
+	uint64_t tags[64];
+	int count = osEventLoopWait(gEvents, tags, (int) (sizeof tags / sizeof tags[0]),
+		timeoutMs);
+	Fiber *self = fiberCurrent();
+	_Bool selfReady = 0;
+	for (int i = 0; i < count; i++) {
+		if (gArmedWaiters > 0) {
+			gArmedWaiters--;
 		}
-		return fiberGrowStack(fiber, clow - 1);
-	}
-	return fiberGrowStack(fiber, faultAddr);
-}
-
-
-
-
-void schedulerInit(void)
-{
-	Heap *heap = CurrentThread.heap;
-
-	// Fiber stack sizing (per-thread caches; env read once, values idempotent).
-	char *stackEnv = getenv("ST_FIBER_STACK_KB"); // reservation ceiling
-	if (stackEnv != NULL) {
-		long kb = atol(stackEnv);
-		if (kb >= 64) {
-			gWorkerStackSize = (size_t) kb * 1024;
+		if (self != NULL && (size_t) tags[i] == self->id) {
+			selfReady = 1;
+			continue;
 		}
+		// The tag IS the fiber id, which is why a stale one is harmless: a fiber
+		// that died while armed simply is not there any more, and resume answers
+		// false. An ADDRESS would have found a stranger in the same place, which
+		// is the same argument the home token rests on.
+		schedulerResume((size_t) tags[i]);
 	}
-	size_t commit = 64 * 1024;
-	char *commitEnv = getenv("ST_FIBER_COMMIT_KB");
-	if (commitEnv != NULL) {
-		long kb = atol(commitEnv);
-		if (kb >= 16) {
-			commit = (size_t) kb * 1024;
-		}
-	}
-
-	if (heap->sched == NULL) {
-		// First scheduler activation on this heap: allocate the SHARED state (ready
-		// queue, registry, timers, epoll, pool coordination). Later workers of the
-		// same heap reuse it.
-		struct Scheduler *sched = calloc(1, sizeof(struct Scheduler));
-		sched->events = osEventLoopCreate();
-		osMutexInit(&sched->lock);
-		osCondInit(&sched->work);
-		// Worker-pool size: N OS threads share this scheduler, each running fibers pinned
-		// to it. DEFAULT = one worker per available core (respects taskset/cgroup
-		// affinity). The whole gate is green at N workers: shared-heap GC via STW
-		// safepoints incl. the strengthened stack-root scan, per-heap sync monitor +
-		// symbol lock, become: under STW, thread-safe actors, no fiber migration, the
-		// per-worker TLS lookup cache (a baked &LookupCache immediate in shared send
-		// code tore under the owner's concurrent rewrites -> wrong-method dispatch),
-		// and the remembered-set barrier on old-space-born objects. `ST_SCHED_WORKERS`
-		// overrides: a fixed count N>=1 (1 = the old cooperative single thread), or 0
-		// for one-per-core explicitly.
-		sched->workerCount = osAvailableCoreCount();
-		char *workersEnv = getenv("ST_SCHED_WORKERS");
-		if (workersEnv != NULL) {
-			long n = atol(workersEnv);
-			if (n == 0) {
-				sched->workerCount = osAvailableCoreCount();
-			} else if (n >= 1 && n <= 1024) {
-				sched->workerCount = (int) n;
-			}
-		}
-		// Per-worker ready queues, sized exactly to the worker count (fibers are pinned
-		// to a home worker; see struct Scheduler). Zeroed = all queues empty.
-		sched->readyHead = calloc((size_t) sched->workerCount, sizeof(Fiber *));
-		sched->readyTail = calloc((size_t) sched->workerCount, sizeof(Fiber *));
-		sched->nextHome = 0;
-		sched->workerStackSize = gWorkerStackSize;
-		sched->initialCommit = commit;
-		sched->handles = Handles; // snapshot of well-known symbols for helper workers
-		heap->sched = sched;
-	}
-
-	// Per-OS-thread (TLS) setup — runs for every worker that joins this scheduler.
-	gScheduler.stackBase = NULL;
-	gScheduler.sp = NULL;
-	gScheduler.tsanFiber = TSAN_CURRENT_FIBER(); // this worker's native-stack fiber (for TSan)
-	gCurrent = NULL;
-	// Writing to a peer that has closed its end must return EPIPE, not kill us.
-	osIgnoreBrokenPipe();
-	gActive = 1;
-
-	// Publish the SHARED fiber registry + this worker's current-fiber/handler slots
-	// so a GC collector on ANOTHER OS thread can reach this mutator's live roots (the
-	// Fiber structs are heap-allocated; schedCurrent points at THIS worker's TLS).
-	CurrentThread.schedFibers = &gFibers;
-	CurrentThread.schedFiberSlots = &gFiberSlots;
-	CurrentThread.schedCurrent = &gCurrent;
-	CurrentThread.schedExceptionHandler = &CurrentExceptionHandler; // this thread's own TLS slot
-	CurrentThread.schedUnwindHandler = &CurrentThread.unwindHandler;
-
-	fiberInitStackGrowth(commit); // caches page size + initial commit for fiberCreate
-
-	osInstallSegvHandler(fiberSegvGrowCallback); // per-thread altstack + once-global handler
+	return selfReady;
 }
 
 
-Fiber *schedulerSpawnC(FiberCEntry entry, void *arg, size_t stackSize)
+_Bool schedulerWaitFd(OsFd fd, _Bool forWrite)
 {
-	Fiber *fiber = fiberCreate(stackSize ? stackSize : MAIN_STACK_SIZE);
-	fiber->cEntry = entry;
-	fiber->cArg = arg;
-	fiber->entryBlock = 0;
-	initFiberContext(fiber); // allocates (no lock held); no scavenge window drops a root
-	schedLock();
-	registerFiber(fiber);
-	fiber->state = FIBER_READY;
-	readyPush(fiber);
-	signalWork();
-	schedUnlock();
-	return fiber;
-}
-
-
-size_t schedulerSpawnBlock(Value block)
-{
-	HandleScope scope;
-	openHandleScope(&scope);
-	Object *blockHandle = scopeHandle(asObject(block));
-
-	Fiber *fiber = fiberCreate(gWorkerStackSize);
-	fiber->cEntry = NULL;
-	fiber->entryBlock = getTaggedPtr(blockHandle);
-	schedLock();
-	registerFiber(fiber);          // entryBlock is a GC root from here on (fiber is dirty)
-	schedUnlock();
-	initFiberContext(fiber);       // may GC; entryBlock stays live (fiber is registered)
-	fiber->state = FIBER_SUSPENDED; // left off the ready queue; no id published yet, so no racing resume
-
-	size_t id = fiber->id;
-	closeHandleScope(&scope, NULL);
-	return id;
-}
-
-
-// Wake one worker parked on the ready condvar (a fiber just became runnable). Caller
-// holds sched->lock. No-op when single-worker (no one is ever parked on `work`).
-// Kick the sole poller out of epoll_wait by writing to the wake-eventfd. Called when a
-// fiber becomes ready and a poller is active, so a fiber made ready on the POLLER's own
-// per-worker queue is not stranded behind a blocking epoll_wait. Caller holds sched->lock.
-static void wakePoller(struct Scheduler *s)
-{
-	if (s->pollerActive && s->events != NULL) {
-		osEventLoopWake(s->events);
+	schedulerInit();
+	OsEventLoop *loop = eventLoop();
+	Fiber *self = fiberCurrent();
+	if (loop == NULL || self == NULL) {
+		return 0;
 	}
-}
-
-static void signalWork(void)
-{
-	// Broadcast (not signal): fibers are pinned to per-worker queues sharing ONE condvar,
-	// so we must wake the fiber's HOME worker, which a single signal might miss (waking an
-	// idle peer whose own queue is empty → it re-sleeps and the home worker stays parked →
-	// lost wakeup / hang). All woken workers re-check their own queue; non-home ones re-wait.
-	struct Scheduler *s = curSched();
-	osCondBroadcast(&s->work);
-	wakePoller(s); // the target worker might be the one currently blocked in epoll_wait
-}
-
-
-// True iff every per-worker ready queue is empty. Caller holds sched->lock.
-static _Bool allQueuesEmpty(struct Scheduler *s)
-{
-	for (int w = 0; w < s->workerCount; w++) {
-		if (s->readyHead[w] != NULL) {
-			return 0;
-		}
-	}
+	// ARM BEFORE PARKING, in that order and with nothing in between. Nothing
+	// else runs on this thread until the park switches away, so the readiness
+	// that arrives between the two cannot be missed: the poller only runs from
+	// the suspend loop, which is downstream of the switch. That is the same
+	// lost-wakeup window parkOnMonitor closes, closed the same way -- by there
+	// being no switch point in the middle.
+	osEventLoopArm(loop, fd, forWrite, (uint64_t) self->id);
+	gArmedWaiters++;
+	schedulerSuspendCurrent();
 	return 1;
 }
 
 
-// Make a fiber runnable. Caller holds sched->lock. This is the leaf used by the event
-// loop, by timers, and by the public schedulerResume.
-static void schedulerResumeLocked(size_t id)
+void schedulerForgetFd(OsFd fd)
 {
-	Fiber *fiber = fiberFromId(id);
-	if (fiber == NULL) {
+	if (gEvents == NULL) {
 		return;
 	}
-	if (fiber->state == FIBER_SUSPENDED) {
-		// Fully parked (its stack is off any worker): make it runnable now.
-		fiber->state = FIBER_READY;
-		readyPush(fiber);
-		signalWork();
-	} else if (fiber->state == FIBER_PARKING) {
-		// It chose to suspend but has not finished switching off its worker's stack.
-		// Record the wake; the run loop's commit will re-queue it instead of parking,
-		// so this resume is never lost (and we never make it runnable mid-switch).
-		fiber->parkPending = 1;
+	osEventLoopDisarm(gEvents, fd);
+	if (gArmedWaiters > 0) {
+		gArmedWaiters--;
 	}
-	// READY / RUNNING / DONE: no-op (matches the old SUSPENDED-only guard).
 }
 
 
-void schedulerResume(size_t id)
-{
-	schedLock();
-	schedulerResumeLocked(id);
-	schedUnlock();
-}
-
-
-// Record the current fiber's park intent and switch off to this worker's scheduler
-// stack. Caller holds sched->lock; parkSelf RELEASES it before the switch (never hold
-// the scheduler lock across a context switch). The fiber does NOT re-queue itself: the
-// run loop re-queues/parks it AFTER the switch completes, so no other worker can pop
-// and run this same stack while it is still switching (no "same stack on two threads").
-static void parkSelf(ParkIntent intent)
-{
-	Fiber *self = gCurrent;
-	self->parkIntent = intent;
-	self->parkPending = 0;
-	self->state = FIBER_PARKING;
-	schedUnlock();
-	yieldToScheduler(); // committed by the run loop after the switch
-}
-
-
-void schedulerYield(void)
-{
-	if (gCurrent == NULL) {
-		return;
-	}
-	schedLock();
-	parkSelf(PARK_YIELD); // releases the lock, switches; committed to READY by the run loop
-}
-
-
-void schedulerSuspend(void)
-{
-	if (gCurrent == NULL) {
-		return;
-	}
-	schedLock();
-	parkSelf(PARK_SUSPEND); // committed to SUSPENDED (or re-queued if a resume raced)
-}
-
-
-// Park the current fiber like schedulerSuspend, but atomically release the sync monitor
-// STRIPE the fiber holds as part of the park — this closes the lost-wakeup window for the
-// Smalltalk sync primitives. The caller MUST hold monitorLocks[stripe] (heapMonitorEnterStripe).
+// ---------------------------------------------------------------------------
+// Thread state, which belongs to the FIBER and not to the OS thread
+// ---------------------------------------------------------------------------
 //
-// Ordering & why no wakeup is lost: the caller holds `stripe`; we take `sched->lock`
-// (always monitor→lock, never the reverse), publish FIBER_PARKING, THEN drop the
-// stripe, THEN drop sched->lock and switch. A signaller must hold the SAME stripe to
-// touch the waiter queue and call resumeId:, so it cannot run its resume until we have
-// already published PARKING; schedulerResumeLocked then records parkPending and the run
-// loop re-queues us instead of leaving us parked forever. Mirrors schedulerSleep's
-// "register-the-wait and transition-to-PARKING under one lock hold" invariant. The stripe
-// is passed in (computed once at monitorEnterOn:), never recomputed here.
-void schedulerParkAndUnlockMonitorStripe(size_t stripe)
-{
-	if (gCurrent == NULL) {
-		// No scheduler yet (bootstrap / main thread before schedulerRun): there is no
-		// peer to hand off to, so just drop the stripe — matches schedulerSuspend's
-		// gCurrent==NULL early-out (the "wait" becomes a no-op).
-		heapMonitorExitStripe(CurrentThread.heap, stripe);
-		return;
-	}
-	Fiber *self = gCurrent;
-	schedLock();
-	self->parkIntent = PARK_SUSPEND;
-	self->parkPending = 0;
-	self->state = FIBER_PARKING;
-	heapMonitorExitStripe(CurrentThread.heap, stripe); // release stripe AFTER PARKING is published, still under sched->lock
-	schedUnlock();
-	yieldToScheduler(); // committed to SUSPENDED (or re-queued if a resume raced)
-}
+// Handle scopes, the native frame chain and the two handler chains are all
+// per-ACTIVATION, and a fiber is a stack of activations. Leaving them in the
+// Thread across a switch would hand the next fiber the previous one's handle
+// scopes and its on:do: chain, so an exception raised in one fiber would find a
+// handler installed by another.
 
-// Legacy no-arg park == stripe 0.
-void schedulerParkAndUnlockMonitor(void)
+static void saveThreadStateInto(Fiber *fiber)
 {
-	schedulerParkAndUnlockMonitorStripe(0);
+	fiber->roots.handleScopes = CurrentThread.handleScopes;
+	fiber->roots.stackFramesTail = CurrentThread.stackFramesTail;
+	fiber->roots.context = CurrentThread.context;
+	fiber->roots.exceptionHandler = CurrentThread.exceptionHandler;
+	fiber->roots.unwindHandler = CurrentThread.unwindHandler;
+	fiber->roots.compiledFrames = CurrentThread.compiledFrames;
+	fiber->roots.unwinds = CurrentThread.unwinds;
+	fiber->roots.homeToken = CurrentThread.homeToken;
 }
 
 
-void schedulerSleep(int64_t micros)
+static void restoreThreadStateFrom(Fiber *fiber)
 {
-	Fiber *self = gCurrent;
-	if (self == NULL) {
-		return;
-	}
-	if (micros < 0) {
-		micros = 0;
-	}
-	// Register the timer AND transition to PARKING under one lock hold, so a poller on
-	// another worker cannot fire (and consume) the timer between the push and the park
-	// — it either runs before the push (timer not yet there) or after PARKING is set (a
-	// resume then sets parkPending, never lost).
-	schedLock();
-	timerPush(osCurrentMicroTime() + micros, self->id);
-	parkSelf(PARK_SUSPEND); // releases the lock, switches
+	CurrentThread.handleScopes = fiber->roots.handleScopes;
+	CurrentThread.stackFramesTail = fiber->roots.stackFramesTail;
+	CurrentThread.context = fiber->roots.context;
+	CurrentThread.exceptionHandler = fiber->roots.exceptionHandler;
+	CurrentThread.unwindHandler = fiber->roots.unwindHandler;
+	CurrentThread.compiledFrames = fiber->roots.compiledFrames;
+	CurrentThread.unwinds = fiber->roots.unwinds;
+	CurrentThread.homeToken = fiber->roots.homeToken;
+	// nextHomeToken is NOT restored: it is the process-wide minter, and the
+	// reason is written at FiberRoots in concurrency/Fiber.h.
 }
 
 
-void schedulerWaitFd(OsFd fd, int forWrite)
+// ---------------------------------------------------------------------------
+// Switching
+// ---------------------------------------------------------------------------
+
+// Finish the park of whichever fiber handed us control.
+//
+// It runs HERE, after the switch, and that ordering is the contract in
+// Fiber.h: while a fiber is still executing fiberSwitchAsm it is neither on its
+// own stack nor off it, and putting it on the ready queue in that window would
+// let the next fiber pop it and switch into a half-saved context.
+static void commitPendingPark(void)
 {
-	Fiber *self = gCurrent;
-	if (self == NULL || gEvents == NULL) {
+	Fiber *parked = gScheduler.parking;
+	if (parked == NULL) {
 		return;
 	}
-
-	// Arm readiness AND transition to PARKING under one lock hold (same lost-wakeup
-	// reason as schedulerSleep: an already-ready fd could fire immediately on the poller).
-	schedLock();
-	osEventLoopArm(gEvents, fd, forWrite != 0, self->id);
-	gArmedWaiters++;
-	self->waitFd = fd;  // recorded so schedulerTerminate can disarm a killed waiter
-	parkSelf(PARK_SUSPEND); // resumed by the event loop when the fd is ready
-	self->waitFd = -1;  // woken normally: the event loop already accounted for us
+	gScheduler.parking = NULL;
+	if (parked->state != FIBER_PARKING) {
+		return; // already resolved, e.g. terminated while parking
+	}
+	if (parked->parkIntent == PARK_SUSPEND) {
+		parked->state = FIBER_SUSPENDED;
+	} else {
+		parked->state = FIBER_READY;
+		readyPush(parked);
+	}
+	parked->parkIntent = PARK_NONE;
 }
 
 
-void schedulerTerminate(size_t id)
+// Reclaim fibers that ran to completion. Done from a RUNNING fiber's stack,
+// never from the finished fiber's own: freeing a stack you are standing on is
+// the one thing this cannot do.
+static void reapFinished(void)
 {
-	if (!gActive) {
-		// Before the scheduler is running (e.g. an unhandled exception during
-		// bootstrap) terminating "the process" means exiting the VM. No ensure:
-		// cleanups run on this path (there is no fiber to unwind).
-		exit(1);
-	}
-	if (gCurrent != NULL && gCurrent->id == id) {
-		// Self-terminate: run the pending ensure:/ifCurtailed: cleanups on this
-		// fiber's own (still live) stack before it is torn down. Runs before the
-		// lock: cleanups are arbitrary Smalltalk and may allocate, yield or park.
-		// Cleanups unlink as they run, so a terminate from inside one is bounded.
-		runAllUnwindHandlers();
-	}
-	schedLock();
-	Fiber *fiber = fiberFromId(id);
-	if (fiber == NULL) {
-		schedUnlock();
-		return;
-	}
-
-	if (fiber == gCurrent) {
-		fiber->state = FIBER_DONE;
-		schedUnlock();
-		TSAN_SWITCH_TO_FIBER(gScheduler.tsanFiber);
-		fiberSwitchAsm(&fiber->sp, gScheduler.sp); // never returns; run loop commits DONE
-		abort();
-	}
-
-	if (fiber->state == FIBER_READY) {
-		readyRemove(fiber);
-	} else if (fiber->state == FIBER_SUSPENDED && fiber->waitFd >= 0) {
-		// Killing a fiber parked on an fd: undo its epoll arming and its armed-
-		// waiter accounting, else the run loop keeps blocking on an event that
-		// will never be dispatched to a live fiber (the isolate would hang).
-		osEventLoopDisarm(gEvents, fiber->waitFd);
-		if (gArmedWaiters > 0) {
-			gArmedWaiters--;
+	for (size_t i = 0; i < gScheduler.count;) {
+		Fiber *fiber = gScheduler.all[i];
+		if (fiber->state == FIBER_DONE && fiber != fiberCurrent()) {
+			gScheduler.all[i] = gScheduler.all[--gScheduler.count];
+			fiberDestroy(fiber);
+			continue;
 		}
-		fiber->waitFd = -1;
-	} else if (fiber->state == FIBER_RUNNING || fiber->state == FIBER_PARKING) {
-		// Running or mid-park on ANOTHER worker: we cannot synchronously reclaim its
-		// stack from here. (Unreachable at the default 1 worker, where a non-current
-		// fiber is never RUNNING/PARKING; cross-worker terminate is handled in a later
-		// increment.) Leave it be rather than corrupt a live stack.
-		schedUnlock();
+		i++;
+	}
+}
+
+
+// Switch from the running fiber to `next`, which must be READY or fresh.
+static void switchTo(Fiber *next)
+{
+	Fiber *self = fiberCurrent();
+	next->state = FIBER_RUNNING;
+	next->resumer = self;
+	saveThreadStateInto(self);
+	fiberSwitch(self, next);
+	// Back on our own stack: everything below runs for the fiber that was just
+	// switched INTO, which is us again.
+	restoreThreadStateFrom(self);
+	commitPendingPark();
+	reapFinished();
+}
+
+
+// If this fiber has been condemned by somebody else, die now.
+//
+// POLLED RATHER THAN DONE TO IT, and that is the whole design of terminating a
+// fiber that is not the one running. Its pending `ensure:`/`ifCurtailed:`
+// cleanups belong to activations on ITS stack, and that stack is the only place
+// they can run: a cleanup that does a non-local return, or that registers
+// another cleanup, means something on the victim's chain and something else on
+// the terminator's. So schedulerTerminate MARKS and SCHEDULES, and the fiber
+// leaves through the same unwindToExit a self-terminate takes. One mechanism,
+// not two.
+//
+// Every point where a fiber regains the CPU is either the return of the park
+// below or the start of runSpawnedFiber, so those are the two places this is
+// asked.
+static void terminateIfCondemned(void)
+{
+	Fiber *self = fiberCurrent();
+	if (self != NULL && self->terminating) {
+		unwindToExit(); // never returns
+	}
+}
+
+
+// Park the running fiber with `intent` and give the CPU to someone else.
+// Answers 0 when there was nobody to give it to.
+static _Bool parkAndSwitch(ParkIntent intent)
+{
+	Fiber *self = fiberCurrent();
+	Fiber *next = readyPop();
+	if (next == NULL) {
+		return 0;
+	}
+	self->state = FIBER_PARKING;
+	self->parkIntent = intent;
+	gScheduler.parking = self;
+	switchTo(next);
+	self->state = FIBER_RUNNING;
+	terminateIfCondemned();
+	return 1;
+}
+
+
+// ---------------------------------------------------------------------------
+// The entry trampoline
+// ---------------------------------------------------------------------------
+
+// Evaluate a fiber's block, and BE the place terminating that fiber lands.
+//
+// A FUNCTION OF ITS OWN, and it has to be one. A jump resumes in the frame that
+// took the destination, so the setjmp has to sit in a frame that is still there
+// when the jump happens; and a frame with no locals of its own is a frame with
+// nothing for a longjmp to leave indeterminate, which is the rule the C standard
+// states about setjmp and the one that is easiest to violate by accident.
+//
+// `block` is handed straight to jitSendUnary, which puts it in a handle before
+// anything allocates, so it is never a bare Value across a collection.
+static void runFiberBody(Value block)
+{
+	UnwindRecord bottom;
+	unwindPushExit(&bottom);
+	if (setjmp(bottom.destination) != 0) {
+		// Terminated. The cleanups already ran on the way here; this puts back
+		// the bookkeeping of every frame the jump skipped, exactly as the
+		// non-local return and the exception unwind do at their landing sites.
+		unwindAnswer(&bottom);
 		return;
 	}
-	fiber->state = FIBER_DONE;
-	// Capture the victim's pending ensure:/ifCurtailed: chain before it is
-	// unregistered; the cleanups run below, on THIS fiber, outside the lock.
-	// (A READY fiber that never ran has an empty chain.)
-	Value pendingUnwind = fiber->roots.unwindHandler;
-	fiber->roots.unwindHandler = 0;
-	unregisterFiber(fiber);
-	schedUnlock();
-	if (pendingUnwind != 0) {
-		// The victim never runs again, so its cleanups run on the terminator.
-		// The chain head is handle-protected inside before anything allocates;
-		// no safepoint can intervene between the unlock and that handle.
-		runUnwindHandlerChain(pendingUnwind);
+	if (valueTypeOf(block, VALUE_POINTER)) {
+		jitSendUnary(block, "value", NULL);
 	}
-	fiberDestroy(fiber); // munmap outside the lock; the fiber is already unregistered
+	unwindPop(&bottom);
+}
+
+
+// What a spawned fiber starts on, reached from Fiber.c's own trampoline
+// through cEntry/cArg.
+//
+// It evaluates the block and then has to hand control back WITHOUT returning,
+// because there is nothing to return to: the bottom of this stack was primed by
+// fiberPrimeStack, not called from anywhere.
+static void runSpawnedFiber(void *arg)
+{
+	Fiber *self = arg;
+	// A fresh fiber starts with EMPTY VM state, not with whatever the spawner
+	// happened to be holding. Its handle scopes and frame chain begin here, and
+	// its handler chains are empty, which is what makes an unhandled exception
+	// in a spawned process reach the default action instead of a handler that
+	// belongs to another fiber.
+	restoreThreadStateFrom(self);
+	// AND THE PARK OF WHOEVER GAVE US THE CPU. A fresh fiber does not return
+	// from fiberSwitch -- it starts here -- so the commit that switchTo does on
+	// its return path never runs for this hand-off. Without it the fiber that
+	// yielded to us stays FIBER_PARKING for good: off the ready queue, never
+	// suspended, never scheduled again. Measured as a `fork` round-robin that
+	// dropped the forking fiber after its first turn.
+	commitPendingPark();
+	reapFinished();
+
+	// Condemned before it ever ran, which is legal: `newProcess` answers a
+	// suspended process and terminating one is not required to wait for it to
+	// start. Its chain is empty, so this only skips the block.
+	if (!self->terminating) {
+		runFiberBody(self->entryBlock);
+	}
+
+	// Done, whether the block ran out or the fiber terminated itself: the two
+	// paths join here so a fiber has ONE ending, and everything below is that
+	// ending. Drop the block so a finished fiber stops keeping its closure, and
+	// everything the closure captured, alive until it is reaped.
+	self->entryBlock = tagInt(0);
+	self->state = FIBER_DONE;
+
+	// Hand control on and never come back. There is no park to commit for this
+	// fiber -- it is DONE, not PARKING -- and reaping happens on the next
+	// fiber's stack, which is why this switch is the last thing here.
+	Fiber *next = readyPop();
+	if (next == NULL) {
+		next = gScheduler.main;
+	}
+	next->state = FIBER_RUNNING;
+	saveThreadStateInto(self);
+	fiberSwitch(self, next);
+	// Unreachable: nothing switches into a DONE fiber.
+	ASSERT(0);
+}
+
+
+// ---------------------------------------------------------------------------
+// The public surface
+// ---------------------------------------------------------------------------
+
+void schedulerInit(void)
+{
+	if (gScheduler.started) {
+		return;
+	}
+	gScheduler.started = 1;
+	gScheduler.nextId = 1;
+	// 8 MB reserved per stack with 64 KB committed: the reservation is address
+	// space, not memory, and the window grows on fault (Fiber.h).
+	fiberInitStacks(8u << 20, 64u << 10);
+	fiberInstallGrowthHandler();
+
+	Fiber *main = calloc(1, sizeof *main);
+	ASSERT(main != NULL);
+	fiberAdoptCurrentStack(main);
+	main->id = gScheduler.nextId++;
+	main->state = FIBER_RUNNING;
+	main->entryBlock = tagInt(0);
+	main->process = tagInt(0);
+	gScheduler.main = main;
+	registryAdd(main);
 }
 
 
 size_t schedulerCurrentId(void)
 {
-	return gCurrent != NULL ? gCurrent->id : 0;
+	schedulerInit();
+	Fiber *self = fiberCurrent();
+	return self == NULL ? 0 : self->id;
 }
 
 
-// The sole poller blocks in epoll until an fd becomes ready or the next timer is due,
-// then wakes the corresponding fibers. Called WITHOUT sched->lock; clears pollerActive
-// and wakes idle workers before returning. Serves both socket readiness and Delay sleeps.
-static void waitForEvents(void)
+size_t schedulerSpawn(Value block)
 {
-	Heap *heap = CurrentThread.heap;
-	struct Scheduler *s = curSched();
-
-	schedLock();
-	int timeout = -1; // block indefinitely by default
-	if (gTimerCount > 0) {
-		int64_t wait = gTimers[0].deadline - osCurrentMicroTime();
-		timeout = wait <= 0 ? 0 : (int) ((wait + 999) / 1000);
+	schedulerInit();
+	Fiber *fiber = fiberCreate(runSpawnedFiber, NULL);
+	if (fiber == NULL) {
+		return 0;
 	}
-	schedUnlock();
-
-	uint64_t readyTags[64];
-	// The wait blocks: count as safe so a peer's stop-the-world GC isn't held up, then
-	// leave the blocked state (waiting out any in-progress STW) before mutating the
-	// scheduler as an active mutator. Poller kicks (osEventLoopWake) are consumed
-	// inside osEventLoopWait and only cause an early return with no tag.
-	heapGcEnterBlocked(heap, &CurrentThread);
-	int n = osEventLoopWait(gEvents, readyTags, 64, timeout);
-	heapGcLeaveBlocked(heap, &CurrentThread);
-
-	schedLock();
-	for (int i = 0; i < n; i++) {
-		if (gArmedWaiters > 0) {
-			gArmedWaiters--;
-		}
-		schedulerResumeLocked((size_t) readyTags[i]);
-	}
-	wakeExpiredTimers(); // resumes via schedulerResumeLocked (lock held)
-	s->pollerActive = 0;
-	osCondBroadcast(&s->work); // wake idle workers for the freshly-ready fibers
-	schedUnlock();
+	fiber->cArg = fiber; // the trampoline needs its own Fiber, not the spawner's
+	fiber->id = gScheduler.nextId++;
+	fiber->entryBlock = block;
+	fiber->process = tagInt(0);
+	// SUSPENDED, not ready: `Block>>newProcess` promises a process that does not
+	// run until it is sent #resume, and `fork` is newProcess plus resume.
+	fiber->state = FIBER_SUSPENDED;
+	registryAdd(fiber);
+	return fiber->id;
 }
 
 
-// Post-run commit, run under sched->lock. runFiber has fully switched the fiber off
-// THIS worker's stack (gCurrent == NULL again), so it is now safe to make it runnable
-// (a peer worker could pop it), park it, or destroy it — the "same stack on two OS
-// threads" hazard is closed because ready-queue membership is granted only here,
-// strictly after the switch completed. May briefly drop the lock for a munmap.
-static void commitFiber(Fiber *fiber)
+void schedulerYield(void)
 {
-	if (fiber->state == FIBER_DONE) {
-		unregisterFiber(fiber);
-		schedUnlock();
-		fiberDestroy(fiber); // munmap outside the lock; the fiber is unregistered/unreachable
-		schedLock();
+	schedulerInit();
+	sleepersWake();
+	// A NON-BLOCKING poll, so a loop that yields notices a socket that became
+	// ready without having to park. Blocking here would be wrong: the caller
+	// asked to give others a turn, not to wait for one.
+	pumpEvents(0);
+	parkAndSwitch(PARK_YIELD); // nobody else ready: carry on, having done nothing
+}
+
+
+void schedulerSuspendCurrent(void)
+{
+	schedulerInit();
+	Fiber *self = fiberCurrent();
+	if (self == gScheduler.main && gScheduler.readyHead == NULL
+			&& gSleeperCount == 0 && gArmedWaiters == 0) {
+		// Suspending the last runnable fiber would stop the program with no way
+		// back. Refusing is not a policy choice: there is no fiber left that
+		// could ever resume this one.
+		//
+		// ARMED DESCRIPTORS COUNT AS A WAY BACK, which is why they are in the
+		// test: a server whose main fiber waits on a listening socket has
+		// nothing ready and no sleeper, and returning here would turn `accept`
+		// into a busy loop.
 		return;
 	}
-	// Otherwise it is FIBER_PARKING (it chose to yield or suspend).
-	if (fiber->parkIntent == PARK_YIELD) {
-		fiber->state = FIBER_READY;
-		readyPush(fiber);
-		signalWork();
-	} else if (fiber->parkPending) {
-		// A resume raced in while the fiber was still FIBER_PARKING: re-queue it instead
-		// of parking, so the wakeup is not lost.
-		fiber->parkPending = 0;
-		fiber->state = FIBER_READY;
-		readyPush(fiber);
-		signalWork();
-	} else {
-		fiber->state = FIBER_SUSPENDED;
-		// Hand the dead pages below its stack pointer back to the OS. Done UNDER the lock
-		// (madvise is fast and non-blocking) so the fiber cannot be resumed and run into a
-		// just-madvised stack: a racing resume must take the lock we still hold.
-		fiberReleaseIdleStack(fiber);
-	}
-	fiber->parkIntent = PARK_NONE;
-}
-
-
-// One pool worker's run loop: pull a ready fiber and run it, commit its disposition,
-// and when the queue is empty either drive the event loop (sole poller), idle-wait
-// GC-safely, or shut the pool down when no work remains anywhere.
-static void schedulerRunWorker(void)
-{
-	Heap *heap = CurrentThread.heap;
-	struct Scheduler *s = curSched();
-	for (;;) {
-		schedLock();
-		Fiber *fiber = readyPop();
-		if (fiber != NULL) {
-			s->runningCount++;
-			// Mark dirty UNDER sched->lock (running code may create young roots): the
-			// shared dirty list must never be mutated unlocked. Was in runFiber (outside
-			// the lock) — a data race vs register/unregister/scavenge that corrupts the
-			// list and crashes a later scavenge. Idempotent (no-op if already dirty).
-			schedulerMarkFiberDirty(fiber);
-			schedUnlock();
-
-			runFiber(fiber);
-
-			schedLock();
-			s->runningCount--;
-			commitFiber(fiber);
-			schedUnlock();
+	while (!parkAndSwitch(PARK_SUSPEND)) {
+		// NOTHING READY, and there are exactly three reasons that can change:
+		// a sleeper's deadline, a descriptor becoming ready, or nothing at all.
+		// The third is a program that has parked its last runnable fiber, and
+		// this has to notice rather than spin or block forever.
+		int64_t earliest = sleepersWake();
+		if (gScheduler.readyHead != NULL) {
 			continue;
 		}
-		// Ready queue empty.
-		if (s->shutdown) {
-			schedUnlock();
-			break;
-		}
-		if (s->runningCount == 0 && allQueuesEmpty(s) && gArmedWaiters == 0 && gTimerCount == 0) {
-			// Nothing running, EVERY worker's queue empty, and nothing pending anywhere:
-			// shut the whole pool down. (Must check all queues, not just ours — a fiber
-			// could be ready on a peer worker's queue while we and it are both idle.)
-			s->shutdown = 1;
-			osCondBroadcast(&s->work);
-			schedUnlock();
-			break;
-		}
-		if ((gArmedWaiters > 0 || gTimerCount > 0) && !s->pollerActive) {
-			// Become the sole poller.
-			s->pollerActive = 1;
-			schedUnlock();
-			waitForEvents(); // enter/leaveBlocked around epoll_wait; clears pollerActive
+		if (earliest == 0) {
+			if (gArmedWaiters == 0) {
+				return; // nobody sleeping, nobody armed, nobody ready
+			}
+			// Descriptors and no clock: BLOCK in the poller. This is the idle
+			// state of a server, and it must not be a spin.
+			if (pumpEvents(-1)) {
+				return; // it was OUR descriptor: stop waiting
+			}
 			continue;
 		}
-		// A peer is running work that may re-enqueue, or another worker polls: idle-wait,
-		// GC-safe. heapGcEnterBlocked (spBlocked=1) makes a peer's STW not wait on us; the
-		// cond_wait releases sched->lock while parked.
-		s->idleWorkers++;
-		schedUnlock();
-		heapGcEnterBlocked(heap, &CurrentThread);
-		schedLock();
-		while (s->readyHead[gWorkerIndex] == NULL && !s->shutdown
-		       && !((gArmedWaiters > 0 || gTimerCount > 0) && !s->pollerActive)) {
-			osCondWait(&s->work, &s->lock);
+		int64_t remaining = earliest - osMonotonicNanos();
+		if (remaining <= 0) {
+			continue;
 		}
-		s->idleWorkers--;
-		schedUnlock();
-		heapGcLeaveBlocked(heap, &CurrentThread); // wait out any in-progress STW before running
+		if (gArmedWaiters > 0) {
+			// A DEADLINE AND DESCRIPTORS AT ONCE, so the wait has to be the
+			// poller with the deadline as its timeout. Sleeping instead would
+			// hold a ready socket until a timer nobody was waiting for expired.
+			int milliseconds = (int) (remaining / 1000000);
+			if (pumpEvents(milliseconds < 1 ? 1 : milliseconds)) {
+				return;
+			}
+			continue;
+		}
+		osSleepNanos(remaining);
 	}
 }
 
 
-// Argument to a helper worker thread: which heap to join and this worker's index
-// (1..workerCount-1; index 0 is the schedulerRun thread).
-typedef struct { Heap *heap; int index; } HelperArg;
-
-// A spawned helper worker OS thread: set up its TLS to share the caller's heap and
-// scheduler (mirrors parallelPrimWorker), then run the shared run loop.
-static void schedulerHelperMain(void *arg)
+void schedulerSleep(int64_t micros)
 {
-	HelperArg *ha = (HelperArg *) arg;
-	Heap *heap = ha->heap;
-	int myIndex = ha->index;
-	free(ha);
-	struct Scheduler *s = heap->sched;
-
-	memset(&CurrentThread, 0, sizeof(Thread));
-	gWorkerIndex = myIndex; // this helper pops from readyHead[myIndex]
-	CurrentThread.heap = heap;
-	initRememberedSet(&CurrentThread.rememberedSet);
-	CurrentThread.nextMutator = NULL;
-	heapAddMutator(heap, &CurrentThread);                      // register before any allocation
-	CurrentThread.schedExceptionHandler = &CurrentExceptionHandler;
-	CurrentThread.schedUnwindHandler = &CurrentThread.unwindHandler;
-	// Handles are per-heap now (Handle.h): CurrentThread.heap == the shared heap, whose
-	// handles are already populated — no TLS copy needed.
-	gWorkerStackSize = s->workerStackSize;
-	initThreadContext(&CurrentThread);                         // allocates this worker's root context
-
-	// Publish this worker's scheduler TLS (heap->sched already exists — do NOT re-run the
-	// shared init). schedFibers/schedCurrent point at the SHARED registry / this worker's
-	// TLS current fiber so a cross-thread collector can reach this worker's roots.
-	gScheduler.stackBase = NULL;
-	gScheduler.sp = NULL;
-	gScheduler.tsanFiber = TSAN_CURRENT_FIBER(); // this worker's native-stack fiber (for TSan)
-	gCurrent = NULL;
-	gActive = 1;
-	CurrentThread.schedFibers = &gFibers;
-	CurrentThread.schedFiberSlots = &gFiberSlots;
-	CurrentThread.schedCurrent = &gCurrent;
-	// Do NOT call fiberInitStackGrowth here: it writes process-global page-size/commit
-	// caches that the primary already set in schedulerInit BEFORE the spawn (a
-	// happens-before edge), so helpers only READ them. Re-writing them races (TSan). We
-	// still need this worker's OWN sigaltstack for the growable-stack SIGSEGV handler.
-	osInstallSegvHandler(fiberSegvGrowCallback);
-
-	schedulerRunWorker();
-
-	heapEndMutator(heap, &CurrentThread); // deregister so a later GC never scans this dead thread
+	schedulerInit();
+	if (micros <= 0) {
+		schedulerYield();
+		return;
+	}
+	Fiber *self = fiberCurrent();
+	sleepersAdd(self, osMonotonicNanos() + micros * 1000);
+	// The sleeper is SUSPENDED; sleepersWake is what makes it ready again, and
+	// it runs from schedulerYield and from the wait loop below.
+	if (!parkAndSwitch(PARK_SUSPEND)) {
+		// The only runnable fiber: there is nobody to switch to, so this is an
+		// ordinary blocking sleep. It is still correct -- no other fiber could
+		// have made progress -- and it keeps a lone `Delay wait` from spinning.
+		sleepersDrop(self);
+		self->state = FIBER_RUNNING;
+		osSleepNanos(micros * 1000);
+	}
 }
 
 
-Value schedulerRun(void)
+_Bool schedulerResume(size_t id)
 {
-	struct Scheduler *s = curSched();
-	Heap *heap = CurrentThread.heap;
-	int helpers = s->workerCount - 1;
+	schedulerInit();
+	Fiber *fiber = fiberWithId(id);
+	if (fiber == NULL || fiber->state != FIBER_SUSPENDED) {
+		return 0;
+	}
+	sleepersDrop(fiber); // resuming early cancels a sleep
+	fiber->state = FIBER_READY;
+	readyPush(fiber);
+	return 1;
+}
 
-	gWorkerIndex = 0; // the schedulerRun thread is worker 0 (pops readyHead[0])
 
-	OsThread *tids = NULL;
-	if (helpers > 0) {
-		tids = malloc((size_t) helpers * sizeof(OsThread));
-		for (int i = 0; i < helpers; i++) {
-			HelperArg *ha = malloc(sizeof(HelperArg));
-			ha->heap = heap;
-			ha->index = i + 1; // workers 1..workerCount-1
-			osThreadSpawn(&tids[i], schedulerHelperMain, ha);
+// Terminate a fiber by id, answering whether it is going to die.
+//
+// THE KERNEL'S CONTRACT IS THAT CLEANUPS RUN. `Block>>ensure:` promises its
+// block runs "whether the receiver completes normally or is unwound (by an
+// exception, a non-local return, or termination)", and
+// `Block>>valueUnwindProtected:` names Process terminate outright. So a
+// terminate is an UNWIND and not a stack being dropped, and an unwind runs on
+// the stack it is unwinding.
+//
+// TERMINATING YOURSELF NEVER ANSWERS. It is a change of stack that does not come
+// back: the pending cleanups run here, on this still-live stack, and control
+// leaves through this fiber's exit record (jit/Jit.h). Whether that ends the
+// program or just this fiber is decided by the frame that pushed the record --
+// main() for the main process, runSpawnedFiber above for every other -- and not
+// here, which is why the main fiber needs no case of its own.
+//
+// TERMINATING SOMEBODY ELSE marks and schedules, and the victim dies the moment
+// it next has the CPU (terminateIfCondemned above). It answers before that has
+// happened, and that is the honest thing to answer: the alternative is running
+// the victim's cleanups on the terminator's stack, where a cleanup's non-local
+// return would look for a home activation that is not on this chain.
+_Bool schedulerTerminate(size_t id)
+{
+	schedulerInit();
+	Fiber *fiber = fiberWithId(id);
+	if (fiber == NULL || fiber->state == FIBER_DONE) {
+		return 0; // nothing there, or already finished
+	}
+	if (fiber == fiberCurrent()) {
+		unwindToExit(); // never returns
+	}
+	if (fiber->terminating) {
+		return 1; // already condemned; asking twice is not an error
+	}
+	fiber->terminating = 1;
+	// Runnable, because the cleanups are ITS work. A sleeper's deadline is
+	// cancelled for the same reason `resume` cancels one: it is on the ready
+	// queue now, and waking it again later would push it a second time.
+	sleepersDrop(fiber);
+	if (fiber->state == FIBER_SUSPENDED) {
+		fiber->state = FIBER_READY;
+		readyPush(fiber);
+	}
+	return 1;
+}
+
+
+// ---------------------------------------------------------------------------
+// The sync monitor
+// ---------------------------------------------------------------------------
+//
+// ONE MONITOR, A PLAIN FIELD, AND NO LOCK, and all three follow from the same
+// fact rather than from three separate decisions: this scheduler runs ONE OS
+// THREAD (Scheduler.h says so in capitals, and nothing in the v2 build spawns a
+// second one -- WorkerParallelPrimitive is not implemented).
+//
+// What that buys, and it is worth being precise because the shape looks wrong
+// for a system meant to run hundreds of fibers:
+//
+//   * NO ATOMICS. Two fibers cannot execute at once, so a read-modify-write of
+//     the owner cannot race. An atomic here would be describing a hazard that
+//     does not exist and hiding the assumption that it does not.
+//   * NO CONTENTION TO STRIPE AWAY. A critical section is never held ACROSS a
+//     switch: the only way out of one while holding the monitor is
+//     parkOnMonitor, which releases it first. So two unrelated sync objects
+//     sharing one monitor cost nothing here -- unlike the old VM, where many
+//     OS threads serialising on one lock was measured and answered with
+//     striping.
+//   * ONE FIELD, in the Scheduler struct above, so it becomes per-worker with
+//     the rest of the scheduler state instead of surviving as a global that
+//     nobody notices.
+//
+// WHAT HAS TO CHANGE WHEN WORKERS RETURN, stated so it is not rediscovered: the
+// owner needs a real lock or an atomic compare-and-swap, `enter` needs to block
+// rather than yield, and the object argument to monitorEnterOn: stops being
+// ignored and picks the stripe. That is a rewrite of these three functions and
+// of nothing above them, which is why the seam is here.
+
+_Bool schedulerMonitorEnter(void)
+{
+	schedulerInit();
+	Fiber *self = fiberCurrent();
+	if (gScheduler.monitorOwner == self) {
+		// Re-entry. `ProcessorScheduler>>monitorEnterOn:` says in capitals that
+		// critical sections stay FLAT, and a section that enters twice would
+		// release on the first exit while the outer one believed it still held
+		// the monitor. Answering 0 makes that say so.
+		return 0;
+	}
+	while (gScheduler.monitorOwner != NULL) {
+		// Held by somebody else, which in a cooperative scheduler means a fiber
+		// that parked while holding it. Yield until it lets go; if nobody else
+		// can run, waiting would be waiting forever and this says so instead.
+		if (!parkAndSwitch(PARK_YIELD)) {
+			return 0;
 		}
 	}
+	gScheduler.monitorOwner = self;
+	return 1;
+}
 
-	schedulerRunWorker(); // the calling thread participates as a worker (index 0)
 
-	if (helpers > 0) {
-		// Our run loop returned (shutdown broadcast); wait for the helpers. Count as
-		// safe while joining so a helper's final GC isn't blocked by us.
-		heapGcEnterBlocked(heap, &CurrentThread);
-		for (int i = 0; i < helpers; i++) {
-			osThreadJoin(&tids[i]);
+_Bool schedulerMonitorExit(void)
+{
+	schedulerInit();
+	if (gScheduler.monitorOwner != fiberCurrent()) {
+		return 0; // exiting a monitor this fiber does not hold
+	}
+	gScheduler.monitorOwner = NULL;
+	return 1;
+}
+
+
+_Bool schedulerMonitorPark(void)
+{
+	schedulerInit();
+	Fiber *self = fiberCurrent();
+	if (gScheduler.monitorOwner != self) {
+		return 0;
+	}
+	// RELEASE THEN PARK, with nothing in between that could switch. A waker has
+	// to hold the monitor to dequeue this fiber's id, so it cannot act until the
+	// release; and the park is committed on the next fiber's stack before any
+	// Smalltalk runs there (commitPendingPark), so it cannot act before this
+	// fiber's parked state is published either. Both halves of the lost-wakeup
+	// window are closed by the switch protocol rather than by a lock.
+	gScheduler.monitorOwner = NULL;
+	schedulerSuspendCurrent();
+	return 1;
+}
+
+
+// ---------------------------------------------------------------------------
+// The collector's view
+// ---------------------------------------------------------------------------
+
+// The strong definition of the seam declared in memory/Roots.h. Linking this
+// file is what turns the weak no-op there into a real walk.
+void rootsVisitFibers(RootVisitor visit, void *ctx)
+{
+	Fiber *running = fiberCurrent();
+	for (size_t i = 0; i < gScheduler.count; i++) {
+		Fiber *fiber = gScheduler.all[i];
+		// The RUNNING fiber is skipped: its live state is in CurrentThread and
+		// the per-mutator scan already has it. Its FiberRoots copy is stale, and
+		// the reason that matters is written at rootsVisitFibers in Roots.h.
+		if (fiber == running) {
+			continue;
 		}
-		heapGcLeaveBlocked(heap, &CurrentThread);
-		free(tids);
-	}
-	return gExitResult;
-}
+		fiberVisitRoots(fiber, visit, ctx);
 
-
-// ---- GC integration -------------------------------------------------------
-
-_Bool schedulerActive(void)
-{
-	return gActive;
-}
-
-
-size_t schedulerFiberSlots(void)
-{
-	return gFiberSlots;
-}
-
-
-size_t schedulerLiveFibers(void)
-{
-	return gFiberSlots - gFreeCount;
-}
-
-
-size_t schedulerArmedWaiters(void)
-{
-	return gArmedWaiters;
-}
-
-
-Fiber *schedulerFiberAt(size_t slot)
-{
-	return slot < gFiberSlots ? gFibers[slot] : NULL;
-}
-
-
-void schedulerSyncCurrentRoots(void)
-{
-	if (gActive && gCurrent != NULL) {
-		saveRoots(gCurrent);
-	}
-}
-
-
-void schedulerRestoreCurrentRoots(void)
-{
-	if (gActive && gCurrent != NULL) {
-		loadRoots(gCurrent);
+		// The chains, through a THREAD-SHAPED VIEW of this fiber rather than a
+		// second set of walkers. handlesVisitRoots, rootsVisitNativeFrames and
+		// rootsVisitUnwindRecords all read exactly these fields out of a Thread,
+		// and giving them a view is what keeps ONE implementation of each walk.
+		// A second copy here is the drift this project keeps paying for, and a
+		// frame walker is the last place to have two of.
+		Thread view;
+		memset(&view, 0, sizeof view);
+		view.handleScopes = fiber->roots.handleScopes;
+		view.compiledFrames = fiber->roots.compiledFrames;
+		view.unwinds = fiber->roots.unwinds;
+		handlesVisitRoots(&view, visit, ctx);
+		rootsVisitNativeFrames(&view, visit, ctx);
+		rootsVisitUnwindRecords(&view, visit, ctx);
 	}
 }

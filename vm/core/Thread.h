@@ -1,12 +1,14 @@
 #ifndef THREAD_H
 #define THREAD_H
 
+#include "core/Tls.h"
 #include "memory/Heap.h"
 
 struct HandleScope;
 struct StackFrame;
 struct EntryStackFrame;
 struct Fiber;
+struct CompiledFrameGuard;
 
 // Per-mutator thread-local allocation buffer: a chunk carved from the shared
 // young space that this OS thread bump-allocates into WITHOUT locking (Go's
@@ -37,13 +39,12 @@ typedef struct CodegenSites {
 
 typedef struct Thread {
 	Heap *heap; // heap-allocated; ONE heap per isolate, shared by its worker threads
-	struct Handle *handles;
 	struct HandleScope *handleScopes;
 	Value context;
 	struct EntryStackFrame *stackFramesTail;
 	// Head of this mutator's on:do: handler chain (was a standalone TLS `CurrentExceptionHandler`).
 	// Per-mutator so the JIT reaches it via CTX->thread (like tlab/stackFramesTail) instead of a
-	// baked TLS address — a baked address in SHARED JIT code would be the CODEGEN thread's slot,
+	// baked TLS address: a baked address in SHARED JIT code would be the CODEGEN thread's slot,
 	// breaking on:do: on every other worker. A fiber's saved handler is loaded here on resume; the
 	// B2.5 context rebind keeps CTX->thread pointing at the running worker.
 	Value exceptionHandler;
@@ -71,7 +72,7 @@ typedef struct Thread {
 	struct Fiber **schedCurrent;
 	// Address of this mutator's TLS CurrentExceptionHandler (a Value holding the head
 	// of its running fiber's on:do: chain), so a cross-thread GC collector can scan a
-	// peer's live handler chain — it is a root reachable ONLY through this slot, not
+	// peer's live handler chain, because it is a root reachable ONLY through this slot, not
 	// the Smalltalk stack. NULL until published (initThread / schedulerInit / worker
 	// registration). Stale for a scheduler mutator parked in the scheduler context.
 	Value *schedExceptionHandler;
@@ -79,42 +80,70 @@ typedef struct Thread {
 	Value *schedUnwindHandler;
 	// Striped sync monitor bookkeeping. The stripe for a sync object is computed ONCE at
 	// monitorEnterOn: (mix of obj->hash) and stashed here; monitorExit/parkOnMonitor read
-	// it back and NEVER recompute — so enter/exit/park provably drop the same lock they
+	// it back and NEVER recompute, so enter/exit/park provably drop the same lock they
 	// took even if the object moved/was become:-d mid-critical-section. `heldMonitor`
 	// makes a reentrant monitorEnter fail-fast (critical sections must stay flat). Valid
 	// only while heldMonitor==1. APPENDED at struct end so JIT-baked field offsets are
 	// unchanged (the StoreCheck golden reads Thread offsets).
 	size_t heldMonitorStripe;
 	_Bool heldMonitor;
+
+	// The compiled frames this mutator has underneath it, in SEGMENTS separated
+	// by the C frames of the runtime helpers that were called from them. Newest
+	// first, NULL when no compiled code is on the stack at all.
+	//
+	// Pushed by whichever runtime helper can allocate, and each entry lives on
+	// that helper's own C stack frame, so the chain unwinds itself as they
+	// return. It costs NOTHING in generated code: the frame pointer follows from
+	// the slot address the call already passes (jit/Jit.h).
+	struct CompiledFrameGuard *compiledFrames;
+
+	// Non-local return (ADR 0008). `unwinds` is the chain of activations a `^`
+	// inside a block can return FROM, newest first, and each entry lives on the
+	// C frame that entered that activation, so the chain unwinds itself.
+	//
+	// `homeToken` is the token of the innermost such activation now running, and
+	// `nextHomeToken` mints them. A token is minted per ACTIVATION and never
+	// reused, which is what makes a return into an activation that has already
+	// finished fail to find anything instead of matching a frame that happens to
+	// sit at the same address.
+	//
+	// Only methods whose blocks actually contain a `^` push a record, so a
+	// program that never writes one pays nothing at all for this.
+	//
+	// PENDING(fibers): these are per-THREAD, like compiledFrames above, and a
+	// fiber switch will have to save and restore all three. A record lives on the
+	// C stack of the frame that entered the activation, so a fiber that is
+	// switched away from must not leave its records reachable from the thread
+	// that keeps running on another stack.
+	struct UnwindRecord *unwinds;
+	uint64_t homeToken;
+	uint64_t nextHomeToken;
 } Thread;
 
 extern __thread Thread CurrentThread;
 
 // Offset of &CurrentThread from the OS thread pointer (%fs base) for the initial-exec
-// TLS model — a link-time constant, identical on every thread. Computed once in
+// TLS model, a link-time constant, identical on every thread. Computed once in
 // initThread. JIT code bakes this to read EACH running worker's CurrentThread via
 // %fs:tpoff (see asmLoadTls), instead of a per-thread address that would be wrong in
 // shared code.
 extern ptrdiff_t gCurrentThreadTpoff;
 
-// Per-isolate VM globals (Handles, the scheduler, LookupCache, JIT stubs, ...)
-// are thread-local so every isolate OS-thread owns its own copy. They MUST use
-// the initial-exec TLS model: libVM.so is linked directly into `st` (never
-// dlopen'd) so IE is valid, and it is required for correctness — the default
-// general-dynamic model resolves a __thread address via a __tls_get_addr call,
-// which misbehaves when such a global is touched from JIT-generated code's C
-// callouts during a GC. IE is a direct %fs-relative access (also faster).
-#define PER_ISOLATE __thread __attribute__((tls_model("initial-exec")))
+// PER_ISOLATE now lives in core/Tls.h, so memory/Heap.h can declare per-isolate
+// globals without including this header (which includes Heap.h back).
 
 void initThread(Thread *thread);
-void initThreadContext(Thread *thread);
 void freeThread(Thread *thread);
-void threadSetExitFrame(struct StackFrame *stackFrame);
 
 
+// The generational write barrier. Three tests, in the order that rejects
+// fastest: the store target must be old, the stored value young, and the target
+// not already logged. The GC_REMEMBERED bit is what bounds the log.
 static inline void rawObjectStorePtr(RawObject *object, Value *field, RawObject *value)
 {
-	if (isOldObject(object) && isNewObject(value) && (object->tags & TAG_REMEMBERED) == 0) {
+	if (isOldObject(object) && isNewObject(value)
+			&& !rawObjectHasGcBit(object, GC_REMEMBERED)) {
 		rememberedSetAdd(&CurrentThread.rememberedSet, object);
 	}
 	*field = tagPtr(value);
@@ -124,6 +153,24 @@ static inline void rawObjectStorePtr(RawObject *object, Value *field, RawObject 
 static inline void objectStorePtr(Object *object, Value *field, Object *value)
 {
 	rawObjectStorePtr(object->raw, field, value->raw);
+}
+
+
+// Store an ALREADY TAGGED value, which may be an immediate.
+//
+// The barrier above takes an untagged RawObject* and tags it, which is right
+// for the kernel fields that are known to hold objects. Anything storing a
+// Smalltalk value -- Array>>at:put:, an instance variable write from compiled
+// code -- has a tagged Value in hand and cannot know whether it is a pointer.
+// Written here, next to the barrier, rather than at each call site, so there is
+// one place where "does this store need remembering" is decided.
+static inline void rawObjectStoreValue(RawObject *object, Value *field, Value value)
+{
+	if (valueTypeOf(value, VALUE_POINTER)) {
+		rawObjectStorePtr(object, field, asObject(value));
+	} else {
+		*field = value;
+	}
 }
 
 #endif

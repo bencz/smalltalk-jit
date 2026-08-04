@@ -80,5 +80,23 @@ FutureProbe := Actor [
 	t check: 'awaitFor: on a never-completed Future times out to nil' that: [
 		| f | f := Future in: Actors. (f awaitFor: 50) isNil ].
 
+	"------------------------------------------------ more than one waiter"
+	"A single waiter slot lost the FIRST of two: the second await overwrote it
+	 and nothing could ever resume the process parked before it, so the caller
+	 hung and its fiber leaked. Both waiters park BEFORE the completion (the
+	 yield is what guarantees that), and both have to come back with the value."
+
+	t check: 'both waiters on one Future wake with the value' that: [
+		| f first second done |
+		f := Future in: Actors.
+		first := #none. second := #none.
+		done := Semaphore new.
+		[ first := f await. done signal ] fork.
+		[ second := f await. done signal ] fork.
+		Processor yield.
+		f complete: 42.
+		done wait. done wait.
+		(first = 42) and: [ second = 42 ] ].
+
 	^t report
 ]

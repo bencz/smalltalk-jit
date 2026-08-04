@@ -32,8 +32,41 @@ Props := Object [
 	throughput [ ^throughput ]
 
 
-	"configuration (fluent)"
+	"configuration (fluent)
 
-	withSupervisor: aStrategy [ supervisor := aStrategy. ^self ]
-	withThroughput: anInteger [ throughput := anInteger. ^self ]
+	 EACH ONE ANSWERS A NEW PROPS and leaves the receiver alone, which is what
+	 makes the sentence at the top of this file true: a Props is a description
+	 that can be handed around and reused. They used to assign in place and
+	 answer self, so `base withThroughput: 5` reconfigured the shared `base`
+	 for every other spawn site holding it -- the same trap ProtoActor's
+	 WithX-returns-a-copy avoids."
+
+	withSupervisor: aStrategy [
+		^self copyWithProducer: producer supervisor: aStrategy throughput: throughput
+	]
+
+
+	withThroughput: anInteger [
+		^self copyWithProducer: producer supervisor: supervisor throughput: anInteger
+	]
+
+
+	withProducer: aBlock [
+		^self copyWithProducer: aBlock supervisor: supervisor throughput: throughput
+	]
+
+
+	copyWithProducer: aBlock supervisor: aStrategy throughput: anInteger [
+		| copy |
+		copy := self class new setProducer: aBlock.
+		copy setSupervisor: aStrategy.
+		copy setThroughput: anInteger.
+		^copy
+	]
+
+
+	"private, for copyWithProducer:supervisor:throughput: -- these DO assign"
+
+	setSupervisor: aStrategy [ supervisor := aStrategy. ^self ]
+	setThroughput: anInteger [ throughput := anInteger. ^self ]
 ]

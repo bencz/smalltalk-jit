@@ -31,24 +31,98 @@ Float := Number [
 
 	+ aNumber [
 		<primitive: FloatAddPrimitive>
+		"SAME-GENERALITY FAILURE, and it must be caught HERE.
+
+		 Number>>retry:coercing: says so in capitals: on equal generality it
+		 re-sends the same selector to the same representation, and it is only
+		 not an infinite loop because every concrete class short-circuits its own
+		 type first. Float did not, so `1.0 / 0.0` recursed until the stack ran
+		 out -- a SEGFAULT, and one that was hidden for as long as a scaffold
+		 method shadowed these (tools/Bootstrap.c).
+
+		 A result outside the immediate window is NOT one of those cases: the
+		 primitive boxes it into a BoxedFloat64 and answers normally, which is
+		 why `1.0e300 * 10.0` is an ordinary Float and not an error. What is left
+		 is a zero divisor, which is ZeroDivide, and anything unforeseen, which
+		 stops with a name instead of recursing."
+		(aNumber isKindOf: Float) ifTrue: [
+			^self error: 'float ', self class name, ' operation failed on a Float'].
 		^self retry: #+ coercing: aNumber
 	]
 
 
 	- aNumber [
 		<primitive: FloatSubPrimitive>
+		"SAME-GENERALITY FAILURE, and it must be caught HERE.
+
+		 Number>>retry:coercing: says so in capitals: on equal generality it
+		 re-sends the same selector to the same representation, and it is only
+		 not an infinite loop because every concrete class short-circuits its own
+		 type first. Float did not, so `1.0 / 0.0` recursed until the stack ran
+		 out -- a SEGFAULT, and one that was hidden for as long as a scaffold
+		 method shadowed these (tools/Bootstrap.c).
+
+		 A result outside the immediate window is NOT one of those cases: the
+		 primitive boxes it into a BoxedFloat64 and answers normally, which is
+		 why `1.0e300 * 10.0` is an ordinary Float and not an error. What is left
+		 is a zero divisor, which is ZeroDivide, and anything unforeseen, which
+		 stops with a name instead of recursing."
+		(aNumber isKindOf: Float) ifTrue: [
+			^self error: 'float ', self class name, ' operation failed on a Float'].
 		^self retry: #- coercing: aNumber
 	]
 
 
 	* aNumber [
 		<primitive: FloatMulPrimitive>
+		"SAME-GENERALITY FAILURE, and it must be caught HERE.
+
+		 Number>>retry:coercing: says so in capitals: on equal generality it
+		 re-sends the same selector to the same representation, and it is only
+		 not an infinite loop because every concrete class short-circuits its own
+		 type first. Float did not, so `1.0 / 0.0` recursed until the stack ran
+		 out -- a SEGFAULT, and one that was hidden for as long as a scaffold
+		 method shadowed these (tools/Bootstrap.c).
+
+		 A result outside the immediate window is NOT one of those cases: the
+		 primitive boxes it into a BoxedFloat64 and answers normally, which is
+		 why `1.0e300 * 10.0` is an ordinary Float and not an error. What is left
+		 is a zero divisor, which is ZeroDivide, and anything unforeseen, which
+		 stops with a name instead of recursing."
+		(aNumber isKindOf: Float) ifTrue: [
+			^self error: 'float ', self class name, ' operation failed on a Float'].
 		^self retry: #* coercing: aNumber
 	]
 
 
 	/ aNumber [
 		<primitive: FloatDivPrimitive>
+		"SAME-GENERALITY FAILURE, and it must be caught HERE.
+
+		 Number>>retry:coercing: says so in capitals: on equal generality it
+		 re-sends the same selector to the same representation, and it is only
+		 not an infinite loop because every concrete class short-circuits its own
+		 type first. Float did not, so `1.0 / 0.0` recursed until the stack ran
+		 out -- a SEGFAULT, and one that was hidden for as long as a scaffold
+		 method shadowed these (tools/Bootstrap.c).
+
+		 A result outside the immediate window is NOT one of those cases: the
+		 primitive boxes it into a BoxedFloat64 and answers normally, which is
+		 why `1.0e300 * 10.0` is an ordinary Float and not an error.
+
+		 NEITHER IS A ZERO DIVISOR. Float division is IEEE 754 division and
+		 answers what IEEE 754 answers: 1.0/0.0 is +inf, -1.0/0.0 is -inf and
+		 0.0/0.0 is a NaN, all three produced by the primitive. ZeroDivide is
+		 what INTEGER division by zero raises, and the two are different
+		 operations rather than one operation with a policy: tests/ZeroDivide
+		 Test.st asks for it from SmallInteger, Fraction and LargeInteger and
+		 never from a Float, and tests/FloatEdgeTest.st asks for the three IEEE
+		 answers by name.
+
+		 So what is left is anything unforeseen, which stops with a name instead
+		 of recursing."
+		(aNumber isKindOf: Float) ifTrue: [
+			^self error: 'float ', self class name, ' operation failed on a Float'].
 		^self retry: #/ coercing: aNumber
 	]
 
@@ -82,7 +156,14 @@ Float := Number [
 	the same semantics directly (unordered = false); these methods keep the
 	dispatch (mixed-type / intrinsic-miss) path consistent with it."
 
+	"The primitives answer IEEE-754 directly, which is the same rule these
+	 fallbacks spell out: every ordered comparison against NaN is false, and the C
+	 operators behind them already do that. The bodies are unchanged and still run
+	 whenever the primitive fails, which is every argument that is not a
+	 SmallInteger or a Float."
+
 	> aNumber [
+		<primitive: FloatGreaterThanPrimitive>
 		^(aNumber isKindOf: Number)
 			ifTrue: [aNumber asFloat < self]
 			ifFalse: [self retryRelationalOp: #> coercing: aNumber]
@@ -90,12 +171,22 @@ Float := Number [
 
 
 	>= aNumber [
+		<primitive: FloatGreaterEqualsPrimitive>
 		^(self > aNumber) or: [self = aNumber]
 	]
 
 
 	<= aNumber [
+		<primitive: FloatLessEqualsPrimitive>
 		^(self < aNumber) or: [self = aNumber]
+	]
+
+
+	~= aNumber [
+		"Object derives this as `= not`, which is right for NaN too: NaN = NaN is
+		 false, so NaN ~= NaN is true, and C's != agrees."
+		<primitive: FloatNotEqualsPrimitive>
+		^self = aNumber == false
 	]
 
 

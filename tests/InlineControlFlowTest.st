@@ -281,5 +281,57 @@ InlineIvarLoop := Object [
 	t check: 'an inlined ivar branch inside a loop answers correctly'
 		equals: 0 is: [ bad ].
 
+	"--- the BOOLEAN GUARD, on every inlined form ---
+
+	 Inlined control flow tests a value the compiler has not proved is a
+	 Boolean, so each of these forms has three cases: true, false, and NEITHER.
+	 The third has to raise.
+
+	 The suite had this for ifTrue:/ifFalse: and for whileTrue (BlockTest), and
+	 NOT for and:, or: or whileFalse -- and that is exactly where the bug lived:
+	 `nil and: [true]` answered TRUE, silently, because the emitter tested one
+	 sense and let everything else fall through.
+
+	 THE LOOP CASES ARE BOUNDED ON PURPOSE. A condition that answers a
+	 non-Boolean forever would, if this regresses, make the test HANG instead of
+	 fail, and a suite that hangs reports nothing. So the condition answers a
+	 non-Boolean first and false soon after: with the guard it raises on the
+	 first evaluation, and without it the loop still terminates and the missing
+	 exception is an ordinary red check."
+
+	t expect: 'and: on a non-Boolean raises' raises: Error in: [ nil and: [ true ] ].
+	t expect: 'and: on an integer raises' raises: Error in: [ 3 and: [ true ] ].
+	t expect: 'or: on a non-Boolean raises' raises: Error in: [ nil or: [ true ] ].
+	t expect: 'or: on an integer raises' raises: Error in: [ 3 or: [ false ] ].
+	t expect: 'ifTrue: on a non-Boolean raises' raises: Error in: [ nil ifTrue: [ 1 ] ].
+	t expect: 'ifFalse: on a non-Boolean raises' raises: Error in: [ 3 ifFalse: [ 1 ] ].
+	t expect: 'ifTrue:ifFalse: on a non-Boolean raises' raises: Error in: [
+		nil ifTrue: [ 1 ] ifFalse: [ 2 ] ].
+
+	t expect: 'whileTrue on a non-Boolean raises' raises: Error in: [
+		| n | n := 0.
+		[ n := n + 1. n < 5 ifTrue: [ nil ] ifFalse: [ false ] ] whileTrue ].
+	t expect: 'whileTrue: on a non-Boolean raises' raises: Error in: [
+		| n | n := 0.
+		[ n := n + 1. n < 5 ifTrue: [ nil ] ifFalse: [ false ] ] whileTrue: [ ] ].
+	t expect: 'whileFalse on a non-Boolean raises' raises: Error in: [
+		| n | n := 0.
+		[ n := n + 1. n < 5 ifTrue: [ 7 ] ifFalse: [ true ] ] whileFalse ].
+	t expect: 'whileFalse: on a non-Boolean raises' raises: Error in: [
+		| n | n := 0.
+		[ n := n + 1. n < 5 ifTrue: [ 7 ] ifFalse: [ true ] ] whileFalse: [ ] ].
+
+	"And the guard must not have cost the ordinary meanings anything. Without
+	 these, every check above is satisfiable by a form that simply always
+	 raises."
+	t check: 'and: still short-circuits: a false receiver never runs the argument'
+		that: [ (false and: [ 1/0 ]) == false ].
+	t check: 'or: still short-circuits: a true receiver never runs the argument'
+		that: [ (true or: [ 1/0 ]) == true ].
+	t check: 'and: still answers the argument when the receiver is true'
+		equals: 7 is: [ true and: [ 7 ] ].
+	t check: 'or: still answers the argument when the receiver is false'
+		equals: 7 is: [ false or: [ 7 ] ].
+
 	^t report
 ]

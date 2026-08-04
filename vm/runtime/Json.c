@@ -273,9 +273,13 @@ static _Bool parseNumber(JsonParser *j, JsonValue *out)
 			out->isImmediate = 1;
 			out->immediate = tagFloat(d);
 		} else {
-			Float *f = newFloat(d);
+			// Outside the immediate window, so it lives on the heap. v2 has no
+			// newFloat: a BoxedFloat64 is an ordinary object of that class with
+			// one raw body word, which is what its shape says.
+			Object *boxed = newObject(&Handles.BoxedFloat64, 0);
+			((RawFloat *) boxed->raw)->value = d;
 			out->isImmediate = 0;
-			out->object = (Object *) f;
+			out->object = boxed;
 		}
 		return 1;
 	}
@@ -298,31 +302,12 @@ static _Bool parseNumber(JsonParser *j, JsonValue *out)
 	return 1;
 }
 
-// ordCollAddObject with GEOMETRIC growth (the Collection.c version grows +8 a
-// time, which is O(n^2) on big JSON arrays). The plain memcpy of the old
-// contents is safe even when the new Array lands in old space: allocateObject
-// remembers every old-space birth, so the next scavenge scans the young
-// referents it received.
-static void jsonOrdCollAppend(OrderedCollection *collection, JsonValue *v)
-{
-	Array *contents = scopeHandle(ordCollGetContents(collection));
-	size_t size = ordCollSize(collection);
-
-	if (size == (size_t) contents->raw->size) {
-		size_t grown = size < 8 ? 8 : size * 2;
-		Array *newContents = newObject(Handles.Array, grown);
-		memcpy(newContents->raw->vars, contents->raw->vars, size * sizeof(Value));
-		objectStorePtr((Object *) collection, &collection->raw->contents, (Object *) newContents);
-		contents = newContents;
-	}
-	intptr_t lastIndex = ordCollGetLastIndex(collection);
-	if (v->isImmediate) {
-		contents->raw->vars[lastIndex] = v->immediate;
-	} else {
-		objectStorePtr((Object *) contents, &contents->raw->vars[lastIndex], v->object);
-	}
-	collection->raw->lastIndex = tagInt(lastIndex + 1);
-}
+// THE HAND-ROLLED APPEND IS GONE. It existed because the old VM's
+// OrderedCollection grew by EIGHT slots at a time, which is quadratic on a
+// large JSON array, so this file reached into the collection's internals to
+// double instead. v2's ordCollGrow already doubles (runtime/Collection.c), so
+// the workaround would now be a second copy of the same policy -- and the copy
+// that reached past the accessors is exactly the one that goes stale.
 
 static _Bool parseObject(JsonParser *j, int depth, JsonValue *out)
 {
@@ -365,7 +350,7 @@ static _Bool parseObject(JsonParser *j, int depth, JsonValue *out)
 			// Association after reading the value.
 			stringDictAtPut(dict, key, val.immediate);
 		} else {
-			stringDictAtPutObject(dict, key, val.object);
+			stringDictAtPut(dict, key, objectTagged(val.object));
 		}
 		skipWs(j);
 		char c = j->p < j->end ? *j->p : 0;
@@ -408,7 +393,7 @@ static _Bool parseArray(JsonParser *j, int depth, JsonValue *out)
 			closeHandleScope(&scope, NULL);
 			return 0;
 		}
-		jsonOrdCollAppend(array, &val);
+		ordCollAdd(array, val.isImmediate ? val.immediate : objectTagged(val.object));
 		skipWs(j);
 		char c = j->p < j->end ? *j->p : 0;
 		closeHandleScope(&scope, NULL);
@@ -456,21 +441,21 @@ static _Bool parseValue(JsonParser *j, int depth, JsonValue *out)
 			return 0;
 		}
 		out->isImmediate = 0;
-		out->object = Handles.true;
+		out->object = (Object *) &Handles.true_;
 		return 1;
 	case 'f':
 		if (!parseLiteral(j, "false", 5)) {
 			return 0;
 		}
 		out->isImmediate = 0;
-		out->object = Handles.false;
+		out->object = (Object *) &Handles.false_;
 		return 1;
 	case 'n':
 		if (!parseLiteral(j, "null", 4)) {
 			return 0;
 		}
 		out->isImmediate = 0;
-		out->object = Handles.nil;
+		out->object = (Object *) &Handles.nil;
 		return 1;
 	default:
 		if (*j->p == '-' || (*j->p >= '0' && *j->p <= '9')) {
@@ -502,7 +487,7 @@ _Bool jsonParse(String *input, Value *result)
 	if (!ok) {
 		return 0;
 	}
-	*result = v.isImmediate ? v.immediate : getTaggedPtr(v.object);
+	*result = v.isImmediate ? v.immediate : objectTagged(v.object);
 	return 1;
 }
 
@@ -642,6 +627,22 @@ static _Bool encodeStringBody(JsonBuf *b, RawString *s)
 	return bufByte(b, '"');
 }
 
+// Is this object an instance of exactly this class?
+//
+// BY CLASS INDEX, which is what an object's header carries (ADR 0005), so this
+// is a compare of two integers and never a dereference of the class. The old
+// VM compared class POINTERS, which is the same question asked in the form the
+// v2 header no longer stores.
+//
+// EXACT and not `isKindOf:`: the encoder handles the core JSON classes and
+// hands anything else to the reflective Smalltalk path, so a subclass of
+// Dictionary must NOT be encoded as a plain one.
+static _Bool isClassIndex(RawObject *object, Class *class)
+{
+	return class->raw != NULL && rawObjectClassIndex(object) == classIndexOf(class);
+}
+
+
 static _Bool encodeValue(JsonBuf *b, Value v, int depth);
 
 static _Bool encodeDictBody(JsonBuf *b, RawDictionary *dict, int depth)
@@ -654,7 +655,7 @@ static _Bool encodeDictBody(JsonBuf *b, RawDictionary *dict, int depth)
 	}
 	for (size_t i = 0; i < (size_t) contents->size; i++) {
 		Value slot = contents->vars[i];
-		if (!valueTypeOf(slot, VALUE_POINTER) || asObject(slot) == Handles.nil->raw) {
+		if (!valueTypeOf(slot, VALUE_POINTER) || slotIsEmpty(slot)) {
 			continue;
 		}
 		RawAssociation *assoc = (RawAssociation *) asObject(slot);
@@ -662,7 +663,7 @@ static _Bool encodeDictBody(JsonBuf *b, RawDictionary *dict, int depth)
 			return 0; // non-string key: Smalltalk fallback prints it
 		}
 		RawObject *key = asObject(assoc->key);
-		if (key->class != Handles.String->raw && key->class != Handles.Symbol->raw) {
+		if (!isClassIndex(key, &Handles.String) && !isClassIndex(key, &Handles.Symbol)) {
 			return 0;
 		}
 		if (!first && !bufByte(b, ',')) {
@@ -719,22 +720,21 @@ static _Bool encodeValue(JsonBuf *b, Value v, int depth)
 	}
 
 	RawObject *object = asObject(v);
-	if (object == Handles.nil->raw) {
+	if (object == Handles.nil.raw) {
 		return bufWrite(b, "null", 4);
 	}
-	if (object == Handles.true->raw) {
+	if (object == Handles.true_.raw) {
 		return bufWrite(b, "true", 4);
 	}
-	if (object == Handles.false->raw) {
+	if (object == Handles.false_.raw) {
 		return bufWrite(b, "false", 5);
 	}
 
-	RawClass *class = object->class;
-	if (class == Handles.String->raw || class == Handles.Symbol->raw) {
+	if (isClassIndex(object, &Handles.String) || isClassIndex(object, &Handles.Symbol)) {
 		return encodeStringBody(b, (RawString *) object);
 	}
-	if (class == Handles.BoxedFloat64->raw) {
-		double x = rawFloatValue(object);
+	if (isClassIndex(object, &Handles.BoxedFloat64)) {
+		double x = ((RawFloat *) object)->value;
 		if (isnan(x) || isinf(x)) {
 			return 0; // no JSON representation: Smalltalk raises JsonError
 		}
@@ -742,17 +742,17 @@ static _Bool encodeValue(JsonBuf *b, Value v, int depth)
 		size_t n = jsonFormatDouble(x, num);
 		return bufWrite(b, num, n);
 	}
-	if (class == Handles.Dictionary->raw) {
+	if (isClassIndex(object, &Handles.Dictionary)) {
 		return encodeDictBody(b, (RawDictionary *) object, depth);
 	}
-	if (class == Handles.OrderedCollection->raw) {
+	if (isClassIndex(object, &Handles.OrderedCollection)) {
 		RawOrderedCollection *coll = (RawOrderedCollection *) object;
 		RawArray *contents = (RawArray *) asObject(coll->contents);
 		intptr_t first = asCInt(coll->firstIndex);
 		intptr_t last = asCInt(coll->lastIndex);
 		return encodeSpan(b, contents->vars + (first - 1), (size_t) (last - first + 1), depth);
 	}
-	if (class == Handles.Array->raw) {
+	if (isClassIndex(object, &Handles.Array)) {
 		RawArray *array = (RawArray *) object;
 		return encodeSpan(b, array->vars, (size_t) array->size, depth);
 	}

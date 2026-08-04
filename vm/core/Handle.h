@@ -1,296 +1,229 @@
 #ifndef HANDLE_H
 #define HANDLE_H
 
+// Scoped handles: how C code holds a heap object across an allocation.
+//
+// The young generation MOVES (memory/Nursery.h), so a bare RawObject* held by C
+// across anything that can allocate is a dangling pointer waiting for a
+// collection. A handle is a slot the collector knows about and UPDATES, so the
+// C code reads the object's current address every time through `->raw`.
+//
+// Scopes nest and are stack-shaped: a function opens one, allocates through it,
+// and closes it, optionally promoting one result into the parent scope. Nothing
+// here is a garbage-collection root in the "keeps alive forever" sense; a scope
+// keeps its contents alive exactly as long as the C frame that owns it.
+//
+// The inline array is 256 entries, on the C stack, and the overflow is CHUNKED
+// rather than reallocated: a handle pointer already handed out must never move,
+// because callers hold it. Chunk chain is newest-first and every chunk but the
+// newest is full.
+
 #include "core/Object.h"
 #include "core/Thread.h"
-#include "runtime/Dictionary.h"
+#include "memory/Roots.h"
+#include <stddef.h>
 #include <string.h>
 
-#define REMEMBER_SCOPE_POSITION 0
-
-// Inline capacity of a scope (on the C stack) and the size of each heap
-// overflow chunk appended once the inline part is full. The inline part is
-// back at the original 256 (it was raised to 1024 while overflow meant a hard
-// FAIL): now that a full scope spills to chunks, a small inline part costs
-// giant methods one malloc while every recursive C frame (parser, analyzer,
-// codegen) carries 2KB instead of 8KB, which directly buys AST depth on the
-// growable fiber stacks.
 #define HANDLE_SCOPE_INLINE 256
 #define HANDLE_CHUNK_SIZE 1024
 
-typedef struct Handle {
-	void *object;
-	struct Handle *prev;
-	struct Handle *next;
-} Handle;
-
-// Heap overflow for a scope that outgrew its inline array (a giant method's
-// literals, a long `,` chain). Chunked so already-issued handle pointers never
-// move; the chain is NEWEST chunk first, every chunk but the newest is full.
 typedef struct HandleChunk {
-	struct HandleChunk *next; // the previous (older, full) chunk
+	struct HandleChunk *next; // the older, full chunk
 	Object handles[HANDLE_CHUNK_SIZE];
 } HandleChunk;
 
 typedef struct HandleScope {
 	struct HandleScope *parent;
-	Object handles[HANDLE_SCOPE_INLINE]; // 2KB/scope on the C stack; the common case
-	size_t size;                         // total, inline part plus all chunks
-	HandleChunk *overflow;               // NULL until the scope outgrows the inline part
-#if REMEMBER_SCOPE_POSITION
-	char *file;
-	size_t line;
-#endif
+	Object handles[HANDLE_SCOPE_INLINE];
+	size_t size;           // total across the inline array and every chunk
+	HandleChunk *overflow; // NULL until the scope outgrows the inline array
 } HandleScope;
 
-typedef struct {
-	Handle *current;
-} HandlesIterator;
-
-typedef struct {
-	HandleScope *current;
-} HandleScopeIterator;
-
+// The well-known objects and classes of one heap. Populated at bootstrap and
+// reached through the `Handles` macro below.
+//
+// Every entry is a HANDLE and not a raw pointer, for the same reason the rest of
+// this file exists: these classes are ordinary movable objects. What is stable
+// about a class is its INDEX (ADR 0005), which is why generated code bakes the
+// index and only C code that needs the class OBJECT comes through here.
+// Every field is exactly one pointer wide, and that is load-bearing: the
+// collector walks this struct as a flat array of slots
+// (smalltalkHandleSlotCount below) rather than naming each field, so adding a
+// well-known class here can never be forgotten on the root-scanning side.
 typedef struct SmalltalkHandles {
-	Object *nil;
-	Object *false;
-	Object *true;
-	Class *MetaClass;
-	Class *UndefinedObject;
-	Class *True;
-	Class *False;
-	Class *SmallInteger;
-	Class *Symbol;
-	Class *Character;
-	Class *Float;
-	Class *SmallFloat64;
-	Class *BoxedFloat64;
-	Class *String;
-	Class *Array;
-	Class *ByteArray;
-	Class *Association;
-	Class *Dictionary;
-	Class *OrderedCollection;
-	Class *Class;
-	Class *TypeFeedback;
-	Class *CompiledMethod;
-	Class *CompiledBlock;
-	Class *SourceCode;
-	Class *FileSourceCode;
-	Class *Block;
-	Class *Message;
-	Class *MethodContext;
-	Class *BlockContext;
-	Class *ExceptionHandler;
-	Class *UnwindHandler;
-	Class *ClassNode;
-	Class *MethodNode;
-	Class *BlockNode;
-	Class *BlockScope;
-	Class *ExpressionNode;
-	Class *MessageExpressionNode;
-	Class *NilNode;
-	Class *TrueNode;
-	Class *FalseNode;
-	Class *VariableNode;
-	Class *IntegerNode;
-	Class *CharacterNode;
-	Class *SymbolNode;
-	Class *StringNode;
-	Class *ArrayNode;
-	Class *ParseError;
-	Class *UndefinedVariableError;
-	Class *RedefinitionError;
-	Class *ReadonlyVariableError;
-	Class *InvalidPragmaError;
-	Class *IoError;
-	Dictionary *Smalltalk;
-	Array *SymbolTable;
-	String *initializeSymbol;
-	String *finalizeSymbol;
-	String *valueSymbol;
-	String *value_Symbol;
-	String *valueValueSymbol;
-	String *doesNotUnderstandSymbol;
-	String *cannotReturnSymbol;
-	String *handlesSymbol;
-	String *generateBacktraceSymbol;
-	String *runHandledBySymbol;
-	// Namespace machinery (vm/core/Namespace.h). APPEND ONLY from here on:
-	// the snapshot serializes this struct positionally, and every field must
-	// be a DISTINCT object (registerBuiltinObjects asserts it): two fields
-	// sharing one raw would collapse to one snapshot ID and shift the
-	// positional rebuild for every later field.
-	Class *Namespace;
-	Namespace *CoreNamespace;         // #Core, bindings == Handles.Smalltalk
-	Dictionary *Namespaces;           // registry: Symbol name -> Namespace
-	// Indirection cell (an Association, value = the active default namespace)
-	// rather than a second handle to the namespace itself, honoring the
-	// distinct-object rule above. Read via defaultNamespace().
-	Association *DefaultNamespace;
+	Object nil;
+	Object true_;
+	Object false_;
+
+	Class ObjectClass;
+	Class MetaClass;
+	Class ClassClass;
+	Class UndefinedObject;
+	Class True;
+	Class False;
+	Class SmallInteger;
+	Class LargeInteger;
+	Class Character;
+	// Float is the class the built-in kernel hangs float arithmetic on, and it
+	// exists for one reason: packages/Core declares `Float := Number` with the
+	// real `+`, `/` and the rest, and a scaffold method has to go where the real
+	// one goes or it shadows it forever (tools/Bootstrap.c).
+	Class Float;
+	Class SmallFloat64;
+	Class BoxedFloat64;
+	Class String;
+	Class Symbol;
+	Class Array;
+	Class ByteArray;
+	Class FloatArray;
+	Class Association;
+	Class Dictionary;
+	Class OrderedCollection;
+	Class CompiledMethod;
+	Class CompiledBlock;
+	Class Closure;
+	Class Cell;
+	Class Namespace;
+
+	// The syntax tree, which is made of ORDINARY HEAP OBJECTS.
+	//
+	// That is the parser's design and it is kept (docs/jit-v2/03-escopo-revisado.md
+	// keeps Tokenizer, Parser and Ast). It has one consequence worth stating: a
+	// node is allocated, so a parse can collect, so every node the parser holds
+	// has to be in a handle scope. The upside is that the collector needs to know
+	// nothing about syntax.
+	//
+	// The literal kinds are separate CLASSES rather than a tag field, because
+	// that is how the parser tells them apart and how the semantic analyser will:
+	// a VariableNode and an IntegerNode differ only in class.
+	Class SourceCode;
+	Class FileSourceCode;
+	Class ClassNode;
+	Class MethodNode;
+	Class BlockNode;
+	Class ExpressionNode;
+	Class MessageExpressionNode;
+	Class IntegerNode;
+	Class StringNode;
+	Class SymbolNode;
+	Class CharacterNode;
+	Class ArrayNode;
+	Class VariableNode;
+	Class NilNode;
+	Class TrueNode;
+	Class FalseNode;
+
+	Array symbolTable;
+	Object globals;
 } SmalltalkHandles;
 
-// The well-known handles are per-HEAP (shared by all worker OS threads of a heap),
-// NOT per-OS-thread TLS: they point at the shared old-space kernel objects, so every
-// thread mutating one heap must see the SAME set (removes the old `Handles = gMainHandles`
-// TLS-copy hack). Multiple isolates keep separate handles because they have separate
-// heaps. Storage lives in `struct Heap` (allocated in initHeap); this macro reaches it
-// through the current thread's heap.
+_Static_assert(sizeof(Object) == sizeof(void *), "a handle is one pointer");
+
+static inline size_t smalltalkHandleSlotCount(void)
+{
+	return sizeof(SmalltalkHandles) / sizeof(void *);
+}
+
 #define Handles (*CurrentThread.heap->handles)
 
-static void *scopeHandle(void *object);
-static void *closeHandleScope(HandleScope *scope, void *handle);
-
-static void *persistHandle(void *handle);
-static void *handle(void *object);
-void freeHandle(void *handle);
+void initHandles(void);
 void freeHandles(void);
 
-void *newObject(Class *class, size_t size);
-Float *newFloat(double value);
-static Value getTaggedPtr(void *handle);
-Object *copyResizedObject(Object *object, size_t newSize);
+void openHandleScope(HandleScope *scope);
+// Close `scope`, promoting `result` into the parent scope when non-NULL.
+// Returns the promoted handle, or NULL.
+void *closeHandleScope(HandleScope *scope, void *result);
+// Wrap a raw object in a handle belonging to the innermost open scope.
+void *scopeHandle(void *rawObject);
+// Wrap a raw object in a handle belonging to the OUTERMOST open scope: for the
+// rare object that must outlive every scope between here and the top of the
+// call chain. A compile error's offending AST node is the motivating case: the
+// failure happens under scopes the compiler closes on its way out, and the
+// error is only read back at the primitive that asked for the compile. The
+// slot is never reclaimed before the chain unwinds completely, so use this for
+// error paths, not in loops.
+void *outermostHandle(void *rawObject);
 
-void initHandlesIterator(HandlesIterator *iterator, Handle *handles);
-_Bool handlesIteratorHasNext(HandlesIterator *iterator);
-Object *handlesIteratorNext(HandlesIterator *iterator);
+// Allocate an instance of `class` with `elements` indexed elements, already
+// wrapped in a handle. THE ONLY way C code should create objects: the raw
+// allocator hands back a pointer that the very next allocation may invalidate.
+void *newObject(Class *class, size_t elements);
+// An instance that will NEVER MOVE (memory/Heap.h). For nil, true and false,
+// whose addresses generated code bakes as immediates.
+void *newImmortalObject(Class *class, size_t elements);
 
-void initHandleScopeIterator(HandleScopeIterator *iterator, HandleScope *scopes);
-_Bool handleScopeIteratorHasNext(HandleScopeIterator *iterator);
-HandleScope *handleScopeIteratorNext(HandleScopeIterator *iterator);
+// Visit the heap's well-known objects. Walked as a flat slot array, so a field
+// added above is scanned without touching this.
+void smalltalkHandlesVisitRoots(struct Heap *heap, RootVisitor visit, void *ctx);
 
+// Every handle in every scope of one mutator, for the collector.
+void handlesVisitRoots(struct Thread *thread, RootVisitor visit, void *ctx);
 
-// NB: do NOT memset the whole scope — `handles[]` is up to ~4 KB of stack and is
-// pure waste to zero (every consumer reads only [0..size), and scopeHandle writes
-// slots sequentially as size grows). Zeroing only `size` (and `parent`) is enough.
-// This is a hot path (every allocateObject / primitive / entry) and a big chunk of
-// each C frame's stack, so the memset dominated both perf and the compile spike.
-#if REMEMBER_SCOPE_POSITION
-	#define openHandleScope(scope) _openHandleScope(scope, __FILE__, __LINE__)
-	static void _openHandleScope(HandleScope *scope, char *file, size_t line)
-	{
-		scope->size = 0;
-		scope->overflow = NULL;
-		scope->parent = CurrentThread.handleScopes;
-		scope->file = file;
-		scope->line = line;
-		CurrentThread.handleScopes = scope;
-	}
-#else
-	static void openHandleScope(HandleScope *scope)
-	{
-		scope->size = 0;
-		scope->overflow = NULL;
-		scope->parent = CurrentThread.handleScopes;
-		CurrentThread.handleScopes = scope;
-	}
-#endif
-
-
-// Free a scope's heap overflow chunks: on every path that retires a scope,
-// closeHandleScope AND the exception unwinder (unwindThreadStateTo), which
-// pops scopes without closing them.
-static void handleScopeFreeChunks(HandleScope *scope)
-{
-	HandleChunk *chunk = scope->overflow;
-	while (chunk != NULL) {
-		HandleChunk *next = chunk->next;
-		free(chunk);
-		chunk = next;
-	}
-	scope->overflow = NULL;
-}
-
-
-// The handle at global index `index` of a scope, inline part or overflow
-// chunk. O(1) for the inline part; beyond it walks the newest-first chain
-// (rare: only scopes past 1024 live handles, and the GC walk stays O(chunks)
-// per access). Used by the collectors and the snapshot writer.
-static inline Object *handleScopeAt(HandleScope *scope, size_t index)
-{
-	if (index < HANDLE_SCOPE_INLINE) {
-		return &scope->handles[index];
-	}
-	size_t overflowIndex = index - HANDLE_SCOPE_INLINE;
-	size_t overflowSize = scope->size - HANDLE_SCOPE_INLINE;
-	size_t chunkCount = (overflowSize + HANDLE_CHUNK_SIZE - 1) / HANDLE_CHUNK_SIZE;
-	size_t ordinal = overflowIndex / HANDLE_CHUNK_SIZE; // 0-based from the OLDEST chunk
-	HandleChunk *chunk = scope->overflow;               // newest first
-	for (size_t back = chunkCount - 1; back > ordinal; back--) {
-		chunk = chunk->next;
-	}
-	return &chunk->handles[overflowIndex % HANDLE_CHUNK_SIZE];
-}
-
-
-static void *closeHandleScope(HandleScope *scope, void *handle)
-{
-	ASSERT(CurrentThread.handleScopes == scope);
-	CurrentThread.handleScopes = CurrentThread.handleScopes->parent;
-	void *result = NULL;
-	if (handle != NULL) {
-		ASSERT(CurrentThread.handleScopes != NULL);
-		// Re-home into the parent BEFORE freeing: `handle` may live in a chunk.
-		result = scopeHandle(((Object *) handle)->raw);
-	}
-	handleScopeFreeChunks(scope);
-	return result;
-}
-
-
-static void *scopeHandle(void *object)
-{
-	ASSERT(CurrentThread.handleScopes != NULL);
-	HandleScope *scope = CurrentThread.handleScopes;
-	if (scope->size < HANDLE_SCOPE_INLINE) {
-		Object *handle = &scope->handles[scope->size++];
-		handle->raw = object;
-		return handle;
-	}
-	// Inline part exhausted: spill to heap chunks (entries never move, so
-	// previously returned handle pointers stay valid). Replaces the old hard
-	// FAIL() at 1024: a giant compiled method or a deep `,` chain now just
-	// grows the scope.
-	size_t index = (scope->size - HANDLE_SCOPE_INLINE) % HANDLE_CHUNK_SIZE;
-	if (index == 0) {
-		HandleChunk *chunk = malloc(sizeof(HandleChunk));
-		if (chunk == NULL) {
-			FAIL();
-		}
-		chunk->next = scope->overflow;
-		scope->overflow = chunk;
-	}
-	Object *handle = &scope->overflow->handles[index];
-	handle->raw = object;
-	scope->size++;
-	return handle;
-}
-
-
-static void *persistHandle(void *object)
-{
-	return handle(((Object *) object)->raw);
-}
-
-
-static void *handle(void *object)
-{
-	Handle *handle = malloc(sizeof(Handle));
-	ASSERT(handle != NULL);
-	handle->object = object;
-	handle->prev = NULL;
-	handle->next = CurrentThread.handles;
-	if (handle->next != NULL) {
-		handle->next->prev = handle; // keep the list doubly-linked so freeHandle works
-	}
-	CurrentThread.handles = handle;
-	return (void *) handle;
-}
-
-
-static Value getTaggedPtr(void *handle)
+// The tagged Value naming a handled object. The one place C code converts a
+// handle into something storable in a heap slot.
+static inline Value objectTagged(void *handle)
 {
 	return tagPtr(((Object *) handle)->raw);
+}
+
+
+// The named instance variables of an object, and its indexed part.
+//
+// Both take a HANDLE and re-read `->raw`, which is the point: the caller is C
+// code that may allocate between one call and the next, and a bare body pointer
+// held across an allocation is a dangling pointer into the evacuated semispace.
+static inline Value *objectVars(void *handle)
+{
+	return (Value *) ((Object *) handle)->raw->body;
+}
+
+
+// The indexed region, whatever the format uses it for: tagged elements for an
+// Array, bytes for a String or a LargeInteger, doubles for a FloatArray. Body
+// word 0 is the element count in every indexed format, so it is stepped over
+// here rather than at each call site.
+static inline void *objectIndexedVars(void *handle)
+{
+	return (uint8_t *) ((Object *) handle)->raw->body + sizeof(uint64_t);
+}
+
+
+// A copy of an indexed object with a different element count, truncating or
+// zero-extending. The parser builds keyword selectors this way: it does not know
+// the final length until it has read the last keyword.
+Object *copyResizedObject(Object *object, size_t elements);
+
+// Is this slot EMPTY, in either of the two spellings the VM produces?
+//
+// The allocator writes ZERO into a slot nobody set, which is the SmallInteger 0
+// and is what ABSENT means inside the VM (memory/Heap.c). But an Array that
+// SMALLTALK reads holds nil in its empty slots instead, because nil is the only
+// absent Smalltalk has and the kernel's own hash probes test `isNil`
+// (runtime/Collection.c, newArray).
+//
+// Both spellings therefore exist in one running system: an Array allocated
+// before nil did carries zeros, every one after carries nil. Every hash probe in
+// C has to accept both, or a table built on one side reads as permanently full
+// from the other, and the probe walks off into a slot it thinks is occupied.
+static inline _Bool slotIsEmpty(Value slot)
+{
+	return !valueTypeOf(slot, VALUE_POINTER) || asObject(slot) == Handles.nil.raw;
+}
+
+
+// Class index of a handled class, which is what generated code and inline
+// caches compare against.
+static inline uint32_t classIndexOf(Class *class)
+{
+	return class->raw->classIndex;
+}
+
+
+// Is `object` an instance of `class`? An index compare, no dereference of the
+// class and no second cache line.
+static inline _Bool isInstanceOf(RawObject *object, Class *class)
+{
+	return rawObjectClassIndex(object) == class->raw->classIndex;
 }
 
 #endif

@@ -4,7 +4,10 @@
 
 UnwindHandler := Object [
 
-	<shape: UnwindHandlerShape>
+	"An ordinary object until ensure: exists in jit-v2, for the same reason as
+	 ExceptionHandler: the chain the VM walks is the unwind record chain the
+	 non-local return built, not a chain of these."
+
 
 	| parent context block |
 

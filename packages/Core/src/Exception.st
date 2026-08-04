@@ -159,8 +159,22 @@ Exception := Object [
 	 value of the signal expression and execution continues at the signal
 	 point."
 	defaultAction [
+		"THE LAST RESORT, so nothing in here may raise.
+
+		 defaultAction is what runs when NOBODY handled the exception, and an
+		 exception raised inside it has nowhere left to go but defaultAction
+		 again. Both statements below were exactly that: signalingContext answers
+		 `self notYetImplemented` until the ADR 0008 materialiser exists, and
+		 noteUnhandled was a primitive with an empty body, so each one raised and
+		 re-entered here. Every unhandled error in the system died of stack
+		 exhaustion instead of being reported, which is a SEGFAULT where the
+		 design says print-and-exit-non-zero.
+
+		 The backtrace is GUARDED rather than removed: it comes back for free the
+		 day a Context can be materialised, and until then a missing backtrace is
+		 worth strictly less than the message, which still prints."
 		Transcript nextPutAll: self messageText; lf.
-		self signalingContext printBacktrace.
+		[self signalingContext printBacktrace] on: Error do: [ :ignored | ].
 		"Count this death so main folds it into a nonzero process exit code
 		 (non-interactive runs): a test can no longer print a backtrace and
 		 still report success. Resumable defaults (Warning) never reach here."
@@ -192,13 +206,21 @@ Exception := Object [
 
 
 	signalingContext [
+		"The context the handler runs in, found by walking OUT of the Exception
+		 frames that got here: every frame whose receiver is this exception is
+		 one of its own methods (this one, generateBacktrace, defaultAction),
+		 and the first frame beyond them belongs to whoever asked. The handler
+		 runs on top of the signaling frames (nothing was unwound), so the walk
+		 is over live frames.
+
+		 thisContext is not a field read in jit-v2: an activation is a native
+		 frame, and a Context is MATERIALISED from it on demand (ADR 0008).
+		 nil when the walk runs out (the signal came straight from the VM)."
 		| context |
 
 		context := thisContext.
-		[(context code ownerClass == Exception or: [context code ownerClass inheritsFrom: Exception])
-		or: [context code ownerClass == Exception class or: [context code ownerClass inheritsFrom: Exception class]]]
+		[context notNil and: [context receiver == self]]
 			whileTrue: [context := context parent].
-
 		^context
 	]
 

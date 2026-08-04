@@ -74,6 +74,13 @@ ActorSystem := Object [
 	]
 
 
+	deadLetters [
+		"The dead-letter process, so a caller can count what was undeliverable
+		 or silence the report around a case that expects one."
+		^deadLetters
+	]
+
+
 	"------------------------------------------------------ delivery"
 
 	deliverUser: aMessage to: aPid from: aSenderPid [
@@ -83,16 +90,23 @@ ActorSystem := Object [
 		endpoint := aPid endpoint.
 		endpoint isNil ifTrue: [ endpoint := self endpointFor: aPid ].
 		endpoint isNil
-			ifTrue: [ deadLetters postUser: aMessage sender: aSenderPid ]
+			ifTrue: [ deadLetters userMessage: aMessage to: aPid from: aSenderPid ]
 			ifFalse: [ endpoint postUser: aMessage sender: aSenderPid ].
 		^self
 	]
 
 
 	deliverSystem: aMessage to: aPid [
+		"Undeliverable SYSTEM messages are dead letters too. They used to be
+		 dropped where the ifNotNil: fell through, so `pid stop` on an actor
+		 that had already terminated was indistinguishable from one that
+		 worked -- and a supervisor directive lost to a race left no trace at
+		 all, which is the one case where the trace is the whole point."
 		| endpoint |
 		endpoint := self endpointFor: aPid.
-		endpoint ifNotNil: [:e | e postSystem: aMessage ].
+		endpoint isNil
+			ifTrue: [ deadLetters systemMessage: aMessage to: aPid ]
+			ifFalse: [ endpoint postSystem: aMessage ].
 		^self
 	]
 
@@ -133,6 +147,20 @@ ActorSystem := Object [
 
 
 	"------------------------------------------------------ guardian supervision"
+
+	guardianStrategy [ ^guardianStrategy ]
+
+
+	guardianStrategy: aStrategy [
+		"The strategy governing TOP-LEVEL actors, which have no parent whose
+		 Props could govern them. Props supervisors apply to an actor's
+		 CHILDREN (ActorContext>>handleChildFailure:), exactly as ProtoActor's
+		 do, so this is the only way to change what happens to a root actor --
+		 ProtoActor spells it RootContext.WithGuardian."
+		guardianStrategy := aStrategy.
+		^self
+	]
+
 
 	guardianHandleFailure: aFailure [
 		"A top-level actor failed; the guardian strategy decides its fate."

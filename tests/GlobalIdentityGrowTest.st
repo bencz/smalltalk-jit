@@ -17,8 +17,13 @@ GrowHolder := Object [
 	read [ ^GrowMutable ]
 ]
 
-"Pad classes: each installs a global (its own name). The post-bootstrap dict
- sits at ~248/256, so ~20 of these comfortably cross the grow threshold."
+"Pad classes: each installs a global (its own name), through the SAME C path a
+ class definition always takes, which is the path whose growDictionary is under
+ test. How many are needed is a property of the kernel, not of this test: the
+ dictionary rehashes at 3/4 of its 256 slots, so it takes as many as the gap
+ between 192 and however many globals the bootstrap leaves. v1 left ~248 and 20
+ sufficed; v2's kernel is smaller (165), so 20 landed at 187 -- four short, and
+ the test reported a failure for a rehash that never had to happen."
 GrowPad01 := Object [ ]
 GrowPad02 := Object [ ]
 GrowPad03 := Object [ ]
@@ -39,17 +44,40 @@ GrowPad17 := Object [ ]
 GrowPad18 := Object [ ]
 GrowPad19 := Object [ ]
 GrowPad20 := Object [ ]
+GrowPad21 := Object [ ]
+GrowPad22 := Object [ ]
+GrowPad23 := Object [ ]
+GrowPad24 := Object [ ]
+GrowPad25 := Object [ ]
+GrowPad26 := Object [ ]
+GrowPad27 := Object [ ]
+GrowPad28 := Object [ ]
+GrowPad29 := Object [ ]
+GrowPad30 := Object [ ]
+GrowPad31 := Object [ ]
+GrowPad32 := Object [ ]
+GrowPad33 := Object [ ]
+GrowPad34 := Object [ ]
+GrowPad35 := Object [ ]
+GrowPad36 := Object [ ]
+GrowPad37 := Object [ ]
+GrowPad38 := Object [ ]
+GrowPad39 := Object [ ]
+GrowPad40 := Object [ ]
 
 [
 	| fails |
 	fails := 0.
 	GrowMutable := 42.
 
-	"sanity: the system dictionary really did grow past its initial capacity,
-	 so this test actually exercises the rehash path"
-	(Smalltalk size > 256) ifFalse: [
-		Transcript nextPutAll: 'GrowTest: dict did NOT grow (size=';
-			nextPutAll: Smalltalk size printString; nextPutAll: ')'; lf.
+	"sanity: the system dictionary really did REHASH, so this test exercises the
+	 path it is about. The CONTENTS ARRAY is what says so -- it is 256 slots out
+	 of the bootstrap and doubles on the first grow -- and the number of globals
+	 is not: that only says how many the kernel happens to have."
+	((Smalltalk instVarAt: 1) size > 256) ifFalse: [
+		Transcript nextPutAll: 'GrowTest: dict did NOT rehash (entries=';
+			nextPutAll: Smalltalk size printString; nextPutAll: ' slots=';
+			nextPutAll: (Smalltalk instVarAt: 1) size printString; nextPutAll: ')'; lf.
 		fails := fails + 1 ].
 
 	"the crux: identity preserved => the eagerly-compiled read observes the value

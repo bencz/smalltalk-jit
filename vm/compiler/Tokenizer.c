@@ -130,7 +130,6 @@ static char nextChar(Tokenizer *tokenizer);
 static size_t getPosition(Tokenizer *tokenizer);
 static _Bool isNumeric(char ch);
 static _Bool isDigit(char ch, uint8_t base);
-static _Bool isLetter(char ch);
 static _Bool isSeparator(char ch);
 static _Bool isSpecial(char ch);
 static _Bool isIdentifier(char ch);
@@ -508,12 +507,6 @@ static _Bool isNumeric(char ch)
 static _Bool isDigit(char ch, uint8_t base)
 {
 	return CharacterDigitValues[(unsigned char) ch] < base;
-}
-
-
-static _Bool isLetter(char ch)
-{
-	return Characters[(unsigned char) ch] == LET;
 }
 
 

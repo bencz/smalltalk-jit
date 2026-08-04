@@ -7,7 +7,7 @@
  without an intervening context switch, exactly like Semaphore."
 Future := Object [
 
-	| pid completed value waiterId |
+	| pid completed value waiters |
 
 
 	class in: aSystem [
@@ -17,6 +17,13 @@ Future := Object [
 
 	initIn: aSystem [
 		completed := false.
+		"EVERY waiter, not one. A single waiterId slot meant the second await on
+		 the same Future overwrote the first, and the first process parked with
+		 nothing left that could ever resume it -- a leaked fiber and a caller
+		 that never returns. One reply can legitimately be awaited by more than
+		 one process (a Future handed to two workers, an await plus a timeout
+		 watchdog), so completion wakes them all."
+		waiters := OrderedCollection new.
 		"a direct pid: delivery uses `pid endpoint` (this Future) and never the
 		 registry. Keep a real id so Pid>>= / hash stay valid."
 		pid := Pid system: aSystem id: aSystem nextId endpoint: self.
@@ -47,7 +54,8 @@ Future := Object [
 		completed ifTrue: [ Processor monitorExit. ^self ].
 		completed := true.
 		value := aValue.
-		waiterId ifNotNil: [:w | Processor resumeId: w ].
+		waiters do: [:w | Processor resumeId: w ].
+		waiters := OrderedCollection new.
 		Processor monitorExit.
 		^self
 	]
@@ -59,7 +67,7 @@ Future := Object [
 		"Park the current process until the reply arrives."
 		Processor monitorEnterOn: self.
 		completed ifTrue: [ | v | v := value. Processor monitorExit. ^v ].
-		waiterId := Processor currentId.
+		waiters addLast: Processor currentId.
 		Processor parkOnMonitor.
 		^value
 	]
@@ -69,7 +77,7 @@ Future := Object [
 		"Park until the reply arrives or the timeout elapses (then answer nil)."
 		Processor monitorEnterOn: self.
 		completed ifTrue: [ | v | v := value. Processor monitorExit. ^v ].
-		waiterId := Processor currentId.
+		waiters addLast: Processor currentId.
 		[ (Delay forMilliseconds: milliseconds) wait. self complete: nil ] fork.
 		Processor parkOnMonitor.
 		^value

@@ -48,6 +48,14 @@ int64_t osMonotonicNanos(void);
 // instant. Takes the instant because the answer is DST-dependent.
 int64_t osLocalUtcOffsetSeconds(int64_t epochSeconds);
 
+// Block this OS THREAD for at least `nanos`. Interrupted sleeps are resumed
+// inside the layer, so a signal does not cut a sleep short.
+//
+// It blocks the thread, not a fiber: the scheduler calls it only when there is
+// no other fiber that could run, because with one there is always something
+// better to do than wait (concurrency/Scheduler.c).
+void osSleepNanos(int64_t nanos);
+
 // ---- entropy ----------------------------------------------------------------
 
 // Fill buffer with `size` cryptographically strong random bytes (blocking
@@ -145,10 +153,25 @@ void osIgnoreBrokenPipe(void);
 // reliable answer (return 0 and the callers fall back to CWD-relative paths).
 _Bool osExecutablePath(char *buffer, size_t size);
 
+// The value of an environment variable, copied out. 0 when the variable is
+// unset OR when its value does not fit, and the buffer is untouched either way.
+//
+// COPIED rather than answered as a pointer: getenv answers memory the next
+// setenv may reuse, and a Smalltalk String has to be built from stable bytes.
+_Bool osEnvironmentValue(const char *name, char *buffer, size_t size);
+
 // Path for the JIT symbol map consumed by the platform profiler, or 0 when
 // the platform has no such consumer (the feature then stays disabled).
 // Linux: /tmp/perf-<pid>.map for `perf`. PORT_ME(jit-map): others return 0.
 _Bool osJitMapPath(char *buffer, size_t size);
+
+// Stop in the NATIVE debugger, when one is attached; answers whether it was.
+// A trap with nobody tracing would KILL the process (that is what an
+// undisposed SIGTRAP does), so with no debugger this does nothing and answers
+// 0, and the caller says so instead of dying. Linux: TracerPid in
+// /proc/self/status decides, then raise(SIGTRAP). PORT_ME(debug-break):
+// Windows IsDebuggerPresent + DebugBreak.
+_Bool osDebugBreak(void);
 
 // ---- scheduling ----------------------------------------------------------------
 

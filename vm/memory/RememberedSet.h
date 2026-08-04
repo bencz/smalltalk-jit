@@ -1,160 +1,57 @@
-#ifndef REMEMBERED_SET
-#define REMEMBERED_SET
+#ifndef REMEMBERED_SET_H
+#define REMEMBERED_SET_H
 
-#define REMEMBERED_SET_BLOCK_SIZE 1024
+// Old-to-young edge log, appended by the write barrier and drained by the
+// nursery collector.
+//
+// Per MUTATOR, not per heap: the barrier is on the hottest store path in the
+// system and must not take a lock. A collection (which is stop-the-world) folds
+// every mutator's log into the heap-level set, and an exiting worker splices its
+// own in on the way out, so nothing is lost when a thread dies.
+//
+// The GC_REMEMBERED bit in the object header is what keeps the log from growing
+// without bound: an object already in the set is not added again.
+
+#include "core/Object.h"
+#include <stdlib.h>
+
+#define REMEMBERED_BLOCK_CAPACITY 1024
 
 typedef struct RememberedSetBlock {
 	struct RememberedSetBlock *prev;
-	Value *current;
-	Value *end;
-	Value objects[REMEMBERED_SET_BLOCK_SIZE];
+	RawObject **current;
+	RawObject *objects[REMEMBERED_BLOCK_CAPACITY];
 } RememberedSetBlock;
 
 typedef struct {
 	RememberedSetBlock *blocks;
 } RememberedSet;
 
-typedef struct {
-	RememberedSetBlock *block;
-	Value *blockEnd;
-	RememberedSetBlock *firstBlock;
-	_Bool hasPrevBlock;
-	Value *next;
-} RememberedSetIterator;
-
-static void rememberedSetGrow(RememberedSet *rememberedSet);
-static RememberedSetBlock *createRememberedSetBlock(RememberedSetBlock *prev);
-static RememberedSetBlock *rememberedSetBlockFirst(RememberedSetBlock *block);
-static void rememberedSetIteratorSetBlock(RememberedSetIterator *iterator, RememberedSetBlock *block);
+void rememberedSetGrow(RememberedSet *set);
+void rememberedSetFreeBlocks(RememberedSetBlock *block);
+size_t rememberedSetCount(RememberedSet *set);
 
 
-static void initRememberedSet(RememberedSet *rememberedSet)
+static inline void initRememberedSet(RememberedSet *set)
 {
-	rememberedSet->blocks = createRememberedSetBlock(NULL);
+	set->blocks = NULL;
+	rememberedSetGrow(set);
 }
 
 
-static void rememberedSetAdd(RememberedSet *rememberedSet, RawObject *object)
+// The write barrier's slow path. The fast path (the tests on generation and on
+// the GC_REMEMBERED bit) is inlined by the caller, and by the JIT.
+static inline void rememberedSetAdd(RememberedSet *set, RawObject *object)
 {
-	// Grow BEFORE writing when the head block is full, so the store is always in
-	// bounds. (A grow-AFTER-write scheme corrupts the C heap the moment the head
-	// is ever observed full on entry, because the store has already run.) Every
-	// remembered-set writer — the C barrier, the scavenger, and the JIT barrier
-	// (generateStoreCheck) — funnels through here so the invariant holds.
-	RememberedSetBlock *block = rememberedSet->blocks;
-	if (block->current >= block->end) {
-		rememberedSetGrow(rememberedSet);
-		block = rememberedSet->blocks;
+	ASSERT(isOldObject(object));
+	ASSERT(!rawObjectHasGcBit(object, GC_REMEMBERED));
+	RememberedSetBlock *block = set->blocks;
+	if (block->current == block->objects + REMEMBERED_BLOCK_CAPACITY) {
+		rememberedSetGrow(set);
+		block = set->blocks;
 	}
-	ASSERT((object->tags & TAG_REMEMBERED) == 0);
-	object->tags |= TAG_REMEMBERED;
-	*block->current++ = tagPtr(object);
-}
-
-
-static void rememberedSetGrow(RememberedSet *rememberedSet)
-{
-	rememberedSet->blocks = createRememberedSetBlock(rememberedSet->blocks);
-}
-
-
-static RememberedSetBlock *createRememberedSetBlock(RememberedSetBlock *prev)
-{
-	RememberedSetBlock *block = malloc(sizeof(RememberedSetBlock));
-	ASSERT(block != NULL);
-	block->prev = prev;
-	block->current = block->objects;
-	block->end = block->current + REMEMBERED_SET_BLOCK_SIZE;
-	return block;
-}
-
-
-static void rememberedSetReset(RememberedSet *rememberedSet)
-{
-	RememberedSetBlock *block = rememberedSet->blocks;
-	RememberedSetBlock *prev = block->prev;
-	while (prev != NULL) {
-		RememberedSetBlock *tmp = prev;
-		prev = tmp->prev;
-		free(tmp);
-	}
-
-	block->prev = NULL;
-	block->current = block->objects;
-}
-
-
-// Free an entire block chain (unlike rememberedSetReset, which keeps the head).
-// Used by the scavenger to discard a detached set after rebuilding a fresh one.
-static void rememberedSetFreeBlocks(RememberedSetBlock *block)
-{
-	while (block != NULL) {
-		RememberedSetBlock *prev = block->prev;
-		free(block);
-		block = prev;
-	}
-}
-
-
-static size_t rememberedSetCount(RememberedSet *rememberedSet)
-{
-	size_t total = 0;
-	for (RememberedSetBlock *block = rememberedSet->blocks; block != NULL; block = block->prev) {
-		total += (size_t) (block->current - block->objects);
-	}
-	return total;
-}
-
-
-static void initRememberedSetIterator(RememberedSetIterator *iterator, RememberedSet *rememberedSet)
-{
-	RememberedSetBlock *block = rememberedSet->blocks;
-	iterator->firstBlock = rememberedSetBlockFirst(block);
-	rememberedSetIteratorSetBlock(iterator, block);
-	if (iterator->next == NULL && block != iterator->firstBlock) {
-		rememberedSetIteratorSetBlock(iterator, block->prev);
-	}
-}
-
-
-static RememberedSetBlock *rememberedSetBlockFirst(RememberedSetBlock *block)
-{
-	while (block->prev != NULL) {
-		block = block->prev;
-	}
-	return block;
-}
-
-
-static RawObject *rememberedSetIteratorNext(RememberedSetIterator *iterator)
-{
-	Value *next = iterator->next;
-	ASSERT(next != NULL);
-	RawObject *object = asObject(*next++);
-	if (next < iterator->blockEnd) {
-		iterator->next = next;
-	} else if (iterator->hasPrevBlock) {
-		rememberedSetIteratorSetBlock(iterator, iterator->block->prev);
-	} else {
-		iterator->next = NULL;
-	}
-	return object;
-}
-
-
-static void rememberedSetIteratorSetBlock(RememberedSetIterator *iterator, RememberedSetBlock *block)
-{
-	ASSERT(block != NULL);
-	iterator->block = block;
-	iterator->blockEnd = block->current;
-	iterator->hasPrevBlock = block != iterator->firstBlock;
-	iterator->next = block->objects < iterator->blockEnd ? block->objects : NULL;
-}
-
-
-static _Bool rememberedSetIteratorHasNext(RememberedSetIterator *iterator)
-{
-	return iterator->next != NULL;
+	*block->current++ = object;
+	rawObjectSetGcBit(object, GC_REMEMBERED);
 }
 
 #endif

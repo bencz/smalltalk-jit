@@ -4,9 +4,12 @@
 // truncation signal beyond filling the buffer, so a result that used the whole
 // buffer is treated as "does not fit".
 #include "os/Os.h"
+#include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <string.h>
 #include <errno.h>
+#include <signal.h>
 #include <stdio.h>
 
 
@@ -49,4 +52,44 @@ void osErrorMessage(int code, char *buffer, size_t size)
 _Bool osJitMapPath(char *buffer, size_t size)
 {
 	return snprintf(buffer, size, "/tmp/perf-%d.map", (int) getpid()) < (int) size;
+}
+
+
+_Bool osEnvironmentValue(const char *name, char *buffer, size_t size)
+{
+	const char *value = getenv(name);
+	if (value == NULL) {
+		return 0;
+	}
+	size_t length = strlen(value);
+	if (length + 1 > size) {
+		return 0;
+	}
+	memcpy(buffer, value, length + 1);
+	return 1;
+}
+
+
+_Bool osDebugBreak(void)
+{
+	// TracerPid is 0 unless something is ptrace-attached (gdb, strace). Read
+	// fresh on every call: the debugger may have attached since the last one.
+	FILE *status = fopen("/proc/self/status", "r");
+	if (status == NULL) {
+		return 0;
+	}
+	char line[128];
+	_Bool traced = 0;
+	while (fgets(line, sizeof line, status) != NULL) {
+		if (strncmp(line, "TracerPid:", 10) == 0) {
+			traced = strtol(line + 10, NULL, 10) != 0;
+			break;
+		}
+	}
+	fclose(status);
+	if (!traced) {
+		return 0;
+	}
+	raise(SIGTRAP);
+	return 1;
 }

@@ -1,14 +1,25 @@
 #ifndef SMALLTALK_H
 #define SMALLTALK_H
 
-#include "core/Object.h"
-#include "runtime/String.h"
-#include "runtime/Dictionary.h"
+// The system dictionary and the well-known singletons.
+//
+// Adapted to the v2 handle model: SmalltalkHandles holds handles BY VALUE, not
+// as pointers, so `Handles.nil` is an Object and `Handles.nil.raw` is what it
+// names. The old spelling `Handles.nil->raw` is what most of the compile errors
+// in the surviving front end are.
+
 #include "core/Handle.h"
+#include "core/Object.h"
+#include "runtime/Dictionary.h"
+#include "runtime/String.h"
 
 #define SYMBOL_TABLE_SIZE 1024
 
-String *asSymbol(String *string);
+// The system dictionary, Symbol -> Association. Created by the bootstrap and
+// held in `Handles.globals`, so it is a root like every other well-known object.
+Dictionary *smalltalkGlobals(void);
+void smalltalkInitGlobals(size_t capacity);
+
 String *getSymbol(char *s);
 void setGlobal(char *key, Value value);
 void setGlobalObject(char *key, Object *value);
@@ -18,36 +29,40 @@ void globalAtPut(String *key, Value value);
 Value globalAt(String *key);
 Object *globalObjectAt(String *key);
 Class *getClass(char *key);
-void objectBecome(Object *object, Object *other);
+// `become:` is not in v2 yet. It was declared here and implemented by swapping
+// object bodies across three spaces and the stack, which is a decision the new
+// object model has to make again rather than inherit (ADR 0005).
 
 
-static _Bool isNil(void *p)
+static inline _Bool isNil(void *handle)
 {
-	return ((Object *) p)->raw == Handles.nil->raw;
+	return ((Object *) handle)->raw == Handles.nil.raw;
 }
 
 
-static _Bool isRawNil(void *p)
+static inline _Bool isRawNil(void *raw)
 {
-	return (RawObject *) p == Handles.nil->raw;
+	return (RawObject *) raw == Handles.nil.raw;
 }
 
 
-static _Bool isTaggedNil(Value value)
+static inline _Bool isTaggedNil(Value value)
 {
-	return value == getTaggedPtr(Handles.nil);
+	return value == tagPtr(Handles.nil.raw);
 }
 
 
-static _Bool isTaggedTrue(Value value)
+static inline _Bool isTaggedTrue(Value value)
 {
-	return value == getTaggedPtr(Handles.true);
+	return value == tagPtr(Handles.true_.raw);
 }
 
 
-static Object *asBool(_Bool bool)
+// The singleton for a C boolean. Answers the HANDLE, so the caller can store it
+// through the write barrier like any other object.
+static inline Object *asBool(_Bool value)
 {
-	return bool ? Handles.true : Handles.false;
+	return value ? &Handles.true_ : &Handles.false_;
 }
 
 #endif

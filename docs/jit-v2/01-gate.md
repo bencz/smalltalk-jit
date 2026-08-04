@@ -1,0 +1,1530 @@
+# O gate crescente
+
+Sob corte seco (ADR 0002) a suite nao fica verde a cada commit, entao ela nao
+pode ser o contrato de corretude. Este documento e o contrato.
+
+Uma escada de niveis. Cada nivel tem **um comando** e **um criterio objetivo**.
+O nivel atual fica em `scripts/gate.level`. Um commit e valido quando
+`scripts/gate.sh` passa, e `gate.sh` roda **todos os niveis ate o atual**, nao
+so o ultimo. **O nivel so sobe.** Descer exige apagar a linha do registro abaixo
+e escrever por que, no commit.
+
+## A escada
+
+| n | nome | criterio |
+|---|---|---|
+| 0 | aloca e coleta | self-test em C do subsistema de memoria, linkado SOZINHO |
+| 1 | troca de fiber | self-test em C do subsistema de fibers, tambem sozinho |
+| 2 | objetos e colecoes | String, Symbol, Array, OrderedCollection sob coleta |
+| 3 | JIT executa | bytecode escrito a mao, compilado e EXECUTADO, com perfil de tipos |
+| 4 | constroi SSA | bytecode vira SSA, com estado de deopt anexado |
+| 5 | otimiza | os passes, incluindo promocao de representacao de phi |
+| 6 | escapa e materializa | objeto apagado e RECONSTRUIDO a partir da receita |
+| 7 | backend de SSA | SSA otimizado vira codigo de maquina que RODA, e o tier 1 e o oraculo |
+| 8 | primitivas | aritmetica por SEND, e o fallback quando a primitiva falha |
+| 9 | front end | fonte Smalltalk vira bytecode, compila e RODA |
+| 10 | compila | `cmake --build build` limpo, com `-Werror`, sem avisos |
+| 11 | executa | `st -e '(3 + 4) printNl'` imprime `7` |
+| 12 | bootstrap | `st -s snap -b packages/Core` completa e a imagem recarrega |
+| 13 | pacotes | os quatro pacotes compilam e a imagem do projeto e gerada |
+| 14 | paridade | `run_tests.sh` verde, **158 ok**, TUDO |
+| 15 | deopt-stress | a suite inteira verde com `ST_DEOPT_STRESS=1`, resultado identico |
+| 16 | performance | `vec3_flat`: zero alocacao, zero unbox, zero send no laco |
+
+Os niveis 0 a 9 sao subsistemas provados SOZINHOS, cada um linkado a mao com meia
+duzia de arquivos e nenhum CMake. Isso e deliberado: eles tem que continuar
+passando enquanto o resto do VM ainda nem compila, que e precisamente a janela
+que o corte seco abriu, e memoria, fibers, objetos, JIT, SSA, otimizador,
+materializacao, primitivas e front end sao justamente os subsistemas que nao
+dependem de um VM inteiro para serem verificados.
+
+Os niveis 10 a 14 sao o VM voltando a existir e alcancando PARIDADE COMPLETA
+com o v1. O 15 e o que torna a especulacao confiavel. O 16 e o alvo de
+performance.
+
+### Os niveis 7, 8 e 9 foram INSERIDOS, e o que isso custou
+
+A escada original ia de "escapa e materializa" direto para "compila". Dois
+subsistemas faltavam ali, e os dois pela mesma razao: a fase 0 os tratou como
+itens de inventario e nao como coisas que dava para provar sozinhas.
+
+**8, primitivas.** `3 + 4` compilava para um SEND com **nada do outro lado**.
+Nenhum programa real roda assim.
+
+**9, front end.** Tudo abaixo dele foi provado com bytecode escrito a mao. O
+nivel 9 e onde o bytecode passa a vir de FONTE, e ele e provavel sozinho pelo
+mesmo motivo que os outros: parser mais emissor mais JIT mais primitivas nao
+precisam de um VM inteiro, precisam de um heap e de um kernel minimo.
+
+Inserir os dois custou renumerar de 7 para cima, e o **7, backend de SSA**
+custou a mesma renumeracao uma segunda vez, pela mesma regra e pelo mesmo
+motivo: nenhum nivel deslocado tinha sido alcancado. Nao apagou historia nenhuma: o
+registro abaixo so tinha linhas ate o 6, e nenhum dos niveis deslocados havia
+sido alcancado. Se algum tivesse, a insercao teria ido para o fim da escada em
+vez do meio.
+
+## O criterio de aceitacao e paridade, nao o benchmark
+
+O alvo de `vec3_flat` (zero alocacao, zero unbox, zero send no laco) e o alvo de
+PERFORMANCE, e ele e o ULTIMO nivel justamente porque nao e o criterio de
+aceitacao.
+O criterio de aceitacao e que **tudo funcione**, e "tudo" tem tamanho medido:
+
+| | |
+|---|---|
+| arquivos em `tests/` | **141** |
+| pacotes | **4**: Core, Std.Http, Std.Actors, Std.Uuid |
+| fontes Smalltalk nesses pacotes | **160** |
+| testes proprios dos pacotes | 7 |
+| samples que a suite roda | 71 |
+| self-tests em C | 3 (`ST_SMALLFLOAT_TEST`, `ST_BIGINT_TEST`, `ST_ABI_EMIT_TEST`) |
+| **total de itens que `run_tests.sh` reporta** | **158** |
+
+E nao e so rodar: o nivel 12 exige que os quatro pacotes COMPILEM e que a imagem
+do projeto seja GERADA, porque `run_tests.sh` e `run_benchmarks.sh` fazem
+bootstrap de imagem nova a partir de `packages/Core` a cada execucao. A imagem e
+derivada, e e por isso que trocar o modelo de objeto foi possivel sem migracao;
+a contrapartida e que gerar a imagem faz parte do que tem que funcionar.
+
+Um JIT que faz `vec3_flat` chegar a zero alocacoes e nao roda `ExceptionTest.st`
+nao entregou o projeto. A ordem dos niveis diz isso: **paridade primeiro,
+performance depois**.
+
+Os niveis 0 e 1 sao **linkados a mao**, cada um com meia duzia de arquivos e
+nenhum CMake, e isso e deliberado: os dois tem que continuar passando enquanto
+o resto do VM ainda nem compila, que e precisamente a janela que o corte seco
+abriu. Memoria e fibers sao os dois unicos subsistemas que nao dependem de
+motor de execucao nenhum, e por isso sao os dois unicos que dava para provar no
+mesmo dia em que foram escritos.
+
+## Por que "aloca e coleta" vem ANTES de "compila"
+
+A primeira versao desta escada tinha "compila" no nivel 0, e isso estava errado
+de um jeito que so apareceu ao rodar. Sob corte seco, compilar o tree inteiro e
+o nivel MAIS DIFICIL, nao o mais facil: exige que o JIT ja exista, porque
+metade do VM chama `generateMethodCode` e companhia. Com ele no nivel 0, o gate
+ficaria vermelho por semanas e nao mediria nada durante todo esse tempo, que e
+exatamente o que um gate nao pode fazer.
+
+O subsistema de memoria, ao contrario, **nao depende de motor de execucao
+nenhum**. Ele compila e se auto-testa sozinho no dia em que e escrito. Por isso
+ele e o nivel 0: e a primeira coisa que da para provar, e prova-la antes de
+construir qualquer coisa em cima e o unico momento barato de faze-lo.
+
+O self-test do nivel 0 e linkado a mao, com sete arquivos e nenhum CMake, de
+proposito: ele tem que continuar passando enquanto o resto do VM ainda nem
+compila, que e precisamente a janela que o corte seco abriu.
+
+## Por que deopt-stress vem antes de performance
+
+Porque performance sem deopt-stress e uma mentira mensuravel. Zerar alocacao num laco e facil se voce
+nao precisar reconstruir o estado quando a especulacao falhar. O `--deopt-stress`
+e o que prova que da para desfazer, e sob corte seco ele e o **oraculo interno**
+que substitui o oraculo externo que perdemos: com todo guard falhando, todo teste
+e todo benchmark tem que produzir resultado identico ao do caminho normal.
+
+## O oraculo externo, que continua disponivel
+
+O corte seco tirou o v1 da branch, nao do repositorio. Para qualquer duvida de
+"o v2 esta respondendo certo", master continua a poucos segundos de distancia:
+
+```sh
+git worktree add /tmp/st-master master
+(cd /tmp/st-master && cmake -S . -B build && cmake --build build -j"$(nproc)")
+(cd /tmp/st-master && ./build/st -s snapshot -b packages/Core)
+
+# mesmo programa nos dois, saidas comparadas
+diff <(/tmp/st-master/build/st -s /tmp/st-master/snapshot -f prog.st) \
+     <(./build/st -s snapshot -f prog.st)
+```
+
+Isso nao ressuscita o v1 na branch e nao contamina o desenho novo: e uma
+referencia externa, usada sob demanda. **A partir do nivel 3 esta e a maneira
+certa de investigar qualquer resposta suspeita**, e e mais barata que ler codigo.
+
+Limite conhecido: a partir do momento em que o modelo de objeto mudar (ADR 0003,
+R4 a R6), o snapshot deixa de ser compativel entre os dois. Nao e problema:
+`run_tests.sh` regera a imagem a partir de `packages/Core` a cada execucao nos
+dois lados, entao o que se compara e a SAIDA do programa, nunca a imagem.
+
+## Registro de niveis
+
+Apendar, nunca reescrever. Data, commit, o que destravou.
+
+| data | nivel | commit | nota |
+|---|---|---|---|
+| 2026-07-27 | - | `583047d` | baseline v1 antes do corte: **158 ok**, 3375 ms, 141 testes + 4 pacotes |
+| 2026-07-27 | - | (nao commitado) | corte seco: 87 arquivos, 24.520 linhas fora |
+| 2026-07-27 | **0** | (nao commitado) | memoria nova: 17 de 17 no self-test, sem motor de execucao |
+| 2026-07-27 | **1** | (nao commitado) | fibers novos: 11 de 11; o self-test pegou `committedLow` sem `volatile` |
+| 2026-07-27 | 0 | (nao commitado) | handles: 22 de 22; o self-test pegou o TLAB sobrevivendo a coleta |
+| 2026-07-27 | **2** | (nao commitado) | camada de objetos: 23 de 23; pegou a tabela de simbolos sem write barrier |
+| 2026-07-27 | **3** | (nao commitado) | JIT executa: 28 de 28; perfil de tipos e emissao cruzada entre duas ABIs |
+| 2026-07-27 | **4** | (nao commitado) | SSA: 17 de 17; phis de back-edge, estado de deopt so com vivos |
+| 2026-07-27 | **5** | (nao commitado) | otimizador: 16 de 16; corpo de laco sem conversao nenhuma |
+| 2026-07-27 | **6** | (nao commitado) | escape + materializacao: 15 de 15 |
+| 2026-07-27 | **7** | (nao commitado) | primitivas: 98 de 98; a escada ganhou um degrau, ver acima |
+| 2026-07-27 | 0 | (nao commitado) | o nivel 7 achou DOIS bugs de GC pre-existentes, ver abaixo |
+| 2026-07-27 | **8** | (nao commitado) | front end: 40 de 40; fonte -> bytecode -> maquina, sem bloco nao-inlinado ainda |
+| 2026-07-27 | 8 | (nao commitado) | frames compilados viraram raizes: alocar de codigo compilado ficou seguro |
+| 2026-07-27 | 7 | (nao commitado) | closures planas com celulas (ADR 0008) em bytecode: 104 de 104 |
+| 2026-07-27 | 7 | (nao commitado) | nomes de primitiva alinhados a packages/ (173 declaradas, 31 implementadas): 109 de 109 |
+| 2026-07-28 | 8 | (nao commitado) | closures no FRONT END: analise de captura e emissao de CLOSURE, 69 de 69 |
+| 2026-07-28 | 0 | (nao commitado) | as closures acharam DOIS bugs de memoria pre-existentes, ver abaixo: 27 de 27 |
+| 2026-07-28 | 8 | `c2ac221` | closures commitadas |
+| 2026-07-28 | 8 | `fe9b5e8` | `super` no tier 1 e retorno nao local: 88 de 88 |
+| 2026-07-28 | **9** | (nao commitado) | CMakeLists reescrito para o conjunto v2; `cmake --build` limpo com -Werror |
+| 2026-07-28 | **10** | (nao commitado) | kernel EMBUTIDO em C + `st -e`: `(3 + 4) printNl` imprime 7 |
+| 2026-07-28 | 10 | `c4ef859` | construtor de classes: 142 arquivos do Core, 1567 metodos, 16 falhas nomeadas |
+| 2026-07-28 | 10 | `e77a111` | formas reconciliadas e os 5 arquivos v1 reescritos: o Core inteiro constroi |
+| 2026-07-28 | 10 | (nao commitado) | o Core EXECUTA: 158 inicializadores, metaclasses eager, sends ate 5 argumentos |
+| 2026-07-28 | 8 | (nao commitado) | metodo que e SO primitiva falha em voz alta: 93 de 93, e a varredura achou 77 |
+| 2026-07-28 | 10 | (nao commitado) | `printNl` contra o Core DE VERDADE: 5 bugs, nenhum na pilha de streams, 98 de 98 |
+| 2026-07-28 | **11** | (nao commitado) | imagem: 1,1 MB, recarrega e RODA, e salvar-carregar-salvar e byte-identico |
+| 2026-07-28 | 11 | (nao commitado) | `Primitive.c` quebrado em 14 dominios: 1730 -> 104 linhas, gate 0..11 verde, 66 de 175 e 109 de 109 |
+| 2026-07-28 | 11 | (nao commitado) | `-Wall -Wextra -Werror` de verdade nos dois builds: 93 erros, um deles `classVariableScope` implicito em main.c |
+| 2026-07-28 | 11 | (nao commitado) | filesystem + `StreamOpen` (10 prims) no seam de OS; `st build` ligado ao ProjectTool |
+| 2026-07-28 | 11 | (nao commitado) | compilador reflexivo (5 prims) + classes de AST NOMEADAS: o Core reabre as do bootstrap em vez de criar segundas |
+| 2026-07-29 | **7** | (nao commitado) | backend de SSA INSERIDO, renumerando de 7 para cima: LIR, lowering, linear scan com splitting, emissor x64; 10 de 10 contra o tier 1 como oraculo, em pool 12, 8, 6, 4, 3 e 2 |
+| 2026-07-29 | 7 | (nao commitado) | o backend achou 3 defeitos de RESPOSTA ERRADA na IR e o verificador achou 3 no alocador, ver abaixo |
+| 2026-07-28 | **13** | (nao commitado) | namespaces (cadeia propria -> imports -> Core), `Namespaces`/`Smalltalk`, `MethodSend`, `GetEnv`: os 4 pacotes E samples geram imagem, 88 de 175 |
+| 2026-07-29 | 7 | (nao commitado) | **especializacao de aritmetica pelo perfil**: 21 de 21 no nivel 7 e 46 de 46 no nivel 5, em pool 12, 8, 4 e 2 |
+| 2026-07-29 | 5 | (nao commitado) | o otimizador ganhou tres passes que a especializacao exigiu, ver abaixo |
+| 2026-07-29 | 7 | (nao commitado) | a especializacao achou UM bug de resposta errada no guard, TRES no alocador e um latente na desotimizacao, ver abaixo |
+
+## O que o nivel 7 encontrou, e por que so ele podia encontrar
+
+Dois bugs de raiz de GC, os dois anteriores ao nivel 7 e os dois invisiveis para
+todos os niveis abaixo dele. Ficam registrados porque a CAUSA de terem escapado
+importa mais que os bugs.
+
+**1. O scan de Cheney nao alcancava objeto PROMOVIDO** (`memory/Collector.c`). O
+ponteiro de scan varre a to-space em ordem de endereco, e isso e a lista de
+trabalho completa apenas para quem foi copiado PARA a to-space. Um objeto
+promovido para a old space e sobrevivente igual, com slots igualmente obsoletos,
+e nao esta naquela faixa. Os slots dele ficavam apontando para a semispace morta.
+
+Por que nenhum nivel via: o nivel 0 promovia e conferia o objeto promovido, mas
+nunca relia um PONTEIRO dele depois. E o sintoma nao aparece na coleta: o objeto
+esta intacto, a coleta reporta sucesso, e o dado so vira lixo quando a semispace
+for reusada, a uma distancia arbitraria do bug. O teste de regressao que ficou
+(`vm/tests/MemoryTest.c`) confere a GERACAO do alvo, e nao o conteudo dele: com o
+conserto removido, a checagem de conteudo **continua passando**, porque nada
+chegou a encaminhar o objeto abandonado.
+
+**2. `IcCell.selector` e `CodeUnit.literals` nao eram raizes** (`jit/Jit.c`). Um
+`CodeUnit` e um struct C de `malloc` com `Value`s tagueados dentro, e uma celula
+de cache guarda o seletor como ponteiro cru. Nenhum dos dois esta dentro de
+objeto de heap, entao nenhum provedor de raiz os encontrava, e uma coleta jovem
+move exatamente os objetos que eles nomeiam. Como lookup de seletor e por
+IDENTIDADE de Symbol interned, o sintoma e `doesNotUnderstand` para um metodo que
+existe, a partir da primeira coleta e nunca antes dela.
+
+Conserto: `rootsVisitCompiledCode` em `memory/Roots.h`, o mesmo seam de
+`rootsVisitNativeFrames`, com no-op fraco para quem linka sem JIT.
+
+**A licao operacional**: os dois so apareceram quando um teste passou a
+**coletar e continuar executando**. Todo nivel ate o 6 ou coletava no fim, ou
+executava sem coletar. Nivel novo que envolva heap deve fazer as duas coisas, e
+nessa ordem.
+
+## O que o nivel 8 encontrou
+
+**Um bug de precedencia no parser**, que sobreviveu ao v1 inteiro
+(`vm/compiler/Parser.c`). As macros de checagem de token nao parentizavam o
+parametro:
+
+```c
+if ((token->type & tokenType) == 0) { ... }
+```
+
+Os chamadores passam um CONJUNTO de alternativas, `TOKEN_IDENTIFIER |
+TOKEN_KEYWORD | ...`, e `&` liga mais forte que `|`, entao o teste lia
+`(type & PRIMEIRO) | RESTO`. Como RESTO e uma constante nao-zero, a condicao era
+sempre falsa e **a checagem aceitava qualquer token**, em todos os lugares onde
+uma alternativa era passada. Nunca reportou erro de sintaxe nesses pontos.
+
+Achado por `-Wparentheses`, nao por teste, e nao poderia ter sido achado por
+teste com facilidade: o efeito e aceitacao silenciosa, entao so um programa
+MALFORMADO que mesmo assim compila o revela.
+
+## Frames compilados viraram raizes, e o que quase deu errado
+
+`rootsVisitNativeFrames` era o no-op fraco de `memory/Roots.c`, entao NADA podia
+alocar com um frame compilado vivo. Isso bloqueava closures (que alocam),
+`Object new`, e todo o resto. Agora esta implementado, e duas coisas o tornaram
+barato:
+
+**O mapa de frame do tier 1 e UNIFORME.** Todo slot de um frame de template
+guarda um `Value` tagueado, sempre: o compilador de template nunca poe double cru
+nem inteiro cru num slot, e o prologo nilifica todo slot que nao recebe
+argumento. Entao o mapa e "slots 0 a frameSlots-1, todos ponteiros" e **nao
+existe tabela por safepoint neste tier**. Isso muda no tier 2, onde o backend de
+SSA guarda valores crus e o R1 do ADR 0003 passa a valer de verdade.
+
+**A ancora custa ZERO instrucao no codigo gerado.** O frame pointer sai do
+endereco de slot que a chamada ja passa, e o metodo sai de
+`__builtin_return_address(0)`. Nada foi emitido para isso.
+
+**O erro que quase passou**: ancorar so o segmento MAIS NOVO. Frames compilados
+vem em SEGMENTOS separados por frames C:
+
+```
+churn (compilado) -> jitDispatch (C) -> new: (compilado) -> primitiva (C)
+```
+
+Com uma ancora so, o walk achava o frame de `new:`, parava na fronteira C, e os
+registradores vivos de `churn` nunca eram varridos. As ancoras sao uma CADEIA.
+
+**E a licao do teste, que e a mesma de antes**: a checagem tem que ser a
+GERACAO do objeto, nao o conteudo dele. Um objeto que o coletor nunca viu fica
+abandonado na semispace evacuada com os bytes intactos, entao "ainda le 111"
+responde SIM mesmo com o walk desligado. Medido: a primeira versao da checagem
+passava com o walk inteiro removido. O que nao acontece por sorte e estar na OLD
+space, porque so um coletor que ACHOU o objeto duas vezes poderia te-lo
+promovido.
+
+## Closures: FEITAS, e o que decidiu o desenho
+
+O ADR 0008 esta implementado dos dois lados. **Em bytecode**, verificado no
+nivel 7: `CLOSURE`, `GETUP`, `NEWCELL`, `GETCELL`, `SETCELL`, mais
+`value`/`value:` como primitivas (que sao SENDs, entao um sitio de chamada de
+bloco carrega cache inline como qualquer outro). Objeto `Closure` = contagem,
+metodo, capturas, tudo tagueado (`FORMAT_INDEXED_POINTERS`), entao o coletor nao
+tem caso especial.
+
+Provado com bytecode escrito a mao, de proposito, pelo mesmo motivo dos niveis
+abaixo: o mecanismo erra de jeitos que o nivel de fonte esconde.
+
+**E no FRONT END**, verificado no nivel 8: analise de captura mais emissao de
+`CLOSURE`. Tres coisas decidiram o desenho.
+
+**UM predicado de inlining, lido pelos dois lados.** A analise e o emissor
+chamam a MESMA funcao para decidir se um bloco vira controle de fluxo ou
+closure. Se discordassem, a discordancia seria silenciosa e cara: um
+`sum := sum + i` dentro de um `to:do:` cujo bloco a analise achasse ser closure
+poria `sum` numa celula de heap, e o resultado e um programa correto com o laco
+morto, que e exatamente o laco que este projeto existe para otimizar. O nivel 8
+le o bytecode de volta e conta: o laco inlinado tem ZERO instrucoes de celula e
+ZERO `CLOSURE`, e o mesmo laco com uma closure lendo o acumulador tem as duas
+coisas. Um numero so nao provaria nada; sao os dois que provam.
+
+**A analise roda ANTES de existir uma instrucao.** Celula ou registrador muda
+toda leitura e toda escrita da variavel, inclusive as emitidas antes da closure
+que a captura. Decidir no sitio da closure exigiria reescrever o que ja foi
+emitido.
+
+**As tabelas da analise sao colecoes de HEAP, nao arrays C de `RawObject *`.**
+A emissao aloca, entao um array C de ponteiros para nos da AST seria um conjunto
+de enderecos que a primeira coleta invalida. Essa e a familia de bug que este
+repositorio ja pagou tres vezes; nao vai pagar a quarta dentro do compilador.
+
+Onde a celula e criada e onde o registrador e inicializado, e isso da de graca
+as duas semanticas que importam: temporario de bloco inlinado ganha celula NOVA
+por iteracao (closures feitas num laco capturam variaveis diferentes) e
+temporario de metodo ganha UMA para a ativacao inteira (closures irmas
+compartilham).
+
+Tres guardas sao ASSERT e nao teste, porque o modo de falha e silencio: um bloco
+que a analise nao viu, uma escrita em captura por valor, e "todo bloco preparado
+foi emitido exatamente uma vez", que e a unica maneira de tornar barulhenta a
+divergencia na direcao contraria.
+
+## `super`, e onde a busca comeca
+
+`SENDSUPER` roda no tier 1. O conteudo inteiro da palavra e UM argumento
+diferente no caminho de send: a busca comeca onde o COMPILADOR disse, na classe
+acima da que DEFINIU o metodo em execucao, e nao em nada que o receptor nomeie.
+
+Nao da para derivar em runtime. O receptor pode ser instancia de uma subclasse
+tres niveis abaixo, e comecar pela classe dele acharia o proprio metodo em
+execucao de novo, que e recursao infinita. Por isso o indice da classe inicial e
+resolvido na COMPILACAO e mora na celula do sitio (`IcCell.lookupStart`): indice
+e estavel e nao precisa de relocacao (ADR 0005), a sequencia de chamada ja
+materializa o endereco da celula, e o sitio continua sendo um send comum com
+perfil comum. O teste que separa uma implementacao certa de uma errada e o de
+RECEPTOR DE SUBCLASSE; com a versao errada ele responde 2 em vez de 1.
+
+Super numa classe sem superclasse tem `lookupStart` invalido e vai para
+doesNotUnderstand, em vez de recomecar pelo receptor, que e a mesma recursao.
+Super sem classe definidora nenhuma e **erro limpo** de compilacao.
+
+## Retorno nao local: o token e o registro
+
+`^` dentro de bloco retorna do METODO EM QUE O BLOCO FOI ESCRITO, quantas
+ativacoes houver no meio, e entre o bloco e o home ha frames compilados E frames
+C alternados. Os frames C sao o que descarta "vai desempilhando frame compilado".
+
+Duas metades:
+
+**O TOKEN responde QUAL ativacao.** E um contador, nao um endereco de frame,
+porque endereco e reusado: um bloco que sobrevive ao home tem que achar NADA, e
+um endereco acabaria casando com o frame de um estranho no mesmo lugar. A closure
+carrega o token da ativacao em que nasceu, como SmallInteger tagueado, entao o
+objeto continua uniformemente tagueado e o coletor continua sem caso especial.
+
+**O REGISTRO responde COMO CHEGAR LA.** Mora no frame C que ENTROU na ativacao
+home, entao a cadeia se desfaz sozinha conforme esses frames retornam, e guarda o
+destino do salto mais o estado que um salto deixaria para tras (a cadeia de
+ancoras de frame compilado e a de handle scopes: quem foi pulado nao passou pelo
+proprio `leave`).
+
+**QUEM PAGA.** So um metodo que de fato tem `^` dentro de bloco ganha registro, e
+quem decide isso e o front end na compilacao (`CodeUnit.couldBeHome`). Programa
+que nunca escreve um roda exatamente como antes: token nenhum e cunhado, registro
+nenhum e empilhado, e NADA e emitido em send nenhum. Essa e a razao de o custo
+ficar aqui e nao como uma checagem depois de cada send, que e o outro jeito de
+construir isso e taxaria o caminho mais quente do sistema por causa de um recurso
+que a maioria dos sends nao usa.
+
+Tres checagens do nivel 8 sao as que separam desenho certo de desenho parecido, e
+as tres foram verificadas DESLIGANDO o conserto:
+
+- **recursao**: cada ativacao do mesmo metodo cunha o proprio token, entao cada
+  bloco retorna da ativacao que o construiu, e nao da mais externa;
+- **bloco dentro de bloco**: o de dentro herda o home do de fora, e nao a ativacao
+  sob a qual esta rodando. Com uma home intermediaria empilhada de proposito, a
+  versao errada responde 0 em vez de 14;
+- **home ja retornado**: token aposentado nao casa com registro nenhum, entao
+  levanta. Roda em processo FILHO, porque levantar hoje e abortar (nao ha
+  excecoes no v2 ainda), e o teste confere COMO o filho morreu.
+
+## O que as closures encontraram no subsistema de memoria
+
+Dois bugs pre-existentes, os dois no nivel 0, os dois invisiveis para tudo o que
+rodou antes. Ficam registrados porque a CAUSA de terem escapado importa mais que
+os bugs.
+
+**1. Objeto INDEXADO com slot NOMEADO era medido pela contagem de elementos.**
+Um `Closure` e exatamente isso: contagem, depois o metodo, depois as capturas. A
+contagem de elementos nao sabe do slot nomeado, entao `objectSizeInBytes`
+respondia UMA PALAVRA A MENOS: o walk entrava no meio do objeto, e a faixa de
+ponteiros calculada parava ANTES do campo `method`. Ninguem atualizava esse
+campo, e o primeiro scavenge que movesse o `CompiledMethod` deixava a closure
+apontando para um cadaver.
+
+Por que o nivel 7 nao viu: closure la so passou por `collectorMarkSweep`, que
+**nao move**. O ponteiro obsoleto continuava certo por acidente.
+
+Conserto: o CABECALHO responde primeiro. `sizeWords` e o tamanho TOTAL e foi
+escrito por `objectSizeForShape`, entao ja contempla o que vem antes dos
+elementos. A derivacao pela contagem fica so para o objeto grande demais para o
+campo, e um `ASSERT` em `objectSizeForShape` mantem slot nomeado fora desse
+caminho. O teto que sai dai e `CLOSURE_MAX_CAPTURES`, com **erro limpo** de
+compilacao.
+
+**2. O alocador nao escrevia o corpo, e as semispaces nao sao rezeradas.** O
+comentario dizia "o corpo ja esta zerado", e isso e verdade so no primeiro ciclo:
+a partir da segunda troca de semispace uma alocacao cai sobre os BYTES DE UM
+OBJETO MORTO. Todo slot que o alocador nao escrevesse guardava o valor do
+cadaver, e o coletor varre esse slot. O PADDING de alinhamento e o caso facil de
+perder: um objeto de dois slots ocupa tres palavras de corpo, a faixa de
+ponteiros sai do TAMANHO, e ninguem escreve a terceira.
+
+Conserto: `initializeObject` escreve o corpo inteiro. Com ZERO, que e
+`tagInt(0)`, e nao com nil: no VM inteiro um slot nao setado responde falso a
+`valueTypeOf(slot, VALUE_POINTER)` e significa AUSENTE (classe sem superclasse,
+metodo sem dono), e nil e um objeto. O que o Smalltalk exige, `Object new` com
+variaveis em nil, passou a ser feito na primitiva que serve `new`, que e onde a
+regra do Smalltalk comeca a valer.
+
+**Os dois testes checam GERACAO, nao conteudo**, e os dois foram verificados
+DESLIGANDO o conserto: o primeiro vira FAIL limpo, o segundo tambem, e a
+ausencia do registro de unidades (abaixo) vira SEGV dentro do coletor.
+
+## Um quarto baked pointer, e por que a unidade de bloco e diferente
+
+A unidade de um bloco e construida quando o metodo que a contem compila, e nao
+roda ate alguem mandar `value` para a closure. Nesse intervalo o frame de
+literais dela nao era alcancavel de lugar nenhum: uma `CodeUnit` e um struct C
+de `malloc`, e o `CompiledMethod` que a segura a segura como PALAVRA CRUA que o
+coletor nao segue.
+
+`jitRegisterUnit` passou a registrar a unidade quando ela e CONSTRUIDA e nao
+quando e compilada. Com o registro desligado, o nivel 8 nao falha: ele SEGFATA
+dentro do `markSlot`, seguindo o ponteiro obsoleto.
+
+## Um baked pointer que o coletor movia
+
+O terceiro da mesma familia (celula de IC, literal de CodeUnit, e agora este), e o
+mais barato de errar: **`nil`, `true` e `false` sao BAKEADOS como imediatos no
+codigo gerado.** `ifTrue:` inlinado e um compare contra o singleton `true`, e o
+prologo enche os slots nao usados com `nil`, e as duas coisas sao uma instrucao
+so porque o endereco e constante.
+
+So que os tres eram alocados na NURSERY, entao a primeira coleta os movia e todo
+compare bakeado parava de casar. O sintoma: um metodo que recebe `false` nao
+entra em nenhum dos dois bracos e cai no caminho `mustBeBoolean`, para um valor
+que E `false`. Nada quebra ate a primeira coleta, e o programa que revelou isso
+alocava 64 MB num laco.
+
+**Conserto**: `allocateImmortalObject` poe os tres na old space, que nao move
+(ADR 0005), entao o endereco e permanente e bakear passa a ser legitimo.
+
+**A guarda e um ASSERT, nao um teste**: `jitCompileFor` confere em TODA
+compilacao que os tres sao `isOldObject`. Vale mais que teste porque roda em toda
+compilacao de toda execucao da suite, e porque o modo de falha e silencio. Ele
+imediatamente pegou o bootstrap do nivel 3, que ainda alocava `nil` na nursery.
+
+## O contrato REAL esta em packages/, e ele agora e o que o VM fala
+
+Achado tarde e registrado antes de virar retrabalho maior.
+
+`packages/Core/src/*.st` declara primitivas por PRAGMA NOMEADA, e sao **173
+nomes distintos** em uso:
+
+```smalltalk
++ aNumber [
+	<primitive: IntAddPrimitive>
+	...fallback em Smalltalk...
+]
+```
+
+FEITO. `vm/runtime/Primitives.def` foi **extraido de packages/**, nao inventado:
+as 173 declaradas, cada uma com o nome que o kernel escreve. E um X-macro
+incluido duas vezes, uma para o enum e outra para a tabela, entao nome e
+implementacao nao tem como divergir. O front end le a pragma.
+
+Tres regras que sairam disso:
+
+- **nome desconhecido e ERRO de compilacao** (e typo, ou primitiva que ninguem
+  escreveu). **Nome conhecido sem implementacao NAO e erro**: o metodo compila, a
+  tentativa de primitiva simplesmente nao e emitida, e ele roda o fallback
+  Smalltalk que ja carrega. As duas situacoes sao indistinguiveis de fora e
+  tratar iguais seria esconder o typo;
+- por isso o `.def` e tambem o **checklist de paridade**: hoje **40 de 175**, e
+  `primitiveCoverage()` responde isso em runtime em vez de alguem contar NULLs;
+- `IntAddPrimitive` e `FloatAddPrimitive` apontam para a MESMA funcao. E de graca
+  e e exatamente o caminho rapido de aritmetica mista que o v1 nao tinha e pagava
+  100x.
+
+Uma consequencia de desenho: o kernel declara so `<` e `=` como primitiva de
+comparacao, e deriva `>`, `<=` e `>=` em Smalltalk (Magnitude). Os testes
+passaram a fazer o mesmo, entao o laco de `to:do:` agora exercita despacho de
+verdade e nao um atalho em C.
+
+Duas divergencias de desenho que a leitura revelou, e que nao sao renomeacao:
+
+1. **`AtPrimitive` e UMA primitiva polimorfica em `Object`**, herdada por String,
+   ByteArray, Array e FloatArray. RESOLVIDO do jeito do kernel: uma so, que
+   decide pelo FORMATO. O unico caso que o formato nao resolve e String contra
+   ByteArray (os dois sao `FORMAT_BYTES` e `at:` responde Character para um e
+   SmallInteger para o outro), e esse desempata por CLASSE. E o unico lugar deste
+   arquivo onde o formato nao basta, e esta dito la.
+2. **`Block.st` ainda e o desenho de CONTEXTOS do v1**: `<shape: BlockShape>` com
+   `| compiledBlock receiver outerContext homeContext |`. O ADR 0008 substitui
+   isso por closure plana, entao esse arquivo muda. O ADR ja aceitou a mudanca de
+   comportamento observavel; o arquivo simplesmente ainda nao acompanhou.
+
+Ha tambem pragmas de CLASSE (`<shape: BytesShape>`, `<shape: IndexedShape>`, ...)
+que o bootstrap novo vai ter que ler para carimbar a forma da instancia.
+
+## Niveis 9 e 10: o VM voltou a existir como PROGRAMA
+
+**O que compila.** O CMakeLists foi reescrito para o conjunto v2 e ficou MENOR de
+proposito. O corte seco tirou 87 arquivos; o que ainda nao foi reimplementado
+NAO esta na lista, em vez de estar listado e quebrado. Continuam no disco e fora
+do build, cada um voltando quando a camada dele voltar:
+`core/{CompiledCode,Entry,Exception,Lookup,Namespace,StackFrame}.c`,
+`compiler/{Compiler,Scope}.c`, `concurrency/Scheduler.c`,
+`runtime/{Base64,FileSystem,Iterator,Json,Message,Primitives,Socket,Stream}.c`,
+`tools/{Repl,Snapshot}.c`. Os backends POWER falham no CONFIGURE com mensagem
+propria: nao foram portados para o macro assembler novo, e um build que anda
+quase todo e depois nao acha um simbolo nao explica nada.
+
+**O kernel EMBUTIDO, e por que ele existe.** Ha um problema de ordem: o kernel
+de verdade e `packages/Core`, que e fonte Smalltalk, e ler fonte Smalltalk exige
+parser, compilador, heap, classes para compilar contra e primitivas para mandar
+mensagem. Alguma coisa tem que existir antes de qualquer imagem, e
+`vm/tools/Bootstrap.c` e essa coisa: a classe das classes, as classes que o
+proprio parser instancia, as classes dos imediatos, e as primitivas ja
+implementadas. E andaime, nao um subconjunto de `packages/Core` que tenha que
+ficar em sincronia com ele.
+
+Duas decisoes dentro dele:
+
+- **o fallback de uma primitiva embutida MANDA `#primitiveFailed`**, que ninguem
+  implementa, entao a falha para e diz quem falhou. Responder nil viraria
+  resposta errada em outro lugar: uma soma que estourou nao tem LargeInteger para
+  onde cair aqui, e um `at:` fora de faixa nao tem excecao para levantar, porque
+  nenhum dos dois existe antes de `packages/Core`;
+- **as comparacoes derivadas sao compiladas de FONTE no bootstrap**
+  (`> aNumber [ ^aNumber < self ]` e companhia), entao um bootstrap que passou
+  daqui ja exercitou parser, compilador e JIT antes de o primeiro programa rodar.
+
+**Uma primitiva que `packages/` nao escreve.** `PrintValuePrimitive`, e o
+`Primitives.def` diz isso na linha dela. O kernel embutido nao tem stream, nem
+`printOn:`, nem Transcript; sem ela o VM roda um programa e nao tem como dizer o
+que saiu. Ela nao e ligada em `packages/Core` de proposito: o `printNl` de la vai
+por stream BUFFERIZADO, e uma primitiva C escrevendo direto no descritor
+intercalaria com esse buffer.
+
+**A LICAO DO `Assert.h`, de novo.** A mensagem de `doesNotUnderstand` chegava
+como `doesNotUnderstand: ` e mais nada. O seletor era impresso com `printf`, ou
+seja em stdout, que quando redirecionado e bufferizado por bloco, e `abort()` nao
+faz flush. E exatamente como o abort do teto de 64KB no POWER embarcou silencioso.
+Agora a mensagem inteira vai para stderr, com `fflush(NULL)` antes do abort, e
+passou a nomear tambem a CLASSE do receptor: sem ela a mensagem diz o que nao foi
+entendido e omite quem nao entendeu, que e a metade que diz onde olhar.
+
+**O CLI continua inteiro.** O vocabulario vem de `vm/tools/Cli.h` sem mudanca
+nenhuma: `new`, `build`, `run`, `test`, `repl`, `help`, mais `-e -f -s -b -h`.
+Um port nao e motivo para mexer nisso. O que e estreito hoje e quanto de cada
+comando da para CUMPRIR: cada um termina numa operacao que o corte tirou e que
+ainda nao voltou (ler/escrever imagem, transformar diretorio de pacote em
+classes, o laco do REPL), e cada um DIZ qual e a peca que falta e sai com codigo
+nao-zero. Comando que finge trabalhar e pior que comando que recusa. Imagem
+achada pela BUSCA e passada por cima com um aviso; imagem pedida com `-s` e
+recusada, porque ai o chamador pediu aquela imagem.
+
+## O construtor de classes, e a MEDICAO do que falta para packages/
+
+`ClassNode` vira classe de verdade: forma, superclasse, variaveis de instancia e
+cada metodo compilado dentro dela. Metaclasse criada no primeiro uso, com a
+cadeia de metaclasses PARALELA a de classes, que e o que faz metodo de classe ser
+herdado; sao 294 metodos de classe so no Core, entao nao era opcional.
+
+Duas decisoes que o Core forcou, as duas de desenho e nao de conveniencia:
+
+**Referencia adiantada a global.** Um nome com INICIAL MAIUSCULA que ainda nao
+existe ganha a Association agora, com nil, e a definicao preenche a MESMA
+Association depois. O kernel precisa disso e nao da para reordenar em volta:
+`Object>>at:` levanta um `OutOfRangeError` definido trinta arquivos abaixo, entao
+a ordem de carga teria que ser uma ordem total que nao existe. A regra e a
+MAIUSCULA, que e a convencao do proprio Smalltalk; nome minusculo que nao resolve
+continua sendo ERRO, porque aquilo e variavel escrita errada e nada la na frente
+vai definir.
+
+**Campo nao setado do AST e ZERO, nao nil.** Os acessores de `Ast.h` testavam
+"nao e nil", e no v2 o alocador escreve ZERO de proposito (ausente e diferente de
+"setado como nil"). Resultado: TODA classe do Core respondia que era um namespace.
+Os acessores que podem ser perguntados sobre campo que o parser nao escreve
+passaram a responder NULL.
+
+### O numero
+
+```
+$ st -b packages/Core
+142 files, 158 classes, 1727 methods
+```
+
+**O Core inteiro constroi.** Zero falhas. O que faltava eram 16 classes em tres
+grupos, e cada grupo foi uma correcao de natureza diferente:
+
+| grupo | o que era | o que resolveu |
+|---|---|---|
+| 5 formas em conflito | Class, BoxedFloat64, Character, Array, Symbol | **HERANCA DE FORMA** mais **variaveis de classe**, os dois abaixo |
+| 5 formas que o VM possui | `CompiledCodeShape`, `BlockShape`, `ContextShape`, `ExceptionHandlerShape`, `UnwindHandlerShape` | os `.st` eram o DESENHO V1 e foram reescritos, ver abaixo |
+| 5 subclasses em cascata | CompiledBlock, CompiledMethod, ContextCopy, MethodContext, BlockContext | sumiram junto |
+| 1 lacuna de linguagem | `thisContext` em `Exception.st` | recusa nomeada: o materializador do ADR 0008 nao existe ainda |
+
+**A FORMA E HERDADA** quando a classe nao declara uma. Era isso que quebrava
+`Array := ArrayedCollection [ ]` e `Symbol := String [ ]`, que nao repetem a
+pragma do pai. Errar aqui e caro na direcao pior: o coletor teria lido a
+CONTAGEM DE ELEMENTOS de um Array como se fosse a primeira variavel de instancia.
+
+**NOME MAIUSCULO NA SECAO DE VARIAVEIS E VARIAVEL DE CLASSE**, que e a convencao
+do proprio Smalltalk, e o kernel depende dela: `Character` declara `| Table |` e
+o preenche num metodo de classe, e as instancias de Character sao IMEDIATOS, sem
+slot nenhum onde uma variavel de instancia pudesse morar. Uma variavel de classe
+vira Association no dicionario da classe, que e exatamente o que uma global ja e,
+entao o compilador le e escreve com as instrucoes que ja tinha; o que muda e so
+onde a Association foi achada.
+
+**O ESPELHO TEM QUE CONCORDAR COM O STRUCT.** `Behavior + Class` declaram, em
+ordem, os 9 campos tagueados de `RawClass`, e `<shape: ClassShape>` e a classe
+dizendo em voz alta que e espelho de um struct em vez de o construtor inferir
+isso de uma lista de campos. O construtor CONFERE a contagem: acrescentar campo
+de um lado sem o outro apareceria como metodo lendo o slot errado, que e resposta
+errada e nao crash.
+
+Um campo saiu do espelho: **`instanceShape`**. No v2 a forma e palavra RAW no
+trailer da classe, justamente para o coletor nunca varre-la (ADR 0005), entao o
+Smalltalk chega nela por primitiva e nao por campo.
+
+### Os cinco arquivos v1, e o que cada um virou
+
+- **`Block.st`**: era o desenho de CONTEXTOS (`| compiledBlock receiver
+  outerContext homeContext |`). Virou closure plana do ADR 0008,
+  `<shape: ClosureShape>`, sem campo nenhum: `receiver` e uma captura como outra
+  qualquer, e os outros dois eram elos de uma cadeia que nao existe mais;
+- **`CompiledCode.st`**: a palavra `header` empacotava contagem de argumentos,
+  de temporarios e numero de primitiva. Isso mora na CodeUnit, que e struct C.
+  Junto foi o DESASSEMBLADOR em Smalltalk, que decodificava o bytecode do v1
+  instrucao por instrucao e nao descreve mais nenhuma instrucao que exista;
+- **`CompiledMethod.st`**: ficou com os dois campos tagueados que o v2 tem
+  (`selector`, `ownerClass`). `literals` foi para a CodeUnit e `descriptors`
+  virou array ao lado do codigo nativo;
+- **`Context.st`**: deixou de ter forma propria. Ativacao e frame nativo, e um
+  Context e MATERIALIZADO de um quando alguem pede;
+- **`ExceptionHandler.st` e `UnwindHandler.st`**: objetos comuns ate a maquinaria
+  de excecao existir. A cadeia que o VM percorre e a de registros de unwind que o
+  retorno nao local ja construiu, nao uma cadeia desses.
+
+Onde um metodo perdeu o campo que lia, ele passou a `self notYetImplemented`, que
+LEVANTA. Responder nil seria resposta plausivel vinda de um metodo que nao tem
+como computar nada, e isso e resposta errada em outro lugar.
+
+### O Core agora EXECUTA, e onde ele para
+
+`st -b DIR -e CODE` constroi as classes do pacote e roda codigo contra elas no
+mesmo processo. Nao precisa de imagem: e a maneira mais barata de descobrir o que
+o kernel de verdade faz quando executa, e foi ela que achou tudo o que segue.
+
+```
+142 files, 158 classes, 1727 methods, 7 initializers
+```
+
+Quatro coisas que so apareceram ao RODAR, cada uma um erro de desenho e nao um
+detalhe:
+
+- **`initialize` de classe tinha que rodar.** Nada e opcional ali: e
+  `ExternalStream class initialize` que faz Transcript ser um stream no descritor
+  1, e sem ele o proprio `printNl` do kernel manda `nextPutAll:` para nil. A
+  ordem e a do manifesto, que e a ordem em que as classes foram definidas, porque
+  um inicializador rotineiramente usa uma classe definida antes. **So a classe
+  que DEFINE um o roda**; a primeira versao mandava `initialize` para as 158 e
+  contava 158, e a contagem era o proprio bug, ver a secao de `printNl` abaixo;
+- **metaclasse preguicosa quebra HERANCA de metodo de classe.** Criar a
+  metaclasse so para quem declara metodo de classe parecia economia e era bug: a
+  cadeia de metaclasses e o que faz metodo de classe ser herdado, entao `Array`,
+  que nao declara nenhum, continuava instancia da classe-das-classes e a busca de
+  `with:with:` nunca chegava na metaclasse de ArrayedCollection. Agora TODA classe
+  tem a sua;
+- **"e uma classe?" mudou de pergunta.** Era "e instancia da classe-das-classes",
+  e isso deixou de ser verdade no instante em que metaclasses existiram: uma
+  classe e instancia da SUA metaclasse. O teste desceu um nivel e aceita os dois,
+  que e o certo, porque `Array new` e `Array class new` sao os dois sends a uma
+  classe;
+- **send de 3 a 5 argumentos** era `FAIL()` com um PENDING. O teto agora e o da
+  ABI (receptor mais cinco, o conjunto de registradores inteiros do SysV), e
+  passar disso DIZ isso em vez de chamar com argumentos que ninguem escreveu.
+
+Onde para hoje: `printNl` roda contra o Core de verdade, ver a secao propria
+abaixo. Sao **40 das 175 primitivas implementadas**, e os testes usam muito mais;
+o que falta agora aparece nomeado (`FloatAsStringPrimitive`, a familia
+`LargeInt*`) em vez de responder o receptor.
+
+Duas armadilhas achadas ali, as duas da mesma familia:
+
+- **`flush` chamando o SO era erro.** `fsync` num terminal ou num pipe responde
+  EINVAL, entao `Transcript flush` falhava, o fallback levantava um IoError, e
+  reportar esse IoError precisava do Transcript. Recursao infinita, medida. Nada
+  e bufferizado do lado C; o buffer que existe e o do proprio kernel, em
+  Smalltalk, e ja foi escrito quando esse send chega. E no-op de proposito;
+- **metodo com primitiva e SEM corpo de fallback responde SELF.** `IoError class
+  last` era exatamente isso, entao respondia a CLASSE IoError, e
+  `IoError last signal` saia procurando um signal de classe. Vale como regra
+  geral: primitiva nao implementada mais corpo vazio e um metodo que responde o
+  receptor, silenciosamente.
+
+## A varredura: metodo que e SO primitiva, e os 77 que respondiam o RECEPTOR
+
+A licao acima (`IoError class last` respondendo a classe `IoError`) foi tratada
+como regra geral e VARRIDA, porque o modo de falha e silencio e um caso achado a
+mao nao diz quantos outros existem. O numero:
+
+| | |
+|---|---|
+| metodos com pragma de primitiva e CORPO VAZIO | **77** |
+| destes, nomeando primitiva **nao implementada** | **65** |
+| destes, nomeando primitiva implementada | 12 |
+
+Os 65 respondiam o receptor em TODA chamada. Os 12 respondem so quando a
+primitiva falha, e `Character>>codePoint` esta entre eles: implementar a
+primitiva calou o sintoma e deixou o caminho de falha intacto.
+
+Onde estao os 65, e o agrupamento importa porque ele e uma lista de trabalho:
+
+| | | |
+|---|---|---|
+| 22 | raiz de `src/` | Block, CompiledMethod, Context, Debugger, Exception, GarbageCollector, Namespace, Object, System |
+| 13 | `Magnitudes/` | Float (trigonometria, `sqrt`, `printString`), DateTime, Stopwatch |
+| 11 | `Processes/` | ProcessorScheduler inteiro |
+| 8 | `Files/` | Directory, File |
+| 4 + 3 | `Compiler/`, `Parser/` | as primitivas reflexivas |
+| 2 + 1 + 1 | `Collections/`, `Streams/`, `Concurrency/` | String `hash` e `asSymbol`, Socket, Atomic |
+
+**A varredura foi conferida contra o parser de verdade** antes de qualquer numero
+ser reivindicado: o scanner conta **1727 metodos em 142 arquivos**, exatamente o
+que `st -b packages/Core` reporta. Um scanner que discordasse ali estaria
+tokenizando errado, e a diferenca inicial (1730 em 144) era `VMTools.st` mais o
+proprio `package.st`, que existem no disco e nao no manifesto.
+
+### O conserto e no COMPILADOR, e por que nao nos 77 arquivos
+
+Editar 77 metodos a mao consertaria os 77 de hoje e nao o 78. A condicao e
+decidivel na COMPILACAO, entao a regra mora la:
+
+**Um metodo cujo corpo esta vazio e que carrega pragma de primitiva emite
+`self primitiveFailed: #NomeDaPrimitiva` no lugar do `^self` implicito.**
+
+Tres coisas decidiram o desenho:
+
+- **o kernel EMBUTIDO ja fazia isso** (`definePrimitiveMethod` em
+  `tools/Bootstrap.c` manda `#primitiveFailed` desde sempre). Entao a MESMA
+  FORMA DE FONTE significava duas coisas diferentes conforme quem compilou:
+  "falha em voz alta" no kernel de C, "responde o receptor" no `packages/Core`.
+  Essa divergencia era o defeito de verdade, e agora e uma regra so para os dois;
+- **a mensagem NOMEIA A PRIMITIVA.** A classe do receptor sozinha diz quem falhou
+  e omite o que estava sendo tentado, e para um Float isso e uma duzia de
+  candidatos. O `doesNotUnderstand` passou a imprimir os argumentos que sao
+  Symbol ou String, que sao os unicos seguros de imprimir dali, e a mensagem
+  ficou `doesNotUnderstand: primitiveFailed: (receiver is a String) (argument 1
+  is StringAsSymbolPrimitive)`;
+- **nao custa nada quando a primitiva funciona**: este codigo so e alcancado
+  quando ela nao rodou.
+
+Erro de compilacao seria a guarda mais forte e esta fora de questao: os 65 fariam
+`st -b packages/Core` parar de construir, e o nivel do gate so sobe.
+
+**Verificado DESLIGANDO o conserto**, nas duas direcoes. Com ele desligado
+`'abc' asSymbol` responde uma **String** (o receptor) e o programa segue; com ele
+ligado a chamada para e diz qual primitiva faltou. As duas checagens novas do
+nivel 8 falham com a emissao desligada, e as tres de controle passam dos dois
+jeitos, de proposito: elas existem para provar que a regra nao engole metodo com
+fallback de verdade nem metodo vazio sem primitiva, que continua sendo `^self` e
+continua sendo Smalltalk correto.
+
+**Nao entrou script de varredura no repositorio.** Ele e um SEGUNDO parser de
+Smalltalk, e a divergencia entre duas copias da mesma logica e exatamente o que
+custou caro nos backends do v1. A medicao foi feita uma vez, conferida contra o
+parser, e esta registrada acima; a regra que impede o 78 esta no compilador.
+
+## `printNl` contra o Core de verdade, e os cinco bugs que estavam atras dele
+
+O diagnostico anterior dizia que `printNl` morria "dentro da pilha de streams
+(BufferedStream/PositionableStream)". **Estava errado, e a pilha de streams nao
+tinha bug nenhum.** Eram cinco bugs, em cinco camadas diferentes, e o unico
+sintoma que qualquer um deles produzia era `printNl` nao funcionar.
+
+Fica registrado porque o erro de diagnostico e o item mais caro aqui: a peca que
+esta no meio do caminho leva a culpa, e nenhuma das cinco causas estava nela.
+
+### 1. `initialize` de classe rodava HERDADO, uma vez por subclasse
+
+`ExternalStream class initialize` faz `Transcript := self descriptor: 1`. Um
+metodo de classe e herdado pela cadeia de metaclasses como qualquer outro, e o
+carregador mandava `initialize` para as 158 classes, entao **FileStream e Socket,
+que nao declaram nenhum e sao construidos depois, rodavam o de ExternalStream com
+`self` diferente**. `Transcript` terminava um SOCKET no descritor 1.
+
+A busca do carregador agora **nao herda**: so a classe que DEFINE `initialize` o
+roda. O numero honesto caiu de "158 initializers" para **7**, que e exatamente
+quantas classes do Core declaram um (conferido: `grep -c` responde 7).
+
+### 2. Variavel de CLASSE era invisivel do lado da CLASSE
+
+Um metodo de classe e compilado com a METACLASSE como `ownerClass`, e a busca de
+variavel de classe andava a cadeia a partir dai. Uma metaclasse nao carrega as
+variaveis de classe da classe, entao **a busca nao achava nada**, e como o nome
+comeca com maiuscula ele caia na regra de referencia adiantada e ganhava uma
+Association GLOBAL nova.
+
+Resultado: `Character class initialize` escrevia `Table` numa Association, e
+`Character>>isVowel` lia `Table` de OUTRA. A tabela de tipos de caractere estava
+sempre nil, e `$a printNl` morria dentro de `isVowel`.
+
+`CompileContext` ganhou `classVariableScope`: variaveis de instancia e `super`
+continuam vindo da metaclasse, variaveis de classe vem da CLASSE. Silencioso do
+comeco ao fim, e sem sintoma nenhum ate alguem ler a variavel.
+
+### 3. Literal `#( )` era a colecao de trabalho do PARSER
+
+O no de array guarda uma `OrderedCollection` de NOS DA ARVORE, que e como o
+parser acumula os elementos enquanto le. O emissor publicava esse campo direto,
+entao `#(1 2 3)` era uma **OrderedCollection de LiteralNodes**.
+
+`#(1 2 3) size` respondia **3** o tempo todo. So a classe estava errada, e so o
+`do:` do print revelava.
+
+### 4. Literal `#sym` era uma String
+
+Mesma familia: o no de simbolo guarda uma String, e um Symbol e uma String
+INTERNADA. `#sym` saia String, entao `#sym == #sym` era **false**, que e
+exatamente a propriedade pela qual o interning existe.
+
+Os dois viraram `literalValueOf`, que traduz o no para o valor de runtime e
+recursa nos arrays aninhados. Cinco checagens novas no nivel 8, todas verificadas
+falhando com a traducao removida.
+
+### 5. `Object superClass` respondia 0, e derrubava `isKindOf:` inteiro
+
+`Object := nil [ ... ]` DECLARA que a superclasse e nil, e o construtor de
+classes descartava a declaracao: o campo ficava com o ZERO do alocador. Do lado
+C isso e certo, porque ausente e `valueTypeOf(slot, VALUE_POINTER)` falso. Do
+lado Smalltalk **nao ha zero, so nil**, e `inheritsFrom:` anda a cadeia com
+`aSuperClass == nil` ate parar.
+
+Entao a cadeia andava um passo A MAIS e mandava `superClass` para um
+SmallInteger. Isso e `isKindOf:` para toda classe que nao case exatamente, ou
+seja `3 isKindOf: Fraction`, e por baixo dele a torre numerica inteira: `(3/4) +
+(1/4)` levantava.
+
+**Duas linguagens, dois "ausente", e agora um lugar so**: `rawClassSuperclass()`
+responde NULL para os dois, e os sete leitores em C passam por ele. Sem isso, o
+lado C aceitaria nil como classe e andaria PARA DENTRO da instancia de
+UndefinedObject.
+
+O mesmo zero aparecia em `namespace` (`Class>>qualifiedName` pergunta
+`namespace isNil`, recebia false, e ia indexar uma colecao que nao existe, entao
+imprimir QUALQUER classe levantava). `classFillAbsentSmalltalkFields` poe nil nos
+quatro campos que **so o Smalltalk le**: `subClasses`, `comment`, `category`,
+`namespace`.
+
+**Os outros quatro ficam com zero de proposito**, e isso e a parte que nao pode
+ser esquecida: `name`, `methodDictionary`, `instanceVariables` e
+`classVariables` sao lidos em C como "e um ponteiro?", e esse teste E a checagem
+de presenca. nil e um ponteiro, entao enche-los trocaria "esta classe nao tem
+dicionario de metodos" por "o dicionario de metodos dela e o objeto nil".
+
+### O que passou a funcionar
+
+Nao so `(3 + 4) printNl`. Aferido com valor esperado, 24 de 24: inteiro, String,
+Symbol, Character, nil, true, Fraction, Array (aninhado), Dictionary, Set,
+SortedCollection, Interval com `collect:` e `inject:into:`, Association,
+`isKindOf:` nos dois sentidos, impressao de classe e de metaclasse.
+
+O que ainda nao: `3.5 printNl` (`FloatAsStringPrimitive`) e `100 factorial`
+(a familia `LargeInt*`). Os dois sao primitivas nao implementadas, os dois
+aparecem na varredura acima, e os dois agora DIZEM qual primitiva falta em vez de
+responder o receptor.
+
+## Nivel 11: a imagem, e as tres coisas que ela tem que carregar
+
+`Snapshot.c` foi reescrito. O grafo continua sendo escrito por descoberta a
+partir das raizes, com ids e referencias, que era o desenho certo do v1; o que
+mudou por completo foi o que um registro contem, porque tres coisas do v2 nao
+existem no modelo antigo:
+
+- **a TABELA DE CLASSES, restaurada indice por indice.** O cabecalho de um objeto
+  nomeia a classe por INDICE de 22 bits (ADR 0005), um guard em codigo gerado
+  compara esse indice, e o trailer da propria classe o repete. Renumerar na carga
+  seria silencioso e total. `classTableSet` ja existia para isso;
+- **as CODE UNITS**, que sao structs C de `malloc` e nao objetos de heap. Um
+  CompiledMethod alcanca o bytecode dele por uma palavra CRUA que o coletor nunca
+  segue, entao nada de uma unit esta no grafo de objetos e tudo dela e escrito a
+  parte. Toda unit e alcancavel: a de um bloco mora num CompiledMethod dentro do
+  `blocks` da unit que a contem;
+- **NADA de codigo nativo.** Um metodo carregado tem `native == NULL` e compila
+  de novo no primeiro send. Nao e atalho: codigo gerado BAKEIA os enderecos de
+  nil, true e false como imediatos, e no processo que carrega a imagem esses
+  enderecos sao outros.
+
+Tres decisoes que valem registro:
+
+**A imagem carrega na OLD SPACE, e isso e corretude e nao arrumacao.** A old
+space nao move (ADR 0005), entao a tabela id-para-endereco do carregador continua
+valida do primeiro registro ao ultimo. Na nursery, uma coleta no meio realocaria
+tudo o que ja foi lido e deixaria a tabela inteira apontando para onde as coisas
+estavam.
+
+**Coleta durante a carga e ASSERT, nao "pula".** Entre o primeiro registro e o
+fim da correcao de ponteiros, os objetos lidos sao alcancaveis SO pela tabela do
+carregador, que e um array C que nenhum provedor de raiz conhece. `collectGarbage`
+falha alto se for chamado ali.
+
+**Um valor codificado guarda os dois bits de tag**, entao ele se descreve
+sozinho: tag de ponteiro significa "o resto e `id + 1`", e os outros tres tags
+sao imediatos escritos como estao. Nada pode ser confundido com referencia, e um
+slot com o ZERO do alocador (o "ausente" do VM) atravessa como ele mesmo.
+
+### O criterio do nivel 11 e RECARREGAR, e o gate agora mede isso
+
+O runner antigo so escrevia a imagem. Sao tres checagens, cada uma falhando por
+um motivo diferente: a imagem e escrita; ela carrega e o kernel dentro dela RODA
+(`printNl`, nao `3 + 4`, porque um metodo carregado nao tem codigo nativo e
+imprimir e o que prova que a recarga chegou ate o JIT); e salvar-carregar-salvar
+e um PONTO FIXO byte a byte.
+
+O ponto fixo e a unica checagem que pega um campo que o escritor persiste e o
+leitor descarta: a imagem continua carregando e continua rodando, e a perda nao
+aparece em lugar nenhum. Medido: **a imagem do bootstrap ja e um ponto fixo**,
+`img1 == img2`, 1.149.776 bytes. As 24 checagens de `printNl` com valor esperado
+respondem identicamente contra a imagem carregada e contra o pacote vivo.
+
+## `st -f`, e o censo dos 141
+
+`-f` roda um arquivo de cima a baixo, e o arquivo tem duas coisas separadas por
+UM token: `[` abre um bloco de topo, que e avaliado, e qualquer outra coisa
+comeca uma definicao de classe, que e construida. **O ultimo valor respondido
+vira o codigo de saida** quando for inteiro, que e como a suite le um arquivo
+terminado em `[ ^AlgumRun report ]`.
+
+Um bug caiu junto: `methodNodeGetPragmas` derreferenciava o zero de um campo nao
+setado. Nenhum no vindo do PARSER deixa esse campo vazio; um no construido a mao
+deixa, e `-f` e o primeiro que constroi um.
+
+**O censo, rodando os 141 arquivos de `tests/` contra a imagem:**
+
+| | |
+|---|---|
+| **99** | `BlockOnExceptionPrimitive`, ou seja `on:do:` |
+| 5 | assert em C |
+| 4 cada | `ProcessSpawnPrimitive`, `WorkerParallelPrimitive`, `MonotonicNanoTimePrimitive`, aritmetica de LargeInteger |
+| 3 | JA PASSAM |
+| o resto | 1 ou 2 cada: `ParseClass`, `MonitorEnterOn`, `BlockUnwind`, `FloatAsString`, `thisContext`, e outros |
+
+**70% dos arquivos param na MESMA coisa**, e e o proximo item da ordem aprovada:
+`TestRun check:` envolve cada checagem em `on:do:`, entao excecoes nao sao um
+item entre outros, sao o que destranca a suite. O unwind que o retorno nao local
+ja construiu e a metade que existe.
+
+## Excecoes: UMA cadeia, tres tipos de entrada
+
+Feito. `on:do:`, `signal`, `ensure:`, `ifCurtailed:`, `resume:`, `return:`,
+`retry`, `pass`, `outer`, `resignalAs:`. O PROTOCOLO inteiro ja estava escrito em
+Smalltalk (`Exception.st`, `HandlerEscape.st`, `Block.st`) e nao foi tocado; o
+que entrou sao **tres primitivas** e o que Smalltalk nao consegue expressar:
+tomar um destino de salto, achar um handler atravessando frames que a linguagem
+nao ve, e rodar um cleanup na saida.
+
+**Uma cadeia so, com tres tipos de entrada** (`UNWIND_HOME`, `UNWIND_HANDLER`,
+`UNWIND_CLEANUP`). Os tres sao "um ponto na pilha C, ordenado por aninhamento,
+que sair atravessando tem que notar"; em tres cadeias separadas, toda varredura
+teria que intercala-las corretamente de qualquer jeito. O retorno nao local ja
+tinha a primeira, e ganhou de graca o que faltava: agora ele roda os `ensure:`
+que atravessa.
+
+**A ORDEM E O PROTOCOLO INTEIRO, e ela e o contrario da obvia**: o handler roda
+ANTES de qualquer coisa desenrolar. Procura para fora o primeiro handler
+habilitado cuja classe responde `handles:`, roda ele EM CIMA dos frames que
+sinalizaram (`runHandledBy:`), e so entao decide: `false -> valor` e resume, com
+nada desempilhado e todo `ensure:` pendente ainda armado; `true -> valor`
+desenrola. Decidir primeiro e desenrolar depois e o que torna `resume:`
+expressavel; um handler de longjmp comum destroi os frames em que a resumacao
+tem que voltar antes de alguem dizer se resume.
+
+Um handler que esta RODANDO fica desabilitado, entao uma excecao levantada dentro
+de um handler procura para FORA em vez de reentrar no que ja esta tratando uma.
+
+**A cadeia e RAIZ DE GC**, e isso nao e formalidade: o bloco handler e segurado
+durante a avaliacao INTEIRA do bloco protegido, que aloca como qualquer codigo.
+Verificado desligando: com `rootsVisitUnwindRecords` fora do coletor, um
+`on:do:` cujo bloco aloca 200.000 vezes morre lendo indice de classe de um
+cadaver. Com ela, responde.
+
+### Dois bugs que so apareceram porque excecoes existem
+
+**1. O ANDAIME EMBUTIDO SOMBREAVA o kernel de verdade.** O bootstrap instalava
+`at:`, `at:put:` e `size` em Array, ByteArray e String, uma copia em cada, que e
+onde o `at:` de uma colecao indexada obviamente mora. Mas `packages/Core` declara
+`at:` UMA vez, em Object, e deixa a primitiva decidir pelo FORMATO. Um metodo de
+andaime mais especifico ganhava toda busca, e a versao de `packages/Core` nunca
+rodava.
+
+Invisivel enquanto a primitiva ACERTA, porque as duas fazem o mesmo. O que
+diferia era o caminho de falha: o andaime diz `primitiveFailed:` e para, o real
+sinaliza um `OutOfRangeError` que um handler pega. Entao
+`[#(1 2 3) at: 9] on: Error do: [...]` nao tinha como funcionar, e o motivo nao
+tinha nada a ver com excecoes. **A regra do andaime e uma so: ele vai onde
+`packages/Core` poe o de verdade, ou sombreia para sempre.**
+
+**2. `allocateOld` COLETAVA DEPOIS DE ENTREGAR OS BYTES.** Ele carvava a regiao,
+checava o limiar, chamava o mark-sweep e so entao devolvia o endereco. A varredura
+entao andava por uma regiao ja entregue cujo CABECALHO O CHAMADOR AINDA NAO
+ESCREVEU: lia zeros e calculava passo zero.
+
+O assert era a metade de sorte. A outra metade e que a varredura LIBERA o que nao
+esta marcado, e nada marca um objeto que ainda nao existe, entao a alocacao
+fresca ia para uma free list enquanto o chamador estava prestes a inicializa-la:
+um endereco, dois donos, descoberto em outro lugar. **Reproduzido com o kernel
+embutido e imagem nenhuma**, alocando alem do limiar num laco, entao e anterior a
+tudo desta campanha. Conserto: coletar ANTES de carvar.
+
+O teste do nivel 0 que ficou precisou de duas correcoes minhas para valer alguma
+coisa, e as duas valem registro: a primeira versao alocava objetos PEQUENOS, que
+vao para a nursery e nunca chegam em `allocateOld`, entao passava com o bug no
+lugar; e ela achou um bug meu, `initHeap` nao inicializando `gcInhibited`, num
+struct que rotineiramente e variavel de pilha, o que desliga a coleta em silencio.
+
+### O numero
+
+**40 dos 141** arquivos de `tests/` saem com codigo zero, contra 3 antes.
+
+## A cauda: 23 primitivas, e tres bugs de DECODIFICACAO
+
+Depois das excecoes o que sobrou deixou de ser uma parede e virou cauda longa.
+Um lote de primitivas e tres bugs, e os tres bugs sao a mesma doenca: **duas
+metades do sistema decodificando a mesma coisa de dois jeitos.**
+
+**23 primitivas** entraram de uma vez, e a cobertura foi de 40 para **66 de 175**:
+a matematica de Float inteira (`sqrt`, as trigonometricas, `exp`, `ln`, `floor`,
+`ceiling`, `truncated`, `rounded`, `exponent`, `timesTwoPower:`), tempo
+(`MonotonicNanoTime`, `CurrentMicroTime`), `StringHash`, `StringAsSymbol`, e o
+par do coletor. Todas eram declaradas com CORPO VAZIO, entao antes disso cada uma
+respondia o proprio receptor: um programa que tirava raiz quadrada seguia com o
+numero de onde partiu.
+
+**Imprimir Float** e o unico que nao e mecanico. E a decimal MAIS CURTA que le de
+volta como o mesmo double, achada pedindo um digito significativo e alargando ate
+`strtod` casar. Precisao fixa erra dos dois lados de um jeito que o usuario ve:
+`%.17g` imprime 3.14 como 3.1400000000000001, e qualquer coisa mais curta para de
+fazer o round-trip. E a NOTACAO e escolhida separadamente do numero de digitos,
+porque `%g` decide por uma regra que ninguem quer aqui: com dois digitos
+significativos ele imprime `1500.0` como `1.5e+03`, que faz round-trip e e a
+resposta errada.
+
+### `Behavior>>isIndexable` decodificava o shape do V1
+
+`packages/Core` lia a palavra de shape com os deslocamentos do modelo antigo.
+Nenhuma classe do sistema respondia verdadeiro, **incluindo Array**, e o estrago
+foi silencioso e largo: `shallowCopy` pega o braco nao-indexado, entao
+`#(1 2 3) copy` voltava um Array VAZIO, e tudo construido sobre copy (`sort`,
+`replaceAll:`, `replaceFrom:to:with:`, `Dictionary copy`) devolvia colecao vazia
+como RESPOSTA, sem falhar.
+
+Junto saiu um defeito do lado do VM: `primInstanceShape` empacotava a palavra com
+`memcpy` de um struct **com padding**, e o C deixa byte de padding indeterminado.
+Agora e campo a campo, e o layout esta escrito nos dois lugares que o usam e em
+nenhum outro.
+
+### Slot vazio de Array: ZERO em C, `nil` em Smalltalk
+
+`Object new respondsTo: #foo` bastava para derrubar o processo, e o caminho e
+curto: `respondsTo:` procura um seletor que ninguem implementa, que e exatamente
+a busca que ALCANCA um slot vazio do dicionario de metodos. O probe do kernel
+acha slot livre com `isNil`; um dicionario construido em C tem o ZERO do
+alocador, que e o SmallInteger 0. Todo slot vazio lia como OCUPADO, e o kernel
+mandava `key` para um inteiro.
+
+`newArray` passou a escrever nil, que e a MESMA fronteira que `Array new:` ja
+atravessava na primitiva dele. E como as duas grafias de vazio agora coexistem
+num sistema rodando (a tabela de simbolos nasce antes de nil e fica com zeros),
+todo probe em C passa por `slotIsEmpty`, que aceita as duas. Aceitar so uma faz
+metade dos dicionarios do sistema parecer permanentemente cheia.
+
+**53 dos 141** com isso.
+
+E uma licao de manutencao junto: o nivel 7 tinha uma checagem que NOMEAVA
+`PRIM_FloatSin` como exemplo de primitiva nao implementada, e ela quebrou no dia
+em que `sin` foi implementada. Ela agora PROCURA uma na tabela, porque o que ela
+quer afirmar e um fato sobre a tabela e nao sobre uma primitiva. E os tres niveis
+que linkam `Primitive.c` a mao precisaram de `-lm`, que e a armadilha ja
+registrada aqui sobre os niveis 0 a 8 linkarem a mao.
+`ExceptionProtocolTest` responde **23 de 23**, que e o protocolo resumivel
+inteiro. O que resta e cauda longa de primitiva ausente, nao mais uma parede: 7
+`ParseClass`, 6 LargeInteger, 5 `ProcessSpawn`, 5 `MonotonicNanoTime`, 4
+`WorkerParallel`, 4 `ParseMethod`, 4 `MonitorEnterOn`, e o resto com 1 a 3 cada.
+
+E compilar nao e rodar. A IMAGEM esta feita (nivel 11, acima). O que resta entre
+isto e `run_tests.sh` verde, em ordem e agora com numero: as EXCECOES (`signal`,
+`on:do:`, `ensure:`, o segundo cliente do unwind que o retorno nao local ja
+construiu), que sozinhas destrancam **99 dos 141** arquivos de teste; e as
+PRIMITIVAS, 40 das 175, com a lista do que falta saindo do censo acima em vez de
+de um palpite. Um metodo que declara uma primitiva ausente E NAO TEM corpo
+de fallback agora falha nomeando-a, em vez de responder o receptor: sao 65 assim
+no Core, contados na varredura acima.
+
+## O que o gate NAO cobre, e como cobrimos
+
+O gate mede **funcionamento**, nao **desempenho**, e no nivel 8 mede um alvo
+unico. Duas coisas ficam de fora e precisam de tratamento proprio:
+
+**Regressao de desempenho.** Fica com `scripts/ab.sh` mais
+`benchmarks/results/BASELINE.jsonl`, exatamente como hoje. Regra herdada e nao
+negociada: layout de codigo neste VM ja produziu 4% de variacao com instrucoes
+identicas, entao nenhum ganho abaixo disso e reivindicavel sem A/B intercalado, e
+a contagem de instrucoes retiradas manda sobre o relogio.
+
+**Corretude que nenhum teste alcanca.** A licao registrada deste repositorio e
+que um slot de stackmap faltando nao produz teste vermelho. A guarda certa nao e
+teste, e `ASSERT` no codegen, e esse e o requisito R2 do ADR 0003. Todo `ASSERT`
+novo que codifique uma invariante do mapa de deopt ou do stackmap vale mais que
+um teste, porque roda em toda compilacao de toda execucao da suite.
+
+## O nivel 7: o backend de SSA, e o oraculo que ele usa
+
+`SSA otimizado -> codigo de maquina` era a linha que dizia NAO EXISTE. Existe:
+LIR neutro, lowering, linear scan com splitting e bancos separados, emissor x64.
+
+**O ORACULO E O TIER 1.** Cada metodo e compilado pelos DOIS geradores de codigo,
+os dois sao EXECUTADOS, e o que se confere e que concordam. Sob corte seco o
+oraculo externo se foi e o interno, `--deopt-stress`, ainda nao existe; este
+existe agora, e existe precisamente porque o tier 1 e uma implementacao completa
+e provada sozinha da mesma linguagem. Uma checagem de valor passa numa resposta
+certa pelo motivo errado; dois geradores chegando nela por caminhos diferentes,
+nao.
+
+**E RODA EM VARIOS TAMANHOS DE POOL.** `ST_SSA_REGS=n` finge que o banco tem so
+os n primeiros registradores. Spill e split sao o codigo que um arquivo de doze
+registradores nunca alcanca, logo o menos provavel de ter executado e o mais
+provavel de estar errado; em pool 2 todo metodo passa por eles. O nivel roda em
+12, 8, 4 e 2.
+
+### O que o backend achou na IR, e o modo de falha de cada um
+
+Tres defeitos de RESPOSTA ERRADA, todos invisiveis ate alguem CONSUMIR a IR: o
+dry run a construia e jogava fora.
+
+- **`OP_LOADK` perdia o indice do literal.** Virava `IR_CONST` com `extra`
+  nomeando o OPCODE, entao o indice nao era gravado em lugar nenhum e nenhum
+  backend poderia emitir a carga certa. Pior: `gvnEqual` compara `op`, `extra`,
+  `konst`, `argCount` e `repr`, e duas cargas de literais DIFERENTES concordavam
+  nos cinco, entao o GVN as FUNDIA e o metodo passava a ler um literal onde
+  deveria ler varios. Medido: dois entram, um sai. Agora `IR_LITERAL` e op
+  proprio, e nil/true/false continuam `IR_CONST` porque para esses fundir esta
+  certo.
+- **`OP_SENDSUPER` era indistinguivel de `OP_SEND`.** Os dois opcodes dividiam um
+  braco e produziam o mesmo `IR_SEND`. Um backend emitiria send comum, a busca
+  comecaria na classe do receptor, e para um receptor que e instancia de
+  subclasse isso acha o metodo em execucao de novo: a recursao infinita que
+  `lookupStart` existe para impedir. Agora e `IR_FLAG_SUPER`, flag e nao opcode
+  novo, porque todo passe testa `op == IR_SEND` e um opcode novo exigiria achar
+  cada um deles.
+- **O bci nao existia na IR.** A celula de cache de um sitio e indexada por ele,
+  entao sem ele todo send de um metodo compartilharia um sitio. Lido do estado
+  de deopt funcionaria hoje e pararia de funcionar no dia do inlining, porque os
+  frames sao documentados de fora para dentro.
+
+### O que o verificador achou no alocador
+
+O modo de falha de um alocador de registradores e dois valores vivos no mesmo
+registrador, e o que isso produz e resposta errada em outro metodo, arbitrariamente
+longe da compilacao que a causou. Nenhum teste ponta a ponta acha isso. Conferir
+a SAIDA contra as proprias invariantes acha na compilacao que causou, em todo
+metodo que o sistema compilar, que e o mesmo argumento que este repositorio ja
+faz para ASSERT de stackmap no codegen em vez de teste.
+
+Tres, e os tres so apareceram porque ele roda:
+
+- **intervalos fixos varridos por ordem de inicio** em vez de pre-semeados em
+  `inactive`. `tryAllocateFree` consulta so `active` e `inactive`, entao um valor
+  que nasce antes da primeira chamada pegava registrador caller-saved e o mantinha
+  atravessando a chamada;
+- **despejo derramava o intervalo INTEIRO**, definicao inclusa, e um valor
+  derramado por completo nao tem onde escrever o proprio resultado;
+- **dono INATIVO tratado como algo contra o que cortar** em vez de bloqueio.
+  Inativo significa buraco de vida, e este alocador nunca derrama um intervalo
+  inativo, entao o registrador dele e inutilizavel a partir do encontro. Medido
+  sobre 17977 metodos reais: 14 alocacoes erradas em pool 4 e 47 em pool 3,
+  todas em posicao IMPAR, que e ponto de split, e foi isso que apontou o lugar.
+
+Depois dos tres: **17977 de 17977 alocados e verificados em pool 12, 8 e 4**, e
+em pool 3 sao 12 RECUSAS limpas em vez de alocacao errada, porque tres
+registradores de fato nao bastam para alguns metodos e isso agora e dito em voz
+alta.
+
+### Onde o backend para hoje
+
+`canLower` recusa POR NOME o que nao sabe selecionar, e a lista de recusas e a
+lista de trabalho:
+
+- **as alocacoes e os acessos indexados** (`IR_NEW`, `IR_ANEW`, `IR_ALOAD` e
+  companhia), porque nenhum produtor os cria e seriam codigo nao exercitado;
+- **`IR_FIELD_F` e `IR_SETFIELD_F`**, que sao das classes de valor da fase 7.
+
+E duas coisas que sao primeiro corte declarado, nao desenho: o send do tier 2 vai
+por `jitDispatch` SEM caminho rapido de cache (correto e mais lento, e o perfil
+continua sendo gravado, que e o que o ADR 0006 exige), e box/unbox sao CHAMADAS
+em vez de sequencia inline.
+
+## Especializacao de aritmetica pelo perfil
+
+`3 + 4` chega na IR como SEND opaco, e o ADR 0006 exige que chegue: resolver `+`
+no front end faz o perfil de tipos deixar de existir. A consequencia era que GVN,
+LICM e promocao de phi rodavam sobre chamadas e nao moviam nada, e as operacoes
+cruas em volta das quais a IR foi desenhada nao tinham PRODUTOR nenhum.
+
+Agora tem. Onde o sitio e monomorfico o bastante, o otimizador troca
+
+```
+send #+ (r, a)      ->      guard_class r, SmallInteger
+                            guard_class a, SmallInteger
+                            box_i(iadd(unbox_i r, unbox_i a))   [checado]
+```
+
+**A ORDEM E O ARGUMENTO INTEIRO**: o perfil existe porque aritmetica passou por
+cache; a troca e legal porque esta atras de guard; o guard e legal porque falhar
+da para desotimizar. Cada peca precisa da anterior, e e por isso que esta e a
+ultima e nao a primeira.
+
+### Tres coisas que a especializacao NAO decide
+
+**Nao decide pelo SELETOR.** Um sitio que manda `+` para SmallInteger so e
+especializado quando o metodo que aquele sitio RESOLVEU carrega
+`IntAddPrimitive`, achado pela via do cache que ele resolveu. Decidir pelo nome
+compilaria `+` como soma num programa que redefiniu `SmallInteger>>+`, e a
+resposta seria errada sem nada para notar: o guard continua valendo, porque o
+receptor de fato E um SmallInteger. Quem sabe o que um numero de primitiva
+significa e UM arquivo, `jit/Specialize.c`, porque isso e um fato sobre
+`packages/Core` e este VM ja pagou varias vezes por fatos sobre `packages/`
+escritos em duas metades.
+
+**Nao decide dentro do otimizador.** O passe recebe uma TABELA por indice de
+bytecode, ja decidida. O nivel 5 linka `Passes.c` com a IR e mais nada, entao um
+passe que lesse uma `IcCell` nao poderia ser provado la.
+
+**Nao decide sobre aritmetica MISTA.** `3 + 4.0` chega em `PRIM_IntAdd` com
+argumento Float e responde Float; especializar esse par como soma inteira
+desempacotaria um SmallFloat64 como se fosse SmallInteger, que e resposta errada
+e nao guard que falha. Os dois operandos sao conferidos contra a representacao
+que a operacao consome, e o par misto continua send. E o primeiro corte, dito
+como corte: e exatamente o caso que um `i2f` mais operacao de float serviria.
+
+### O overflow vai na ARITMETICA, nao no box
+
+`+`, `-` e `*` de dois SmallIntegers podem sair da carga de 62 bits, e a resposta
+do kernel para isso e um LargeInteger construido pelo Smalltalk do proprio
+metodo, que codigo otimizado nao constroi. Entao a operacao carrega
+`IR_FLAG_CHECK_OVERFLOW` e desotimiza.
+
+**No box a checagem nao serve**, e isso parece detalhe e e a corretude toda:
+`sum := sum + i` num laco tem o box e o unbox removidos pela promocao de phi, que
+e o objetivo do passe, entao uma checagem que morasse no box desapareceria com
+ele e o acumulador daria a volta em 64 bits em silencio. Verificado desligando: a
+checagem fora, `maxVal + 1` nao responde diferente, ele ABORTA o processo no
+assert de `jitBoxInteger`.
+
+### O guard nao sabia checar classe IMEDIATA, e isso era perda total
+
+`LIR_GUARD_CLASS` testava a tag contra `VALUE_POINTER` e so depois lia o indice
+de classe do cabecalho. Um SmallInteger nao tem cabecalho: a classe dele vem de
+uma tabela indexada pela TAG (`core/Class.h`). Entao o guard respondia NAO para
+todo SmallInteger que existe.
+
+**E o modo de falha e o pior possivel: a resposta continua CERTA.** Desotimizar e
+correto por construcao, entao um guard que falha em toda execucao entrega
+exatamente o que o tier 1 entrega. Nenhuma checagem de valor ve isso. O que ve e
+um CONTADOR de desotimizacoes, e a checagem que o le e "uma chamada dentro do
+perfil desotimiza ZERO vezes". Medido desligando o conserto: as 21 respostas
+continuam certas e SEIS checagens quebram, todas por contagem.
+
+O que o guard emite agora e exatamente `classIndexOfValue(v) == imm`, com os
+bracos de imediato lidos da mesma tabela que o C le.
+
+### O que a especializacao encontrou no ALOCADOR: tres, e todos de ORDEM
+
+Os tres sao a mesma doenca e nenhum e novo: **os moves de resolucao sao uma COPIA
+PARALELA e estavam sendo emitidos como sequencia.** Faltava um laco que carregasse
+valor derramado no cabecalho, e nada tinha construido um. Os tres foram achados
+pelo ORACULO (tier 1), nao pelo verificador, e o verificador estava certo em
+passar: os intervalos eram consistentes, so a COLOCACAO estava errada.
+
+1. **Split no cabecalho de bloco resolvido com UM move dentro do bloco.** Um
+   bloco com dois predecessores nao concorda sobre onde o valor esta, e o move
+   roda nos dois: no cabecalho de laco o derrame da aresta de entrada re-executa
+   a cada iteracao, lendo um registrador que ja e de outro e escrevendo isso no
+   slot. Medido: laco com acumulador float respondeu 32.0 onde o tier 1 respondeu
+   3.0, porque o PASSO foi sobrescrito pelo acumulador na segunda iteracao. Agora
+   split no cabecalho vai para as arestas.
+2. **A pergunta da aresta era feita em `block->to - 1`**, que e a posicao IMPAR
+   entre o ultimo instrucao do bloco e a primeira do sucessor, ou seja exatamente
+   onde um split de fronteira COMECA. Ler ali responde onde o valor vai estar
+   DEPOIS da aresta, e o move que tem que acontecer NELA parece desnecessario.
+3. **Move de aresta colocado antes de um terminador CONDICIONAL.** Ele roda nas
+   duas saidas e pode sobrescrever o registrador que o branch esta prestes a ler.
+   Medido: o laco rodou UMA iteracao e respondeu 2.0. Com varios sucessores a
+   aresta e a CABECA DO SUCESSOR, e isso e seguro porque o lowering ja corta
+   aresta critica, o que esta ASSERTado em vez de assumido.
+
+E a copia paralela passou a ser ordenada: primeiro os DERRAMES (leem registrador,
+escrevem memoria), depois os moves registrador-a-registrador em ordem
+topologica, depois as RECARGAS (escrevem registrador, leem memoria). **Ciclo
+verdadeiro** (r1 para r2 enquanto r2 vai para r1) e quebrado PELO FRAME, com um
+slot alocado na primeira vez que aparece, porque o alocador ja distribuiu todo
+registrador. Medido: 7 dos 17977 metodos tem um, entao recusar custaria sete
+compilacoes para evitar duas instrucoes.
+
+### E um bug latente na desotimizacao, que so a aritmetica de float alcanca
+
+A area onde o guard derrama o banco de registradores cobria so o banco INTEIRO.
+Um `DeoptSlot` grava o banco em que foi alocado, e ler um de volta de uma area
+que so guardou registrador inteiro pega os oito bytes de qualquer inteiro que
+divida o numero: um double plausivel, de um valor sem relacao nenhuma.
+
+**Achar um caso que alcanca isso custou uma tentativa errada, e ela vale
+registro**: `(a + b) < c` em float NAO alcanca, porque o receptor da comparacao e
+a soma BOXED, entao o registrador de bytecode que o estado nomeia guarda o box e
+o valor cru nao e de ninguem. So a PROMOCAO DE PHI torna um registrador de
+bytecode cru. O teste que ficou tem acumulador float semeado por uma soma (para
+os dois operandos do phi serem box, que e o que a promocao exige) e um contador
+inteiro que estoura; verificado tirando os saves de float e vendo esse, e so
+esse, responder diferente.
+
+### Tres passes que a especializacao exigiu do otimizador
+
+Nenhum e enfeite: sem eles a especializacao nao paga.
+
+- **classe de literal inteiro.** Sem saber que indice de classe um SmallInteger
+  tagueado tem, `x + 1` guarda a constante em runtime e um acumulador semeado com
+  `0` tem phi cujos operandos nao concordam em classe, o que impede a remocao do
+  guard, o que deixa um box na aresta do laco, que e exatamente o custo que a
+  promocao de phi existe para tirar. Um indice recupera tudo isso, e ele entra
+  como DADO (`IrProfile`) porque o nivel 5 nao tem tabela de classes.
+- **semente de constante na promocao de phi.** A promocao exigia que TODO operando
+  do phi fosse um box. Todo acumulador inteiro da linguagem se escreve
+  `sum := 0` e depois `sum := sum + x`, ou seja o operando da aresta de entrada e
+  uma CONSTANTE tagueada. Exigir box rejeita essa forma, que e A forma.
+- **box que so um estado de deopt ainda quer.** `a + b + c` deixa um box
+  intermediario sem usuario ordinario nenhum: o que o mantem vivo e o estado do
+  segundo sitio. Esse estado nao precisa do box, porque um `DeoptSlot` carrega o
+  KIND e o `DeoptResume` re-empacota na saida. E o MESMO argumento que a
+  substituicao escalar faz sobre uma alocacao, e reusa o mesmo predicado.
+
+Junto entrou `unbox_i` de constante virando `iconst`, que hoje remove uma CHAMADA
+de todo `x + 1` e do preheader de todo laco contado.
+
+### Os numeros
+
+Sobre 17977 metodos reais (todos os `tests/*.st` contra a imagem do Core), com o
+perfil que a propria execucao deixou:
+
+| | |
+|---|---|
+| metodos | 17977 |
+| sitios que o perfil ofereceu | **2091** |
+| sitios que o otimizador trocou | **2091** |
+| ofertas que o passe recusou | **0** |
+| guards depois da remocao de redundante | 2009 de 4182 emitidos |
+| boxes afundados no estado de deopt | 632 |
+| phis promovidos | 315 |
+
+`lowered 17977, allocated 17977, allocFailed 0, verifyFailed 0, deoptSites 63651,
+deoptIncomplete 0`, identico ao registrado antes desta sessao.
+
+E por benchmark, contando SITIOS e nao execucoes:
+
+| | metodos | sends | especializados | guards | boxes afundados | phis |
+|---|---|---|---|---|---|---|
+| Richards | 125 | 393 | 17 | 20 | 4 | 2 |
+| DeltaBlue | 201 | 737 | 60 | 57 | 15 | 8 |
+| MixedArith | 52 | 199 | 11 | 15 | 3 | 2 |
+| FloatBench | 44 | 169 | 16 | 23 | 4 | 3 |
+
+**NENHUM DESSES NUMEROS E UM GANHO DE PERFORMANCE, e nao pode ser**: o tier 2
+continua desligado, e ligado hoje seria mais lento pelos dois cortes declarados
+(send por `jitDispatch` sem caminho rapido, box/unbox como chamada). Sao contagem
+ESTATICA de sitios, nao fracao de sends executados. O que eles dizem e que a
+maquina que ja estava verificada passou a ter o que otimizar, que era o bloqueio.
+
+E o `--deopt-stress` (nivel 15) vem ANTES de qualquer ganho reivindicado, porque
+sem ele a especulacao e promessa sem oraculo.
+
+## O nivel 15: o oraculo interno, e o que ele achou no primeiro dia
+
+`scripts/deopt-stress.sh` roda a suite inteira em TRES configuracoes e exige
+saida IDENTICA, arquivo por arquivo, byte por byte, codigo de saida incluso:
+
+| | |
+|---|---|
+| baseline | so tier 1. A referencia. |
+| `ST_TIER2_ALL=1` | tier 2 compila e RODA todo metodo que consegue, especulacoes intactas |
+| `ST_DEOPT_STRESS=1` | idem, e toda especulacao FALHA |
+
+### A primeira coisa que o modo precisou nao era o modo
+
+**`ST_DEOPT_STRESS=1` sobre um sistema onde nenhum codigo otimizado executa
+reporta que todos os testes passam, o que e verdade e nao significa nada**: nao
+havia de onde sair. Um modo de stress tem que ser capaz de FALHAR para o fato de
+ele passar ser evidencia.
+
+Entao entrou tambem `jit/Tier2Stress.c`, e ele e dito pelo que e: **modo de
+TESTE, nao politica de tier**. Politica (quando um metodo esta quente, o que
+invalida codigo otimizado quando um dicionario de metodos muda, como um laco em
+execucao transfere para codigo otimizado) e trabalho proprio e nada disso esta
+la. O que esta e a regra mais crua possivel: todo metodo que tier 2 consegue
+compilar e compilado e instalado, NO PRIMEIRO SEND que chega nele.
+
+**O primeiro send e nao quando esquenta, e a razao e onde o sitio guarda a
+resposta.** O caminho rapido emitido entra em `way->target` e nunca rele
+`method->native`, entao um sitio armado enquanto o metodo era tier 1 continua
+entrando em tier 1 para sempre. Fazer o upgrade no primeiro dispatch evita isso
+inteiro: nenhum sitio armou ainda. O preco e que o perfil esta VAZIO nesse
+instante, entao nada especializa e o codigo nao carrega guard proprio, e e por
+isso que o stress ADICIONA um guard em todo sitio de send em vez de depender de o
+perfil ter produzido um.
+
+### O poison, e por que `CLASS_INDEX_INVALID` estava errado duas vezes
+
+Um guard de stress exige um indice de classe que nenhum objeto tem. A primeira
+escolha, `CLASS_INDEX_INVALID`, falha por dois motivos ao mesmo tempo: ele e
+ZERO, que alguma classe de fato tem, e e tambem o que `irNewValue` escreve em
+`klass` para dizer "desconhecido". O passe de guard redundante le
+`subject->klass == wanted`, acha verdadeiro para TODO valor do programa, e apaga
+todos os guards de stress. **Medido: a primeira execucao com stress reportou que
+nada nunca saiu de codigo otimizado**, que e exatamente o verde vazio acima.
+
+O certo e `OBJ_CLASS_MASK`, um passo ALEM do maior indice que o cabecalho aceita
+(`CLASS_INDEX_MAX`, que `core/ClassTable.c` impoe), entao nenhum objeto pode
+carregar ele e ele sobrevive ao mascaramento do imediato no emissor.
+
+### O que faltava para tier 2 rodar: a PRIMITIVA
+
+Tier 2 nao tentava a primitiva do metodo. `LIR_CALL_PRIMITIVE` existia para isso
+e nao tinha produtor nenhum.
+
+Nao era otimizacao faltando. `packages/Core` escreve a maior parte do kernel como
+pragma mais fallback Smalltalk, e **65 desses metodos nao tem corpo de fallback
+nenhum**, entao o compilador da a eles `self primitiveFailed: #Nome` (ver a
+varredura acima). Codigo de tier 2 que pulava a tentativa caia direto nisso, e
+`primitiveFailed:` ninguem implementa: a primeira coisa que tier 2 fez quando foi
+finalmente deixado RODAR foi `doesNotUnderstand` na aritmetica do proprio
+receptor. Agora ele emite a tentativa no PROLOGO, como tier 1, e pela mesma razao
+de desenho: tentar a primitiva e propriedade do METODO e nenhum passe decide
+diferente por causa dela.
+
+### E o perfil estava sendo JOGADO FORA a cada mudanca de dicionario
+
+`jitFlushSendCaches` dizia no proprio comentario que as contagens sao mantidas e
+em seguida fazia `wayCount = 0`, que nao e uma versao menor de manter:
+`icDominantClass` responde `CLASS_INDEX_INVALID` num sitio sem ways, e o
+`icRecord` seguinte comeca de novo na way 0. Todo perfil do sistema era descartado
+em toda mudanca de qualquer dicionario de metodos, o que num bootstrap e
+constantemente. E precisamente a amnesia que `jit/InlineCache.h` diz que o indice
+de classe de 22 bits do ADR 0005 existe para acabar.
+
+Medido: os sitios especializaveis foram de **2091 para 2171**, mesmo codigo, so
+mais do que o programa fez lembrado.
+
+### Tres bugs de RESPOSTA ERRADA que so o oraculo achou
+
+Os tres estavam em codigo anterior a esta sessao. Nenhum foi achado pelo
+verificador, e o verificador estava certo em passar nos tres: os intervalos eram
+consistentes, a COLOCACAO nao era.
+
+1. **`mergeBlocks` absorvia o BLOCO DE ENTRADA no proprio predecessor de
+   back-edge.** `predCount` nao diz que a entrada tem uma entrada de fora: controle
+   chega nela de FORA da funcao e nada no CFG registra isso, entao um laco cujo
+   cabecalho E a entrada tem cabecalho com exatamente um predecessor, o proprio
+   latch. Fundir deixa `function->entry` nomeando um bloco vazio e sem arestas e o
+   metodo inteiro inalcancavel da propria entrada. Achado no PRIMEIRO metodo real
+   que tier 2 foi mandado compilar: um `whileTrue:` no topo de um metodo.
+2. **E os blocos absorvidos ficavam na lista.** Vazios, sem terminador e sem
+   sucessor: o lowering cria um bloco LIR para eles, `terminateSplitBlocks` lhes
+   da um JUMP porque nao tem terminador, e o emissor derreferencia o label nulo de
+   um sucessor que nao existe.
+3. **Um derrame emitido DEPOIS da instrucao que ja tomou o registrador.** Um
+   registrador e tomado quando a instrucao EXECUTA, mas um intervalo que comeca
+   numa definicao comeca uma posicao DEPOIS dessa instrucao, pela convencao de
+   slot impar. Cortar o dono anterior na posicao inicial poe o store depois de o
+   registrador ter sido sobrescrito. Medido: `a + b` respondeu 8 em vez de 300 num
+   metodo cujo send precisava de dez slots de argumento de saida.
+
+### O numero, e ele NAO e verde
+
+| | |
+|---|---|
+| arquivos comparados | 143 |
+| execucoes comparadas | 143 x 4 (baseline, tier2all, stress em 3 profundidades) |
+| diferentes no primeiro dia | **196** |
+| diferentes depois dos tres consertos | **56** |
+| desotimizacoes numa execucao com stress | 101, com 45 metodos promovidos |
+
+Das 56: **7 em `tier2all`**, ou seja o backend discordando do tier 1 com as
+especulacoes intactas, que e a familia mais fundamental; **49 em stress**. As 7
+estao caracterizadas e cada uma reproduz em um arquivo pequeno:
+excecao de classe errada, `false is not a Number`, shift de LargeInteger,
+tamanho de colecao lido como zero (`1 to: 0`), e um LACO INFINITO num
+`to:do:` cujo corpo tem retorno antecipado dentro de `ifTrue:` (reduzido a um
+metodo de dez linhas).
+
+**O nivel do gate NAO subiu e nao podia**: o nivel 14 e paridade
+(`run_tests.sh` verde) e nao foi alcancado, e o proprio nivel 15 nao esta verde.
+O que existe agora e o RUNNER e a medicao. `gate.sh` nivel 15 chama
+`scripts/deopt-stress.sh`.
+
+E a limitacao do modo, dita: **so o PRIMEIRO guard que um caminho alcanca
+dispara**, porque depois dele o resto da ativacao e do tier 1. Uma execucao
+estressa o primeiro sitio de cada metodo em cada caminho executado, e
+`ST_DEOPT_STRESS_SKIP` e o que anda mais fundo; o runner varre 0, 1 e 2.

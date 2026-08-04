@@ -49,12 +49,20 @@ Envelope := Object [
 
 
 ActorFailure := Object [
-	"Sent to a supervisor when one of its children fails while handling a message."
+	"Sent to a supervisor when one of its children fails while handling a
+	 message. It carries the child's RestartStatistics because the supervisor
+	 does not own them: one strategy governs many children, and the restart
+	 budget is per child."
 
-	| child reason failedMessage |
+	| child reason failedMessage statistics |
 
 	class child: aPid reason: anException message: aMessage [
 		^self new setChild: aPid reason: anException message: aMessage
+	]
+
+	class child: aPid reason: anException message: aMessage statistics: aStatistics [
+		^(self new setChild: aPid reason: anException message: aMessage)
+			setStatistics: aStatistics
 	]
 
 	setChild: aPid reason: anException message: aMessage [
@@ -64,9 +72,15 @@ ActorFailure := Object [
 		^self
 	]
 
+	setStatistics: aStatistics [
+		statistics := aStatistics.
+		^self
+	]
+
 	child [ ^child ]
 	reason [ ^reason ]
 	failedMessage [ ^failedMessage ]
+	statistics [ ^statistics ]
 ]
 
 

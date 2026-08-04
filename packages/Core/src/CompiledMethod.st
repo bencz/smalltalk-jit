@@ -1,14 +1,18 @@
 CompiledMethod := CompiledCode [
 
-	| literals selector ownerClass sourceCode descriptors |
+	"The two TAGGED fields of RawCompiledMethod, in order. `literals` and
+	 `descriptors` are not here any more: the literal frame belongs to the
+	 CodeUnit and the bci-to-machine map is an array beside the native code, both
+	 of them C structures the collector reaches through jit/Jit.c rather than
+	 through this object."
+
+	| selector ownerClass |
 
 
 	"accessing"
 
-	literals [
-		^literals
-	]
-
+	"literals, sourceCode and descriptors are inherited from CompiledCode: all
+	 three live in the CodeUnit, which is what the primitives there read."
 
 	selector [
 		^selector
@@ -17,16 +21,6 @@ CompiledMethod := CompiledCode [
 
 	ownerClass [
 		^ownerClass
-	]
-
-
-	sourceCode [
-		^sourceCode
-	]
-
-
-	descriptors [
-		^descriptors
 	]
 
 

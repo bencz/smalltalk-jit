@@ -49,6 +49,16 @@ False := Boolean [
 	]
 
 
+	"controlling, the cold arm"
+
+	mustBeBoolean [
+		"See True>>mustBeBoolean: an instance of False that is not the `false`
+		 singleton stands for false, and the singleton is what the branch can
+		 test by identity."
+		^false
+	]
+
+
 	"printing"
 
 	printOn: aStream [

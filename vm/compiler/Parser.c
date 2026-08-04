@@ -1,4 +1,5 @@
 #include "compiler/Parser.h"
+#include "runtime/Number.h"
 #include "runtime/BigInt.h"
 #include "core/Smalltalk.h"
 #include "memory/Heap.h"
@@ -18,15 +19,21 @@
 	EXPECT_TOKEN(tokenType, result) \
 	nextToken(&parser->tokenizer);
 
+// The parameter is PARENTHESISED, and that is not tidiness. Callers pass a
+// set of alternatives, `TOKEN_IDENTIFIER | TOKEN_KEYWORD | ...`, and `&` binds
+// tighter than `|`: without the parentheses the test read
+// `(type & FIRST) | REST`, which is non-zero whenever REST is, so the check
+// accepted every token and never reported a syntax error. Found by
+// -Wparentheses, not by a test, because the failure is silent acceptance.
 #define EXPECT_TOKEN(tokenType, result) \
-	if ((currentToken(&parser->tokenizer)->type & tokenType) == 0) { \
+	if ((currentToken(&parser->tokenizer)->type & (tokenType)) == 0) { \
 		errorExpected(parser, tokenType); \
 		return result; \
 	}
 
 #define NEXT_EXPECT_TOKEN(token, tokenType, result) \
 	token = nextToken(&parser->tokenizer); \
-	if ((token->type & tokenType) == 0) { \
+	if ((token->type & (tokenType)) == 0) { \
 		errorExpected(parser, tokenType); \
 		return result; \
 	}
@@ -77,7 +84,7 @@ void initParser(Parser *parser, String *source)
 	stringPrintOn(source, buffer);
 	initTokenizer(&parser->tokenizer, buffer);
 	parser->sourceOrFileName = source;
-	parser->sourceCodeClass = Handles.SourceCode;
+	parser->sourceCodeClass = &Handles.SourceCode;
 	parser->error.code = PARSER_ERROR_NONE;
 }
 
@@ -86,7 +93,7 @@ void initFileParser(Parser *parser, FILE *file, String *fileName)
 {
 	initFileTokenizer(&parser->tokenizer, file);
 	parser->sourceOrFileName = fileName;
-	parser->sourceCodeClass = Handles.FileSourceCode;
+	parser->sourceCodeClass = &Handles.FileSourceCode;
 	parser->error.code = PARSER_ERROR_NONE;
 }
 
@@ -129,7 +136,7 @@ ClassNode *parseClass(Parser *parser)
 	HandleScope scope;
 	openHandleScope(&scope);
 
-	ClassNode *class = newObject(Handles.ClassNode, 0);
+	ClassNode *class = newAstNode(&Handles.ClassNode);
 	SourceCode *sourceCode = createSourceCode(parser, 0);
 	OrderedCollection *tmp;
 
@@ -227,8 +234,8 @@ MethodNode *parseMethod(Parser *parser)
 	HandleScope scope;
 	openHandleScope(&scope);
 
-	MethodNode *method = newObject(Handles.MethodNode, 0);
-	BlockNode *block = newObject(Handles.BlockNode, 0);
+	MethodNode *method = newAstNode(&Handles.MethodNode);
+	BlockNode *block = newAstNode(&Handles.BlockNode);
 	SourceCode *sourceCode = createSourceCode(parser, 0);
 	OrderedCollection *args = newOrdColl(16);
 	Object *tmp;
@@ -236,7 +243,7 @@ MethodNode *parseMethod(Parser *parser)
 	methodNodeSetSourceCode(method, sourceCode);
 
 	if (currentToken(&parser->tokenizer)->type == TOKEN_IDENTIFIER && isMethodFirstToken(peekToken(&parser->tokenizer)))  {
-		methodNodeSetClassName(method, asString(currentToken(&parser->tokenizer)->content));
+		methodNodeSetClassName(method, stringFromC(currentToken(&parser->tokenizer)->content));
 		nextToken(&parser->tokenizer);
 	}
 
@@ -294,7 +301,7 @@ static String *parseMessagePattern(Parser *parser, OrderedCollection *args)
  */
 static String *parseUnaryMessagePattern(Parser *parser)
 {
-	String *selector = asString(currentToken(&parser->tokenizer)->content);
+	String *selector = stringFromC(currentToken(&parser->tokenizer)->content);
 	nextToken(&parser->tokenizer);
 	return selector;
 }
@@ -306,7 +313,7 @@ static String *parseUnaryMessagePattern(Parser *parser)
 static String *parseBinaryMessagePattern(Parser *parser, OrderedCollection *args)
 {
 	Token *token;
-	String *selector = asString(currentToken(&parser->tokenizer)->content);
+	String *selector = stringFromC(currentToken(&parser->tokenizer)->content);
 
 	NEXT_EXPECT_TOKEN(token, TOKEN_IDENTIFIER, NULL);
 	ordCollAddObject(args, (Object *) parseVariable(parser));
@@ -479,7 +486,7 @@ static ExpressionNode *parseExpression(Parser *parser)
 	HandleScope scope;
 	openHandleScope(&scope);
 
-	ExpressionNode *expression = newObject(Handles.ExpressionNode, 0);
+	ExpressionNode *expression = newAstNode(&Handles.ExpressionNode);
 	SourceCode *sourceCode = createSourceCode(parser, 0);
 	Object *receiver;
 	OrderedCollection *messageExpressions;
@@ -505,7 +512,10 @@ static ExpressionNode *parseExpression(Parser *parser)
 		ordCollAddObject(messageExpressions, tmp);
 		expressionNodeSetReceiver(expression, (LiteralNode *) receiver);
 
-	} else if (receiver->raw->class == Handles.ExpressionNode->raw) {
+	// The class INDEX, not the class object: identity of a class is its index in
+	// the class table (ADR 0005), and comparing class pointers would be reading
+	// a header field that no longer exists.
+	} else if (isInstanceOf(receiver->raw, &Handles.ExpressionNode)) {
 		messageExpressions = expressionNodeGetMessageExpressions((ExpressionNode *) receiver);
 		expressionNodeSetReceiver(expression, expressionNodeGetReceiver((ExpressionNode *) receiver));
 
@@ -589,7 +599,7 @@ static Object *parseUnaryObject(Parser *parser)
 
 static ExpressionNode *convertToExpression(LiteralNode *literal, MessageExpressionNode *messageExpression)
 {
-	ExpressionNode *expression = newObject(Handles.ExpressionNode, 0);
+	ExpressionNode *expression = newAstNode(&Handles.ExpressionNode);
 	OrderedCollection *messageExpressions = newOrdColl(8);
 
 	expressionNodeSetSourceCode(expression, literalNodeGetSourceCode(literal));
@@ -640,17 +650,17 @@ static LiteralNode *parseVariable(Parser *parser)
 	Class *class;
 
 	if (strcmp("nil", content) == 0) {
-		class = Handles.NilNode;
+		class = &Handles.NilNode;
 	} else if (strcmp("true", content) == 0) {
-		class = Handles.TrueNode;
+		class = &Handles.TrueNode;
 	} else if (strcmp("false", content) == 0) {
-		class = Handles.FalseNode;
+		class = &Handles.FalseNode;
 	} else {
-		class = Handles.VariableNode;
+		class = &Handles.VariableNode;
 	}
 
 	literal = (LiteralNode *) newObject(class, 0);
-	literalNodeSetValue(literal, (Object *) asString(content));
+	literalNodeSetValue(literal, (Object *) stringFromC(content));
 	literalNodeSetSourceCode(literal, createSourceCode(parser, 1));
 	nextToken(&parser->tokenizer);
 	return literal;
@@ -665,7 +675,7 @@ BlockNode *parseBlock(Parser *parser)
 	HandleScope scope;
 	openHandleScope(&scope);
 
-	BlockNode *block = newObject(Handles.BlockNode, 0);
+	BlockNode *block = newAstNode(&Handles.BlockNode);
 	SourceCode *sourceCode = createSourceCode(parser, 0);
 	Object *tmp;
 
@@ -859,8 +869,8 @@ static Value buildIntegerLiteral(const char *str, int base, _Bool negative)
 		// user code always loads after the kernel.
 		ASSERT(cls != NULL && !isNil(cls));
 		Object *large = newObject(cls, limbs32 * sizeof(uint32_t));
-		memcpy(getObjectIndexedVars(large), wide, limbs32 * sizeof(uint32_t));
-		result = getTaggedPtr(closeHandleScope(&scope, large));
+		memcpy(objectIndexedVars(large), wide, limbs32 * sizeof(uint32_t));
+		result = objectTagged(closeHandleScope(&scope, large));
 	}
 	free(wide);
 	free(limbs);
@@ -915,7 +925,7 @@ static Value buildScaledDecimalLiteral(const char *str, _Bool negative)
 
 	Class *cls = getClass("ScaledDecimal");
 	Object *sd = newObject(cls, 0);
-	Value *vars = getObjectVars(sd);
+	Value *vars = objectVars(sd);
 	if (numHandle != NULL) {
 		objectStorePtr(sd, &vars[0], numHandle);
 	} else {
@@ -927,13 +937,13 @@ static Value buildScaledDecimalLiteral(const char *str, _Bool negative)
 		vars[1] = den;
 	}
 	vars[2] = tagInt((intptr_t) scale);
-	return getTaggedPtr(closeHandleScope(&scope, sd));
+	return objectTagged(closeHandleScope(&scope, sd));
 }
 
 
 static LiteralNode *parseNumber(Parser *parser, int8_t sign)
 {
-	LiteralNode *literal = newObject(Handles.IntegerNode, 0);
+	LiteralNode *literal = newAstNode(&Handles.IntegerNode);
 	literalNodeSetSourceCode(literal, createSourceCode(parser, 1));
 
 	Token *token = currentToken(&parser->tokenizer);
@@ -965,7 +975,7 @@ static LiteralNode *parseNumber(Parser *parser, int8_t sign)
 		// a fitting literal becomes an immediate SmallFloat64; a boxed literal
 		// keeps its scoped handle alive for the rest of the parse/compile
 		literalNodeSetRawValue(literal, smallFloatFits(value)
-			? tagFloat(value) : getTaggedPtr(newFloat(value)));
+			? tagFloat(value) : objectTagged(newFloat(value)));
 	} else {
 		literalNodeSetRawValue(literal, buildIntegerLiteral(content, 10, sign < 0));
 	}
@@ -1003,7 +1013,7 @@ static SignedValue parseInteger(Parser *parser)
  */
 static LiteralNode *parseSymbol(Parser *parser)
 {
-	LiteralNode *literal = newObject(Handles.SymbolNode, 0);
+	LiteralNode *literal = newAstNode(&Handles.SymbolNode);
 	Token *token;
 
 	NEXT_EXPECT_TOKEN(token, TOKEN_IDENTIFIER | TOKEN_KEYWORD | SPECIAL_CHARS_TOKENS | TOKEN_STRING, NULL);
@@ -1024,7 +1034,7 @@ static LiteralNode *parseSymbol(Parser *parser)
 		} while (token->type == TOKEN_KEYWORD && !token->isSeparated);
 		literalNodeSetValue(literal, copyResizedObject((Object *) symbol, size));
 	} else {
-		literalNodeSetValue(literal, (Object *) asString(token->content));
+		literalNodeSetValue(literal, (Object *) stringFromC(token->content));
 		nextToken(&parser->tokenizer);
 	}
 	return literal;
@@ -1036,8 +1046,8 @@ static LiteralNode *parseSymbol(Parser *parser)
  */
 static LiteralNode *parseString(Parser *parser)
 {
-	LiteralNode *literal = newObject(Handles.StringNode, 0);
-	literalNodeSetValue(literal, (Object *) asString(currentToken(&parser->tokenizer)->content));
+	LiteralNode *literal = newAstNode(&Handles.StringNode);
+	literalNodeSetValue(literal, (Object *) stringFromC(currentToken(&parser->tokenizer)->content));
 	literalNodeSetSourceCode(literal, createSourceCode(parser, 1));
 	nextToken(&parser->tokenizer);
 	return literal;
@@ -1050,7 +1060,7 @@ static LiteralNode *parseString(Parser *parser)
 static LiteralNode *parseChar(Parser *parser)
 {
 	Token *token = currentToken(&parser->tokenizer);
-	LiteralNode *literal = newObject(Handles.CharacterNode, 0);
+	LiteralNode *literal = newAstNode(&Handles.CharacterNode);
 	literalNodeSetSourceCode(literal, createSourceCode(parser, 1));
 	if (strcmp("$<", token->content) == 0 && peekToken(&parser->tokenizer)->type == TOKEN_DIGIT) {
 		nextToken(&parser->tokenizer);
@@ -1074,7 +1084,7 @@ static LiteralNode *parseArray(Parser *parser)
 	HandleScope scope;
 	openHandleScope(&scope);
 
-	LiteralNode *arrayLiteral = newObject(Handles.ArrayNode, 0);
+	LiteralNode *arrayLiteral = newAstNode(&Handles.ArrayNode);
 	SourceCode *sourceCode = createSourceCode(parser, 0);
 	OrderedCollection *array = newOrdColl(16);
 
@@ -1109,16 +1119,16 @@ static LiteralNode *parseArrayLiteral(Parser *parser)
 	if (token->type == TOKEN_IDENTIFIER) {
 		Class *class;
 		if (strcmp("nil", token->content) == 0) {
-			class = Handles.NilNode;
+			class = &Handles.NilNode;
 		} else if (strcmp("true", token->content) == 0) {
-			class = Handles.TrueNode;
+			class = &Handles.TrueNode;
 		} else if (strcmp("false", token->content) == 0) {
-			class = Handles.FalseNode;
+			class = &Handles.FalseNode;
 		} else {
 			return NULL;
 		}
 		LiteralNode *literal = (LiteralNode *) newObject(class, 0);
-		literalNodeSetValue(literal, (Object *) asString(token->content));
+		literalNodeSetValue(literal, (Object *) stringFromC(token->content));
 		literalNodeSetSourceCode(literal, createSourceCode(parser, 1));
 		nextToken(&parser->tokenizer);
 		return literal;
@@ -1186,7 +1196,7 @@ static MessageExpressionNode *parseUnaryExpression(Parser *parser)
 
 	SourceCode *source = createSourceCode(parser, 0);
 	MessageExpressionNode *expression = createMessageExpressionNode(
-		asString(currentToken(&parser->tokenizer)->content),
+		stringFromC(currentToken(&parser->tokenizer)->content),
 		newOrdColl(0),
 		source
 	);
@@ -1205,7 +1215,7 @@ static MessageExpressionNode *parseBinaryExpression(Parser *parser)
 	openHandleScope(&scope);
 
 	Object *tmp;
-	String *selector = asString(currentToken(&parser->tokenizer)->content);
+	String *selector = stringFromC(currentToken(&parser->tokenizer)->content);
 	OrderedCollection *args = newOrdColl(1);
 	SourceCode *source = createSourceCode(parser, 0);
 
@@ -1254,7 +1264,7 @@ static MessageExpressionNode *parseKeywordExpression(Parser *parser)
 
 static MessageExpressionNode *createMessageExpressionNode(String *selector, OrderedCollection *args, SourceCode *source)
 {
-	MessageExpressionNode *node = newObject(Handles.MessageExpressionNode, 0);
+	MessageExpressionNode *node = newAstNode(&Handles.MessageExpressionNode);
 	messageExpressionNodeSetSelector(node, selector);
 	messageExpressionNodeSetArgs(node, args);
 	messageExpressionNodeSetSourceCode(node, source);

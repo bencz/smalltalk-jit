@@ -1,1258 +1,678 @@
-#ifndef ASSEMBLERX64_H
-#define ASSEMBLERX64_H
+#ifndef ASSEMBLER_X64_H
+#define ASSEMBLER_X64_H
 
-#include "jit/Assembler.h"
-#include "jit/x64/TraitsX64.h"
-#include "core/Assert.h"
-#include <stddef.h>
+// x86-64 instruction encoding, and only the instructions this JIT emits.
+//
+// Deliberately small. A general assembler is a lot of surface to get subtly
+// wrong, and every encoding here is exercised by generated code that runs in
+// the self-test, so nothing sits untested. Adding an instruction means adding
+// it to the test that executes it.
 
-// Register numbers are the hardware encoding. C-ABI roles (argument order,
-// caller/callee-saved sets) are NOT annotated here — they belong to the
-// selected ABI instance (vm/jit/x64/Abi.h, abi/<abi>/). VM-internal roles:
-// TMP=R10 per-instruction scratch, CTX=R12 context pointer, R11 native-code
-// entry across sends, RAX result.
+#include "jit/CodeBuffer.h"
+#include <stdint.h>
+
 typedef enum {
-	RAX = 0,
-	RCX = 1,
-	RDX = 2,
-	RBX = 3,
-	RSP = 4,
-	RBP = 5,
-	RSI = 6,
-	RDI = 7,
-	R8  = 8,
-	R9  = 9,
-	R10 = 10,
-	R11 = 11,
-	R12 = 12,
-	R13 = 13,
-	R14 = 14,
-	R15 = 15,
-	RIP = -1,
-	NO_REGISTER = -2,
+	RAX = 0, RCX = 1, RDX = 2, RBX = 3,
+	RSP = 4, RBP = 5, RSI = 6, RDI = 7,
+	R8 = 8, R9 = 9, R10 = 10, R11 = 11,
+	R12 = 12, R13 = 13, R14 = 14, R15 = 15,
+	NO_REGISTER = -1,
 } Register;
 
-typedef enum {
-	AL = 0,
-	CL = 1,
-	DL = 2,
-	BL = 3,
-	AH = 4,
-	CH = 5,
-	DH = 6,
-	BH = 7,
-	SPL = 4 | (1 << 4),
-	BPL = 5 | (1 << 4),
-	SIL = 6 | (1 << 4),
-	DIL = 7 | (1 << 4),
-	R8L = 8,
-	R9L = 9,
-	R10L = 10,
-	R11L = 11,
-	R12L = 12,
-	R13L = 13,
-	R14L = 14,
-	R15L = 15,
-} ByteRegister;
-
-#define TMP R10
-#define CTX R12
-
-enum {
-	REX_W = 8,
-	REX_R = 4,
-	REX_X = 2,
-	REX_B = 1,
-};
-
-enum {
-	MOD_MEM = 0,
-	MOD_DISP8 = 1,
-	MOD_DISP32 = 2,
-	MOD_REG = 3,
-};
-
-enum {
-	SIB = 4,
-	ZERO_INDEX = 4,
-};
-
-typedef enum {
-	SS_1 = 0,
-	SS_2 = 1,
-	SS_4 = 2,
-	SS_8 = 3,
-} Scale;
-
-enum {
-	ADD = 0,
-	SUB = 5,
-};
-
-enum {
-	CALL_ABSOLUTE = 2,
-	JUMP_ABSOLUTE = 4,
-};
-
-enum {
-	COND_OVERFLOW =  0,
-	COND_NO_OVERFLOW = 1,
-	COND_BELOW = 2,
-	COND_ABOVE_EQUAL = 3,
-	COND_EQUAL = 4,
-	COND_NOT_EQUAL = 5,
-	COND_BELOW_EQUAL = 6,
-	COND_ABOVE = 7,
-	COND_SIGN = 8,
-	COND_NOT_SIGN = 9,
-	COND_PARITY_EVEN = 10,
-	COND_PARITY_ODD = 11,
-	COND_LESS = 12,
-	COND_GREATER_EQUAL = 13,
-	COND_LESS_EQUAL = 14,
-	COND_GREATER = 15,
-	COND_ZERO = COND_EQUAL,
-	COND_NOT_ZERO = COND_NOT_EQUAL,
-	COND_NEGATIVE = COND_SIGN,
-	COND_POSITIVE = COND_NOT_SIGN,
-	COND_CARRY = COND_BELOW,
-	COND_NOT_CARRY = COND_ABOVE_EQUAL,
-};
-
-typedef struct {
-	uint8_t mod;
-	uint8_t reg;
-	uint8_t rm;
-	uint8_t scale;
-	uint8_t index;
-	uint8_t base;
-	int32_t disp;
-} Operands;
-
-typedef struct {
-	int8_t base;
-	int8_t index;
-	int8_t scale;
-	int32_t disp;
-} MemoryOperand;
-
-static uint8_t Registers[] = { R11, R13, R14, R15, RBX, R9, R8, RCX, RDX, /*RSI, RDI*/ };
-static AvailableRegs X64AvailableRegs = {
-	.regsSize = sizeof(Registers),
-	.regs = Registers,
-};
-static MemoryOperand asmMem(Register base, Register index, Scale scale, ptrdiff_t disp);
-
-static void asmPushq(AssemblerBuffer *buffer, Register src);
-static void asmPushqImm(AssemblerBuffer *buffer, int32_t imm);
-static void asmPushqMem(AssemblerBuffer *buffer, MemoryOperand operand);
-static void asmPopq(AssemblerBuffer *buffer, Register dst);
-static void asmPopqMem(AssemblerBuffer *buffer, MemoryOperand operand);
-
-static void asmRet(AssemblerBuffer *buffer);
-
-static void asmMovq(AssemblerBuffer *buffer, Register src, Register dst);
-static void asmMovqImm(AssemblerBuffer *buffer, int64_t imm, Register dst);
-static void asmMovqToMem(AssemblerBuffer *buffer, Register src, MemoryOperand operand);
-static void asmMovqMem(AssemblerBuffer *buffer, MemoryOperand operand, Register dst);
-static void asmMovqMemImm(AssemblerBuffer *buffer, int64_t imm, MemoryOperand operand);
-// TLS load is a PLATFORM-ABI operation (sysv: %fs:0 + tpoff; win64: %gs TEB):
-// an extern delegate into the selected ABI instance — see jit/x64/Abi.h and
-// the implementation in abi/<abi>/. Unlike the static encoders around it,
-// this is one real function per process (Abi.c).
-void asmLoadTls(AssemblerBuffer *buffer, Register dst, ptrdiff_t tpoff);
-void asmLoadTlsField(AssemblerBuffer *buffer, Register dst, ptrdiff_t offset);
-static void asmMovb(AssemblerBuffer *buffer, ByteRegister src, ByteRegister dst);
-static void asmMovbToMem(AssemblerBuffer *buffer, ByteRegister src, MemoryOperand operand);
-static void asmMovbMem(AssemblerBuffer *buffer, MemoryOperand operand, ByteRegister dst);
-static void asmMovbMemImm(AssemblerBuffer *buffer, int8_t imm, MemoryOperand operand);
-
-static void asmMovzxbMemq(AssemblerBuffer *buffer, MemoryOperand operand, Register dst);
-static void asmMovzxwMemq(AssemblerBuffer *buffer, MemoryOperand operand, Register dst);
-
-static void asmCmovq(AssemblerBuffer *buffer, uint8_t condition, Register src, Register dst);
-
-static void asmLeaq(AssemblerBuffer *buffer, MemoryOperand operand, Register dst);
-
-static void asmAddq(AssemblerBuffer *buffer, Register src, Register dst);
-static void asmAddqImm(AssemblerBuffer *buffer, Register reg, int32_t imm);
-static void asmAddqMem(AssemblerBuffer *buffer, MemoryOperand operand, Register dst);
-static void asmAddqToMem(AssemblerBuffer *buffer, Register dst, MemoryOperand operand);
-static void asmAddqMemImm(AssemblerBuffer *buffer, MemoryOperand operand, int32_t imm);
-static void asmAddb(AssemblerBuffer *buffer, ByteRegister src, ByteRegister dst);
-static void asmAddbMem(AssemblerBuffer *buffer, MemoryOperand operand, ByteRegister dst);
-static void asmSubq(AssemblerBuffer *buffer, Register src, Register dst);
-static void asmSubqImm(AssemblerBuffer *buffer, Register reg, int32_t imm);
-static void asmSubqMem(AssemblerBuffer *buffer, MemoryOperand operand, Register dst);
-static void asmImulq(AssemblerBuffer *buffer, Register src, Register dst);
-static void asmImulqImm(AssemblerBuffer *buffer, Register src, int8_t imm, Register dst);
-static void asmImulqMem(AssemblerBuffer *buffer, MemoryOperand operand, Register dst);
-static void asmIdivq(AssemblerBuffer *buffer, Register divisor);
-static void asmIdivqMem(AssemblerBuffer *buffer, MemoryOperand divisor);
-static void asmSbbq(AssemblerBuffer *buffer, Register src, Register dst);
-static void asmNegq(AssemblerBuffer *buffer, Register dst);
-static void asmNegb(AssemblerBuffer *buffer, ByteRegister dst);
-
-static void asmIncq(AssemblerBuffer *buffer, Register dst);
-static void asmIncqMem(AssemblerBuffer *buffer, MemoryOperand operand);
-static void asmDecq(AssemblerBuffer *buffer, Register dst);
-static void asmDecqMem(AssemblerBuffer *buffer, MemoryOperand operand);
-
-static void asmAndq(AssemblerBuffer *buffer, Register src, Register dst);
-static void asmAndqImm(AssemblerBuffer *buffer, Register dst, int32_t imm);
-static void asmAndqMem(AssemblerBuffer *buffer, MemoryOperand operand, Register dst);
-static void asmAndbImm(AssemblerBuffer *buffer, ByteRegister dst, int8_t imm);
-static void asmOrq(AssemblerBuffer *buffer, Register src, Register dst);
-static void asmOrqMem(AssemblerBuffer *buffer, MemoryOperand operand, Register dst);
-static void asmOrbMemImm(AssemblerBuffer *buffer, MemoryOperand operand, int8_t imm);
-static void asmXorq(AssemblerBuffer *buffer, Register src, Register dst);
-static void asmXorqMem(AssemblerBuffer *buffer, MemoryOperand operand, Register dst);
-
-static void asmSarq(AssemblerBuffer *buffer, Register dst);
-static void asmSarqImm(AssemblerBuffer *buffer, Register dst, uint8_t imm);
-static void asmShlq(AssemblerBuffer *buffer, Register dst);
-static void asmShlqImm(AssemblerBuffer *buffer, Register dst, uint8_t imm);
-static void asmRolqImm(AssemblerBuffer *buffer, Register dst, uint8_t imm);
-static void asmRorqImm(AssemblerBuffer *buffer, Register dst, uint8_t imm);
-static void asmShrq(AssemblerBuffer *buffer, Register dst);
-static void asmShrqImm(AssemblerBuffer *buffer, Register dst, uint8_t imm);
-
-static void asmTestq(AssemblerBuffer *buffer, Register src, Register dst);
-static void asmTestqImm(AssemblerBuffer *buffer, Register reg, int32_t imm);
-static void asmTestqMem(AssemblerBuffer *buffer, MemoryOperand operand, Register reg);
-static void asmTestbImm(AssemblerBuffer *buffer, ByteRegister reg, int8_t imm);
-static void asmTestbMem(AssemblerBuffer *buffer, MemoryOperand operand, ByteRegister reg);
-static void asmTestbMemImm(AssemblerBuffer *buffer, MemoryOperand operand, int8_t imm);
-
-static void asmCmpq(AssemblerBuffer *buffer, Register src, Register dst);
-static void asmCmpqMem(AssemblerBuffer *buffer, MemoryOperand operand, Register reg);
-static void asmCmpqImm(AssemblerBuffer *buffer, Register reg, int32_t imm);
-static void asmCmpbMem(AssemblerBuffer *buffer, MemoryOperand operand, ByteRegister reg);
-static void asmCmpbMemImm(AssemblerBuffer *buffer, MemoryOperand operand, int8_t imm);
-static void asmCmpbImm(AssemblerBuffer *buffer, ByteRegister reg, int8_t imm);
-
-static void asmCqo(AssemblerBuffer *buffer);
-
-static void asmCallq(AssemblerBuffer *buffer, Register src);
-static void asmCallqMem(AssemblerBuffer *buffer, MemoryOperand operand);
-static void asmJmpq(AssemblerBuffer *buffer, Register src);
-static void asmJmpqMem(AssemblerBuffer *buffer, MemoryOperand operand);
-static void asmJmpdImm(AssemblerBuffer *buffer, int32_t imm);
-static void asmJmpLabel(AssemblerBuffer *buffer, AssemblerLabel *label);
-static void asmJ(AssemblerBuffer *buffer, uint8_t condition, AssemblerLabel *label);
-static void asmInt3(AssemblerBuffer *buffer);
-
-static void asmEmitAddImm(AssemblerBuffer *buffer, uint8_t op, Register reg, int32_t imm);
-static void asmEmitShift(AssemblerBuffer *buffer, uint8_t op, Register dst);
-static void asmEmitShiftImm(AssemblerBuffer *buffer, uint8_t op, Register dst, uint8_t imm);
-static void asmInitMemoryOperand(Operands *operands, MemoryOperand operand);
-static void asmEmitRexOperands(AssemblerBuffer *buffer, uint8_t rex, Operands *operands);
-static void asmEmitRex(AssemblerBuffer *buffer, uint8_t rex);
-static void asmEmitOperands(AssemblerBuffer *buffer, Operands *operands);
-
-
-static MemoryOperand asmMem(Register base, Register index, Scale scale, ptrdiff_t disp)
-{
-	ASSERT(INT32_MIN <= disp && disp <= INT32_MAX);
-	MemoryOperand operand = {.base = base, .index = index, .scale = scale, .disp = disp};
-	return operand;
-}
-
-
-static void asmPushq(AssemblerBuffer *buffer, Register src)
-{
-	Operands operands = { .reg = 0, .rm = src };
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, 0, &operands);
-	asmEmitUint8(buffer, 0x50 | (src & 7));
-}
-
-
-static void asmPushqImm(AssemblerBuffer *buffer, int32_t imm)
-{
-	asmEnsureCapacity(buffer);
-	asmEmitUint8(buffer, 0x68);
-	asmEmitInt32(buffer, imm);
-}
-
-
-static void asmPushqMem(AssemblerBuffer *buffer, MemoryOperand operand)
-{
-	Operands operands = {.reg = 6};
-	asmEnsureCapacity(buffer);
-	asmInitMemoryOperand(&operands, operand);
-	asmEmitRexOperands(buffer, 0, &operands);
-	asmEmitUint8(buffer, 0xFF);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmPopq(AssemblerBuffer *buffer, Register dst)
-{
-	Operands operands = { .reg = 0, .rm = dst };
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, 0, &operands);
-	asmEmitUint8(buffer, 0x58 | (dst & 7));
-}
-
-
-static void asmPopqMem(AssemblerBuffer *buffer, MemoryOperand operand)
-{
-	Operands operands = {.reg = 0};
-	asmEnsureCapacity(buffer);
-	asmInitMemoryOperand(&operands, operand);
-	asmEmitRexOperands(buffer, 0, &operands);
-	asmEmitUint8(buffer, 0x8F);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmRet(AssemblerBuffer *buffer)
-{
-	asmEnsureCapacity(buffer);
-	asmEmitUint8(buffer, 0xC3);
-}
-
-
-static void asmMovq(AssemblerBuffer *buffer, Register src, Register dst)
-{
-	Operands operands = {.mod = MOD_REG, .reg = dst, .rm = src};
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0x8B);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmMovqImm(AssemblerBuffer *buffer, int64_t imm, Register dst)
-{
-	asmEnsureCapacity(buffer);
-	asmEmitRex(buffer, REX_W | dst >> 3);
-	asmEmitUint8(buffer, 0xB8 | dst);
-	asmEmitUint64(buffer, imm);
-}
-
-
-static void asmMovqToMem(AssemblerBuffer *buffer, Register src, MemoryOperand operand)
-{
-	Operands operands = {.reg = src};
-	asmInitMemoryOperand(&operands, operand);
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0x89);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmMovqMem(AssemblerBuffer *buffer, MemoryOperand operand, Register dst)
-{
-	Operands operands = {.reg = dst};
-	asmInitMemoryOperand(&operands, operand);
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0x8B);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmMovqMemImm(AssemblerBuffer *buffer, int64_t imm, MemoryOperand operand)
-{
-	ASSERT(INT32_MIN <= imm && imm <= INT32_MAX);
-	Operands operands = {.reg = 0};
-	asmInitMemoryOperand(&operands, operand);
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0xC7);
-	asmEmitOperands(buffer, &operands);
-	asmEmitInt32(buffer, imm);
-}
-
-
-static void asmMovb(AssemblerBuffer *buffer, ByteRegister src, ByteRegister dst)
-{
-	Operands operands = {.mod = MOD_REG, .reg = dst, .rm = src};
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, 0, &operands);
-	asmEmitUint8(buffer, 0x8A);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmMovbToMem(AssemblerBuffer *buffer, ByteRegister src, MemoryOperand operand)
-{
-	Operands operands = {.reg = src};
-	asmInitMemoryOperand(&operands, operand);
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, 0, &operands);
-	asmEmitUint8(buffer, 0x88);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmMovbMem(AssemblerBuffer *buffer, MemoryOperand operand, ByteRegister dst)
-{
-	Operands operands = {.reg = dst};
-	asmInitMemoryOperand(&operands, operand);
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, 0, &operands);
-	asmEmitUint8(buffer, 0x8A);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmMovbMemImm(AssemblerBuffer *buffer, int8_t imm, MemoryOperand operand)
-{
-	Operands operands = {.reg = 0};
-	asmInitMemoryOperand(&operands, operand);
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, 0, &operands);
-	asmEmitUint8(buffer, 0xC6);
-	asmEmitOperands(buffer, &operands);
-	asmEmitInt8(buffer, imm);
-}
-
-
-static void asmMovzxbMemq(AssemblerBuffer *buffer, MemoryOperand operand, Register dst)
-{
-	Operands operands = {.reg = dst};
-	asmInitMemoryOperand(&operands, operand);
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0x0F);
-	asmEmitUint8(buffer, 0xB6);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmMovzxwMemq(AssemblerBuffer *buffer, MemoryOperand operand, Register dst)
-{
-	Operands operands = {.reg = dst};
-	asmInitMemoryOperand(&operands, operand);
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0x0F);
-	asmEmitUint8(buffer, 0xB7);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmCmovq(AssemblerBuffer *buffer, uint8_t condition, Register src, Register dst)
-{
-	Operands operands = {.mod = MOD_REG, .reg = dst, .rm = src};
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0x0F);
-	asmEmitUint8(buffer, 0x40 + condition);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmLeaq(AssemblerBuffer *buffer, MemoryOperand operand, Register dst)
-{
-	Operands operands = {.reg = dst};
-	asmInitMemoryOperand(&operands, operand);
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0x8D);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmAddq(AssemblerBuffer *buffer, Register src, Register dst)
-{
-	Operands operands = {.mod = MOD_REG, .reg = src, .rm = dst};
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0x01);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmAddqImm(AssemblerBuffer *buffer, Register reg, int32_t imm)
-{
-	asmEnsureCapacity(buffer);
-	asmEmitAddImm(buffer, ADD, reg, imm);
-}
-
-
-static void asmAddqMem(AssemblerBuffer *buffer, MemoryOperand operand, Register dst)
-{
-	Operands operands = {.reg = dst};
-	asmInitMemoryOperand(&operands, operand);
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0x03);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmAddqToMem(AssemblerBuffer *buffer, Register dst, MemoryOperand operand)
-{
-	Operands operands = {.reg = dst};
-	asmInitMemoryOperand(&operands, operand);
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0x01);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmAddqMemImm(AssemblerBuffer *buffer, MemoryOperand operand, int32_t imm)
-{
-	Operands operands = {.reg = 0};
-	asmInitMemoryOperand(&operands, operand);
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0x81);
-	asmEmitOperands(buffer, &operands);
-	asmEmitInt32(buffer, imm);
-}
-
-
-static void asmAddb(AssemblerBuffer *buffer, ByteRegister src, ByteRegister dst)
-{
-	Operands operands = {.mod = MOD_REG, .reg = src, .rm = dst};
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, 0, &operands);
-	asmEmitUint8(buffer, 0x00);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmAddbMem(AssemblerBuffer *buffer, MemoryOperand operand, ByteRegister dst)
-{
-	Operands operands = {.reg = dst};
-	asmInitMemoryOperand(&operands, operand);
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, 0, &operands);
-	asmEmitUint8(buffer, 0x02);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmSubq(AssemblerBuffer *buffer, Register src, Register dst)
-{
-	Operands operands = {.mod = MOD_REG, .reg = src, .rm = dst};
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0x29);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmSubqImm(AssemblerBuffer *buffer, Register reg, int32_t imm)
-{
-	asmEnsureCapacity(buffer);
-	asmEmitAddImm(buffer, SUB, reg, imm);
-}
-
-
-static void asmSubqMem(AssemblerBuffer *buffer, MemoryOperand operand, Register dst)
-{
-	Operands operands = {.reg = dst};
-	asmInitMemoryOperand(&operands, operand);
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0x2B);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmEmitAddImm(AssemblerBuffer *buffer, uint8_t op, Register reg, int32_t imm)
-{
-	Operands operands = {.mod = MOD_REG, .reg = op, .rm = reg};
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0x81);
-	asmEmitOperands(buffer, &operands);
-	asmEmitInt32(buffer, imm);
-}
-
-
-static void asmImulq(AssemblerBuffer *buffer, Register src, Register dst)
-{
-	Operands operands = {.mod = MOD_REG, .reg = dst, .rm = src};
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0x0F);
-	asmEmitUint8(buffer, 0xAF);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmImulqImm(AssemblerBuffer *buffer, Register src, int8_t imm, Register dst)
-{
-	Operands operands = {.mod = MOD_REG, .reg = dst, .rm = src};
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0x6B);
-	asmEmitOperands(buffer, &operands);
-	asmEmitInt8(buffer, imm);
-}
-
-
-static void asmImulqMem(AssemblerBuffer *buffer, MemoryOperand operand, Register dst)
-{
-	Operands operands = {.reg = dst};
-	asmInitMemoryOperand(&operands, operand);
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0x0F);
-	asmEmitUint8(buffer, 0xAF);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmIdivq(AssemblerBuffer *buffer, Register divisor)
-{
-	Operands operands = {.mod = MOD_REG, .reg = 7, .rm = divisor};
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0xF7);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmIdivqMem(AssemblerBuffer *buffer, MemoryOperand divisor)
-{
-	Operands operands = {.reg = 7};
-	asmInitMemoryOperand(&operands, divisor);
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0xF7);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmSbbq(AssemblerBuffer *buffer, Register src, Register dst)
-{
-	Operands operands = {.mod = MOD_REG, .reg = src, .rm = dst};
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0x19);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmNegq(AssemblerBuffer *buffer, Register dst)
-{
-	Operands operands = {.mod = MOD_REG, .reg = 3, .rm = dst};
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0xF7);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmNegb(AssemblerBuffer *buffer, ByteRegister dst)
-{
-	Operands operands = {.mod = MOD_REG, .reg = 3, .rm = dst};
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, 0, &operands);
-	asmEmitUint8(buffer, 0xF6);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmIncq(AssemblerBuffer *buffer, Register dst)
-{
-	Operands operands = {.mod = MOD_REG, .reg = 0, .rm = dst};
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0xFF);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmIncqMem(AssemblerBuffer *buffer, MemoryOperand operand)
-{
-	Operands operands = {.reg = 0};
-	asmInitMemoryOperand(&operands, operand);
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0xFF);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmDecq(AssemblerBuffer *buffer, Register dst)
-{
-	Operands operands = {.mod = MOD_REG, .reg = 1, .rm = dst};
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0xFF);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmDecqMem(AssemblerBuffer *buffer, MemoryOperand operand)
-{
-	Operands operands = {.reg = 1};
-	asmInitMemoryOperand(&operands, operand);
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0xFF);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmAndq(AssemblerBuffer *buffer, Register src, Register dst)
-{
-	Operands operands = {.mod = MOD_REG, .reg = src, .rm = dst};
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0x21);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmAndqImm(AssemblerBuffer *buffer, Register dst, int32_t imm)
-{
-	Operands operands = {.mod = MOD_REG, .reg = 4, .rm = dst};
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0x81);
-	asmEmitOperands(buffer, &operands);
-	asmEmitInt32(buffer, imm);
-}
-
-
-static void asmAndqMem(AssemblerBuffer *buffer, MemoryOperand operand, Register dst)
-{
-	Operands operands = {.reg = dst};
-	asmInitMemoryOperand(&operands, operand);
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0x23);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmAndbImm(AssemblerBuffer *buffer, ByteRegister dst, int8_t imm)
-{
-	Operands operands = {.mod = MOD_REG, .reg = 4, .rm = dst};
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, 0, &operands);
-	asmEmitUint8(buffer, 0x80);
-	asmEmitOperands(buffer, &operands);
-	asmEmitInt8(buffer, imm);
-}
-
-
-static void asmOrq(AssemblerBuffer *buffer, Register src, Register dst)
-{
-	Operands operands = {.mod = MOD_REG, .reg = src, .rm = dst};
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0x09);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmOrqMem(AssemblerBuffer *buffer, MemoryOperand operand, Register dst)
-{
-	Operands operands = {.reg = dst};
-	asmInitMemoryOperand(&operands, operand);
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0x0B);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmOrbMemImm(AssemblerBuffer *buffer, MemoryOperand operand, int8_t imm)
-{
-	Operands operands = {.reg = 1};
-	asmInitMemoryOperand(&operands, operand);
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, 0, &operands);
-	asmEmitUint8(buffer, 0x80);
-	asmEmitOperands(buffer, &operands);
-	asmEmitInt8(buffer, imm);
-}
-
-
-static void asmXorq(AssemblerBuffer *buffer, Register src, Register dst)
-{
-	Operands operands = {.mod = MOD_REG, .reg = src, .rm = dst};
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0x31);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmXorqMem(AssemblerBuffer *buffer, MemoryOperand operand, Register dst)
-{
-	Operands operands = {.reg = dst};
-	asmInitMemoryOperand(&operands, operand);
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0x33);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-// ARITHMETIC right shift by CL (opcode extension 7), as opposed to asmShrq's
-// LOGICAL shift (extension 5). Sign-preserving, which is what a Smalltalk
-// bitShift: with a negative receiver needs.
-static void asmSarq(AssemblerBuffer *buffer, Register dst)
-{
-	asmEnsureCapacity(buffer);
-	asmEmitShift(buffer, 7, dst);
-}
-
-
-static void asmSarqImm(AssemblerBuffer *buffer, Register dst, uint8_t imm)
-{
-	asmEnsureCapacity(buffer);
-	asmEmitShiftImm(buffer, 7, dst, imm);
-}
-
-
-static void asmShlq(AssemblerBuffer *buffer, Register dst)
-{
-	asmEnsureCapacity(buffer);
-	asmEmitShift(buffer, 4, dst);
-}
-
-
-static void asmShlqImm(AssemblerBuffer *buffer, Register dst, uint8_t imm)
-{
-	asmEnsureCapacity(buffer);
-	asmEmitShiftImm(buffer, 4, dst, imm);
-}
-
-
-static void asmShrq(AssemblerBuffer *buffer, Register dst)
-{
-	asmEnsureCapacity(buffer);
-	asmEmitShift(buffer, 5, dst);
-}
-
-
-static void asmShrqImm(AssemblerBuffer *buffer, Register dst, uint8_t imm)
-{
-
-	asmEmitShiftImm(buffer, 5, dst, imm);
-}
-
-
-static void asmRolqImm(AssemblerBuffer *buffer, Register dst, uint8_t imm)
-{
-	asmEnsureCapacity(buffer);
-	asmEmitShiftImm(buffer, 0, dst, imm);
-}
-
-
-static void asmRorqImm(AssemblerBuffer *buffer, Register dst, uint8_t imm)
-{
-	asmEnsureCapacity(buffer);
-	asmEmitShiftImm(buffer, 1, dst, imm);
-}
-
-
-static void asmEmitShift(AssemblerBuffer *buffer, uint8_t op, Register dst)
-{
-	Operands operands = {.mod = MOD_REG, .reg = op, .rm = dst};
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0xD3);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmEmitShiftImm(AssemblerBuffer *buffer, uint8_t op, Register dst, uint8_t imm)
-{
-	Operands operands = {.mod = MOD_REG, .reg = op, .rm = dst};
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0xC1);
-	asmEmitOperands(buffer, &operands);
-	asmEmitUint8(buffer, imm);
-}
-
-
-static void asmTestq(AssemblerBuffer *buffer, Register src, Register dst)
-{
-	Operands operands = {.mod = MOD_REG, .reg = src, .rm = dst};
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0x85);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmTestqImm(AssemblerBuffer *buffer, Register reg, int32_t imm)
-{
-	Operands operands = {.mod = MOD_REG, .reg = 0, .rm = reg};
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0xF7);
-	asmEmitOperands(buffer, &operands);
-	asmEmitInt32(buffer, imm);
-}
-
-
-static void asmTestqMem(AssemblerBuffer *buffer, MemoryOperand operand, Register reg)
-{
-	Operands operands = {.reg = reg};
-	asmInitMemoryOperand(&operands, operand);
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0x85);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmTestbImm(AssemblerBuffer *buffer, ByteRegister reg, int8_t imm)
-{
-	Operands operands = {.mod = MOD_REG, .reg = 0, .rm = reg};
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, 0, &operands);
-	asmEmitUint8(buffer, 0xF6);
-	asmEmitOperands(buffer, &operands);
-	asmEmitInt8(buffer, imm);
-}
-
-
-static void asmTestbMem(AssemblerBuffer *buffer, MemoryOperand operand, ByteRegister reg)
-{
-	Operands operands = {.reg = reg};
-	asmInitMemoryOperand(&operands, operand);
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, 0, &operands);
-	asmEmitUint8(buffer, 0x84);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmTestbMemImm(AssemblerBuffer *buffer, MemoryOperand operand, int8_t imm)
-{
-	Operands operands = {.reg = 0};
-	asmInitMemoryOperand(&operands, operand);
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, 0, &operands);
-	asmEmitUint8(buffer, 0xF6);
-	asmEmitOperands(buffer, &operands);
-	asmEmitInt8(buffer, imm);
-}
-
-
-static void asmCmpq(AssemblerBuffer *buffer, Register src, Register dst)
-{
-	Operands operands = {.mod = MOD_REG, .reg = src, .rm = dst};
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0x3B);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmCmpqMem(AssemblerBuffer *buffer, MemoryOperand operand, Register reg)
-{
-	Operands operands = {.reg = reg};
-	asmInitMemoryOperand(&operands, operand);
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0x3B);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmCmpqImm(AssemblerBuffer *buffer, Register reg, int32_t imm)
-{
-	Operands operands = {.mod = MOD_REG, .reg = 7, .rm = reg};
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0x81);
-	asmEmitOperands(buffer, &operands);
-	asmEmitInt32(buffer, imm);
-}
-
-
-static void asmCmpbMem(AssemblerBuffer *buffer, MemoryOperand operand, ByteRegister reg)
-{
-	Operands operands = {.reg = reg};
-	asmInitMemoryOperand(&operands, operand);
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, 0, &operands);
-	asmEmitUint8(buffer, 0x3A);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmCmpbMemImm(AssemblerBuffer *buffer, MemoryOperand operand, int8_t imm)
-{
-	Operands operands = {.reg = 7};
-	asmInitMemoryOperand(&operands, operand);
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, 0, &operands);
-	asmEmitUint8(buffer, 0x80);
-	asmEmitOperands(buffer, &operands);
-	asmEmitInt8(buffer, imm);
-}
-
-
-static void asmCmpbImm(AssemblerBuffer *buffer, ByteRegister reg, int8_t imm)
-{
-	Operands operands = {.mod = MOD_REG, .reg = 7, .rm = reg};
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, 0, &operands);
-	asmEmitUint8(buffer, 0x80);
-	asmEmitOperands(buffer, &operands);
-	asmEmitInt8(buffer, imm);
-}
-
-
-static void asmCqo(AssemblerBuffer *buffer)
-{
-	asmEnsureCapacity(buffer);
-	asmEmitRex(buffer, REX_W);
-	asmEmitUint8(buffer, 0x99);
-}
-
-
-static void asmCallq(AssemblerBuffer *buffer, Register src)
-{
-	Operands operands = {.mod = MOD_REG, .reg = CALL_ABSOLUTE, .rm = src};
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, 0, &operands);
-	asmEmitUint8(buffer, 0xFF);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmCallqMem(AssemblerBuffer *buffer, MemoryOperand operand)
-{
-	Operands operands = {.reg = CALL_ABSOLUTE};
-	asmInitMemoryOperand(&operands, operand);
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, 0, &operands);
-	asmEmitUint8(buffer, 0xFF);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmJmpq(AssemblerBuffer *buffer, Register src)
-{
-	Operands operands = {.mod = MOD_REG, .reg = JUMP_ABSOLUTE, .rm = src};
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, 0, &operands);
-	asmEmitUint8(buffer, 0xFF);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmJmpqMem(AssemblerBuffer *buffer, MemoryOperand operand)
-{
-	Operands operands = {.reg = 4};
-	asmInitMemoryOperand(&operands, operand);
-	asmEnsureCapacity(buffer);
-	asmEmitRexOperands(buffer, 0, &operands);
-	asmEmitUint8(buffer, 0xFF);
-	asmEmitOperands(buffer, &operands);
-}
-
-
-static void asmJmpdImm(AssemblerBuffer *buffer, int32_t imm)
-{
-	asmEnsureCapacity(buffer);
-	asmEmitUint8(buffer, 0xE9);
-	asmEmitInt32(buffer, imm);
-}
-
-
-static void asmJmpLabel(AssemblerBuffer *buffer, AssemblerLabel *label)
-{
-	asmEnsureCapacity(buffer);
-	asmEmitUint8(buffer, 0xE9);
-	asmEmitLabel32(buffer, label);
-}
-
-
-// Fixed width of what asmJ emits: 0F, 80+cc, rel32. asmJ NEVER emits the
-// 2-byte short form, which is what lets a caller locate the branch it just
-// emitted by subtracting this (see the SPEC_GUARD registration in
-// generateBody) and lets targetPoisonGuardBranch rewrite it in place.
-#define ASM_COND_BRANCH_SIZE 6
-
-static void asmJ(AssemblerBuffer *buffer, uint8_t condition, AssemblerLabel *label)
-{
-	asmEnsureCapacity(buffer);
-	asmEmitUint8(buffer, 0x0F);
-	asmEmitUint8(buffer, 0x80 + condition);
-	asmEmitLabel32(buffer, label);
-	ASSERT(1 + 1 + sizeof(int32_t) == ASM_COND_BRANCH_SIZE);
-}
-
-
-static void asmInt3(AssemblerBuffer *buffer)
-{
-	asmEnsureCapacity(buffer);
-	asmEmitUint8(buffer, 0xCC);
-}
-
-
-static void asmInitMemoryOperand(Operands *operands, MemoryOperand operand)
-{
-	if (operand.base == RIP) {
-		operands->mod = MOD_MEM;
-		operand.base = 5;
-	} else if (operand.disp == 0) {
-		operands->mod = MOD_MEM;
-	} else if (INT8_MIN <= operand.disp && operand.disp <= INT8_MAX) {
-		operands->mod = MOD_DISP8;
-	} else {
-		operands->mod = MOD_DISP32;
-	}
-	if (operand.index != NO_REGISTER) {
-		operands->rm = (operand.base & 8) | SIB;
-		operands->base = operand.base;
-		operands->index = operand.index;
-		operands->scale = operand.scale;
-	} else {
-		operands->rm = operand.base;
-		operands->index = 4; // none index in case SIB is emited
-		operands->base = operands->rm; // in case of R12 which collides with SIB
-	}
-	operands->disp = operand.disp;
-}
-
-
-static void asmEmitRexOperands(AssemblerBuffer *buffer, uint8_t rex, Operands *operands)
-{
-	rex = rex | (operands->reg & 8) >> 1 | (operands->rm & 8) >> 3;
-	if ((operands->rm & 7) == SIB) {
-		rex = rex | (operands->index & 8) >> 2;
-	}
-	if (operands->reg >= 20 || operands->rm >= 20) {
-		asmEmitRex(buffer, rex);
-	} else if (rex != 0) {
-		asmEmitRex(buffer, rex);
-	}
-}
-
-
-static void asmEmitRex(AssemblerBuffer *buffer, uint8_t rex)
-{
-	asmEmitUint8(buffer, 0x40 | rex);
-}
-
-
-static void asmEmitOperands(AssemblerBuffer *buffer, Operands *operands)
-{
-	ASSERT(operands->mod <= 3);
-	asmEmitUint8(buffer, (operands->mod & 7) << 6 | (operands->reg & 7) << 3 | (operands->rm & 7));
-	if (operands->mod != MOD_REG && (operands->rm & 7) == SIB) {
-		asmEmitUint8(buffer, operands->scale << 6 | (operands->index & 7) << 3 | (operands->base & 7));
-	}
-	if (operands->mod == MOD_DISP8) {
-		asmEmitInt8(buffer, operands->disp);
-	} else if (operands->mod == MOD_DISP32 || (operands->mod == MOD_MEM && operands->rm == 5)) {
-		asmEmitInt32(buffer, operands->disp);
-	}
-}
-
-
-// --- SSE scalar-double support (used by the inline Float intrinsic) ----------
-// XMM register numbers encode in the ModRM reg/rm fields exactly like GPRs, so
-// the existing Operands/REX/ModRM machinery is reused; only the mandatory
-// prefix (F2 for scalar-double, 66 for ucomisd) + the 0F escape are prepended.
-// Byte order is: legacy prefix -> REX -> 0F -> opcode -> ModRM/SIB/disp.
-
+// The SSE register file, numbered from zero IN ITS OWN SPACE.
+//
+// A SEPARATE ENUM and not more entries in the one above, because they are a
+// separate BANK: the SSA backend allocates the two independently, so register 3
+// means RBX in one and XMM3 in the other, and jit/Abi.h says exactly that where
+// it calls the numbers backend-local. Folding them into one enum would make the
+// overlap look like a collision and tempt a reader to renumber one of them,
+// which is the sort of change that produces code that assembles and computes
+// with the wrong file.
 typedef enum {
 	XMM0 = 0, XMM1 = 1, XMM2 = 2, XMM3 = 3,
 	XMM4 = 4, XMM5 = 5, XMM6 = 6, XMM7 = 7,
+	XMM8 = 8, XMM9 = 9, XMM10 = 10, XMM11 = 11,
+	XMM12 = 12, XMM13 = 13, XMM14 = 14, XMM15 = 15,
 } XmmRegister;
 
-// movsd xmm(dst), [mem]   (F2 0F 10 /r)
-static void asmMovsdMem(AssemblerBuffer *buffer, MemoryOperand operand, XmmRegister dst)
+typedef enum {
+	COND_OVERFLOW = 0x0, COND_NO_OVERFLOW = 0x1,
+	COND_BELOW = 0x2, COND_ABOVE_EQUAL = 0x3,
+	COND_EQUAL = 0x4, COND_NOT_EQUAL = 0x5,
+	COND_BELOW_EQUAL = 0x6, COND_ABOVE = 0x7,
+	COND_SIGN = 0x8, COND_NO_SIGN = 0x9,
+	// PARITY is how an SSE comparison reports NaN: ucomisd sets it instead of
+	// raising, and every ordered answer about a NaN is false. A float fast path
+	// that ignored it would answer `NaN < 1.0` with whatever the other flags
+	// happened to hold.
+	COND_PARITY = 0xA, COND_NO_PARITY = 0xB,
+	COND_LESS = 0xC, COND_GREATER_EQUAL = 0xD,
+	COND_LESS_EQUAL = 0xE, COND_GREATER = 0xF,
+} Condition;
+
+
+// The opposite test. x86 numbers its condition codes in PAIRS, each condition
+// immediately followed by its negation, so flipping the low bit is the whole
+// operation -- which is exactly why every pair above is written on one line.
+// A caller that has a condition in a variable and needs to branch the other way
+// asks for it here rather than carrying a second column in its table.
+static inline Condition invertCondition(Condition condition)
 {
-	Operands operands = {.reg = dst};
-	asmInitMemoryOperand(&operands, operand);
-	asmEnsureCapacity(buffer);
-	asmEmitUint8(buffer, 0xF2);
-	asmEmitRexOperands(buffer, 0, &operands);
-	asmEmitUint8(buffer, 0x0F);
-	asmEmitUint8(buffer, 0x10);
-	asmEmitOperands(buffer, &operands);
+	return (Condition) (condition ^ 1);
 }
 
-// movsd [mem], xmm(src)   (F2 0F 11 /r)
-static void asmMovsdToMem(AssemblerBuffer *buffer, XmmRegister src, MemoryOperand operand)
+
+// A forward reference: emitted with a placeholder displacement, patched when
+// the label is bound. A LIST of references, not one slot: the old assembler
+// allowed exactly one forward reference per label and silently produced a wrong
+// displacement for the second, which shows up as a jump into the middle of an
+// instruction.
+#define LABEL_MAX_REFERENCES 64
+
+typedef struct X64Label {
+	_Bool bound;
+	size_t offset;
+	size_t references[LABEL_MAX_REFERENCES];
+	size_t referenceCount;
+} X64Label;
+
+
+// REX.W is always set: every value in this VM is 64 bits wide, so there is no
+// 32-bit operand path to get wrong.
+static inline void emitRexW(CodeBuffer *buffer, Register reg, Register rm)
 {
-	Operands operands = {.reg = src};
-	asmInitMemoryOperand(&operands, operand);
-	asmEnsureCapacity(buffer);
-	asmEmitUint8(buffer, 0xF2);
-	asmEmitRexOperands(buffer, 0, &operands);
-	asmEmitUint8(buffer, 0x0F);
-	asmEmitUint8(buffer, 0x11);
-	asmEmitOperands(buffer, &operands);
+	uint8_t rex = 0x48;
+	if (reg >= R8) { rex |= 0x04; }
+	if (rm >= R8) { rex |= 0x01; }
+	emit8(buffer, rex);
 }
 
-// scalar-double reg,reg: <prefix> 0F <op> /r  with dst in ModRM.reg, src in ModRM.rm
-static void asmSseRegReg(AssemblerBuffer *buffer, uint8_t prefix, uint8_t op, uint8_t regField, uint8_t rmField)
+
+static inline void emitModRmReg(CodeBuffer *buffer, Register reg, Register rm)
 {
-	Operands operands = {.mod = MOD_REG, .reg = regField, .rm = rmField};
-	asmEnsureCapacity(buffer);
-	asmEmitUint8(buffer, prefix);
-	asmEmitRexOperands(buffer, 0, &operands);
-	asmEmitUint8(buffer, 0x0F);
-	asmEmitUint8(buffer, op);
-	asmEmitOperands(buffer, &operands);
+	emit8(buffer, (uint8_t) (0xC0 | ((reg & 7) << 3) | (rm & 7)));
 }
 
-// dst = dst OP src
-static void asmAddsd(AssemblerBuffer *buffer, XmmRegister src, XmmRegister dst) { asmSseRegReg(buffer, 0xF2, 0x58, dst, src); }
-static void asmSubsd(AssemblerBuffer *buffer, XmmRegister src, XmmRegister dst) { asmSseRegReg(buffer, 0xF2, 0x5C, dst, src); }
-static void asmMulsd(AssemblerBuffer *buffer, XmmRegister src, XmmRegister dst) { asmSseRegReg(buffer, 0xF2, 0x59, dst, src); }
-static void asmDivsd(AssemblerBuffer *buffer, XmmRegister src, XmmRegister dst) { asmSseRegReg(buffer, 0xF2, 0x5E, dst, src); }
-// ucomisd a, b : sets EFLAGS (CF/ZF/PF) from comparing a to b; unordered => CF=ZF=PF=1
-static void asmUcomisd(AssemblerBuffer *buffer, XmmRegister a, XmmRegister b) { asmSseRegReg(buffer, 0x66, 0x2E, a, b); }
 
-// movq xmm(dst), r64(src)   (66 REX.W 0F 6E /r) : raw bit move GPR -> XMM,
-// used by the SmallFloat64 immediate decode in the inline Float intrinsic
-static void asmMovqToXmm(AssemblerBuffer *buffer, Register src, XmmRegister dst)
+// [base + displacement]. RSP needs a SIB byte and RBP needs an explicit zero
+// displacement; both are encoding quirks rather than choices, and both are why
+// this helper exists instead of open-coded ModRM everywhere.
+static inline void emitModRmMem(CodeBuffer *buffer, Register reg, Register base,
+	int32_t displacement)
 {
-	Operands operands = {.mod = MOD_REG, .reg = dst, .rm = src};
-	asmEnsureCapacity(buffer);
-	asmEmitUint8(buffer, 0x66);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0x0F);
-	asmEmitUint8(buffer, 0x6E);
-	asmEmitOperands(buffer, &operands);
+	uint8_t mod;
+	if (displacement == 0 && (base & 7) != (RBP & 7)) {
+		mod = 0x00;
+	} else if (displacement >= -128 && displacement <= 127) {
+		mod = 0x40;
+	} else {
+		mod = 0x80;
+	}
+	emit8(buffer, (uint8_t) (mod | ((reg & 7) << 3) | (base & 7)));
+	if ((base & 7) == (RSP & 7)) {
+		emit8(buffer, 0x24); // SIB: base only, no index
+	}
+	if (mod == 0x40) {
+		emit8(buffer, (uint8_t) displacement);
+	} else if (mod == 0x80) {
+		emit32(buffer, (uint32_t) displacement);
+	}
 }
 
-// cvtsi2sd xmm(dst), r64(src)   (F2 REX.W 0F 2A /r) : signed 64-bit integer to
-// double. NOT a bit move like asmMovqToXmm: this is the numeric conversion the
-// inline Float intrinsic uses for a SmallInteger operand, and it is exactly
-// what Float>>coerce: does through asFloat, including losing precision above
-// 2^53. Only the low 53 bits are exact, which is the same contract the
-// dispatched retry:coercing: path has always had.
-static void asmCvtsi2sdq(AssemblerBuffer *buffer, Register src, XmmRegister dst)
+
+// ---- moves -----------------------------------------------------------------
+
+static inline void asmMovRegReg(CodeBuffer *buffer, Register dst, Register src)
 {
-	Operands operands = {.mod = MOD_REG, .reg = dst, .rm = src};
-	asmEnsureCapacity(buffer);
-	asmEmitUint8(buffer, 0xF2);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0x0F);
-	asmEmitUint8(buffer, 0x2A);
-	asmEmitOperands(buffer, &operands);
+	emitRexW(buffer, src, dst);
+	emit8(buffer, 0x89);
+	emitModRmReg(buffer, src, dst);
 }
 
-// movq r64(dst), xmm(src)   (66 REX.W 0F 7E /r) : raw bit move XMM -> GPR,
-// used by the SmallFloat64 immediate encode in the inline Float intrinsic
-static void asmMovqFromXmm(AssemblerBuffer *buffer, XmmRegister src, Register dst)
+
+static inline void asmMovRegImm64(CodeBuffer *buffer, Register dst, uint64_t value)
 {
-	Operands operands = {.mod = MOD_REG, .reg = src, .rm = dst};
-	asmEnsureCapacity(buffer);
-	asmEmitUint8(buffer, 0x66);
-	asmEmitRexOperands(buffer, REX_W, &operands);
-	asmEmitUint8(buffer, 0x0F);
-	asmEmitUint8(buffer, 0x7E);
-	asmEmitOperands(buffer, &operands);
+	uint8_t rex = 0x48;
+	if (dst >= R8) { rex |= 0x01; }
+	emit8(buffer, rex);
+	emit8(buffer, (uint8_t) (0xB8 + (dst & 7)));
+	emit64(buffer, value);
+}
+
+
+// dst = [base + displacement]
+static inline void asmMovRegMem(CodeBuffer *buffer, Register dst, Register base,
+	int32_t displacement)
+{
+	emitRexW(buffer, dst, base);
+	emit8(buffer, 0x8B);
+	emitModRmMem(buffer, dst, base, displacement);
+}
+
+
+// [base + displacement] = src
+static inline void asmMovMemReg(CodeBuffer *buffer, Register base,
+	int32_t displacement, Register src)
+{
+	emitRexW(buffer, src, base);
+	emit8(buffer, 0x89);
+	emitModRmMem(buffer, src, base, displacement);
+}
+
+
+// dst = base + displacement, computed without touching memory. How a compiled
+// send hands the runtime the ADDRESS of a frame slot.
+static inline void asmLeaRegMem(CodeBuffer *buffer, Register dst, Register base,
+	int32_t displacement)
+{
+	emitRexW(buffer, dst, base);
+	emit8(buffer, 0x8D);
+	emitModRmMem(buffer, dst, base, displacement);
+}
+
+
+// ---- arithmetic ------------------------------------------------------------
+
+static inline void asmAddRegReg(CodeBuffer *buffer, Register dst, Register src)
+{
+	emitRexW(buffer, src, dst);
+	emit8(buffer, 0x01);
+	emitModRmReg(buffer, src, dst);
+}
+
+
+static inline void asmSubRegReg(CodeBuffer *buffer, Register dst, Register src)
+{
+	emitRexW(buffer, src, dst);
+	emit8(buffer, 0x29);
+	emitModRmReg(buffer, src, dst);
+}
+
+
+static inline void asmAddRegImm32(CodeBuffer *buffer, Register dst, int32_t value)
+{
+	emitRexW(buffer, (Register) 0, dst);
+	emit8(buffer, 0x81);
+	emitModRmReg(buffer, (Register) 0, dst);
+	emit32(buffer, (uint32_t) value);
+}
+
+
+// [base + displacement] += value, sixty-four bits, WITHOUT a register.
+//
+// The inline cache bumps two counters per hit (the site's total and the way's),
+// and doing it through a register would be three instructions each plus a
+// scratch that has to survive the rest of the sequence. The counters are
+// uint64_t, so this is the REX.W form: a 32-bit add would wrap silently at four
+// billion sends, which a long-running program reaches.
+static inline void asmAddMemImm32(CodeBuffer *buffer, Register base,
+	int32_t displacement, int32_t value)
+{
+	emitRexW(buffer, (Register) 0, base);
+	emit8(buffer, 0x81);
+	emitModRmMem(buffer, (Register) 0, base, displacement);
+	emit32(buffer, (uint32_t) value);
+}
+
+
+static inline void asmSubRegImm32(CodeBuffer *buffer, Register dst, int32_t value)
+{
+	emitRexW(buffer, (Register) 5, dst);
+	emit8(buffer, 0x81);
+	emitModRmReg(buffer, (Register) 5, dst);
+	emit32(buffer, (uint32_t) value);
+}
+
+
+static inline void asmCmpRegReg(CodeBuffer *buffer, Register a, Register b)
+{
+	emitRexW(buffer, b, a);
+	emit8(buffer, 0x39);
+	emitModRmReg(buffer, b, a);
+}
+
+
+static inline void asmCmpRegImm32(CodeBuffer *buffer, Register reg, int32_t value)
+{
+	emitRexW(buffer, (Register) 7, reg);
+	emit8(buffer, 0x81);
+	emitModRmReg(buffer, (Register) 7, reg);
+	emit32(buffer, (uint32_t) value);
+}
+
+
+static inline void asmTestRegImm32(CodeBuffer *buffer, Register reg, int32_t value)
+{
+	emitRexW(buffer, (Register) 0, reg);
+	emit8(buffer, 0xF7);
+	emitModRmReg(buffer, (Register) 0, reg);
+	emit32(buffer, (uint32_t) value);
+}
+
+
+static inline void asmOrRegReg(CodeBuffer *buffer, Register dst, Register src)
+{
+	emitRexW(buffer, src, dst);
+	emit8(buffer, 0x09);
+	emitModRmReg(buffer, src, dst);
+}
+
+
+static inline void asmSarRegImm8(CodeBuffer *buffer, Register reg, uint8_t bits)
+{
+	emitRexW(buffer, (Register) 7, reg);
+	emit8(buffer, 0xC1);
+	emitModRmReg(buffer, (Register) 7, reg);
+	emit8(buffer, bits);
+}
+
+
+static inline void asmShlRegImm8(CodeBuffer *buffer, Register reg, uint8_t bits)
+{
+	emitRexW(buffer, (Register) 4, reg);
+	emit8(buffer, 0xC1);
+	emitModRmReg(buffer, (Register) 4, reg);
+	emit8(buffer, bits);
+}
+
+
+// LOGICAL right shift, which is a different instruction from asmSarRegImm8 above
+// and not a stylistic choice: the SmallFloat64 payload is an unsigned bit
+// pattern, and shifting its top bit in as a sign would corrupt every value in
+// the upper half of the encoding's range (core/Object.h).
+static inline void asmShrRegImm8(CodeBuffer *buffer, Register reg, uint8_t bits)
+{
+	emitRexW(buffer, (Register) 5, reg);
+	emit8(buffer, 0xC1);
+	emitModRmReg(buffer, (Register) 5, reg);
+	emit8(buffer, bits);
+}
+
+
+// Rotates. The SmallFloat64 encoding is a one-bit rotation of the IEEE pattern,
+// so these two ARE the encode and decode step, not an optimization of one: the
+// C spells it `(bits >> 1) | (bits << 63)` because ISO C has no rotate.
+static inline void asmRolRegImm8(CodeBuffer *buffer, Register reg, uint8_t bits)
+{
+	emitRexW(buffer, (Register) 0, reg);
+	emit8(buffer, 0xC1);
+	emitModRmReg(buffer, (Register) 0, reg);
+	emit8(buffer, bits);
+}
+
+
+static inline void asmRorRegImm8(CodeBuffer *buffer, Register reg, uint8_t bits)
+{
+	emitRexW(buffer, (Register) 1, reg);
+	emit8(buffer, 0xC1);
+	emitModRmReg(buffer, (Register) 1, reg);
+	emit8(buffer, bits);
+}
+
+
+// ---- 32-bit forms, for reading the low half of an object header -------------
+//
+// No REX.W: these operate on 32 bits and zero-extend into the full register,
+// which is exactly what is wanted when pulling a bitfield out of a header.
+
+static inline void asmMov32RegMem(CodeBuffer *buffer, Register dst, Register base,
+	int32_t displacement)
+{
+	if (dst >= R8 || base >= R8) {
+		uint8_t rex = 0x40;
+		if (dst >= R8) { rex |= 0x04; }
+		if (base >= R8) { rex |= 0x01; }
+		emit8(buffer, rex);
+	}
+	emit8(buffer, 0x8B);
+	emitModRmMem(buffer, dst, base, displacement);
+}
+
+
+// [base + displacement] = src, THIRTY-TWO BITS. The inline cache writes the
+// argument's class index into its way with it: the field is uint32_t, and a
+// 64-bit store would take the neighbouring field with it.
+static inline void asmMov32MemReg(CodeBuffer *buffer, Register base,
+	int32_t displacement, Register src)
+{
+	if (src >= R8 || base >= R8) {
+		uint8_t rex = 0x40;
+		if (src >= R8) { rex |= 0x04; }
+		if (base >= R8) { rex |= 0x01; }
+		emit8(buffer, rex);
+	}
+	emit8(buffer, 0x89);
+	emitModRmMem(buffer, src, base, displacement);
+}
+
+
+static inline void asmAnd32RegImm32(CodeBuffer *buffer, Register reg, uint32_t value)
+{
+	if (reg >= R8) { emit8(buffer, 0x41); }
+	emit8(buffer, 0x81);
+	emitModRmReg(buffer, (Register) 4, reg);
+	emit32(buffer, value);
+}
+
+
+static inline void asmCmp32RegImm32(CodeBuffer *buffer, Register reg, uint32_t value)
+{
+	if (reg >= R8) { emit8(buffer, 0x41); }
+	emit8(buffer, 0x81);
+	emitModRmReg(buffer, (Register) 7, reg);
+	emit32(buffer, value);
+}
+
+
+// ---- 32-bit compare against an immediate ------------------------------------
+//
+// The inline-cache guard, and the reason the object header carries a class
+// INDEX rather than a pointer (ADR 0005): `cmp dword [obj], imm32` compares the
+// low half of the header, where the 22-bit class index lives, without loading
+// the class and without touching a second cache line.
+// The SIXTY-FOUR bit form, which the one below is deliberately not: that one
+// compares a 32-bit field and this one compares a whole word. A caller testing a
+// uint64 counter with the 32-bit version would be testing the low half and
+// answering differently every time the counter crossed 2^32.
+static inline void asmCmpMemImm32(CodeBuffer *buffer, Register base,
+	int32_t displacement, int32_t value)
+{
+	emitRexW(buffer, (Register) 7, base);
+	emit8(buffer, 0x81);
+	emitModRmMem(buffer, (Register) 7, base, displacement);
+	emit32(buffer, (uint32_t) value);
+}
+
+
+static inline void asmCmpMem32Imm32(CodeBuffer *buffer, Register base,
+	int32_t displacement, uint32_t value)
+{
+	if (base >= R8) {
+		emit8(buffer, 0x41); // REX.B only: this is a 32-bit compare
+	}
+	emit8(buffer, 0x81);
+	emitModRmMem(buffer, (Register) 7, base, displacement);
+	emit32(buffer, value);
+}
+
+
+// ---- stack -----------------------------------------------------------------
+
+static inline void asmPush(CodeBuffer *buffer, Register reg)
+{
+	if (reg >= R8) { emit8(buffer, 0x41); }
+	emit8(buffer, (uint8_t) (0x50 + (reg & 7)));
+}
+
+
+static inline void asmPop(CodeBuffer *buffer, Register reg)
+{
+	if (reg >= R8) { emit8(buffer, 0x41); }
+	emit8(buffer, (uint8_t) (0x58 + (reg & 7)));
+}
+
+
+static inline void asmRet(CodeBuffer *buffer)
+{
+	emit8(buffer, 0xC3);
+}
+
+
+static inline void asmCallReg(CodeBuffer *buffer, Register reg)
+{
+	if (reg >= R8) { emit8(buffer, 0x41); }
+	emit8(buffer, 0xFF);
+	emitModRmReg(buffer, (Register) 2, reg);
+}
+
+
+// ---- labels and branches ---------------------------------------------------
+
+// ---- what the SSA backend needs and the template compiler never did --------
+//
+// Tier 1 computes nothing: every bytecode is a load, a store, a compare or a
+// call. Tier 2 keeps values in registers and does arithmetic on them, so it
+// needs the instructions that do arithmetic.
+
+// dst = dst * src. Signed, and the two-operand form, so the overflow flags are
+// set from the low 64 bits -- which is all this backend looks at, because a
+// SmallInteger result that does not fit is the Smalltalk fallback's problem.
+static inline void asmImulRegReg(CodeBuffer *buffer, Register dst, Register src)
+{
+	emitRexW(buffer, dst, src);
+	emit8(buffer, 0x0F);
+	emit8(buffer, 0xAF);
+	emitModRmReg(buffer, dst, src);
+}
+
+
+// Sign-extend RAX into RDX:RAX. The instruction idiv REQUIRES this first, and
+// forgetting it is not a crash: it divides by whatever RDX held and answers a
+// plausible wrong number.
+static inline void asmCqo(CodeBuffer *buffer)
+{
+	emit8(buffer, 0x48);
+	emit8(buffer, 0x99);
+}
+
+
+// RDX:RAX / src, quotient in RAX and remainder in RDX. Both are clobbered,
+// which is why the allocator is told about them (jit/RegAlloc.c addClobbers).
+static inline void asmIdivReg(CodeBuffer *buffer, Register src)
+{
+	emitRexW(buffer, (Register) 0, src);
+	emit8(buffer, 0xF7);
+	emitModRmReg(buffer, (Register) 7, src);
+}
+
+
+static inline void asmNegReg(CodeBuffer *buffer, Register dst)
+{
+	emitRexW(buffer, (Register) 0, dst);
+	emit8(buffer, 0xF7);
+	emitModRmReg(buffer, (Register) 3, dst);
+}
+
+
+static inline void asmXorRegReg(CodeBuffer *buffer, Register dst, Register src)
+{
+	emitRexW(buffer, src, dst);
+	emit8(buffer, 0x31);
+	emitModRmReg(buffer, src, dst);
+}
+
+
+static inline void asmAndRegReg(CodeBuffer *buffer, Register dst, Register src)
+{
+	emitRexW(buffer, src, dst);
+	emit8(buffer, 0x21);
+	emitModRmReg(buffer, src, dst);
+}
+
+
+// Set the low byte of `reg` to 0 or 1 by condition, then widen it.
+//
+// THE REX PREFIX IS NOT OPTIONAL HERE even when no extended register is
+// involved. Without it, encoding 4 to 7 in the byte-register space means AH,
+// CH, DH and BH rather than SPL, BPL, SIL and DIL, so `setcc sil` silently
+// becomes `setcc dh` and writes the wrong half of a different register. That is
+// the exact family of bug this repository already caught once, in asmTestbImm
+// encoding BH for RDI.
+static inline void asmSetcc(CodeBuffer *buffer, Condition condition, Register reg)
+{
+	if (reg >= 4) {
+		emit8(buffer, (uint8_t) (0x40 | (reg >= R8 ? 0x01 : 0x00)));
+	}
+	emit8(buffer, 0x0F);
+	emit8(buffer, (uint8_t) (0x90 + condition));
+	emit8(buffer, (uint8_t) (0xC0 | (reg & 7)));
+}
+
+
+// Zero-extend the low byte, which is what turns a setcc into a 0 or a 1 that
+// the rest of the backend can do arithmetic with.
+static inline void asmMovzxByte(CodeBuffer *buffer, Register dst, Register src)
+{
+	uint8_t rex = 0x48;
+	if (dst >= R8) { rex |= 0x04; }
+	if (src >= R8) { rex |= 0x01; }
+	emit8(buffer, rex);
+	emit8(buffer, 0x0F);
+	emit8(buffer, 0xB6);
+	emitModRmReg(buffer, dst, src);
+}
+
+
+// ---- SSE, scalar double ----------------------------------------------------
+//
+// The mandatory prefix comes FIRST and REX comes after it, before the 0F. The
+// other order assembles into something else entirely, and it is the single
+// easiest thing to get wrong in SSE encoding.
+static inline void emitSseRex(CodeBuffer *buffer, uint8_t prefix, _Bool wide,
+	uint8_t reg, uint8_t rm)
+{
+	emit8(buffer, prefix);
+	uint8_t rex = (uint8_t) (0x40 | (wide ? 0x08 : 0x00)
+		| (reg >= 8 ? 0x04 : 0x00) | (rm >= 8 ? 0x01 : 0x00));
+	if (rex != 0x40) {
+		emit8(buffer, rex);
+	}
+	emit8(buffer, 0x0F);
+}
+
+
+static inline void asmSseRegReg(CodeBuffer *buffer, uint8_t prefix,
+	uint8_t opcode, XmmRegister dst, XmmRegister src)
+{
+	emitSseRex(buffer, prefix, 0, (uint8_t) dst, (uint8_t) src);
+	emit8(buffer, opcode);
+	emitModRmReg(buffer, (Register) dst, (Register) src);
+}
+
+
+#define asmMovsdRegReg(b, d, s) asmSseRegReg((b), 0xF2, 0x10, (d), (s))
+#define asmAddsd(b, d, s)       asmSseRegReg((b), 0xF2, 0x58, (d), (s))
+#define asmMulsd(b, d, s)       asmSseRegReg((b), 0xF2, 0x59, (d), (s))
+#define asmSubsd(b, d, s)       asmSseRegReg((b), 0xF2, 0x5C, (d), (s))
+#define asmDivsd(b, d, s)       asmSseRegReg((b), 0xF2, 0x5E, (d), (s))
+#define asmSqrtsd(b, d, s)      asmSseRegReg((b), 0xF2, 0x51, (d), (s))
+// UNORDERED compare, which is the right one for IEEE doubles: it sets the
+// parity flag for NaN instead of raising, so a comparison against NaN answers
+// false rather than trapping.
+#define asmUcomisd(b, a, x)     asmSseRegReg((b), 0x66, 0x2E, (a), (x))
+
+
+static inline void asmMovsdRegMem(CodeBuffer *buffer, XmmRegister dst,
+	Register base, int32_t displacement)
+{
+	emitSseRex(buffer, 0xF2, 0, (uint8_t) dst, (uint8_t) base);
+	emit8(buffer, 0x10);
+	emitModRmMem(buffer, (Register) dst, base, displacement);
+}
+
+
+static inline void asmMovsdMemReg(CodeBuffer *buffer, Register base,
+	int32_t displacement, XmmRegister src)
+{
+	emitSseRex(buffer, 0xF2, 0, (uint8_t) src, (uint8_t) base);
+	emit8(buffer, 0x11);
+	emitModRmMem(buffer, (Register) src, base, displacement);
+}
+
+
+// Integer to double, and double to integer. NUMERIC conversions: 1 becomes 1.0.
+// Not to be confused with the two below, which reinterpret the same bits.
+static inline void asmCvtsi2sd(CodeBuffer *buffer, XmmRegister dst, Register src)
+{
+	emitSseRex(buffer, 0xF2, 1, (uint8_t) dst, (uint8_t) src);
+	emit8(buffer, 0x2A);
+	emitModRmReg(buffer, (Register) dst, src);
+}
+
+
+static inline void asmCvttsd2si(CodeBuffer *buffer, Register dst, XmmRegister src)
+{
+	emitSseRex(buffer, 0xF2, 1, (uint8_t) dst, (uint8_t) src);
+	emit8(buffer, 0x2C);
+	emitModRmReg(buffer, dst, (Register) src);
+}
+
+
+// The same eight bytes, moved between the files. BIT REINTERPRETATION, which is
+// what boxing a double is: 1.0 becomes 4607182418800017408, not 1.
+static inline void asmMovqXmmFromGpr(CodeBuffer *buffer, XmmRegister dst,
+	Register src)
+{
+	emitSseRex(buffer, 0x66, 1, (uint8_t) dst, (uint8_t) src);
+	emit8(buffer, 0x6E);
+	emitModRmReg(buffer, (Register) dst, src);
+}
+
+
+static inline void asmMovqGprFromXmm(CodeBuffer *buffer, Register dst,
+	XmmRegister src)
+{
+	emitSseRex(buffer, 0x66, 1, (uint8_t) src, (uint8_t) dst);
+	emit8(buffer, 0x7E);
+	emitModRmReg(buffer, (Register) src, dst);
+}
+
+
+static inline void asmInitLabel(X64Label *label)
+{
+	label->bound = 0;
+	label->offset = 0;
+	label->referenceCount = 0;
+}
+
+
+static inline void asmAddReference(X64Label *label, size_t offset)
+{
+	// A list, not a single slot. The old assembler allowed exactly one forward
+	// reference per label and silently produced a wrong displacement for the
+	// second, which is a class of bug that only shows up as a jump into the
+	// middle of an instruction.
+	ASSERT(label->referenceCount < LABEL_MAX_REFERENCES);
+	label->references[label->referenceCount++] = offset;
+}
+
+
+static inline void asmBind(CodeBuffer *buffer, X64Label *label)
+{
+	ASSERT(!label->bound);
+	label->bound = 1;
+	label->offset = buffer->size;
+	for (size_t i = 0; i < label->referenceCount; i++) {
+		size_t site = label->references[i];
+		int32_t displacement = (int32_t) (label->offset - (site + 4));
+		memcpy(buffer->bytes + site, &displacement, 4);
+	}
+	label->referenceCount = 0;
+}
+
+
+static inline void asmJmp(CodeBuffer *buffer, X64Label *label)
+{
+	emit8(buffer, 0xE9);
+	if (label->bound) {
+		emit32(buffer, (uint32_t) (int32_t) (label->offset - (buffer->size + 4)));
+	} else {
+		asmAddReference(label, buffer->size);
+		emit32(buffer, 0);
+	}
+}
+
+
+static inline void asmJcc(CodeBuffer *buffer, Condition condition, X64Label *label)
+{
+	emit8(buffer, 0x0F);
+	emit8(buffer, (uint8_t) (0x80 + condition));
+	if (label->bound) {
+		emit32(buffer, (uint32_t) (int32_t) (label->offset - (buffer->size + 4)));
+	} else {
+		asmAddReference(label, buffer->size);
+		emit32(buffer, 0);
+	}
 }
 
 #endif

@@ -1,193 +1,255 @@
 #include "concurrency/Fiber.h"
-#include "concurrency/Scheduler.h"
 #include "core/Assert.h"
-#include "jit/TargetTraits.h"
+#include "core/Tls.h"
 #include "os/Os.h"
-
-// PORT_ME(stack-direction): everything below — priming at the HIGH end,
-// the guard floor at the BASE, fiberGrowStack committing DOWNWARD toward the
-// fault, fiberReleaseIdleStack reclaiming [committedLow, sp) — assumes the
-// stack grows toward lower addresses. All currently supported targets do; an
-// upward-stack port must rework this file (and StackFrame.c, see
-// PORT_ME(frame-layout)) rather than flip a flag.
-#if !TARGET_STACK_GROWS_DOWN
-#error "Fiber stack management assumes a downward-growing stack - see PORT_ME(stack-direction)"
-#endif
-#include <stdlib.h>
+#include <signal.h>
 #include <stdint.h>
-#include <stdio.h>
-#include <unistd.h>
+#include <stdlib.h>
+#include <string.h>
 
-// The context switch itself (fiberSwitchAsm) and the initial stack frame
-// layout are CPU-specific and live in the selected backend
-// (vm/jit/<arch>/Fiber<Arch>.c) behind jit/TargetFiber.h.
+// PORT_ME(stack-direction): everything below assumes the stack grows toward
+// LOWER addresses. Priming at the high end, the guard floor at the base,
+// fiberGrowStack committing downward toward the fault, fiberReleaseIdleStack
+// reclaiming [committedLow, sp). Every currently supported target does; an
+// upward-stack port reworks this file rather than flipping a flag.
 
-// In-place growable stacks: a fiber reserves its whole stack region PROT_NONE
-// (no RAM, no overcommit charge) and commits only a small window at the high end;
-// the SIGSEGV handler grows the window downward on the guard fault. These are set
-// once per OS thread by fiberInitStackGrowth (from schedulerInit).
-static size_t gInitialCommit = 64 * 1024;
-static long gPageSize = 4096;
-static int gPrecommitStacks = -1;
+#define KB 1024
+#define MB (1024 * 1024)
 
-// ST_FIBER_PRECOMMIT=1 commits every fiber stack in full at creation and
-// never relies on the SIGSEGV grow-on-fault path. Bring-up workaround for
-// qemu-user (its signal emulation delivers si_addr = NULL, so guard faults
-// cannot be attributed — real kernels fill si_addr and keep the default
-// lazy-commit behavior).
-static _Bool fiberPrecommitStacks(void)
+// Reserved per fiber: ADDRESS SPACE ONLY, no RAM and no overcommit charge.
+// 100k fibers at 1 MB of reservation is 100 GB of address space, which is free,
+// and a few hundred MB of real pages, which is not. Getting this backwards is
+// what makes fiber-per-connection servers impossible.
+#define DEFAULT_RESERVATION (1 * MB)
+#define DEFAULT_COMMIT (16 * KB)
+// Pages kept unreachable at the base, so runaway recursion faults rather than
+// growing quietly until the machine dies.
+#define STACK_FLOOR_PAGES 2
+
+static PER_ISOLATE size_t gReservationBytes;
+static PER_ISOLATE size_t gCommitBytes;
+static PER_ISOLATE size_t gPageSize;
+// The fiber this OS thread is executing right now. The switch keeps it current;
+// the growth handler reads it to learn whose stack just faulted.
+static PER_ISOLATE Fiber *gCurrentFiber;
+static PER_ISOLATE size_t gNextFiberId;
+
+
+void fiberInitStacks(size_t reservationBytes, size_t initialCommitBytes)
 {
-	if (gPrecommitStacks < 0) {
-		char *env = getenv("ST_FIBER_PRECOMMIT");
-		gPrecommitStacks = env != NULL && env[0] == '1';
-	}
-	return gPrecommitStacks == 1;
+	gPageSize = (size_t) osPageSize();
+	gReservationBytes = reservationBytes != 0 ? reservationBytes : DEFAULT_RESERVATION;
+	gCommitBytes = initialCommitBytes != 0 ? initialCommitBytes : DEFAULT_COMMIT;
+	// Every span handed to osPageCommit must be page-aligned.
+	gReservationBytes = (gReservationBytes + gPageSize - 1) & ~(gPageSize - 1);
+	gCommitBytes = (gCommitBytes + gPageSize - 1) & ~(gPageSize - 1);
+	gNextFiberId = 1;
 }
 
-void fiberInitStackGrowth(size_t initialCommitBytes)
+
+Fiber *fiberCurrent(void)
 {
-	gPageSize = osPageSize();
-	gInitialCommit = initialCommitBytes;
+	return gCurrentFiber;
 }
 
-Fiber *fiberCreate(size_t stackSize)
+
+// Where a primed stack lands on its FIRST switch. It runs on the new fiber's
+// own stack, which is why it must never return: there is no frame under it.
+static void fiberTrampoline(void)
 {
-	long pageSize = gPageSize;
+	Fiber *self = gCurrentFiber;
+	self->state = FIBER_RUNNING;
+	if (self->cEntry != NULL) {
+		self->cEntry(self->cArg);
+	}
+	self->state = FIBER_DONE;
+	// Hand control back to whoever resumed us, and keep handing it back if a
+	// broken scheduler resumes a finished fiber: hanging visibly beats
+	// returning into a frame that does not exist.
+	for (;;) {
+		Fiber *resumer = self->resumer;
+		ASSERT(resumer != NULL);
+		gCurrentFiber = resumer;
+		fiberSwitchAsm(&self->sp, resumer->sp);
+	}
+}
 
-#if defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__)
-	// A sanitizer massively inflates C stack-frame sizes (shadow, redzones), and the
-	// growth handler is disabled under a sanitizer, so a deep C call chain (e.g. a full
-	// GC triggered from within JIT'd Smalltalk in a fiber) can overrun a normal stack.
-	// Give every fiber a generous fully-committed stack under a sanitizer.
-	if (stackSize < 64 * 1024 * 1024) {
-		stackSize = 64 * 1024 * 1024;
-	}
-#endif
 
-	// Reserve the whole region + a permanent floor page as PROT_NONE (address
-	// space only), then commit a small window at the high end. The stack grows
-	// DOWN; a fault in the reserved-but-uncommitted span triggers growth, and the
-	// floor page below reserveFloor is the hard overflow backstop.
-	stackSize = (stackSize + pageSize - 1) & ~((size_t) pageSize - 1);
-	size_t mapSize = stackSize + pageSize;
-
-	uint8_t *base = osPageReserve(mapSize);
-	if (base == NULL) {
-		return NULL;
+Fiber *fiberCreate(FiberEntry entry, void *arg)
+{
+	if (gPageSize == 0) {
+		fiberInitStacks(0, 0);
 	}
-
-	size_t commit = (gInitialCommit + pageSize - 1) & ~((size_t) pageSize - 1);
-	if (commit > stackSize) {
-		commit = stackSize;
-	}
-	if (commit == 0) {
-		commit = pageSize;
-	}
-#if defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__)
-	// A sanitizer intercepts SIGSEGV/sigaction/mprotect, which the SIGSEGV-driven stack
-	// growth relies on (and the growth handler is a no-op under a sanitizer). Commit the
-	// whole stack up front so no guard fault ever occurs during a sanitizer run.
-	commit = stackSize;
-#endif
-	if (fiberPrecommitStacks()) {
-		commit = stackSize; // ST_FIBER_PRECOMMIT=1 (qemu-user bring-up)
-	}
-	uint8_t *top = base + mapSize;
-	uint8_t *committedLow = top - commit;
-	if (!osPageCommit(committedLow, commit)) {
-		osPageFree(base, mapSize);
-		return NULL;
-	}
-
 	Fiber *fiber = calloc(1, sizeof(Fiber));
-	fiber->stackBase = base;
-	fiber->stackSize = mapSize;
-	fiber->committedLow = committedLow;
-	fiber->reserveFloor = base + pageSize; // never grow below this
-	fiber->state = FIBER_SUSPENDED;
-	fiber->waitFd = -1;
-	fiber->tsanFiber = TSAN_CREATE_FIBER(); // NULL in a normal build
-	// calloc zeroed entryBlock/process/cEntry/cArg/queueNext/dirty*.
+	ASSERT(fiber != NULL);
 
-	// Prime the stack so the first fiberSwitchAsm into it lands in
-	// fiberTrampoline; the frame layout and alignment are the backend's business.
-	fiber->sp = fiberTargetPrimeStack(top, fiberTrampoline);
+	uint8_t *reservation = osPageReserve(gReservationBytes);
+	ASSERT(reservation != NULL);
+	fiber->reservation = reservation;
+	fiber->reservationSize = gReservationBytes;
+	fiber->stackHigh = reservation + gReservationBytes;
+	fiber->committedLow = fiber->stackHigh - gCommitBytes;
+	fiber->floor = reservation + STACK_FLOOR_PAGES * gPageSize;
+	_Bool committed = osPageCommit(fiber->committedLow, gCommitBytes);
+	ASSERT(committed);
 
+	fiber->state = FIBER_READY;
+	fiber->parkIntent = PARK_NONE;
+	fiber->homeWorker = -1;
+	fiber->cEntry = entry;
+	fiber->cArg = arg;
+	fiber->id = gNextFiberId++;
+	fiber->sp = fiberPrimeStack(fiber->stackHigh, fiberTrampoline);
 	return fiber;
 }
 
 
-// Grow `fiber`'s committed RW window down to cover `faultAddr` (called from the
-// SIGSEGV handler — must be async-signal-safe: only mprotect + plain arithmetic).
-// Returns 1 if grown (retry the faulting instruction), 0 if the fault is outside
-// the growable window (below the floor / not this fiber's stack → genuine fault).
-int fiberGrowStack(Fiber *fiber, uintptr_t faultAddr)
+// Bind the OS thread's OWN context to a Fiber, so the scheduler can switch away
+// from it and back through the same mechanism as everything else. Its stack is
+// the real thread stack: a NULL reservation marks it as not ours to grow or
+// free.
+void fiberAdoptCurrentStack(Fiber *fiber)
 {
-	if (fiber == NULL || fiber->stackBase == NULL) {
-		return 0;
-	}
-	uintptr_t floor = (uintptr_t) fiber->reserveFloor;
-	uintptr_t clow = (uintptr_t) fiber->committedLow;
-	if (faultAddr < floor || faultAddr >= clow) {
-		return 0; // below the hard floor, or already committed / not in this window
-	}
-	uintptr_t pageMask = ~((uintptr_t) gPageSize - 1);
-	uintptr_t faultPage = faultAddr & pageMask;
-	uintptr_t chunkLow = clow - (64 * 1024); // grow at least a 64 KB chunk
-	uintptr_t newLow = faultPage < chunkLow ? faultPage : chunkLow;
-	if (newLow < floor) {
-		newLow = floor;
-	}
-	if (!osPageCommit((void *) newLow, clow - newLow)) {
-		return 0; // ENOMEM etc. → let the handler treat it as fatal
-	}
-	fiber->committedLow = (void *) newLow;
-	return 1;
+	memset(fiber, 0, sizeof(*fiber));
+	fiber->state = FIBER_RUNNING;
+	fiber->homeWorker = -1;
+	gCurrentFiber = fiber;
 }
 
 
 void fiberDestroy(Fiber *fiber)
 {
-	TSAN_DESTROY_FIBER(fiber->tsanFiber); // no-op in a normal build
-	if (fiber->stackBase != NULL) {
-		osPageFree(fiber->stackBase, fiber->stackSize);
+	if (fiber->reservation != NULL) {
+		osPageFree(fiber->reservation, fiber->reservationSize);
+		fiber->reservation = NULL;
 	}
 	free(fiber);
 }
 
 
-// Return the dead region of a just-parked fiber's stack to the OS. The stack
-// grows DOWN with the guard page at the low (base) end, so live frames occupy
-// [sp, top) and everything below the saved sp is unused / already-returned
-// frames. MADV_DONTNEED drops those committed pages; they re-fault zero if the
-// fiber later runs deeper (and the JIT prologue nil-inits every slot before
-// reading it, so zero-fill is safe). Keep a one-page cushion below sp and never
-// touch the guard page. Only worth a syscall when a real span can be reclaimed.
-#define FIBER_STACK_RELEASE_THRESHOLD (32 * 1024)
-
 void fiberReleaseIdleStack(Fiber *fiber)
 {
-	if (fiber->stackBase == NULL) {
-		return; // the scheduler context has no fiber stack
+	// Hand back the pages below the parked stack pointer. The mapping stays
+	// valid and re-faults zero-filled, so a fiber that parks deep and resumes
+	// shallow costs nothing to keep alive.
+	uint8_t *sp = fiber->sp;
+	if (fiber->reservation == NULL || sp == NULL || sp <= fiber->committedLow) {
+		return;
 	}
-	long pageSize = gPageSize;
-	// Only the committed (RW) window [committedLow, sp) is backed by pages; the
-	// span below committedLow is PROT_NONE (reserved, unbacked). Reclaim the dead
-	// part of the RW window below the saved sp. committedLow stays put (monotonic);
-	// re-deepening re-faults these RW pages as ordinary zero-fill, not a SIGSEGV.
-	uintptr_t lo = (uintptr_t) fiber->committedLow;
-	uintptr_t hi = ((uintptr_t) fiber->sp - pageSize) & ~((uintptr_t) pageSize - 1); // cushion below sp
-	if (hi > lo && (hi - lo) >= FIBER_STACK_RELEASE_THRESHOLD) {
-		osPageRelease((void *) lo, hi - lo);
+	uintptr_t low = ((uintptr_t) fiber->committedLow + gPageSize - 1) & ~(gPageSize - 1);
+	uintptr_t high = (uintptr_t) sp & ~(gPageSize - 1);
+	if (high > low) {
+		osPageRelease((void *) low, (size_t) (high - low));
 	}
 }
 
 
-void fiberTrampoline(void)
+void fiberSwitch(Fiber *from, Fiber *to)
 {
-	// Runs on the new fiber's own stack the first time it is scheduled.
-	schedulerFiberMain();
-	// schedulerFiberMain never returns (it switches back to the scheduler
-	// once the fiber's work is done).
-	abort();
+	ASSERT(from != to);
+	to->resumer = from;
+	gCurrentFiber = to;
+	to->state = FIBER_RUNNING;
+	fiberSwitchAsm(&from->sp, to->sp);
+	// Control is back in `from`. Whoever switched here may not be the fiber we
+	// switched to, so gCurrentFiber is restored rather than assumed.
+	gCurrentFiber = from;
+	from->state = FIBER_RUNNING;
+}
+
+
+// ---------------------------------------------------------------------------
+// Growable stacks
+// ---------------------------------------------------------------------------
+
+int fiberGrowStack(Fiber *fiber, uintptr_t faultAddress)
+{
+	if (fiber == NULL || fiber->reservation == NULL) {
+		return 0; // an adopted OS-thread stack: not ours to grow
+	}
+	uint8_t *address = (uint8_t *) faultAddress;
+	// Above the window means the fault was never about growth. Below the floor
+	// means genuine overflow. NEITHER may be swallowed: a swallowed fault here
+	// turns a wild write into a bug that looks like a stack problem forever.
+	if (address >= fiber->committedLow || address < fiber->floor) {
+		return 0;
+	}
+	// Commit down to the faulting page plus a page of headroom, so a deep call
+	// chain does not fault once per page on the way down.
+	uintptr_t page = (uintptr_t) address & ~(gPageSize - 1);
+	uintptr_t floor = (uintptr_t) fiber->floor;
+	uintptr_t low = page > floor + gPageSize ? page - gPageSize : floor;
+	size_t bytes = (size_t) ((uintptr_t) fiber->committedLow - low);
+	if (!osPageCommit((void *) low, bytes)) {
+		return 0;
+	}
+	fiber->committedLow = (uint8_t *) low;
+	return 1;
+}
+
+
+static void growthHandler(int signal, siginfo_t *info, void *context)
+{
+	(void) context;
+	if (fiberGrowStack(gCurrentFiber, (uintptr_t) info->si_addr)) {
+		return; // the faulting instruction retries and now succeeds
+	}
+	// Not a growth fault. Restore the default action and re-raise, so the
+	// process dies where it actually broke, with a usable core, instead of
+	// spinning in the handler.
+	struct sigaction fallback;
+	memset(&fallback, 0, sizeof(fallback));
+	fallback.sa_handler = SIG_DFL;
+	sigaction(signal, &fallback, NULL);
+	raise(signal);
+}
+
+
+void fiberInstallGrowthHandler(void)
+{
+	// The handler runs precisely when a stack could not grow, so it must not
+	// run ON that stack. The alternate signal stack is not an optimization
+	// here: without it the handler never gets to execute at all.
+	static PER_ISOLATE char altStack[64 * KB];
+	stack_t alt;
+	alt.ss_sp = altStack;
+	alt.ss_size = sizeof(altStack);
+	alt.ss_flags = 0;
+	sigaltstack(&alt, NULL);
+
+	struct sigaction action;
+	memset(&action, 0, sizeof(action));
+	action.sa_sigaction = growthHandler;
+	action.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
+	sigemptyset(&action.sa_mask);
+	sigaction(SIGSEGV, &action, NULL);
+	sigaction(SIGBUS, &action, NULL);
+}
+
+
+// ---------------------------------------------------------------------------
+// Roots
+// ---------------------------------------------------------------------------
+
+void fiberVisitRoots(Fiber *fiber, RootVisitor visit, void *ctx)
+{
+	if (valueTypeOf(fiber->entryBlock, VALUE_POINTER)) {
+		visit(ctx, &fiber->entryBlock);
+	}
+	if (valueTypeOf(fiber->process, VALUE_POINTER)) {
+		visit(ctx, &fiber->process);
+	}
+	if (valueTypeOf(fiber->roots.context, VALUE_POINTER)) {
+		visit(ctx, &fiber->roots.context);
+	}
+	if (valueTypeOf(fiber->roots.exceptionHandler, VALUE_POINTER)) {
+		visit(ctx, &fiber->roots.exceptionHandler);
+	}
+	if (valueTypeOf(fiber->roots.unwindHandler, VALUE_POINTER)) {
+		visit(ctx, &fiber->roots.unwindHandler);
+	}
+	// The DEEP root set is the native frames on this fiber's stack, and it is
+	// walked by whichever engine owns frames (memory/Roots.h). With no engine
+	// linked that is the weak no-op, which is exactly what lets this layer be
+	// proved before a JIT exists.
 }

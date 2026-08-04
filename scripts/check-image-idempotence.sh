@@ -23,5 +23,19 @@ else
 	cmp "$TMP/img2" "$TMP/img3" | head -3
 	exit 1
 fi
-# and the resaved image must still work
-"$BUILD/st" -s "$TMP/img3" -e '3 + 4' </dev/null | grep -q 7 && echo "resaved image evaluates OK"
+# The bootstrap output is itself expected to be a fixpoint, so this is checked
+# too rather than only img2 against img3: a writer that normalized something on
+# the way back out would still pass the pair above.
+if cmp -s "$TMP/img1" "$TMP/img2"; then
+	echo "the bootstrap image is already a fixpoint"
+else
+	echo "IMAGE IDEMPOTENCE FAILED: img1 != img2 (the reload normalized something)"
+	cmp "$TMP/img1" "$TMP/img2" | head -3
+	exit 1
+fi
+
+# and the resaved image must still work. printNl, because -e evaluates and does
+# not print: `3 + 4` on its own writes nothing and the grep would pass or fail
+# for reasons that have nothing to do with the image.
+"$BUILD/st" -s "$TMP/img3" -e '(3 + 4) printNl' </dev/null | grep -qx 7 \
+	&& echo "resaved image evaluates OK"

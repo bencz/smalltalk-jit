@@ -35,9 +35,9 @@ static inline int base64Value(uint8_t c)
 
 _Bool base64Encode(Object *input, String **result)
 {
-	size_t n = rawObjectSize(input->raw);
+	size_t n = rawObjectElementCount(input->raw);
 	String *out = newString(((n + 2) / 3) * 4);   // may GC and move the input
-	const uint8_t *src = getRawObjectIndexedVars(input->raw); // re-read AFTER
+	const uint8_t *src = rawObjectBytes(input->raw); // re-read AFTER
 	uint8_t *dst = (uint8_t *) out->raw->contents;
 
 	size_t i = 0;
@@ -91,8 +91,8 @@ _Bool base64Decode(String *input, Class *outputClass, Object **result)
 	}
 
 	Object *out = newObject(outputClass, n / 4 * 3 - pad); // may move the input
-	s = getRawObjectIndexedVars((RawObject *) input->raw);  // re-read AFTER
-	uint8_t *d = getRawObjectIndexedVars(out->raw);
+	s = rawObjectBytes((RawObject *) input->raw);  // re-read AFTER
+	uint8_t *d = rawObjectBytes(out->raw);
 
 	uint32_t accum = 0;
 	int bits = 0;

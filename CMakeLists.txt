@@ -3,7 +3,15 @@ project(smalltalk-jit C)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-set(CMAKE_C_FLAGS "-std=gnu11 -pedantic -Werror -Wno-flexible-array-extensions -Wno-c11-extensions -Wno-gnu -fcommon -fno-omit-frame-pointer")
+# -Wall AND -Wextra, not just -Werror.
+#
+# -Werror on its own promotes the warnings GCC emits by default, and that set is
+# small: -Wunused-function, -Wunused-variable, -Wsign-compare and most of the
+# rest are only produced under -Wall or -Wextra, so without them "every warning
+# is an error" was true and nearly empty. It was measured before being turned
+# on: 65 objects, ZERO warnings, so this costs nothing today and only ever costs
+# what it catches.
+set(CMAKE_C_FLAGS "-std=gnu11 -pedantic -Wall -Wextra -Werror -Wno-flexible-array-extensions -Wno-c11-extensions -Wno-gnu -fcommon -fno-omit-frame-pointer")
 
 # Default to an optimized build with debug info and assertions kept on (the VM's
 # ASSERTs are valuable while the GC/JIT are still maturing). Pass
@@ -15,6 +23,16 @@ set(CMAKE_C_FLAGS_RELWITHDEBINFO "-O2 -g")
 set(CMAKE_C_FLAGS_RELEASE "-O2")
 set(CMAKE_C_FLAGS_DEBUG "-O0 -g")
 
+# Execution counters for the jit-v2 work: -DST_INSTRUMENT=1 (vm/core/Instrument.h).
+# Off by default and it MUST stay that way: with it off every counter macro
+# compiles to nothing and every JIT emission site emits nothing, so an ordinary
+# build carries zero instructions of instrumentation. An instrumented build
+# emits a memory RMW inside the arithmetic fast paths, which is right for
+# counting and useless for timing, so never take a clock reading from one.
+if(ST_INSTRUMENT)
+	string(APPEND CMAKE_C_FLAGS " -DST_INSTRUMENT=1")
+endif()
+
 # Optional sanitizer for debugging memory bugs: -DSANITIZE=address (or undefined).
 if(SANITIZE)
 	string(APPEND CMAKE_C_FLAGS " -fsanitize=${SANITIZE} -fno-sanitize-recover=all")
@@ -25,7 +43,7 @@ endif()
 # ---- CPU architecture selection --------------------------------------------
 # ST_ARCH names the vm/jit/<arch>/ directory holding ALL CPU-specific code:
 # assembler, code generator, stubs, primitive generators, fiber switch. Arch
-# binding is link-time — this block picks WHICH backend .c files get compiled;
+# binding is link-time: this block picks WHICH backend .c files get compiled;
 # generic code calls them through the arch-neutral vm/jit/Target*.h contract
 # headers. Keep this block and vm/jit/TargetAssembler.h in sync (both fail
 # loudly on a mismatch). Porting checklist: PORTING.md.
@@ -44,54 +62,20 @@ if(NOT ST_ARCH)
 endif()
 
 if(ST_ARCH STREQUAL "x64")
+	# The macro assembler's x64 backend. There is no separate code generator any
+	# more: the tier speaks only of frame slots and the backend is the only thing
+	# that knows what a register is (ADR 0009).
 	set(vmArchSources
-		vm/jit/x64/Abi.c
-		vm/jit/x64/CodeGeneratorX64.c
-		vm/jit/x64/CpuX64.c
-		vm/jit/x64/PrimitivesX64.c
-		vm/jit/x64/StubCodeX64.c)
-	# Golden-byte emission tests for this backend's ABI emitters (linked into
-	# st), PLUS BOTH POWER goldens: the encoders and ABI instances are
-	# host-independent (each golden TU pins its TARGET byte order via
-	# ST_PPC64_EMIT_BE/_LE before including the one POWER assembler, and
-	# nothing executes), so both POWER targets' rung-1 bring-up develops
-	# natively here — ST_PPC64_EMIT_TEST / ST_PPC64LE_EMIT_TEST =1|print. The
-	# host stubs trap the one arch-only symbol per ABI (the POWER fiber
-	# switch) if anything tries to RUN it. No cpu/CpuBind*.c here: goldens
-	# exercise the pure decode on locals, never the per-target global.
-	set(vmArchTestSources
-		vm/tests/EmitGoldenX64.c
-		vm/tests/EmitGoldenPpc64.c
-		vm/tests/EmitGoldenPpc64HostStub.c
-		vm/jit/ppc64/abi/elfv1/AbiElfV1.c
-		vm/jit/ppc64/CpuPpc64.c
-		vm/tests/EmitGoldenPpc64le.c
-		vm/tests/EmitGoldenPpc64leHostStub.c
-		vm/jit/ppc64/abi/elfv2/AbiElfV2.c)
+		vm/jit/x64/MacroAssemblerX64.c
+		vm/jit/x64/SsaEmitterX64.c)
+	set(vmArchTestSources)
 elseif(ST_ARCH STREQUAL "ppc64" OR ST_ARCH STREQUAL "ppc64le")
-	# ONE backend serves both POWER byte orders (vm/jit/ppc64/): the ~100
-	# encoders are byte-order-neutral, the word layout comes from the single
-	# selector in AssemblerPpc64.h (WordBe.h/WordLe.h), the C ABI is the
-	# ST_ABI axis (elfv1 on BE, elfv2 on LE) and the CPU floor is the
-	# cpu/CpuBind*.c pair below. Mapping and bring-up war stories:
-	# vm/jit/ppc64/DESIGN.md; the ELFv2 deltas: vm/jit/ppc64/DESIGN-elfv2.md.
-	set(vmArchSources
-		vm/jit/ppc64/CodeGeneratorPpc64.c
-		vm/jit/ppc64/CpuPpc64.c
-		vm/jit/ppc64/CpuDetectPpc64.c
-		vm/jit/ppc64/PrimitivesPpc64.c
-		vm/jit/ppc64/StubCodePpc64.c)
-	if(ST_ARCH STREQUAL "ppc64")
-		list(APPEND vmArchSources vm/jit/ppc64/cpu/CpuBindBe.c)
-		set(vmArchTestSources
-			vm/tests/EmitGoldenPpc64.c
-			vm/tests/EmitGoldenPpc64Bind.c)
-	else()
-		list(APPEND vmArchSources vm/jit/ppc64/cpu/CpuBindLe.c)
-		set(vmArchTestSources
-			vm/tests/EmitGoldenPpc64le.c
-			vm/tests/EmitGoldenPpc64leBind.c)
-	endif()
+	# The POWER backend has not been ported to the v2 macro assembler yet. It
+	# fails HERE rather than at link time, because a build that gets most of the
+	# way and then cannot find a symbol says nothing about why.
+	message(FATAL_ERROR
+		"The POWER backends are not ported to the jit-v2 macro assembler yet "
+		"(vm/jit/MacroAssembler.h). x64 is the only ST_ARCH that builds.")
 else()
 	message(FATAL_ERROR "Unknown ST_ARCH '${ST_ARCH}' (supported: x64, ppc64, ppc64le)")
 endif()
@@ -131,7 +115,7 @@ endif()
 # ST_ABI names the vm/jit/<arch>/abi/<abi>/ directory binding the platform C
 # ABI for the selected backend: C argument registers, callee-/caller-saved
 # sets, C-call frame shape (shadow space), the PrimitiveResult return
-# convention, TLS access and the fiber switch — an ops-struct (see
+# convention, TLS access and the fiber switch, as an ops-struct (see
 # vm/jit/x64/Abi.h). Derived from (ST_ARCH, ST_OS); same link-time model as
 # ST_ARCH/ST_OS. Instance files are compilable on any host of the arch
 # (abi-suffixed symbols) so foreign ABIs can be golden-tested; exactly ONE
@@ -154,71 +138,113 @@ if(NOT ST_ABI)
 endif()
 
 if(ST_ARCH STREQUAL "x64" AND ST_ABI STREQUAL "sysv")
+	# BOTH x64 ABIs are compiled in, not just the host's. The foreign one is what
+	# the cross-emission checks read back byte for byte on a machine that cannot
+	# execute it, which is what an ops-struct buys and #ifdef does not (ADR 0009).
 	set(vmAbiSources
 		vm/jit/x64/abi/sysv/AbiSysV.c
-		vm/jit/x64/abi/sysv/AbiSysVBind.c
-		vm/jit/x64/abi/sysv/FiberSysV.c)
-elseif(ST_ARCH STREQUAL "ppc64" AND ST_ABI STREQUAL "elfv1")
-	set(vmAbiSources
-		vm/jit/ppc64/abi/elfv1/AbiElfV1.c
-		vm/jit/ppc64/abi/elfv1/AbiElfV1Bind.c
-		vm/jit/ppc64/abi/elfv1/FiberElfV1.c)
-elseif(ST_ARCH STREQUAL "ppc64le" AND ST_ABI STREQUAL "elfv2")
-	set(vmAbiSources
-		vm/jit/ppc64/abi/elfv2/AbiElfV2.c
-		vm/jit/ppc64/abi/elfv2/AbiElfV2Bind.c
-		vm/jit/ppc64/abi/elfv2/FiberElfV2.c)
+		vm/jit/x64/abi/sysv/ResumeSysV.c
+		vm/jit/x64/abi/win64/AbiWin64.c)
 else()
 	message(FATAL_ERROR
-		"Unknown ST_ABI '${ST_ABI}' for ST_ARCH '${ST_ARCH}' (implemented: x64+sysv, "
-		"ppc64+elfv1, ppc64le+elfv2). The abi/ layout reserves win64 - see PORTING.md.")
+		"Unknown ST_ABI '${ST_ABI}' for ST_ARCH '${ST_ARCH}' (implemented: x64+sysv). "
+		"The abi/ layout reserves win64 - see PORTING.md.")
 endif()
 
+# The jit-v2 source set.
+#
+# It is SHORTER than the list it replaces, and deliberately: the dry cut (ADR
+# 0002) took 87 files out, and what has not been reimplemented yet is not listed
+# here rather than being listed and broken. What is still v1 and still on disk:
+# core/{CompiledCode,Entry,Exception,Lookup,Namespace,StackFrame}.c,
+# compiler/{Compiler,Scope}.c, concurrency/Scheduler.c, runtime/{Base64,
+# FileSystem,Iterator,Json,Message,Primitives,Socket,Stream}.c and
+# tools/Repl.c. None of them compiles against the new object model,
+# and each comes back when its layer does.
 set(vmSources
-	vm/compiler/Compiler.c
-	vm/compiler/Optimizer.c
+	vm/compiler/Compile.c
 	vm/compiler/Parser.c
-	vm/compiler/Scope.c
 	vm/compiler/Tokenizer.c
 	vm/concurrency/Fiber.c
+	vm/concurrency/FiberSwitchX64.c
 	vm/concurrency/Scheduler.c
 	vm/core/Class.c
-	vm/core/CompiledCode.c
-	vm/core/Entry.c
-	vm/core/Exception.c
+	vm/core/ClassTable.c
 	vm/core/Handle.c
-	vm/core/Lookup.c
+	vm/core/Instrument.c
 	vm/core/Namespace.c
 	vm/core/Smalltalk.c
-	vm/core/StackFrame.c
 	vm/core/Thread.c
+	vm/jit/Backends.c
+	vm/jit/CompiledMethod.c
+	vm/jit/Deopt.c
+	vm/jit/DeoptResume.c
 	vm/jit/InlineCache.c
-	vm/jit/PerfMap.c
-	vm/jit/RegisterAllocator.c
-	vm/jit/StubCode.c
-	vm/jit/Tier.c
-	vm/memory/FreeList.c
-	vm/memory/GarbageCollector.c
+	vm/jit/Ir.c
+	vm/jit/Jit.c
+	vm/jit/Lir.c
+	vm/jit/Lower.c
+	vm/jit/MacroAssembler.c
+	vm/jit/Passes.c
+	vm/jit/RegAlloc.c
+	vm/jit/SsaBackend.c
+	vm/jit/SsaBackends.c
+	vm/jit/SsaBuild.c
+	vm/jit/SsaEmitter.c
+	vm/jit/SsaRuntime.c
+	vm/jit/Specialize.c
+	vm/jit/Tier2Stress.c
+	vm/jit/Tier2DryRun.c
+	vm/memory/Collector.c
 	vm/memory/Heap.c
-	vm/memory/HeapPage.c
-	vm/memory/Safepoint.c
-	vm/memory/Scavenger.c
+	vm/memory/Nursery.c
+	vm/memory/PageSpace.c
+	vm/memory/RememberedSet.c
+	vm/memory/Roots.c
 	vm/runtime/Base64.c
 	vm/runtime/BigInt.c
+	vm/runtime/Json.c
+	vm/runtime/Closure.c
 	vm/runtime/Collection.c
 	vm/runtime/Dictionary.c
-	vm/runtime/FileSystem.c
-	vm/runtime/Iterator.c
-	vm/runtime/Json.c
-	vm/runtime/Message.c
-	vm/runtime/Primitives.c
-	vm/runtime/Socket.c
-	vm/runtime/Stream.c
+	vm/runtime/Number.c
+	# The primitive TABLE, and then one file per domain beside it. LISTED and
+	# not globbed: CMake does not re-run when a file appears, so a glob here
+	# would build yesterday's set until something else forced a configure.
+	# scripts/gate.sh, which links these by hand, does glob -- see the note
+	# there for why the two answers differ.
+	vm/runtime/Primitive.c
+	vm/runtime/primitives/Atomics.c
+	vm/runtime/primitives/Base64.c
+	vm/runtime/primitives/Allocation.c
+	vm/runtime/primitives/Arithmetic.c
+	vm/runtime/primitives/Bits.c
+	vm/runtime/primitives/Block.c
+	vm/runtime/primitives/Characters.c
+	vm/runtime/primitives/Comparison.c
+	vm/runtime/primitives/Context.c
+	vm/runtime/primitives/Exceptions.c
+	vm/runtime/primitives/FileSystem.c
+	vm/runtime/primitives/FloatArray.c
+	vm/runtime/primitives/FloatMath.c
+	vm/runtime/primitives/Identity.c
+	vm/runtime/primitives/Json.c
+	vm/runtime/primitives/LargeInteger.c
+	vm/runtime/primitives/Indexed.c
+	vm/runtime/primitives/Method.c
+	vm/runtime/primitives/PrintValue.c
+	vm/runtime/primitives/Process.c
+	vm/runtime/primitives/Reflect.c
+	vm/runtime/primitives/Socket.c
+	vm/runtime/primitives/Streams.c
+	vm/runtime/primitives/System.c
+	vm/runtime/primitives/Strings.c
+	vm/runtime/primitives/Time.c
+	vm/runtime/primitives/Worker.c
 	vm/runtime/String.c
 	vm/thirdparty/cityhash/city.c
-	vm/thirdparty/linenoise/linenoise.c
 	vm/tools/Bootstrap.c
-	vm/tools/Repl.c
+	vm/tools/ClassBuilder.c
 	vm/tools/Snapshot.c
 	${vmArchSources}
 	${vmAbiSources}
@@ -234,36 +260,28 @@ if(CMAKE_C_BYTE_ORDER STREQUAL "BIG_ENDIAN")
 		PROPERTIES COMPILE_DEFINITIONS WORDS_BIGENDIAN)
 endif()
 add_library(VM SHARED ${vmSources})
-add_executable(st main.c vm/tests/SelfTests.c vm/tests/BigIntTest.c ${vmArchTestSources})
+add_executable(st main.c)
 target_include_directories(st PRIVATE ${CMAKE_SOURCE_DIR})
-
-# Standalone C unit test for the tokenizer (own main(), not part of `st`):
-# built on demand — `cmake --build <build> --target TokenizerTest`.
-# (vm/tests/ParserTest.c is NOT wired: it predates the current AST API and no
-# longer compiles — candidate for deletion.)
-add_executable(TokenizerTest EXCLUDE_FROM_ALL vm/tests/TokenizerTest.c)
-target_link_libraries(TokenizerTest VM)
 
 # All VM-internal includes are bucket-qualified from the vm/ root
 # (#include "memory/Heap.h"); vendored third-party code lives under
 # vm/thirdparty/ and is included the same way ("thirdparty/cityhash/city.h").
 target_include_directories(VM PUBLIC ${CMAKE_SOURCE_DIR}/vm)
 # The per-OS include dir is how contract headers reach their impl headers
-# (vm/os/OsThread.h includes "OsThreadImpl.h" — the header analogue of the
+# (vm/os/OsThread.h includes "OsThreadImpl.h" - the header analogue of the
 # ST_OS link-time source selection; OsThread.h #errors when it is missing).
-# PUBLIC so the st executable's own sources (SelfTests.c) see it too.
 target_include_directories(VM PUBLIC ${CMAKE_SOURCE_DIR}/vm/os/${ST_OS})
 
 target_link_libraries(VM ${CMAKE_THREAD_LIBS_INIT})
 target_link_libraries(VM m)
 target_link_libraries(st VM)
 
-
-# Run the whole Smalltalk test suite: `cmake --build <build> --target check`
-# (bootstraps a fresh image and runs every tests/*.st).
-add_custom_target(check
-	COMMAND ${CMAKE_COMMAND} -E env BUILD=${CMAKE_BINARY_DIR} bash ${CMAKE_SOURCE_DIR}/run_tests.sh --no-build
-	DEPENDS st
+# The GATE (docs/jit-v2/01-gate.md) is NOT built here, and that is deliberate.
+# Levels 0 to 8 each link a handful of files BY HAND with no CMake at all,
+# precisely so they keep passing while the rest of the tree does not yet
+# compile, which is the window the dry cut opened. scripts/gate.sh owns them.
+add_custom_target(gate
+	COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/gate.sh
 	WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 	USES_TERMINAL
 )

@@ -1,0 +1,1534 @@
+#include "jit/Passes.h"
+#include "core/Assert.h"
+#include <stdlib.h>
+#include <string.h>
+
+// The optimizer.
+//
+// THE ORDER MATTERS MORE THAN THE PASSES. Each one is ordinary; the sequence is
+// what makes them compose:
+//
+//   1. trivial phis        clears the noise SSA construction leaves behind
+//   2. specialization      arithmetic sends become raw operations behind guards
+//   3. type propagation    guards make types exact
+//   4. redundant guards    a guard dominated by an equivalent one goes
+//   5. scalar replacement  objects that do not escape become registers
+//   6. GVN                 where box(unbox(x)) disappears
+//   7. LICM                loop-invariant work leaves the loop
+//   8. phi promotion       takes the boxing OFF the loop-carried edge
+//   9. DCE                 removes the allocation that now has no users
+//  10. block merging       makes the result readable
+//
+// Step 2 is what gives the other nine anything to work on. Before it existed
+// every one of them ran over opaque sends and moved nothing, because ADR 0006
+// requires arithmetic to reach the IR as a send so that the type profile can
+// exist at all. It is placed FIRST among the rewrites and not last for the same
+// reason: everything below is expressed in terms of boxes and raw operations,
+// and until this pass runs there are none.
+//
+// Step 8 is the one most implementations omit, and it is the difference between
+// a lukewarm result and a good one. An accumulator `total := total + x` is born
+// as a TAGGED phi whose only producer is a box and whose only consumer is an
+// unbox. Without promoting the phi to F64, boxing elimination stops at the loop
+// boundary and every iteration pays for a box it immediately undoes.
+//
+// None of this is valid without the deoptimization maps. When step 4 erases an
+// object, it leaves a MATERIALIZATION RECIPE in their place, so the object can
+// be rebuilt at the moment a guard fails. That is what makes erasing it legal.
+
+
+typedef struct {
+	IrFunction *function;
+	IrBlock **rpo;
+	uint32_t rpoCount;
+} PassContext;
+
+
+static void collectRpo(PassContext *context)
+{
+	IrFunction *function = context->function;
+	context->rpo = calloc(function->blockCount, sizeof(IrBlock *));
+	_Bool *seen = calloc(function->blockCount, sizeof(_Bool));
+	IrBlock **stack = calloc(function->blockCount + 1, sizeof(IrBlock *));
+	uint32_t stackSize = 0, order = 0;
+
+	// Iterative post-order, then reversed. Recursion would be shorter and would
+	// also blow the C stack on a method with a few thousand blocks, which is
+	// exactly the kind of method a bootstrap produces.
+	IrBlock **post = calloc(function->blockCount, sizeof(IrBlock *));
+	uint8_t *visitIndex = calloc(function->blockCount, sizeof(uint8_t));
+	stack[stackSize++] = function->entry;
+	seen[function->entry->id] = 1;
+	while (stackSize > 0) {
+		IrBlock *block = stack[stackSize - 1];
+		if (visitIndex[block->id] < block->succCount) {
+			IrBlock *next = block->succs[visitIndex[block->id]++];
+			if (!seen[next->id]) {
+				seen[next->id] = 1;
+				stack[stackSize++] = next;
+			}
+		} else {
+			post[order++] = block;
+			stackSize--;
+		}
+	}
+	for (uint32_t i = 0; i < order; i++) {
+		context->rpo[i] = post[order - 1 - i];
+	}
+	context->rpoCount = order;
+	free(seen);
+	free(stack);
+	free(post);
+	free(visitIndex);
+}
+
+
+// ---------------------------------------------------------------------------
+// 1. Trivial phis
+// ---------------------------------------------------------------------------
+//
+// A phi is trivial when every operand is either the phi itself or one single
+// other value. SSA construction produces these constantly: a register that is
+// read inside a loop but never written there gets a phi whose operands are the
+// entry definition and the phi itself.
+
+static uint32_t removeTrivialPhis(PassContext *context)
+{
+	uint32_t removed = 0;
+	_Bool changed = 1;
+	while (changed) {
+		changed = 0;
+		for (IrBlock *block = context->function->blocks; block != NULL;
+				block = block->next) {
+			IrValue *phi = block->phis;
+			while (phi != NULL) {
+				IrValue *next = phi->next;
+				IrValue *same = NULL;
+				_Bool trivial = 1;
+				for (uint16_t i = 0; i < phi->argCount; i++) {
+					IrValue *arg = phi->args[i];
+					if (arg == phi || arg == same) {
+						continue;
+					}
+					if (same != NULL) {
+						trivial = 0;
+						break;
+					}
+					same = arg;
+				}
+				if (trivial && same != NULL) {
+					irRemove(phi);
+					irReplaceAllUses(context->function, phi, same);
+					removed++;
+					changed = 1;
+				}
+				phi = next;
+			}
+		}
+	}
+	return removed;
+}
+
+
+// Is this value a compile-time SmallInteger?
+//
+// THE `extra` TEST IS NOT OPTIONAL. nil, true and false are also IR_CONST, and
+// their `konst` is ZERO because their addresses are runtime facts the IR does
+// not carry -- and zero is a perfectly valid tagged SmallInteger. Reading one of
+// the three as the integer 0 would turn `x := nil` into `x := 0`, silently.
+// Which singleton it is lives in `extra`, and OP_LOADI is what an integer
+// literal sets there.
+static _Bool isIntegerConstant(const IrValue *value)
+{
+	return value->op == IR_CONST && value->extra == OP_LOADI
+		&& valueTypeOf(value->konst, VALUE_INT);
+}
+
+
+// ---------------------------------------------------------------------------
+// 2. Arithmetic specialization from the profile
+// ---------------------------------------------------------------------------
+//
+// THE PASS THAT GIVES EVERY OTHER PASS SOMETHING TO DO. Arithmetic reaches the
+// IR as an opaque IR_SEND, because ADR 0006 says it must: resolve `+` in the
+// front end and the type profile the whole design rests on stops existing. So
+// GVN, LICM and phi promotion were running over opaque calls and moving nothing,
+// and the raw operations the IR was built around had no producer at all.
+//
+// Here is where that turns around, and the ORDER is the argument: the profile
+// exists because arithmetic went through a cache; the specialization is legal
+// because it sits behind a guard; the guard is legal because a failure can
+// deoptimize. Each one needs the one before it, which is why this is the last
+// piece rather than the first.
+//
+//     send #+ (r, a)      ->      guard_class r, SmallInteger
+//                                 guard_class a, SmallInteger
+//                                 box_i(iadd(unbox_i r, unbox_i a))   [checked]
+//
+// The box and the unbox are ordinary instructions, so nothing downstream needs
+// to know this pass ran: simplify collapses adjacent pairs, GVN collapses them
+// across blocks, and phi promotion takes the pair off a loop-carried edge. That
+// is the entire reason the conversions are IR nodes (jit/Ir.h) instead of a
+// decision the backend makes.
+//
+// WHAT IS NOT DECIDED HERE. Which sites, which operation and which classes all
+// arrive as data (SiteSpecialization). A pass that read the caches itself would
+// be a second place that knows what a primitive number means.
+
+// The unbox that produces `repr`, and the box that consumes it. Two lookups
+// rather than a field on the table, so a site can name any raw operation and
+// the conversions follow from the operation's own representation.
+static IrOp unboxFor(Repr repr) { return repr == REPR_F64 ? IR_UNBOX_F : IR_UNBOX_I; }
+static IrOp boxFor(Repr repr) { return repr == REPR_F64 ? IR_BOX_F : IR_BOX_I; }
+
+
+static IrValue *insertBefore(PassContext *context, IrValue *before, IrOp op,
+	IrValue *a, IrValue *b)
+{
+	IrValue *value = irNewValue(context->function, op);
+	if (a != NULL) { irAddArg(context->function, value, a); }
+	if (b != NULL) { irAddArg(context->function, value, b); }
+	irInsertBefore(before->block, before, value);
+	return value;
+}
+
+
+static uint32_t specializeSends(PassContext *context, const IrProfile *profile,
+	uint32_t *declined)
+{
+	if (profile == NULL || profile->sites == NULL) {
+		return 0;
+	}
+	const SiteSpecialization *sites = profile->sites;
+	uint16_t siteCount = profile->siteCount;
+	IrFunction *function = context->function;
+	uint32_t specialized = 0;
+	for (uint32_t i = 0; i < context->rpoCount; i++) {
+		IrBlock *block = context->rpo[i];
+		IrValue *value = block->first;
+		while (value != NULL) {
+			IrValue *next = value->next;
+			if (value->op != IR_SEND || value->bci >= siteCount) {
+				value = next;
+				continue;
+			}
+			const SiteSpecialization *site = &sites[value->bci];
+			if (site->op >= IR_OP_COUNT) {
+				value = next;
+				continue;
+			}
+			// EVERY OFFER THE PASS DECLINES IS COUNTED, because the bridge and
+			// this pass have to agree about what a specializable site looks like
+			// and a silent skip is how they would stop agreeing. A binary send
+			// with a deopt state is the whole contract; a super send is excluded
+			// because its whole content is where the lookup STARTS, which no
+			// class guard on the receiver can stand in for.
+			if (value->argCount != 2 || value->deopt == NULL
+					|| (value->flags & IR_FLAG_SUPER) != 0) {
+				(*declined)++;
+				value = next;
+				continue;
+			}
+
+			IrOp op = (IrOp) site->op;
+			Repr operandRepr = op == IR_FADD || op == IR_FSUB || op == IR_FMUL
+				|| op == IR_FDIV || op == IR_FCMP ? REPR_F64 : REPR_I64;
+
+			// THE SAME DEOPT STATE AS THE SEND, shared rather than copied. It
+			// describes the tier-1 frame just BEFORE the send ran, and that is
+			// exactly the state every instruction of this sequence needs: the
+			// unboxes are pure, so nothing observable has happened yet, and
+			// resuming re-executes the send, which recomputes all of it.
+			DeoptState *state = value->deopt;
+			IrValue *receiver = value->args[0];
+			IrValue *argument = value->args[1];
+
+			IrValue *guard = insertBefore(context, value, IR_GUARD_CLASS,
+				receiver, NULL);
+			guard->extra = (int64_t) site->receiverClass;
+			guard->bci = value->bci;
+			guard->deopt = state;
+			guard = insertBefore(context, value, IR_GUARD_CLASS, argument, NULL);
+			guard->extra = (int64_t) site->argumentClass;
+			guard->bci = value->bci;
+			guard->deopt = state;
+
+			IrValue *left = insertBefore(context, value, unboxFor(operandRepr),
+				receiver, NULL);
+			IrValue *right = insertBefore(context, value, unboxFor(operandRepr),
+				argument, NULL);
+			IrValue *raw = insertBefore(context, value, op, left, right);
+			raw->bci = value->bci;
+			if (op == IR_ICMP || op == IR_FCMP) {
+				raw->extra = site->compare;
+			}
+			if (site->checkOverflow) {
+				raw->flags |= IR_FLAG_CHECK_OVERFLOW;
+				raw->deopt = state;
+			}
+
+			IrValue *tagged;
+			if (raw->repr == REPR_BOOL) {
+				tagged = insertBefore(context, value, IR_BOOL2TAG, raw, NULL);
+			} else {
+				tagged = insertBefore(context, value, boxFor(operandRepr), raw,
+					NULL);
+				// UNCONDITIONAL class knowledge, and only for the integer box:
+				// a CHECKED box_i answers a SmallInteger no matter what, so a
+				// later guard on the result is genuinely redundant -- which is
+				// what makes `a + b + c` cost one guard on each of the three
+				// operands and not five. box_f is NOT given one, because a
+				// double outside the SmallFloat64 window becomes a BoxedFloat64
+				// and claiming otherwise would delete a guard doing real work
+				// (jit/Ir.h). Tied to the overflow check rather than to the
+				// representation, because an UNCHECKED box_i is exactly the one
+				// that could be handed a value no SmallInteger can hold.
+				if (operandRepr == REPR_I64 && site->checkOverflow) {
+					tagged->klass = site->receiverClass;
+				}
+			}
+
+			irRemove(value);
+			irReplaceAllUses(function, value, tagged);
+			specialized++;
+			value = next;
+		}
+	}
+	return specialized;
+}
+
+
+// ---------------------------------------------------------------------------
+// 2b. --deopt-stress: make every speculation fail
+// ---------------------------------------------------------------------------
+//
+// The INTERNAL ORACLE the dry cut left us (ADR 0002). With the external oracle
+// gone, the way to know that leaving optimized code is correct is to leave it
+// EVERYWHERE: every guard fails, so every optimized activation reconstructs a
+// tier-1 frame and continues in it, and every test and every benchmark has to
+// produce the identical answer.
+//
+// It does two things, and both are needed:
+//
+//   * POISONS every existing guard, by giving it a class index no value can
+//     have. The instruction sequence is the production one, unchanged, which is
+//     the point: what is being proved is the guard the system really emits.
+//   * ADDS a guard at every send site that has none, so a method whose profile
+//     offered nothing is stressed too. A send already carries the state to
+//     resume with, which is exactly what the added guard needs, so this costs no
+//     new machinery at all.
+//
+// WHAT IT CANNOT REACH, said plainly: only the FIRST guard a path arrives at
+// ever fires, because after it the rest of the activation belongs to tier 1. So
+// one run stresses the first site of every method on every executed path, and
+// `stressSkip` is what walks it deeper.
+// The class index a stress guard demands, and the choice is not arbitrary.
+//
+// CLASS_INDEX_INVALID would be wrong twice over: it is ZERO, which some class
+// really has, and it is also what `irNewValue` writes into every value's `klass`
+// to mean "unknown" -- so the redundant-guard pass reads `subject->klass ==
+// wanted`, finds it true for every value in the program, and deletes every
+// stress guard. Measured: the first stress run reported that nothing had ever
+// left optimized code, which is the vacuous green this whole mode exists to
+// avoid.
+//
+// OBJ_CLASS_MASK is one PAST the largest index the header field can hold
+// (CLASS_INDEX_MAX, which core/ClassTable.c enforces), so no object anywhere can
+// carry it, and it survives the emitter masking the immediate down to the field.
+#define STRESS_POISON_CLASS ((uint32_t) OBJ_CLASS_MASK)
+
+static uint32_t stressGuards(PassContext *context, const IrProfile *profile,
+	uint32_t *added)
+{
+	if (profile == NULL || !profile->stressGuards) {
+		return 0;
+	}
+	IrFunction *function = context->function;
+	uint32_t poisoned = 0;
+	uint16_t skipped = 0;
+	for (uint32_t i = 0; i < context->rpoCount; i++) {
+		IrBlock *block = context->rpo[i];
+		IrValue *value = block->first;
+		while (value != NULL) {
+			IrValue *next = value->next;
+			if (value->op == IR_GUARD_CLASS) {
+				// No object can have this index, so the compare cannot match on
+				// either the immediate arm or the header arm of the emitted guard.
+				value->extra = (int64_t) STRESS_POISON_CLASS;
+				poisoned++;
+			} else if (value->op == IR_SEND && value->deopt != NULL
+					&& value->argCount > 0) {
+				if (skipped < profile->stressSkip) {
+					skipped++;
+				} else {
+					IrValue *guard = insertBefore(context, value, IR_GUARD_CLASS,
+						value->args[0], NULL);
+					guard->extra = (int64_t) STRESS_POISON_CLASS;
+					guard->bci = value->bci;
+					// THE SEND'S OWN STATE, shared. It describes the frame just
+					// before the send ran, which is precisely where a guard
+					// standing in front of the send has to resume.
+					guard->deopt = value->deopt;
+					(*added)++;
+				}
+			}
+			value = next;
+		}
+	}
+	(void) function;
+	return poisoned;
+}
+
+
+// ---------------------------------------------------------------------------
+// 3. Type propagation
+// ---------------------------------------------------------------------------
+//
+// Only UNCONDITIONAL knowledge is propagated here. A box produces its class by
+// construction; a phi whose operands all agree produces that class. Guards do
+// NOT write here, for the reason spelled out in Ir.h.
+
+static uint32_t propagateTypes(PassContext *context, const IrProfile *profile)
+{
+	uint32_t learned = 0;
+	// A TAGGED INTEGER LITERAL KNOWS ITS CLASS, once something has told this
+	// file which index that is. Unconditional in the strict sense Ir.h means:
+	// the value came out of a constant, so no guard established it and removing
+	// a guard on it removes nothing that was doing work.
+	if (profile != NULL && profile->smallIntegerClass != CLASS_INDEX_INVALID) {
+		for (IrBlock *block = context->function->blocks; block != NULL;
+				block = block->next) {
+			for (IrValue *value = block->first; value != NULL;
+					value = value->next) {
+				if (isIntegerConstant(value)
+						&& value->klass != profile->smallIntegerClass) {
+					value->klass = profile->smallIntegerClass;
+					learned++;
+				}
+			}
+		}
+	}
+	_Bool changed = 1;
+	while (changed) {
+		changed = 0;
+		for (uint32_t i = 0; i < context->rpoCount; i++) {
+			IrBlock *block = context->rpo[i];
+			for (IrValue *phi = block->phis; phi != NULL; phi = phi->next) {
+				uint32_t agreed = CLASS_INDEX_INVALID;
+				_Bool all = phi->argCount > 0;
+				for (uint16_t a = 0; a < phi->argCount; a++) {
+					uint32_t klass = phi->args[a] != NULL
+						? phi->args[a]->klass : CLASS_INDEX_INVALID;
+					if (klass == CLASS_INDEX_INVALID) { all = 0; break; }
+					if (agreed == CLASS_INDEX_INVALID) { agreed = klass; }
+					else if (agreed != klass) { all = 0; break; }
+				}
+				if (all && agreed != phi->klass) {
+					phi->klass = agreed;
+					learned++;
+					changed = 1;
+				}
+			}
+		}
+	}
+	return learned;
+}
+
+
+// ---------------------------------------------------------------------------
+// 4. Redundant guards
+// ---------------------------------------------------------------------------
+//
+// A guard is redundant when the class it checks is already known
+// UNCONDITIONALLY, or when an earlier guard IN THE SAME BLOCK already
+// established it. The second case builds its knowledge as it walks and never
+// writes it onto the value, which is the difference between removing redundant
+// guards and removing all of them.
+
+static uint32_t removeRedundantGuards(PassContext *context)
+{
+	uint32_t removed = 0;
+	uint32_t *established = calloc(context->function->valueCounter + 1,
+		sizeof(uint32_t));
+	for (uint32_t i = 0; i < context->rpoCount; i++) {
+		IrBlock *block = context->rpo[i];
+		memset(established, 0,
+			(context->function->valueCounter + 1) * sizeof(uint32_t));
+		IrValue *value = block->first;
+		while (value != NULL) {
+			IrValue *next = value->next;
+			if (value->op == IR_GUARD_CLASS && value->argCount == 1) {
+				IrValue *subject = value->args[0];
+				uint32_t wanted = (uint32_t) value->extra;
+				_Bool knownAlready = subject->klass == wanted
+					|| established[subject->id] == wanted + 1;
+				if (knownAlready) {
+					irRemove(value);
+					removed++;
+				} else {
+					// Recorded HERE, in the walk, and never on the value: see
+					// the header of Ir.h for what writing it on the value does.
+					established[subject->id] = wanted + 1;
+				}
+			}
+			value = next;
+		}
+	}
+	free(established);
+	return removed;
+}
+
+
+// ---------------------------------------------------------------------------
+// 4b. Local simplification, including the box/unbox pairs
+// ---------------------------------------------------------------------------
+//
+// Not a numbered pass of its own: it is the local rewriting that scalar
+// replacement and GVN both depend on. `fieldOf(new(...))` becoming the
+// argument directly is what leaves an allocation with no users, and
+// `unbox(box(x))` becoming `x` is what GVN then finds across blocks.
+// ---------------------------------------------------------------------------
+
+// Does anything between `from` and `to`, which share a block, write memory?
+static _Bool writesBetween(IrValue *from, IrValue *to)
+{
+	for (IrValue *value = from->next; value != NULL && value != to;
+			value = value->next) {
+		if (irOpWritesMemory((IrOp) value->op)) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+
+static uint32_t simplify(PassContext *context)
+{
+	uint32_t rewritten = 0;
+	for (uint32_t i = 0; i < context->rpoCount; i++) {
+		IrBlock *block = context->rpo[i];
+		IrValue *value = block->first;
+		while (value != NULL) {
+			IrValue *next = value->next;
+			IrValue *source = value->argCount > 0 ? value->args[0] : NULL;
+			IrValue *replacement = NULL;
+
+			switch ((IrOp) value->op) {
+			case IR_UNBOX_F:
+				if (source != NULL && source->op == IR_BOX_F) { replacement = source->args[0]; }
+				break;
+			case IR_UNBOX_I:
+				if (source != NULL && source->op == IR_BOX_I) {
+					replacement = source->args[0];
+				} else if (source != NULL && isIntegerConstant(source)) {
+					// UNBOXING A CONSTANT IS A CONSTANT, and today unboxing is a
+					// CALL (jit/SsaRuntime.c), so this is a call removed from
+					// every `x + 1` and from the preheader of every counted
+					// loop. Written here rather than at the specialization,
+					// because the constant may only become the operand of an
+					// unbox after other rewrites have run.
+					IrValue *raw = irNewValue(context->function, IR_ICONST);
+					raw->ikonst = (int64_t) asCInt(source->konst);
+					irInsertBefore(block, value, raw);
+					replacement = raw;
+				}
+				break;
+			case IR_BOX_F:
+				if (source != NULL && source->op == IR_UNBOX_F) { replacement = source->args[0]; }
+				break;
+			case IR_BOX_I:
+				if (source != NULL && source->op == IR_UNBOX_I) { replacement = source->args[0]; }
+				break;
+			case IR_TAG2BOOL:
+				if (source != NULL && source->op == IR_BOOL2TAG) { replacement = source->args[0]; }
+				break;
+			case IR_FIELD_F: case IR_FIELD_T:
+				// Reading a field straight out of the allocation that filled
+				// it. THIS is what makes scalar replacement work: once every
+				// read is answered from the arguments, the allocation has no
+				// users left and can go.
+				//
+				// ONLY WHEN NOTHING WROTE IN BETWEEN, which is the same trap GVN
+				// was in: the allocation's argument is what the field held when
+				// the object was BUILT, and a store between there and here means
+				// that is no longer what it holds. Answered by walking the
+				// instructions between the two rather than by a version counter,
+				// because that also settles availability -- if the allocation is
+				// not in this block, it is not walkable from here and the
+				// substitution is simply not made.
+				if (source != NULL && (source->op == IR_NEW || source->op == IR_NEWV)
+						&& value->extra < source->argCount
+						&& source->block == value->block
+						&& !writesBetween(source, value)) {
+					IrValue *field = source->args[value->extra];
+					if (field->repr == value->repr) { replacement = field; }
+				}
+				break;
+			default:
+				break;
+			}
+
+			if (replacement != NULL) {
+				irRemove(value);
+				irReplaceAllUses(context->function, value, replacement);
+				rewritten++;
+			}
+			value = next;
+		}
+	}
+	return rewritten;
+}
+
+
+// ---------------------------------------------------------------------------
+// 5. Scalar replacement, and the materialization recipe that makes it legal
+// ---------------------------------------------------------------------------
+//
+// An object whose only remaining references are DEOPTIMIZATION STATES does not
+// need to exist. Every field read has already been answered directly from the
+// arguments of the allocation (that is what `simplify` does above), so nothing
+// in the fast path can observe it.
+//
+// Erasing it is correct ONLY because of what is left in its place: a RECIPE
+// naming the class and the values that fill the fields, so the object can be
+// rebuilt at the exact moment a guard fails and the interpreter needs it. An
+// escape analysis without a materialization recipe is not an optimization, it
+// is a wrong answer waiting for a deoptimization, and --deopt-stress is what
+// catches it.
+
+// Does anything OTHER than a deopt state reference this value? A deopt state is
+// a reference that costs nothing at run time, which is precisely why it does
+// not force the object to exist.
+static _Bool hasNonDeoptUsers(PassContext *context, IrValue *target)
+{
+	for (IrBlock *block = context->function->blocks; block != NULL;
+			block = block->next) {
+		for (IrValue *value = block->phis; value != NULL; value = value->next) {
+			for (uint16_t i = 0; i < value->argCount; i++) {
+				if (value->args[i] == target) { return 1; }
+			}
+		}
+		for (IrValue *value = block->first; value != NULL; value = value->next) {
+			for (uint16_t i = 0; i < value->argCount; i++) {
+				if (value->args[i] == target) { return 1; }
+			}
+		}
+		if (block->terminator != NULL) {
+			for (uint16_t i = 0; i < block->terminator->argCount; i++) {
+				if (block->terminator->args[i] == target) { return 1; }
+			}
+		}
+	}
+	return 0;
+}
+
+
+static void replaceWithRecipe(PassContext *context, IrValue *allocation,
+	IrValue *recipeValue)
+{
+	for (IrBlock *block = context->function->blocks; block != NULL;
+			block = block->next) {
+		IrValue *values[3] = { block->phis, block->first, block->terminator };
+		for (int list = 0; list < 3; list++) {
+			for (IrValue *value = values[list]; value != NULL;
+					value = list == 2 ? NULL : value->next) {
+				if (value->deopt == NULL) { continue; }
+				for (uint16_t f = 0; f < value->deopt->frameCount; f++) {
+					DeoptFrame *frame = &value->deopt->frames[f];
+					for (uint16_t sl = 0; sl < frame->slotCount; sl++) {
+						if (frame->slotValue[sl] == allocation) {
+							frame->slotValue[sl] = recipeValue;
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+
+static uint32_t scalarReplacement(PassContext *context, uint32_t *recipes)
+{
+	IrFunction *function = context->function;
+	uint32_t replaced = 0;
+	for (IrBlock *block = function->blocks; block != NULL; block = block->next) {
+		IrValue *value = block->first;
+		while (value != NULL) {
+			IrValue *next = value->next;
+			_Bool allocation = value->op == IR_NEW || value->op == IR_NEWV;
+			if (allocation && !hasNonDeoptUsers(context, value)) {
+				IrValue *recipeValue = irNewValue(function, IR_NEW);
+				recipeValue->flags |= IR_FLAG_MATERIALIZE;
+				Materialize *recipe = irAlloc(function, sizeof(Materialize));
+				recipe->classIndex = (uint32_t) value->extra;
+				recipe->flat = value->op == IR_NEWV;
+				recipe->fieldCount = value->argCount;
+				recipe->fields = irAlloc(function, value->argCount * sizeof(IrValue *));
+				for (uint16_t i = 0; i < value->argCount; i++) {
+					recipe->fields[i] = value->args[i];
+				}
+				recipeValue->recipe = recipe;
+				replaceWithRecipe(context, value, recipeValue);
+				irRemove(value);
+				replaced++;
+				(*recipes)++;
+			}
+			value = next;
+		}
+	}
+	return replaced;
+}
+
+
+// ---------------------------------------------------------------------------
+// 6. Global value numbering
+// ---------------------------------------------------------------------------
+//
+// Over pure operations, in reverse post-order so a definition is numbered
+// before its uses. This is where the box/unbox pairs that `simplify` did not
+// catch locally collapse, and where repeated field loads and conversions
+// become one.
+
+// Defined with the loop passes below, and used here too: reusing a value is only
+// legal when its definition DOMINATES the use.
+static IrBlock **computeDominators(PassContext *context);
+static _Bool dominates(IrBlock **idom, IrBlock *a, IrBlock *b);
+
+
+// ---- what a store invalidates ----------------------------------------------
+//
+// PRECISE IN THE FIELD, CONSERVATIVE IN THE OBJECT. A store to field N kills
+// reads of field N from anything, and does not touch reads of any other field.
+// That is the cheapest split that is both sound and useful: proving two
+// expressions name different OBJECTS is alias analysis and this optimizer has
+// none, while the field index is sitting right there in the instruction.
+//
+// Everything else -- a send, a safepoint, an array store, a global store --
+// bumps the ONE counter that every read depends on. A send runs arbitrary
+// Smalltalk; a safepoint is a point execution can leave and another fiber can
+// store at (ADR 0007); an array store is indexed by a runtime value, so nothing
+// here can say which element it hit.
+#define MEMORY_FIELD_SLOTS 64
+
+typedef struct {
+	uint32_t all;
+	uint32_t field[MEMORY_FIELD_SLOTS];
+} MemoryVersion;
+
+
+static size_t memorySlot(int64_t fieldIndex)
+{
+	// A collision costs a missed reuse and nothing else, which is why a small
+	// fixed table is enough for a field index that is a 16-bit operand.
+	return (size_t) ((uint64_t) fieldIndex % MEMORY_FIELD_SLOTS);
+}
+
+
+static void memoryAdvance(MemoryVersion *version, IrValue *value)
+{
+	switch ((IrOp) value->op) {
+	case IR_SETFIELD_T: case IR_SETFIELD_F:
+		version->field[memorySlot(value->extra)]++;
+		break;
+	case IR_ASTORE: case IR_VASTORE:
+	case IR_SETGLOBAL: case IR_SEND: case IR_SAFEPOINT:
+		version->all++;
+		break;
+	default:
+		break;
+	}
+}
+
+
+// The field counter a given read depends on, or NULL when it depends only on
+// `all` (an array load or a length).
+static uint32_t memoryFieldVersion(const MemoryVersion *version, IrValue *read)
+{
+	if (read->op == IR_FIELD_T || read->op == IR_FIELD_F) {
+		return version->field[memorySlot(read->extra)];
+	}
+	return 0;
+}
+
+
+typedef struct {
+	IrValue *value;
+	uint32_t hash;
+	// The two counters this entry was recorded at. Only meaningful for a memory
+	// read, and together they are what stops one being reused across a store
+	// that could have changed it.
+	uint32_t memoryAll;
+	uint32_t memoryField;
+} GvnEntry;
+
+
+static uint32_t gvnHash(IrValue *value, const MemoryVersion *memory)
+{
+	uint32_t hash = (uint32_t) value->op * 2654435761u;
+	hash ^= (uint32_t) value->extra * 40503u;
+	hash ^= (uint32_t) value->konst;
+	hash ^= (uint32_t) value->flags * 2246822519u;
+	for (uint16_t i = 0; i < value->argCount; i++) {
+		hash = hash * 31u + (value->args[i] != NULL ? value->args[i]->id : 0);
+	}
+	if (irOpReadsMemory((IrOp) value->op)) {
+		hash = hash * 31u + memory->all;
+		hash = hash * 31u + memoryFieldVersion(memory, value);
+	}
+	return hash;
+}
+
+
+static _Bool gvnEqual(IrValue *a, IrValue *b)
+{
+	// THE FLAGS ARE PART OF THE IDENTITY. An IR_IADD that must not overflow and
+	// an IR_IADD that may agree on op, extra, konst, argCount and repr, and
+	// merging them keeps whichever came FIRST -- so an unchecked one earlier in
+	// the method would swallow a checked one and the overflow would go silently
+	// unnoticed. Same family as the two IR_CONSTs that named different literals
+	// and were merged for agreeing on everything this function used to compare.
+	if (a->op != b->op || a->extra != b->extra || a->konst != b->konst
+			|| a->argCount != b->argCount || a->repr != b->repr
+			|| a->flags != b->flags) {
+		return 0;
+	}
+	if (a->op == IR_FCONST && a->fkonst != b->fkonst) { return 0; }
+	if (a->op == IR_ICONST && a->ikonst != b->ikonst) { return 0; }
+	for (uint16_t i = 0; i < a->argCount; i++) {
+		if (a->args[i] != b->args[i]) { return 0; }
+	}
+	return 1;
+}
+
+
+static uint32_t globalValueNumbering(PassContext *context)
+{
+	uint32_t removed = 0;
+	size_t capacity = 1024;
+	GvnEntry *table = calloc(capacity, sizeof(GvnEntry));
+	IrBlock **idom = computeDominators(context);
+	// Advanced by anything that may write. A memory read carries the counters it
+	// depends on in its key, so an identical read on the other side of a store
+	// that could have changed it is a DIFFERENT value.
+	MemoryVersion memory;
+	memset(&memory, 0, sizeof(memory));
+
+	for (uint32_t i = 0; i < context->rpoCount; i++) {
+		IrBlock *block = context->rpo[i];
+		IrValue *value = block->first;
+		while (value != NULL) {
+			IrValue *next = value->next;
+			memoryAdvance(&memory, value);
+			// Allocations are pure but must NOT be numbered together: two
+			// `new` instructions produce two distinct objects, and collapsing
+			// them would give one identity where the program expects two.
+			// EVERY allocation is excluded, and the cell and the closure are
+			// allocations: two of either are two OBJECTS, and two cells holding
+			// the same value are exactly the case where collapsing them would
+			// give one box to variables the program keeps apart.
+			_Bool numberable = irOpIsPure((IrOp) value->op)
+				&& value->op != IR_NEW && value->op != IR_NEWV
+				&& value->op != IR_ANEW && value->op != IR_VNEW
+				&& value->op != IR_NEWCELL && value->op != IR_CLOSURE
+				&& value->op != IR_PARAM && value->op != IR_PHI;
+			if (numberable) {
+				uint32_t hash = gvnHash(value, &memory);
+				size_t slot = hash % capacity;
+				IrValue *found = NULL;
+				for (size_t probe = 0; probe < capacity; probe++) {
+					if (table[slot].value == NULL) { break; }
+					if (table[slot].hash == hash
+							&& gvnEqual(table[slot].value, value)
+							// SAME HEAP. Equal operands are not enough for a
+							// memory read: the earlier one describes the heap as
+							// it was at ITS version.
+							&& (!irOpReadsMemory((IrOp) value->op)
+								|| (table[slot].memoryAll == memory.all
+									&& table[slot].memoryField
+										== memoryFieldVersion(&memory, value)))
+							// AND IT HAS TO DOMINATE. Reusing a value from a
+							// block that merely ran EARLIER in reverse post
+							// order is not the same thing as reusing one that is
+							// guaranteed to have run: two arms of a conditional
+							// are ordered by the walk and neither reaches the
+							// other, so the replacement would read a register
+							// that was never written on the path taken.
+							&& dominates(idom, table[slot].value->block, block)) {
+						found = table[slot].value;
+						break;
+					}
+					slot = (slot + 1) % capacity;
+				}
+				if (found != NULL) {
+					irRemove(value);
+					irReplaceAllUses(context->function, value, found);
+					removed++;
+				} else {
+					table[slot].value = value;
+					table[slot].hash = hash;
+					table[slot].memoryAll = memory.all;
+					table[slot].memoryField = memoryFieldVersion(&memory, value);
+				}
+			}
+			value = next;
+		}
+	}
+	free(idom);
+	free(table);
+	return removed;
+}
+
+
+// ---------------------------------------------------------------------------
+// 7. Loop-invariant code motion
+// ---------------------------------------------------------------------------
+//
+// Without this, a field read like `data` is performed once per iteration and
+// the promise of "no tagged access inside the loop" does not survive contact
+// with reality. Applied repeatedly it lifts work out of an inner loop into an
+// outer one and then out of the outer one entirely.
+//
+// Only PURE operations move, and only when every operand is defined outside
+// the loop. A guard does NOT move: hoisting a guard out of a loop changes WHEN
+// it fails, and its deoptimization state describes a bytecode index inside the
+// loop, so the state would resume at a point the program had not reached. Doing
+// it properly needs either rewriting the state for the preheader or versioning
+// the loop, and pretending otherwise would be the sort of thing that looks like
+// an optimization and is a wrong answer.
+
+// Immediate dominators by the iterative algorithm, over reverse post-order.
+static IrBlock **computeDominators(PassContext *context)
+{
+	IrFunction *function = context->function;
+	IrBlock **idom = calloc(function->blockCount, sizeof(IrBlock *));
+	uint32_t *position = calloc(function->blockCount, sizeof(uint32_t));
+	for (uint32_t i = 0; i < context->rpoCount; i++) {
+		position[context->rpo[i]->id] = i;
+	}
+	idom[function->entry->id] = function->entry;
+
+	_Bool changed = 1;
+	while (changed) {
+		changed = 0;
+		for (uint32_t i = 0; i < context->rpoCount; i++) {
+			IrBlock *block = context->rpo[i];
+			if (block == function->entry) {
+				continue;
+			}
+			IrBlock *candidate = NULL;
+			for (uint16_t p = 0; p < block->predCount; p++) {
+				IrBlock *pred = block->preds[p];
+				if (idom[pred->id] == NULL) {
+					continue;
+				}
+				if (candidate == NULL) {
+					candidate = pred;
+					continue;
+				}
+				// Walk both up the dominator tree until they meet.
+				IrBlock *a = candidate;
+				IrBlock *b = pred;
+				while (a != b) {
+					while (position[a->id] > position[b->id]) { a = idom[a->id]; }
+					while (position[b->id] > position[a->id]) { b = idom[b->id]; }
+				}
+				candidate = a;
+			}
+			if (candidate != NULL && idom[block->id] != candidate) {
+				idom[block->id] = candidate;
+				changed = 1;
+			}
+		}
+	}
+	free(position);
+	return idom;
+}
+
+
+static _Bool dominates(IrBlock **idom, IrBlock *a, IrBlock *b)
+{
+	IrBlock *cursor = b;
+	for (;;) {
+		if (cursor == a) { return 1; }
+		IrBlock *next = idom[cursor->id];
+		if (next == NULL || next == cursor) { return 0; }
+		cursor = next;
+	}
+}
+
+
+static uint32_t hoistLoopInvariants(PassContext *context)
+{
+	IrFunction *function = context->function;
+	IrBlock **idom = computeDominators(context);
+	uint32_t hoisted = 0;
+
+	for (uint32_t i = 0; i < context->rpoCount; i++) {
+		IrBlock *latch = context->rpo[i];
+		for (uint8_t s = 0; s < latch->succCount; s++) {
+			IrBlock *header = latch->succs[s];
+			// A BACK EDGE: an edge to a block that dominates its source.
+			if (!dominates(idom, header, latch)) {
+				continue;
+			}
+			// The body is everything that reaches the latch without leaving
+			// through the header.
+			_Bool *inLoop = calloc(function->blockCount, sizeof(_Bool));
+			IrBlock **stack = calloc(function->blockCount, sizeof(IrBlock *));
+			uint32_t stackSize = 0;
+			inLoop[header->id] = 1;
+			if (!inLoop[latch->id]) {
+				inLoop[latch->id] = 1;
+				stack[stackSize++] = latch;
+			}
+			while (stackSize > 0) {
+				IrBlock *block = stack[--stackSize];
+				for (uint16_t p = 0; p < block->predCount; p++) {
+					IrBlock *pred = block->preds[p];
+					if (!inLoop[pred->id]) {
+						inLoop[pred->id] = 1;
+						stack[stackSize++] = pred;
+					}
+				}
+			}
+
+			// The preheader: the single predecessor of the header from OUTSIDE.
+			// With more than one there is nowhere unambiguous to hoist to, and
+			// inventing a block would change the CFG under the deopt states.
+			IrBlock *preheader = NULL;
+			uint16_t outside = 0;
+			for (uint16_t p = 0; p < header->predCount; p++) {
+				if (!inLoop[header->preds[p]->id]) {
+					preheader = header->preds[p];
+					outside++;
+				}
+			}
+			if (outside != 1 || preheader == NULL) {
+				free(inLoop);
+				free(stack);
+				continue;
+			}
+
+			// WHAT THE LOOP WRITES. A memory read is pure and still cannot leave
+			// a loop that stores to what it reads: hoisted, it would answer the
+			// first iteration's value for every iteration.
+			//
+			// Same split as GVN, and the same reason: the field index is known,
+			// the object is not. A loop that writes field 3 does not stop a read
+			// of field 2 from being hoisted, which is exactly the case the
+			// existing check below exercises.
+			MemoryVersion loopWrites;
+			memset(&loopWrites, 0, sizeof(loopWrites));
+			for (uint32_t b = 0; b < context->rpoCount; b++) {
+				IrBlock *block = context->rpo[b];
+				if (!inLoop[block->id]) {
+					continue;
+				}
+				for (IrValue *value = block->first; value != NULL;
+						value = value->next) {
+					memoryAdvance(&loopWrites, value);
+				}
+			}
+
+			for (uint32_t b = 0; b < context->rpoCount; b++) {
+				IrBlock *block = context->rpo[b];
+				if (!inLoop[block->id]) {
+					continue;
+				}
+				IrValue *value = block->first;
+				while (value != NULL) {
+					IrValue *next = value->next;
+					_Bool movable = irOpIsPure((IrOp) value->op)
+						&& value->op != IR_PHI && value->op != IR_PARAM
+						&& value->deopt == NULL;
+					if (movable && irOpReadsMemory((IrOp) value->op)) {
+						movable = loopWrites.all == 0
+							&& memoryFieldVersion(&loopWrites, value) == 0;
+					}
+					for (uint16_t k = 0; k < value->argCount && movable; k++) {
+						IrValue *arg = value->args[k];
+						// An operand defined INSIDE the loop makes the value
+						// vary with the iteration.
+						movable = arg == NULL || arg->block == NULL
+							|| !inLoop[arg->block->id];
+					}
+					if (movable) {
+						irRemove(value);
+						irAppend(preheader, value);
+						hoisted++;
+					}
+					value = next;
+				}
+			}
+			free(inLoop);
+			free(stack);
+		}
+	}
+	free(idom);
+	return hoisted;
+}
+
+
+// ---------------------------------------------------------------------------
+// 8b. Boxes that only a deoptimization state still wants
+// ---------------------------------------------------------------------------
+//
+// `a + b + c` leaves an intermediate box with no ordinary users at all: the
+// second addition consumes the raw value directly, because simplify collapsed
+// the unbox against it. What keeps the box alive is the second site's deopt
+// state, which names the bytecode register holding the intermediate.
+//
+// That state does not need the box. A DeoptSlot carries the KIND of what it
+// describes, and DeoptResume re-boxes a SLOT_I64 with tagInt and a SLOT_F64
+// with jitBoxFloat on the way out (jit/DeoptResume.c). So the state can name
+// the RAW value and the box becomes dead.
+//
+// WHY THIS IS EXACTLY AS SAFE AS THE BOX WAS. Re-boxing on the way out and
+// boxing here compute the same Value from the same bits -- tagInt is what
+// jitBoxInteger does, and jitBoxFloat is what the deopt path calls. The one
+// input either would reject is a raw integer outside the SmallInteger range,
+// and the only producer of a raw integer is checked arithmetic, which
+// deoptimizes rather than producing one.
+//
+// It is the SAME ARGUMENT scalar replacement makes about an allocation, and it
+// reuses the same predicate: an object no ordinary instruction reads does not
+// need to exist, because the state that names it can rebuild it.
+static uint32_t sinkBoxesIntoStates(PassContext *context)
+{
+	uint32_t sunk = 0;
+	for (uint32_t i = 0; i < context->rpoCount; i++) {
+		IrBlock *block = context->rpo[i];
+		IrValue *value = block->first;
+		while (value != NULL) {
+			IrValue *next = value->next;
+			if ((value->op == IR_BOX_I || value->op == IR_BOX_F)
+					&& value->argCount == 1
+					&& !hasNonDeoptUsers(context, value)) {
+				// Replacing EVERY use is the same as replacing only the
+				// deoptimization ones, because there are no others left. That
+				// equality is what lets this reuse irReplaceAllUses instead of
+				// growing a second walk over the states.
+				irRemove(value);
+				irReplaceAllUses(context->function, value, value->args[0]);
+				sunk++;
+			}
+			value = next;
+		}
+	}
+	return sunk;
+}
+
+
+// ---------------------------------------------------------------------------
+// 9. Dead code
+// ---------------------------------------------------------------------------
+//
+// Mark from the effectful operations and from the DEOPTIMIZATION STATES, then
+// sweep. Forgetting the states is how a value that is only needed when a guard
+// fails gets deleted, and the result is a wrong answer on exactly the path
+// nobody exercises.
+
+static void markLive(IrValue *value, _Bool *live, IrValue **worklist,
+	uint32_t *worklistSize)
+{
+	if (value == NULL || live[value->id]) {
+		return;
+	}
+	live[value->id] = 1;
+	worklist[(*worklistSize)++] = value;
+}
+
+
+static uint32_t eliminateDeadCode(PassContext *context)
+{
+	IrFunction *function = context->function;
+	_Bool *live = calloc(function->valueCounter + 1, sizeof(_Bool));
+	IrValue **worklist = calloc(function->valueCounter + 1, sizeof(IrValue *));
+	uint32_t worklistSize = 0;
+
+	for (IrBlock *block = function->blocks; block != NULL; block = block->next) {
+		for (IrValue *value = block->first; value != NULL; value = value->next) {
+			if (!irOpIsPure((IrOp) value->op)) {
+				markLive(value, live, worklist, &worklistSize);
+			}
+		}
+		markLive(block->terminator, live, worklist, &worklistSize);
+	}
+
+	while (worklistSize > 0) {
+		IrValue *value = worklist[--worklistSize];
+		for (uint16_t i = 0; i < value->argCount; i++) {
+			markLive(value->args[i], live, worklist, &worklistSize);
+		}
+		if (value->deopt != NULL) {
+			for (uint16_t f = 0; f < value->deopt->frameCount; f++) {
+				DeoptFrame *frame = &value->deopt->frames[f];
+				for (uint16_t s = 0; s < frame->slotCount; s++) {
+					IrValue *slot = frame->slotValue[s];
+					if (slot != NULL && (slot->flags & IR_FLAG_MATERIALIZE)) {
+						Materialize *recipe = slot->recipe;
+						for (uint16_t k = 0; k < recipe->fieldCount; k++) {
+							markLive(recipe->fields[k], live, worklist, &worklistSize);
+						}
+					} else {
+						markLive(slot, live, worklist, &worklistSize);
+					}
+				}
+			}
+		}
+	}
+
+	uint32_t removed = 0;
+	for (IrBlock *block = function->blocks; block != NULL; block = block->next) {
+		IrValue *value = block->first;
+		while (value != NULL) {
+			IrValue *next = value->next;
+			if (!live[value->id]) {
+				irRemove(value);
+				removed++;
+			}
+			value = next;
+		}
+		IrValue *phi = block->phis;
+		while (phi != NULL) {
+			IrValue *next = phi->next;
+			if (!live[phi->id]) {
+				irRemove(phi);
+				removed++;
+			}
+			phi = next;
+		}
+	}
+	free(live);
+	free(worklist);
+	return removed;
+}
+
+
+// ---------------------------------------------------------------------------
+// 8. Representation promotion of loop-carried phis
+// ---------------------------------------------------------------------------
+//
+// Written below dead code in this file and RUN BEFORE it in the pipeline: the
+// order that matters is the one in irOptimize, not the order of definitions.
+//
+// The pass most implementations leave out, and the one that decides whether the
+// result is lukewarm or good.
+//
+// An accumulator is born as a TAGGED phi whose only producers are boxes and
+// whose only consumers are unboxes. Promoting the phi to F64 makes both
+// disappear and the accumulator lives in a register for the whole loop. Without
+// it, every iteration pays for a box it immediately undoes, and all the boxing
+// elimination downstream stops dead at the loop boundary.
+
+// After a phi changes representation, every USE of it has to be made consistent
+// again. Two cases, and missing the second is a wrong answer rather than a
+// missed optimization.
+static void fixPromotedConsumers(PassContext *context, IrValue *phi,
+	IrOp unboxOp, IrOp boxOp)
+{
+	IrFunction *function = context->function;
+	for (IrBlock *block = function->blocks; block != NULL; block = block->next) {
+		IrValue *value = block->first;
+		while (value != NULL) {
+			IrValue *next = value->next;
+			_Bool usesPhi = 0;
+			for (uint16_t i = 0; i < value->argCount; i++) {
+				usesPhi = usesPhi || value->args[i] == phi;
+			}
+			if (usesPhi && value->op == unboxOp) {
+				// The unbox of an already-raw value is the identity.
+				irRemove(value);
+				irReplaceAllUses(function, value, phi);
+			} else if (usesPhi) {
+				for (uint16_t i = 0; i < value->argCount; i++) {
+					if (value->args[i] == phi
+							&& !irOperandIsRaw((IrOp) value->op, i)) {
+						IrValue *box = irNewValue(function, boxOp);
+						irAddArg(function, box, phi);
+						irInsertBefore(block, value, box);
+						value->args[i] = box;
+					}
+				}
+			}
+			value = next;
+		}
+		// AND A PHI CONSUMER, which the walk above cannot reach: a phi is not in
+		// `block->first`, it is in `block->phis`, so that loop never sees one
+		// however it is tested. It used to be excluded there BY NAME, which read
+		// as a decision and was in fact unreachable code.
+		//
+		// A promoted phi feeding a still-tagged phi would be a wrong answer, not a
+		// missed optimization: the consumer would receive a RAW integer and the
+		// guard and unbox that follow it would read that as a tagged value. The box
+		// belongs at the END OF THE PREDECESSOR the operand arrives from, because a
+		// phi's operand is evaluated on its EDGE and there is no "before a phi".
+		//
+		// HONEST STATUS: this fires on NO method in the current suite. Measured over
+		// all 143 files in tests/ under ST_TIER2_ALL=1: zero firings. Every tagged
+		// phi that reaches a promoted one today is trivial and already gone, because
+		// the only producer of a non-trivial one was the unreachable-predecessor bug
+		// buildCfg now prevents. It is kept because the shape is legal SSA that a
+		// second producer would reach, and exercised by gate level 5 rather than by
+		// the suite. Do not read it as the fix for anything that was failing.
+		for (IrValue *consumer = block->phis; consumer != NULL;
+				consumer = consumer->next) {
+			if (consumer == phi || consumer->repr != REPR_TAGGED) {
+				continue;
+			}
+			// One operand per predecessor, which is what makes operand i's edge
+			// preds[i]. Asserted rather than assumed, because reading the wrong
+			// edge would put the box on a path the value does not arrive by.
+			ASSERT(consumer->argCount == block->predCount);
+			for (uint16_t i = 0; i < consumer->argCount; i++) {
+				if (consumer->args[i] != phi) {
+					continue;
+				}
+				IrBlock *edge = block->preds[i];
+				IrValue *box = irNewValue(function, boxOp);
+				irAddArg(function, box, phi);
+				irInsertBefore(edge, edge->terminator, box);
+				consumer->args[i] = box;
+			}
+		}
+		// The terminator too: `ret` and `branch` both take tagged values, and
+		// forgetting them is how a promoted accumulator gets returned as a
+		// bit pattern.
+		IrValue *terminator = block->terminator;
+		if (terminator != NULL) {
+			for (uint16_t i = 0; i < terminator->argCount; i++) {
+				if (terminator->args[i] == phi
+						&& !irOperandIsRaw((IrOp) terminator->op, i)) {
+					IrValue *box = irNewValue(function, boxOp);
+					irAddArg(function, box, phi);
+					irAppend(block, box);
+					terminator->args[i] = box;
+				}
+			}
+		}
+	}
+}
+
+
+static uint32_t promotePhis(PassContext *context)
+{
+	uint32_t promoted = 0;
+	for (IrBlock *block = context->function->blocks; block != NULL;
+			block = block->next) {
+		for (IrValue *phi = block->phis; phi != NULL; phi = phi->next) {
+			if (phi->repr != REPR_TAGGED || phi->argCount == 0) {
+				continue;
+			}
+			// Every operand must be a box of the SAME representation, the phi
+			// itself, or a SEED THE PASS CAN UNBOX FOR FREE. Mixed producers
+			// mean the value genuinely has to be tagged somewhere, and promoting
+			// would just move the conversion.
+			//
+			// THE SEED IS NOT A REFINEMENT, it is the difference between this
+			// pass firing on real code and never firing at all. Every integer
+			// accumulator in the language is written `sum := 0` and then
+			// `sum := sum + x`, so the phi's operands are a boxed sum on the back
+			// edge and a TAGGED CONSTANT on the entry edge. Requiring both to be
+			// boxes rejects that shape, which is the shape.
+			IrOp boxOp = IR_OP_COUNT;
+			_Bool uniform = 1;
+			uint16_t seeds = 0;
+			for (uint16_t i = 0; i < phi->argCount && uniform; i++) {
+				IrValue *arg = phi->args[i];
+				if (arg == phi) { continue; }
+				if (isIntegerConstant(arg)) { seeds++; continue; }
+				if (arg->op != IR_BOX_F && arg->op != IR_BOX_I) { uniform = 0; break; }
+				if (boxOp == IR_OP_COUNT) { boxOp = (IrOp) arg->op; }
+				else if (boxOp != arg->op) { uniform = 0; }
+			}
+			// A seed only agrees with the INTEGER representation: the constant
+			// carries a tagged SmallInteger, and handing its bit pattern to a
+			// float phi would read it as a double. All-seeds and no box is not
+			// promotable either -- there would be nothing raw to promote toward.
+			if (!uniform || boxOp == IR_OP_COUNT
+					|| (seeds > 0 && boxOp != IR_BOX_I)) {
+				continue;
+			}
+			phi->repr = boxOp == IR_BOX_F ? REPR_F64 : REPR_I64;
+			for (uint16_t i = 0; i < phi->argCount; i++) {
+				IrValue *arg = phi->args[i];
+				if (arg == phi) { continue; }
+				if (isIntegerConstant(arg)) {
+					// The same constant, in the representation the phi now has.
+					// Placed beside the tagged one, which already dominates the
+					// phi because it was an operand of it.
+					IrValue *raw = irNewValue(context->function, IR_ICONST);
+					raw->ikonst = (int64_t) asCInt(arg->konst);
+					irInsertBefore(arg->block, arg, raw);
+					phi->args[i] = raw;
+					continue;
+				}
+				phi->args[i] = arg->args[0]; // through the box
+			}
+			// AND THE CONSUMERS. Rewiring only the producers is not merely
+			// incomplete, it is WRONG: every use that expects a tagged value
+			// would now be reading a raw double. The matching unbox becomes the
+			// phi itself; anything that genuinely needs a tagged value gets a
+			// box inserted right before it.
+			fixPromotedConsumers(context, phi,
+				boxOp == IR_BOX_F ? IR_UNBOX_F : IR_UNBOX_I, boxOp);
+			promoted++;
+		}
+	}
+	return promoted;
+}
+
+
+// ---------------------------------------------------------------------------
+// 10. Block merging
+// ---------------------------------------------------------------------------
+
+static uint32_t mergeBlocks(PassContext *context)
+{
+	uint32_t merged = 0;
+	for (IrBlock *block = context->function->blocks; block != NULL;
+			block = block->next) {
+		if (block->succCount != 1 || block->terminator == NULL
+				|| block->terminator->op != IR_JUMP) {
+			continue;
+		}
+		IrBlock *successor = block->succs[0];
+		// NEVER THE ENTRY, and `predCount` does not say so on its own. Control
+		// arrives at the entry block from OUTSIDE the function, and nothing in the
+		// CFG records that, so a loop whose header IS the entry has a header with
+		// exactly one predecessor -- its own latch. Merging it away leaves
+		// `function->entry` naming an empty, edgeless block and the whole method
+		// unreachable from its own entry point.
+		//
+		// Measured, on the first real method tier 2 was ever asked to compile: a
+		// `whileTrue:` at the top of a method. The lowering produced a function
+		// whose entry held one instruction, a jump with nowhere to go, and the
+		// emitter dereferenced the null label of a successor that did not exist.
+		if (successor == block || successor == context->function->entry
+				|| successor->predCount != 1 || successor->phis != NULL) {
+			continue;
+		}
+		for (IrValue *value = successor->first; value != NULL; value = value->next) {
+			value->block = block;
+		}
+		if (successor->first != NULL) {
+			if (block->last == NULL) {
+				block->first = successor->first;
+			} else {
+				block->last->next = successor->first;
+			}
+			block->last = successor->last;
+		}
+		block->terminator = successor->terminator;
+		if (block->terminator != NULL) {
+			block->terminator->block = block;
+		}
+		block->succCount = successor->succCount;
+		for (uint8_t s = 0; s < successor->succCount; s++) {
+			block->succs[s] = successor->succs[s];
+			for (uint16_t p = 0; p < successor->succs[s]->predCount; p++) {
+				if (successor->succs[s]->preds[p] == successor) {
+					successor->succs[s]->preds[p] = block;
+				}
+			}
+		}
+		successor->first = successor->last = NULL;
+		successor->terminator = NULL;
+		successor->succCount = 0;
+		merged++;
+	}
+	// AND THE ABSORBED BLOCKS LEAVE THE LIST. An emptied block has no
+	// instructions, no terminator and no successors, and leaving it in is not
+	// harmless: the lowering makes a LIR block for it, terminateSplitBlocks gives
+	// that block a JUMP because it has no terminator, and the emitter then asks
+	// for the label of a successor it does not have.
+	//
+	// The ids are NOT renumbered. Everything downstream indexes by id into arrays
+	// sized by `blockCount`, so renumbering would be a second mapping to keep in
+	// step for no gain; a hole in the id space costs one unused array slot.
+	IrBlock **link = &context->function->blocks;
+	for (IrBlock *block = context->function->blocks; block != NULL;) {
+		IrBlock *next = block->next;
+		if (block != context->function->entry && block->first == NULL
+				&& block->terminator == NULL && block->succCount == 0
+				&& block->phis == NULL) {
+			*link = next;
+		} else {
+			link = &block->next;
+		}
+		block = next;
+	}
+	return merged;
+}
+
+
+// ---------------------------------------------------------------------------
+// The pipeline
+// ---------------------------------------------------------------------------
+
+PassStats irOptimize(IrFunction *function, const IrProfile *profile)
+{
+	PassStats stats;
+	memset(&stats, 0, sizeof(stats));
+
+	PassContext context;
+	context.function = function;
+	collectRpo(&context);
+
+	stats.trivialPhis += removeTrivialPhis(&context);
+	// BEFORE everything else, because everything else is written in terms of the
+	// boxes and raw operations this produces. It runs once rather than inside the
+	// fixed point below: a send it declined will not become specializable because
+	// some other send was, and re-running it would rewrite nothing at a cost paid
+	// on every method the system compiles.
+	stats.sendsSpecialized += specializeSends(&context, profile,
+		&stats.specializationsDeclined);
+	// AFTER specialization, so the guards it just created are poisoned too, and
+	// BEFORE the redundant-guard pass, so a poisoned guard dominated by another
+	// poisoned one still goes: the stress mode must not change how many guards
+	// the method would have had, only whether they hold.
+	stats.guardsPoisoned += stressGuards(&context, profile, &stats.guardsAdded);
+	stats.typesLearned += propagateTypes(&context, profile);
+
+	// Fixed point: simplification exposes GVN opportunities and GVN exposes
+	// more simplification, and both expose dead code.
+	for (int round = 0; round < 6; round++) {
+		uint32_t before = stats.simplified + stats.gvnRemoved + stats.guardsRemoved;
+		stats.guardsRemoved += removeRedundantGuards(&context);
+		stats.simplified += simplify(&context);
+		// AFTER simplify, which is what turns field reads into direct uses of
+		// the allocation's arguments and therefore what leaves the allocation
+		// with no non-deopt users to begin with.
+		stats.scalarReplaced += scalarReplacement(&context, &stats.materializations);
+		stats.gvnRemoved += globalValueNumbering(&context);
+		stats.typesLearned += propagateTypes(&context, profile);
+		stats.trivialPhis += removeTrivialPhis(&context);
+		if (stats.simplified + stats.gvnRemoved + stats.guardsRemoved == before) {
+			break;
+		}
+	}
+
+	// LICM before promotion: hoisting can expose a phi whose producers become
+	// uniform once the invariant part has left the loop.
+	stats.hoisted += hoistLoopInvariants(&context);
+
+	// Promotion goes AFTER the fixed point and BEFORE the final cleanup: it
+	// needs the boxes to have settled into their final shape, and it creates a
+	// new round of removable conversions.
+	stats.phisPromoted += promotePhis(&context);
+	for (int round = 0; round < 3; round++) {
+		stats.simplified += simplify(&context);
+		stats.gvnRemoved += globalValueNumbering(&context);
+		stats.trivialPhis += removeTrivialPhis(&context);
+	}
+
+	// LAST, and after the conversions have settled: a box only becomes
+	// deopt-only once everything that consumed it has been collapsed against it,
+	// which is what the rounds above finish doing.
+	stats.boxesSunk += sinkBoxesIntoStates(&context);
+	stats.deadRemoved += eliminateDeadCode(&context);
+	stats.blocksMerged += mergeBlocks(&context);
+
+	free(context.rpo);
+	return stats;
+}

@@ -116,16 +116,35 @@ SNAP_ABS="$(cd "$(dirname "$SNAP")" && pwd)/$(basename "$SNAP")"
 ST_ABS="$(cd "$BUILD" && pwd)/st"
 DEVSNAP="$ROOT/samples/.stbuild/program.img"
 echo "${B}building samples project image (core + Std packages)...${Z}"
+# A FAILURE HERE IS REPORTED, NOT FATAL TO THE RUN.
+#
+# It used to `exit 1`, and under the dry cut that made the runner useless: one
+# missing subsystem stopped the suite before a single test file had run, so the
+# whole thing said nothing about the other 154 items. A runner that cannot
+# report the state of what DOES work cannot be used to steer.
+#
+# It stays fatal to the EXIT CODE -- SAMPLES_IMAGE is counted as a failed item
+# below, so "158 ok" still means what it meant and the level 13 criterion is
+# unchanged. What changes is only that the rest of the suite gets to run and be
+# counted first. The sample GROUP is skipped when this fails, because running
+# samples against an image that was never built would report 71 failures that
+# all have one cause.
+SAMPLES_IMAGE_OK=1
 if ! (cd samples && ST_PACKAGE_PATH="$ROOT/packages" ST_IMAGE="$SNAP_ABS" \
 		"$ST_ABS" build >/dev/null 2>&1); then
-	echo "${R}SAMPLES IMAGE BUILD FAILED${Z}"
-	(cd samples && ST_PACKAGE_PATH="$ROOT/packages" ST_IMAGE="$SNAP_ABS" "$ST_ABS" build)
-	exit 1
+	SAMPLES_IMAGE_OK=0
+	echo "${R}SAMPLES IMAGE BUILD FAILED${Z} — the sample groups will be skipped"
+	(cd samples && ST_PACKAGE_PATH="$ROOT/packages" ST_IMAGE="$SNAP_ABS" "$ST_ABS" build) \
+		2>&1 | sed 's/^/        /'
 fi
 
 pass=0
 fail=0
 failed=""
+
+# Counted as an ordinary item so it lands in the totals like everything else.
+# This is what keeps the change above from being a way to hide a red suite.
+report_result "$((1 - SAMPLES_IMAGE_OK))" "SAMPLES_IMAGE" 0
 
 # C-level self-tests that gate every run (no image needed, milliseconds)
 echo ""
@@ -165,6 +184,36 @@ t0=$(now_ms)
 # INVERTED: exiting 0 here is the failure.
 [ $? -ne 0 ]; rc=$?
 report_result "$rc" "UNCAUGHT_ERROR_EXITS_NONZERO" $(( $(now_ms) - t0 ))
+
+# And it must STOP. Exception>>defaultAction ends in `Processor thisProcess
+# terminate`, and for the main process that means the program is over: the
+# statement after the error must not run. Exiting nonzero is not enough on its
+# own -- the count made the status nonzero while execution carried on, so the
+# signal expression answered the Error object and every send after it went to
+# the wrong receiver. That is the doesNotUnderstand cascade this checks against.
+#
+# It CANNOT be an ordinary test file: the process it is about is the one running
+# the test, and a file that proves this dies before it can report.
+t0=$(now_ms)
+out="$("$BUILD/st" -s "$SNAP" -e "nil zork. 'REACHED' printNl" </dev/null 2>&1)"
+case "$out" in *REACHED*) rc=1 ;; *) rc=0 ;; esac
+report_result "$rc" "TERMINATE_STOPS_THE_PROCESS" $(( $(now_ms) - t0 ))
+
+# And the pending cleanups on the way out must run, because
+# Block>>valueUnwindProtected: promises they do when "Process terminate" cuts
+# through the frame.
+#
+# ifCurtailed: AND NOT ensure:, and the difference is the whole check. ensure:
+# runs its block itself on the NORMAL path, so it prints either way and proves
+# nothing -- measured against the pre-fix VM, which printed it. ifCurtailed:
+# runs ONLY during an unwind, so it prints exactly when a terminate really
+# unwound through here. Same reason as above for it not being a test file: the
+# process being unwound is this one.
+t0=$(now_ms)
+out="$("$BUILD/st" -s "$SNAP" -e "[nil zork] ifCurtailed: ['CURTAILED' printNl]" \
+	</dev/null 2>&1)"
+case "$out" in *CURTAILED*) rc=0 ;; *) rc=1 ;; esac
+report_result "$rc" "TERMINATE_RUNS_PENDING_CLEANUPS" $(( $(now_ms) - t0 ))
 
 # Project tooling e2e gate: the whole st new/build/run/test flow against the
 # fresh image. Covers scaffold, build, the up-to-date fast path, staleness on
@@ -384,7 +433,13 @@ run_sandboxed_hammer() {
 [ "$RUN_TESTS" -eq 1 ] && run_group "tests" "$SNAP" tests/*.st
 [ "$RUN_TESTS" -eq 1 ] && run_package_tests
 [ "$RUN_TESTS" -eq 1 ] && run_sandboxed_hammer
-if [ "$RUN_SAMPLES" -eq 1 ]; then
+if [ "$RUN_SAMPLES" -eq 1 ] && [ "$SAMPLES_IMAGE_OK" -eq 0 ]; then
+	echo ""
+	echo "${Y}skipping the sample groups: the samples project image did not build${Z}"
+	echo "${D}  (counted once as SAMPLES_IMAGE above; running them here would report${Z}"
+	echo "${D}   71 failures with a single cause)${Z}"
+fi
+if [ "$RUN_SAMPLES" -eq 1 ] && [ "$SAMPLES_IMAGE_OK" -eq 1 ]; then
 	run_group "samples" "$DEVSNAP" samples/*.st
 	run_group "samples/advanced" "$DEVSNAP" samples/advanced/*.st
 	run_group "samples/concurrency" "$DEVSNAP" samples/concurrency/*.st

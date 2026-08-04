@@ -1,279 +1,99 @@
 #ifndef CLASS_H
 #define CLASS_H
 
+// Classes.
+//
+// A class is an ordinary movable object like any other. What is STABLE about it
+// is its index in the heap's class table (ADR 0005), and that is what generated
+// code bakes, what an inline cache compares, and what an object header carries.
+// Nothing outside this file should hold a RawClass* across an allocation.
+
+#include "core/ClassTable.h"
+#include "core/Handle.h"
 #include "core/Object.h"
-#include "core/Thread.h"
-#include "compiler/Parser.h"
-#include "runtime/Collection.h"
-#include "runtime/Dictionary.h"
 
-union CompiledMethod;
+// The class of any value, immediate or heap. The ONE place that knows tagged
+// immediates have classes too.
+RawClass *classOf(Value value);
 
-Object *buildClass(ClassNode *node);
-// Build into `ns` (NULL = DefaultNamespace): superclass and shape names
-// resolve through the namespace chain, methods compile with it, and the
-// class installs into the namespace's own bindings.
-Object *buildClassIn(ClassNode *node, Namespace *ns);
-// Remove a selector from a Class/MetaClass's own method dictionary under a
-// full send-cache invalidation; 0 when the selector is not defined there.
-_Bool classRemoveSelector(Object *holder, String *selector);
-union CompiledMethod *lookupSelector(Class *startClass, String *selector);
-void printClassName(RawClass *class);
-static RawClass *getClassOf(Value value);
-
-static void classSetMetaClass(Class *class, MetaClass *metaClass);
-static MetaClass *classGetMetaClass(Class *class);
-static void classSetSuperClass(Class *class, Class *superClass);
-static Class *classGetSuperClass(Class *class);
-static void classSetSubClasses(Class *class, OrderedCollection *subClasses);
-static OrderedCollection *classGetSubClasses(Class *class);
-static void classSetMethodDictionary(Class *class, Dictionary *dictionary);
-static Dictionary *classGetMethodDictionary(Class *class);
-static void classSetInstanceShape(Class *class, InstanceShape shape);
-static InstanceShape classGetInstanceShape(Class *class);
-static void classSetInstanceVariables(Class *class, Array *instVars);
-static Array *classGetInstanceVariables(Class *class);
-static void classSetName(Class *class, String *name);
-static String *classGetName(Class *class);
-static void classSetComment(Class *class, String *comment);
-static String *classGetComment(Class *class);
-static void classSetCategory(Class *class, String *category);
-static String *classGetCategory(Class *class);
-static void classSetClassVariables(Class *class, Dictionary *classVars);
-static Dictionary *classGetClassVariables(Class *class);
-
-static void metaClassSetInstanceClass(MetaClass *class, Class *instanceClass);
-static Class *metaClassGetInstanceClass(MetaClass *class);
-static void metaClassSetSuperClass(MetaClass *class, MetaClass *superClass);
-static MetaClass *metaClassGetSuperClass(MetaClass *class);
-static void metaClassSetSubClasses(MetaClass *class, OrderedCollection *subClasses);
-static OrderedCollection *metaClassGetSubClasses(MetaClass *class);
-static void metaClassSetInstanceShape(MetaClass *class, InstanceShape shape);
-static InstanceShape metaClassGetInstanceShape(MetaClass *class);
-static void metaClassSetInstanceVariables(MetaClass *class, Array *instVars);
-static Array *metaClassGetInstanceVariables(MetaClass *class);
-static void metaClassSetMethodDictionary(MetaClass *class, Dictionary *dictionary);
-static Dictionary *metaClassGetMethodDictionary(MetaClass *class);
-
-
-static RawClass *getClassOf(Value value)
+// The superclass, or NULL at the root of the chain.
+//
+// TWO values mean "no superclass", and they mean it in two different languages.
+// The allocator writes ZERO into a field nobody set, and across the VM that is
+// what ABSENT means (core/Object.h); but `Object := nil [ ... ]` DECLARES its
+// superclass to be nil, and nil is the only absent Smalltalk has, because
+// Smalltalk code walks the chain with `superClass == nil ifTrue:` and reads the
+// field as an ordinary instance variable.
+//
+// So both reach this field, and testing only `is it a pointer` accepts nil and
+// walks INTO the UndefinedObject instance as though it were a class. That is why
+// this is one function and not seven copies of a two-part condition.
+static inline RawClass *rawClassSuperclass(RawClass *class)
 {
-	switch (value & 3) {
-	case VALUE_INT:
-		return Handles.SmallInteger->raw;
-	case VALUE_CHAR:
-		return Handles.Character->raw;
-	case VALUE_FLOAT:
-		return Handles.SmallFloat64->raw;
-	case VALUE_POINTER:
-		return asObject(value)->class;
-	default:
-		return NULL;
+	Value super = class->superClass;
+	if (!valueTypeOf(super, VALUE_POINTER)) {
+		return NULL; // never set: the VM's own absent
 	}
+	RawObject *object = asObject(super);
+	return object == Handles.nil.raw ? NULL : (RawClass *) object;
 }
 
+// Just the index, which is what every fast path actually wants: for a heap
+// object it is a field read with no indirection at all.
+static inline uint32_t classIndexOfValue(Value value);
 
-static void classSetMetaClass(Class *class, MetaClass *metaClass)
-{
-	class->raw->class = (RawClass *) metaClass->raw;
-}
+// Create a class: allocates the object, assigns it a class-table index, and
+// records the shape it will stamp onto instances. `superclass` may be NULL for
+// the root.
+union String;
+Class *classCreate(Class *superclass, union String *name, InstanceShape shape);
 
+// Give the Smalltalk-only tagged fields of a class nil instead of the
+// allocator's zero. See the note at the definition for which fields, and for
+// the four that are deliberately left alone.
+void classFillAbsentSmalltalkFields(Class *class);
 
-static MetaClass *classGetMetaClass(Class *class)
-{
-	return (MetaClass *) scopeHandle(class->raw->class);
-}
+// How a class object describes ITSELF: the tagged fields, then a raw trailer.
+// Both numbers come from the C struct, so a field added to RawClass changes
+// them automatically instead of leaving every class one field short.
+#define CLASS_TAGGED_FIELDS 9
+#define CLASS_RAW_TRAILER_BYTES \
+	(sizeof(RawClass) - HEADER_SIZE - CLASS_TAGGED_FIELDS * sizeof(Value))
+#define CLASS_OF_CLASSES_SHAPE \
+	((InstanceShape) DEFINE_SHAPE(FORMAT_MIXED_BYTES, 0, CLASS_TAGGED_FIELDS, 0))
 
-
-static void classSetSuperClass(Class *class, Class *superClass)
-{
-	objectStorePtr((Object *) class,  &class->raw->superClass, (Object *) superClass);
-}
-
-
-static Class *classGetSuperClass(Class *class)
-{
-	return (Class *) scopeHandle(asObject(class->raw->superClass));
-}
-
-
-static void classSetSubClasses(Class *class, OrderedCollection *subClasses)
-{
-	objectStorePtr((Object *) class,  &class->raw->subClasses, (Object *) subClasses);
-}
-
-
-static OrderedCollection *classGetSubClasses(Class *class)
-{
-	return (OrderedCollection *) scopeHandle(asObject(class->raw->subClasses));
-}
-
-
-static void classSetMethodDictionary(Class *class, Dictionary *dictionary)
-{
-	objectStorePtr((Object *) class,  &class->raw->methodDictionary, (Object *) dictionary);
-}
-
-
-static Dictionary *classGetMethodDictionary(Class *class)
-{
-	return (Dictionary *) scopeHandle(asObject(class->raw->methodDictionary));
-}
-
-
-static void classSetInstanceShape(Class *class, InstanceShape shape)
-{
-	class->raw->instanceShape = shape;
-}
-
-
-static InstanceShape classGetInstanceShape(Class *class)
+// The shape a class stamps onto its instances.
+static inline InstanceShape classShape(Class *class)
 {
 	return class->raw->instanceShape;
 }
 
 
-static void classSetInstanceVariables(Class *class, Array *instVars)
+// The class index of an immediate, INDEXED BY ITS TAG. Resolved once at
+// bootstrap, because an immediate has no header to find it in.
+//
+// A TABLE AND NOT THREE NAMED FIELDS, because the inline cache the JIT emits
+// reads it too, and a shift plus a load is a sequence every backend can emit
+// while a three-way switch on the tag is not. The C path below reads the SAME
+// table: two halves answering "what class is this value" from two different
+// places is precisely the defect this VM keeps paying for.
+//
+// Entry VALUE_POINTER has no answer here and holds CLASS_INDEX_INVALID, so a
+// fast path that indexed it by mistake MISSES rather than matching some class.
+extern uint32_t gClassIndexByTag[4];
+
+// Fill the table. One call rather than three assignments at each of the places
+// that bootstrap a heap, so a tag added to the VM breaks one line and not five.
+void classSetImmediateIndices(uint32_t smallInteger, uint32_t character,
+	uint32_t smallFloat);
+
+
+static inline uint32_t classIndexOfValue(Value value)
 {
-	objectStorePtr((Object *) class,  &class->raw->instanceVariables, (Object *) instVars);
-}
-
-
-static Array *classGetInstanceVariables(Class *class)
-{
-	return (Array *) scopeHandle(asObject(class->raw->instanceVariables));
-}
-
-
-static void classSetName(Class *class, String *name)
-{
-	objectStorePtr((Object *) class,  &class->raw->name, (Object *) name);
-}
-
-
-static String *classGetName(Class *class)
-{
-	return (String *) scopeHandle(asObject(class->raw->name));
-}
-
-
-static void classSetComment(Class *class, String *comment)
-{
-	objectStorePtr((Object *) class,  &class->raw->comment, (Object *) comment);
-}
-
-
-static String *classGetComment(Class *class)
-{
-	return (String *) scopeHandle(asObject(class->raw->comment));
-}
-
-
-static void classSetCategory(Class *class, String *category)
-{
-	objectStorePtr((Object *) class,  &class->raw->category, (Object *) category);
-}
-
-
-static String *classGetCategory(Class *class)
-{
-	return (String *) scopeHandle(asObject(class->raw->category));
-}
-
-
-static void classSetClassVariables(Class *class, Dictionary *classVars)
-{
-	objectStorePtr((Object *) class,  &class->raw->classVariables, (Object *) classVars);
-}
-
-
-static Dictionary *classGetClassVariables(Class *class)
-{
-	return (Dictionary *) scopeHandle(asObject(class->raw->classVariables));
-}
-
-
-static void classSetNamespace(Class *class, Namespace *ns)
-{
-	objectStorePtr((Object *) class,  &class->raw->namespace, (Object *) ns);
-}
-
-
-static Namespace *classGetNamespace(Class *class)
-{
-	return (Namespace *) scopeHandle(asObject(class->raw->namespace));
-}
-
-
-static void metaClassSetInstanceClass(MetaClass *class, Class *instanceClass)
-{
-	objectStorePtr((Object *) class,  &class->raw->instanceClass, (Object *) instanceClass);
-}
-
-
-static Class *metaClassGetInstanceClass(MetaClass *class)
-{
-	return scopeHandle(asObject(class->raw->instanceClass));
-}
-
-
-static void metaClassSetSuperClass(MetaClass *class, MetaClass *superClass)
-{
-	objectStorePtr((Object *) class,  &class->raw->superClass, (Object *) superClass);
-}
-
-
-static MetaClass *metaClassGetSuperClass(MetaClass *class)
-{
-	return scopeHandle(asObject(class->raw->superClass));
-}
-
-
-static void metaClassSetSubClasses(MetaClass *class, OrderedCollection *subClasses)
-{
-	objectStorePtr((Object *) class,  &class->raw->subClasses, (Object *) subClasses);
-}
-
-
-static OrderedCollection *metaClassGetSubClasses(MetaClass *class)
-{
-	return scopeHandle(asObject(class->raw->subClasses));
-}
-
-
-static void metaClassSetInstanceShape(MetaClass *class, InstanceShape shape)
-{
-	class->raw->instanceShape = shape;
-}
-
-
-static InstanceShape metaClassGetInstanceShape(MetaClass *class)
-{
-	return class->raw->instanceShape;
-}
-
-
-static void metaClassSetInstanceVariables(MetaClass *class, Array *instVars)
-{
-	objectStorePtr((Object *) class,  &class->raw->instanceVariables, (Object *) instVars);
-}
-
-
-static Array *metaClassGetInstanceVariables(MetaClass *class)
-{
-	return scopeHandle(asObject(class->raw->instanceVariables));
-}
-
-
-static void metaClassSetMethodDictionary(MetaClass *class, Dictionary *dictionary)
-{
-	objectStorePtr((Object *) class,  &class->raw->methodDictionary, (Object *) dictionary);
-}
-
-
-static Dictionary *metaClassGetMethodDictionary(MetaClass *class)
-{
-	return scopeHandle(asObject(class->raw->methodDictionary));
+	Value tag = value & 3;
+	return tag == VALUE_POINTER
+		? rawObjectClassIndex(asObject(value))
+		: gClassIndexByTag[tag];
 }
 
 #endif

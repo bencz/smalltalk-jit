@@ -1,41 +1,88 @@
 CompiledCode := Object [
 
-	<shape: CompiledCodeShape>
+	"THE VM OWNS THIS LAYOUT (vm/jit/CompiledMethod.h). In jit-v2 a compiled
+	 method is three RAW words the collector must not follow, holding the
+	 bytecode size, the CodeUnit and the machine code, followed by the tagged
+	 fields declared in CompiledMethod. The old `header` word is gone: what it
+	 packed (argument and temporary counts, primitive number) lives in the
+	 CodeUnit, which is a C struct rather than a heap object."
 
-	| header |
+	<shape: CompiledMethodShape>
 
 
 	"accessing"
 
-	header [
-		^header
-	]
-
+	"WHAT THE OLD `header` WORD PACKED now lives in the CodeUnit, which is a C
+	 struct and not a heap object (vm/compiler/Bytecode.h), so each of these is
+	 a primitive where v1 had a field read. They accept a method or a block:
+	 the two are the same object with different classes and every question here
+	 is about the unit."
 
 	argumentsSize [
-		^(header bitShift: -6) bitAnd: 16rFF
+		<primitive: CodeArgumentCountPrimitive>
 	]
 
 
 	temporariesSize [
-		^(header bitShift: -14) bitAnd: 16rFF
+		"DERIVED FROM THE SOURCE, like `temporaries` and `arguments` below, and
+		 not from the register count: the frame also holds `self`, the captures
+		 and whatever scratch registers the emitter needed, and a method with no
+		 temporaries at all has several. What the question means is how many the
+		 programmer DECLARED."
+		^self temporaries size
 	]
 
 
 	hasContext [
-		^((header bitShift: -22) bitAnd: 16rFF) = 1
+		<primitive: CodeHasContextPrimitive>
 	]
 
 
 	outerReturns [
-		^((header bitShift: -36) bitAnd: 16rFF) = 1
+		<primitive: CodeOuterReturnsPrimitive>
 	]
 
 
 	primitive [
-		| primitive |
-		primitive := (header bitShift: -46) bitAnd: 16rFFFF.
-		^primitive = 0 ifTrue: [] ifFalse: [primitive - 1]
+		"The primitive NUMBER, or nil for a method that has none."
+		<primitive: CodePrimitiveNumberPrimitive>
+	]
+
+
+	literals [
+		<primitive: CodeLiteralsPrimitive>
+	]
+
+
+	descriptors [
+		<primitive: CodeDescriptorsPrimitive>
+	]
+
+
+	sourceCode [
+		"WHERE the text is, not the text: a SourceCode names a file (or a
+		 string) plus a position and a length, and `sourceContents` is what
+		 fetches it. That is what makes reflection over a method possible
+		 without keeping a parse tree alive."
+		<primitive: CodeSourcePrimitive>
+	]
+
+
+	header [
+		"THE OLD PACKED WORD, REBUILT from the parts that replaced it, because
+		 the image still asks for it. It is a DERIVED value now and not a field:
+		 argument count in the low byte, declared temporaries in the next, the
+		 primitive number above that, and the hasContext flag at the top. Zero
+		 for a method that takes nothing, declares nothing, has no primitive and
+		 is nobody's home, which is what the trivial case meant in v1 too."
+		| bits |
+
+		bits := self argumentsSize.
+		bits := bits bitOr: (self temporariesSize bitShift: 8).
+		self primitive ifNotNil: [ :number |
+			bits := bits bitOr: (number bitShift: 16) ].
+		self hasContext ifTrue: [ bits := bits bitOr: (1 bitShift: 30) ].
+		^bits
 	]
 
 
@@ -57,110 +104,11 @@ CompiledCode := Object [
 
 	"printing"
 
-	printInstructionsOn: aStream [
-		| insts |
-
-		insts := CollectionStream on: self.
-		[insts atEnd] whileFalse: [
-			aStream nextPut: $<.
-			insts position printOn: aStream.
-			aStream nextPut: $>; nextPut: Character tab.
-			self printInstruction: insts on: aStream].
-	]
-
-
-	printInstruction: anInstStream on: aStream [
-		| inst |
-
-		inst := anInstStream next.
-
-		inst = 0 ifTrue: [
-			aStream nextPutAll: 'copy: '.
-			self printOperand: anInstStream on: aStream.
-			aStream nextPutAll: ' to: '.
-			self printOperand: anInstStream on: aStream].
-
-		(inst = 1 or: [inst = 2]) ifTrue: [ | args |
-			aStream nextPutAll: 'send: '.
-			(self literals at: anInstStream next + 1) printOn: aStream.
-			args := anInstStream next.
-			aStream nextPutAll: ' to: '.
-			self printOperand: anInstStream on: aStream.
-			args timesRepeat: [
-				aStream nextPutAll: ' arg: '.
-				self printOperand: anInstStream on: aStream].
-			inst = 2 ifTrue: [
-				aStream nextPutAll: ' storeIn: '.
-				self printOperand: anInstStream on: aStream]].
-
-		inst = 3 ifTrue: [
-			aStream nextPutAll: 'return: '.
-			self printOperand: anInstStream on: aStream].
-
-		inst = 4 ifTrue: [
-			aStream nextPutAll: 'returnToOuter: '.
-			self printOperand: anInstStream on: aStream].
-
-		aStream lf.
-	]
-
-
-	printOperand: anInstStream on: aStream [
-		| operand |
-
-		operand := anInstStream next.
-		operand = 0 ifTrue: [
-			8 timesRepeat: [anInstStream next printOn: aStream].
-			^anInstStream].
-
-		operand = 1 ifTrue: [
-			^aStream nextPutAll: 'nil'].
-
-		operand = 2 ifTrue: [
-			^aStream nextPutAll: 'true'].
-
-		operand = 3 ifTrue: [
-			^aStream nextPutAll: 'false'].
-
-		operand = 4 ifTrue: [
-			^aStream nextPutAll: 'thisContext'].
-
-		operand = 5 ifTrue: [
-			aStream nextPutAll: 'tmp#'.
-			^anInstStream next printOn: aStream].
-
-		operand = 6 ifTrue: [ | index |
-			index := anInstStream next.
-			index = 1
-				ifTrue: [
-					aStream nextPutAll: 'self']
-				ifFalse: [
-					aStream nextPutAll: 'arg#'.
-					index - 1 printOn: aStream]].
-
-		operand = 7 ifTrue: [
-			^aStream nextPutAll: 'super'].
-
-		operand = 8 ifTrue: [
-			aStream nextPutAll: 'ctx#'.
-			anInstStream next printOn: aStream.
-			aStream nextPut: $[.
-			anInstStream next printOn: aStream.
-			^aStream nextPut: $]].
-
-		operand = 9 ifTrue: [
-			aStream nextPutAll: 'inst#'.
-			^anInstStream next printOn: aStream].
-
-		operand = 10 ifTrue: [
-			aStream nextPutAll: 'inst#'.
-			anInstStream next printOn: aStream,
-			aStream nextPutAll: 'of '.
-			^self printOperand: anInstStream on: aStream].
-
-		(operand = 11 or: [operand = 12 or: [operand = 13]]) ifTrue: [
-			(self literals at: anInstStream next + 1) printOn: aStream.
-			^anInstStream].
-	]
+	"THE DISASSEMBLER IS GONE, and not by accident: it decoded the v1 bytecode,
+	 instruction by instruction, and jit-v2's is a different language (fixed
+	 8-byte, register based, three address, docs/jit-v2/04-bytecode.md). Printing
+	 one of those lives in C for now (codeUnitPrint in vm/compiler/Compile.c);
+	 a Smalltalk one comes back when something needs it, written against the
+	 bytecode that actually exists."
 
 ]

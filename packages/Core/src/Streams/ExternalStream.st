@@ -29,6 +29,19 @@ ExternalStream := BufferedStream [
 	]
 
 
+	descriptor [
+		"The OS file descriptor this stream writes to and reads from.
+
+		 It exists because the REFLECTIVE PARSER needs it: Parser parseStream:
+		 keeps the stream, and the parse primitive resumes from wherever the last
+		 parse stopped, so the descriptor IS the parse position. Reaching into
+		 the slot from C instead would mean counting instance variables down four
+		 superclasses, which is the same 'two halves decoding one layout' mistake
+		 that has already cost this project three bugs."
+		^descriptor
+	]
+
+
 	createBuffer [
 		^String new: 2048
 	]

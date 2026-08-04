@@ -1,121 +1,193 @@
 #ifndef FIBER_H
 #define FIBER_H
 
+// Stackful coroutines: each fiber owns a real machine stack, so a Smalltalk
+// activation can be suspended anywhere without the VM having to reify it.
+//
+// Three properties of the old design are kept, and each for a reason that was
+// established rather than assumed:
+//
+//   * THE SWITCH ITSELF. Save the ABI's callee-saved set, swap the stack
+//     pointer, restore, return. Twenty instructions, forced by the ABI. There
+//     is no better version, only wrong ones.
+//   * FIBERS ARE PINNED to one worker. This was not a preference: migrating a
+//     fiber between OS threads corrupted the C unwinder, which was root-caused
+//     and closed by pinning.
+//   * STACKS GROW IN PLACE. The region is reserved untouched and only a window
+//     at the high end is committed; a fault below it grows the window down.
+//     100k fibers at a fixed 1MB each is not a thing you can map.
+//
+// What is NEW is the connection to the collector. A fiber's stack is where
+// native frames live, and every one of them has to be walkable with an EXACT
+// typed map (memory/Roots.h): pointer, raw f64, raw i64, dead. The old design
+// had a bitset of "slots to scan" and a collector that silently repaired what
+// disagreed with it. Nothing here repairs anything.
+
 #include "core/Object.h"
+#include "memory/Roots.h"
 #include <stddef.h>
 
-// ThreadSanitizer cannot follow user-level fiber context switches on its own: a fiber's
-// stack migrates across OS threads (park on one worker, resume on another), which
-// confuses TSan's per-OS-thread shadow stack and crashes it. TSan's fiber API annotates
-// each switch so it tracks the running stack correctly. Zero-cost in a normal build.
-#ifdef __SANITIZE_THREAD__
-#include <sanitizer/tsan_interface.h>
-#define TSAN_CREATE_FIBER()      __tsan_create_fiber(0)
-#define TSAN_DESTROY_FIBER(f)    __tsan_destroy_fiber(f)
-#define TSAN_SWITCH_TO_FIBER(f)  __tsan_switch_to_fiber((f), 0)
-#define TSAN_CURRENT_FIBER()     __tsan_get_current_fiber()
-#else
-#define TSAN_CREATE_FIBER()      NULL
-#define TSAN_DESTROY_FIBER(f)    ((void) (f))
-#define TSAN_SWITCH_TO_FIBER(f)  ((void) (f))
-#define TSAN_CURRENT_FIBER()     NULL
-#endif
-
 struct EntryStackFrame;
-struct Handle;
 struct HandleScope;
+struct Heap;
 
 typedef enum {
-	FIBER_READY,      // in the ready queue, waiting to run
-	FIBER_RUNNING,    // currently executing on some worker
-	FIBER_PARKING,    // transient: chose to yield/suspend, not yet switched off its
-	                  // worker's stack. NEVER observed at a GC safepoint (the park
-	                  // path is allocation-free), so it is not a scan state.
-	FIBER_SUSPENDED,  // parked (semaphore/timer/io), not in ready queue
-	FIBER_DONE        // finished, awaiting destruction
+	FIBER_READY,      // runnable, waiting its turn
+	FIBER_RUNNING,    // executing on its worker right now
+	FIBER_PARKING,    // chose to suspend, has not yet switched off its stack
+	FIBER_SUSPENDED,  // switched off, not runnable
+	FIBER_DONE,       // returned from its entry, stack reclaimable
 } FiberState;
 
-// What the scheduler run loop must do once a FIBER_PARKING fiber has fully switched
-// off its worker's stack (the "commit" happens on the scheduler stack, after the
-// context switch, so a peer worker can never pop-and-run the same stack mid-switch).
+// What the run loop must do once a FIBER_PARKING fiber has fully switched off
+// its worker's stack. The commit happens AFTER the switch, on the scheduler's
+// own stack, so a peer can never pop and run a stack that is still switching.
 typedef enum {
 	PARK_NONE = 0,
-	PARK_YIELD,    // re-queue at the back of the ready queue
-	PARK_SUSPEND   // park off the ready queue (unless a resume raced in: parkPending)
+	PARK_YIELD,   // back of the ready queue
+	PARK_SUSPEND, // off the ready queue entirely
 } ParkIntent;
 
-// The subset of VM execution state that is private to each fiber. The shared
-// isolate state (heap, persistent handle list) lives in CurrentThread and is
-// NOT duplicated here. These fields are kept in sync with CurrentThread /
-// CurrentExceptionHandler while the fiber runs; they hold the saved values
-// while it is suspended, and are the roots the GC walks for every fiber.
+// The slice of VM execution state that belongs to a fiber rather than to the
+// OS thread. These hold the live values while the fiber runs and the saved ones
+// while it is suspended, and they are roots in BOTH cases.
+struct CompiledFrameGuard;
+struct UnwindRecord;
+
 typedef struct FiberRoots {
-	struct EntryStackFrame *stackFramesTail;
+	struct EntryStackFrame *stackFramesTail; // native frame chain, the deep root set
 	struct HandleScope *handleScopes;
 	Value context;
 	Value exceptionHandler;
-	Value unwindHandler; // pending ensure:/ifCurtailed: chain (see Thread.h)
+	Value unwindHandler;
+
+	// The three chains core/Thread.h marked PENDING(fibers), moved here when the
+	// scheduler arrived. Every one of them is a list whose entries live on THIS
+	// fiber's C stack, so leaving them in the Thread across a switch would have
+	// the next fiber walking, popping and asserting on records that belong to a
+	// stack it is not standing on.
+	//
+	// It is not theoretical: the first version of the scheduler saved the five
+	// fields above and not these, and the compiled-frame guard's own
+	// `ASSERT(CurrentThread.compiledFrames == guard)` fired on the first fork.
+	struct CompiledFrameGuard *compiledFrames;
+	struct UnwindRecord *unwinds;
+	uint64_t homeToken;
+
+	// nextHomeToken is DELIBERATELY NOT HERE and stays in the Thread. It is a
+	// MINTER, and a token has to be unique across every fiber: two fibers each
+	// minting from their own counter would hand out the same number twice, and a
+	// non-local return carrying one would then match an activation in the wrong
+	// fiber. That is the "an address is reused, a counter is not" argument that
+	// put a token here in the first place (docs/jit-v2/01-gate.md).
 } FiberRoots;
 
-typedef void (*FiberCEntry)(void *arg);
+typedef void (*FiberEntry)(void *arg);
 
 typedef struct Fiber {
-	void *sp;               // saved stack pointer while not running
-	void *stackBase;        // mmap base (low end); NULL for the scheduler ctx
-	size_t stackSize;       // total mapped (reserved) size incl. the floor page
-	// In-place growable stack: the region is reserved PROT_NONE and only a small
-	// window at the high end is committed RW. `committedLow` is that window's low
-	// edge (moves DOWN as the SIGSEGV handler grows it); `reserveFloor` is the hard
-	// limit below which a fault is a genuine overflow, not a grow.
-	void *committedLow;
-	void *reserveFloor;
+	// Saved stack pointer while not running. The FIRST field on purpose: the
+	// switch reaches it with a zero displacement.
+	void *sp;
+
+	// The reservation, and the committed window inside it. `stackHigh` is the
+	// highest usable byte plus one; the window is [committedLow, stackHigh) and
+	// grows DOWNWARD. A fault below `floor` is a genuine overflow.
+	uint8_t *reservation;
+	size_t reservationSize;
+	uint8_t *stackHigh;
+	// VOLATILE, and this is load-bearing rather than defensive: the growth
+	// handler writes this field from a SIGNAL, asynchronously, while ordinary
+	// code is running. Without the qualifier the compiler is entitled to hoist
+	// the load out of any loop or call that "cannot" modify it, and then a
+	// reader sees the window it had before the stack grew. That is not a
+	// theoretical hazard: it is exactly what the fiber self-test caught, with
+	// a stack that had visibly grown to 488 KB still being reported as 16 KB.
+	uint8_t *volatile committedLow;
+	uint8_t *floor;
 
 	FiberState state;
-	// Park-handoff (multi-worker): set by the fiber under the scheduler lock before it
-	// switches off; read by the run loop's commit after the switch. `parkPending` is a
-	// wake that raced in while the fiber was still FIBER_PARKING — the commit re-queues
-	// instead of parking, so no wakeup is ever lost.
 	ParkIntent parkIntent;
-	_Bool parkPending;
-	int homeWorker; // the ONE worker this fiber runs on (pinned; assigned round-robin at spawn)
+	_Bool parkPending; // a wake raced in while this fiber was still PARKING
+	// Condemned: this fiber has been terminated by SOMEBODY ELSE and dies the
+	// next time it has the CPU. It is a bit here rather than something done to
+	// the fiber from outside because its pending `ensure:` cleanups belong to
+	// activations on THIS stack, and this stack is the only place they can run.
+	_Bool terminating;
+	int homeWorker;    // the ONE worker this fiber runs on; fibers do not migrate
+
 	FiberRoots roots;
 
-	Value entryBlock;       // Smalltalk block to run (nil for C-entry fibers), a GC root
-	Value process;          // the Smalltalk Process object, a GC root
-	FiberCEntry cEntry;     // C entry point (used for the main/program fiber)
+	Value entryBlock; // Smalltalk block to run, or nil for a C-entry fiber
+	Value process;    // the Smalltalk Process object
+	FiberEntry cEntry;
 	void *cArg;
 
-	size_t id;              // stable id, index into the scheduler fiber registry
-	int waitFd;             // fd this fiber is EPOLLONESHOT-armed on, or -1
-	struct Fiber *queueNext; // intrusive link for the ready queue / wait queues
-	// GC: a fiber is "dirty" (may hold a young root directly on its stack/handles)
-	// from when it is registered/run until a scavenge finds all its direct roots
-	// old. Only dirty fibers are walked by the scavenger; clean ones are covered
-	// by the remembered set. Linked into the scheduler's dirty list.
+	size_t id;
+	struct Fiber *queueNext; // ready/wait queue link, valid only when not running
+	// Who switched INTO this fiber. The trampoline of a finished fiber needs it
+	// to hand control back, and it is not the same as queueNext: a fiber can be
+	// resumed by a peer it never yielded to.
+	struct Fiber *resumer;
+	// A fiber is DIRTY from the moment it runs until a collection finds all of
+	// its direct roots old. Only dirty fibers need walking; the rest are covered
+	// by the remembered set.
 	_Bool dirty;
 	struct Fiber *dirtyNext;
 	struct Fiber *dirtyPrev;
-	void *tsanFiber;        // TSan fiber handle (NULL in a normal build; see Fiber.h top)
 } Fiber;
 
-// Low-level context switch + initial stack priming: CPU-specific, provided by
-// the backend selected at link time (vm/jit/<arch>/Fiber<Arch>.c).
-#include "jit/TargetFiber.h"
+// ---- the machine-level switch, one file per CPU ---------------------------
+//
+// Save the current context's callee-saved registers on its own stack, store the
+// resulting sp through `saveSp`, switch to `newSp`, restore that context's
+// registers and return into it.
+void fiberSwitchAsm(void **saveSp, void *newSp);
 
-// Allocate a fiber with its own stack, primed so that the first switch into it
-// begins executing fiberTrampoline (which calls fiberMain). Does not schedule it.
-Fiber *fiberCreate(size_t stackSize);
+// Prime a fresh stack so that the FIRST fiberSwitchAsm into the returned sp
+// pops a zeroed callee-saved frame and returns into `entry`, with whatever
+// entry alignment the ABI requires. `top` is the highest usable address and at
+// least one page below it is committed.
+void *fiberPrimeStack(void *top, void (*entry)(void));
+
+// ---- lifecycle -------------------------------------------------------------
+
+// Call once per OS thread before creating any fiber: caches the page size and
+// sets how much of a new stack is committed up front.
+void fiberInitStacks(size_t reservationBytes, size_t initialCommitBytes);
+
+Fiber *fiberCreate(FiberEntry entry, void *arg);
+// Bind this OS thread's own context to a Fiber, so the scheduler can switch
+// away from it with the same mechanism as everything else.
+void fiberAdoptCurrentStack(Fiber *fiber);
+// The fiber this OS thread is running right now.
+Fiber *fiberCurrent(void);
 void fiberDestroy(Fiber *fiber);
-void fiberReleaseIdleStack(Fiber *fiber); // madvise the dead stack region on park
-// Set the initial committed window (bytes) for new fiber stacks + cache the page
-// size. Call once per OS thread from schedulerInit before any fiber is created.
-void fiberInitStackGrowth(size_t initialCommitBytes);
-// Grow `fiber`'s committed window down to cover `faultAddr` (called from the
-// SIGSEGV handler). Returns 1 if it grew (retry the instruction), 0 if the fault
-// is outside the growable window / below the floor (a genuine fault).
-int fiberGrowStack(Fiber *fiber, uintptr_t faultAddr);
+// Hand the untouched part of a suspended fiber's stack back to the OS.
+void fiberReleaseIdleStack(Fiber *fiber);
 
-// The trampoline the freshly-created stack "returns" into on first switch.
-void fiberTrampoline(void);
+// Switch from `from` to `to`. Returns when someone switches back into `from`.
+void fiberSwitch(Fiber *from, Fiber *to);
+
+// Grow `fiber`'s committed window down to cover `faultAddress`. Returns 1 when
+// it grew (retry the faulting instruction), 0 when the address is outside the
+// growable window, which is a genuine fault and must not be swallowed.
+int fiberGrowStack(Fiber *fiber, uintptr_t faultAddress);
+
+// Install the fault handler that turns a stack-growth fault into a grow. One
+// per process.
+void fiberInstallGrowthHandler(void);
+
+// Is `address` inside this fiber's COMMITTED stack window? The collector uses
+// this to bound a frame walk: a frame pointer outside the window is not a
+// frame, and finding one is a bug in the frame chain, not something to skip.
+static inline _Bool fiberStackContains(Fiber *fiber, void *address)
+{
+	uint8_t *p = address;
+	return fiber->committedLow <= p && p < fiber->stackHigh;
+}
+
+// Walk one fiber's roots: its FiberRoots slots, then its native frames through
+// the engine's rootsVisitNativeFrames.
+void fiberVisitRoots(Fiber *fiber, RootVisitor visit, void *ctx);
 
 #endif

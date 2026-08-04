@@ -1,38 +1,45 @@
 #ifndef DICTIONARY_H
 #define DICTIONARY_H
 
+// Open-addressed dictionary: `contents` is an Array whose slots hold
+// Associations, `tally` counts the live ones. Linear probing, power-of-two
+// capacity, grown at three quarters full.
+//
+// Two flavours, and the difference is only which comparison and which hash:
+//
+//   SYMBOL   keys are interned Symbols, so the comparison is IDENTITY and the
+//            hash is the symbol's header hash. This is what a method dictionary
+//            is, and it is the lookup every send performs.
+//   STRING   keys are Strings compared by CONTENT, for the places that have not
+//            interned yet (the parser's tables, source-level lookups).
+
+#include "core/Handle.h"
 #include "core/Object.h"
 #include "runtime/Collection.h"
 #include "runtime/String.h"
 
 typedef struct {
 	OBJECT_HEADER;
-	Value contents;
-	Value tally;
+	Value contents; // Array of Association, nil in empty slots
+	Value tally;    // tagged SmallInteger: live associations
 } RawDictionary;
 OBJECT_HANDLE(Dictionary);
 
-typedef _Bool (*DictComparator)(Value, Value);
+Dictionary *newDictionary(size_t capacity);
+size_t dictSize(Dictionary *dictionary);
 
-Dictionary *newDictionary(size_t size);
-Array *dictGetContents(Dictionary *dict);
-size_t dictSize(Dictionary *dict);
-
-Association *dictAtPut(Dictionary *dict, DictComparator cmp, Object *key, Value hash, Value value);
-Association *dictAtPutObject(Dictionary *dict, DictComparator cmp, Object *key, Value hash, Object *value);
-Value dictAt(Dictionary *dict, DictComparator cmp, Value key, Value hash);
-Association *dictAssocAt(Dictionary *dict, DictComparator cmp, Value key, Value hash);
-
+// Symbol keys: identity comparison on interned Symbols.
 Association *symbolDictAtPut(Dictionary *dictionary, String *key, Value value);
-Association *symbolDictAtPutObject(Dictionary *dictionary, String *key, Object *object);
+Association *symbolDictAtPutObject(Dictionary *dictionary, String *key, Object *value);
 Value symbolDictAt(Dictionary *dictionary, String *key);
-Object *symbolDictObjectAt(Dictionary *dictionary, String *key);
 Association *symbolDictAssocAt(Dictionary *dictionary, String *key);
+// Answers whether there was a binding. The probe chain is REPAIRED, not left
+// with a hole in it; the reason that is not optional is at the definition.
+_Bool symbolDictRemove(Dictionary *dictionary, String *key);
 
+// String keys: content comparison, for keys not yet interned.
 Association *stringDictAtPut(Dictionary *dictionary, String *key, Value value);
-Association *stringDictAtPutObject(Dictionary *dictionary, String *key, Object *object);
 Value stringDictAt(Dictionary *dictionary, String *key);
-Object *stringDictObjectAt(Dictionary *dictionary, String *key);
 Association *stringDictAssocAt(Dictionary *dictionary, String *key);
 
 #endif

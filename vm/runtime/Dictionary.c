@@ -1,257 +1,294 @@
 #include "runtime/Dictionary.h"
-#include "core/Thread.h"
-#include "core/Smalltalk.h"
-#include "memory/Heap.h"
-#include "core/Handle.h"
-#include "runtime/Iterator.h"
-#include "core/Class.h"
 #include "core/Assert.h"
+#include "memory/Heap.h"
 
-static void growDictionary(Dictionary *dict);
-static Association *createAssoc(Object *key, Object *value);
-static size_t findIndex(RawArray *contents, DictComparator cmp, Value key, Value hash);
-static _Bool identityCmp(Value a, Value b);
-static _Bool stringCmp(Value a, Value b);
+#define DICT_MIN_CAPACITY 8
 
 
-Dictionary *newDictionary(size_t size)
+static size_t roundUpPowerOfTwo(size_t n)
 {
-	Dictionary *dict = newObject(Handles.Dictionary, 0);
-	// XXX: code bellow causes optimization bug in GCC:
-	// dict->raw->contents = tagPtr(allocateObject(CurrentThread.heap, Handles.Array->raw, size));
-	RawObject *contents = allocateObject(CurrentThread.heap, Handles.Array->raw, size);
-	rawObjectStorePtr((RawObject *) dict->raw, &dict->raw->contents, contents);
-	dict->raw->tally = 0;
-	return dict;
+	size_t capacity = DICT_MIN_CAPACITY;
+	while (capacity < n) {
+		capacity *= 2;
+	}
+	return capacity;
 }
 
 
-Array *dictGetContents(Dictionary *dict)
+Dictionary *newDictionary(size_t capacity)
 {
-	Array *contents = scopeHandle(asObject(dict->raw->contents));
-	ASSERT(contents->raw->class == Handles.Array->raw);
-	return contents;
+	HandleScope scope;
+	openHandleScope(&scope);
+
+	Dictionary *dictionary = newObject(&Handles.Dictionary, 0);
+	Array *contents = newArray(roundUpPowerOfTwo(capacity));
+	rawObjectStorePtr((RawObject *) dictionary->raw, &dictionary->raw->contents,
+		(RawObject *) contents->raw);
+	dictionary->raw->tally = tagInt(0);
+	return closeHandleScope(&scope, dictionary);
 }
 
 
-size_t dictSize(Dictionary *dict)
+size_t dictSize(Dictionary *dictionary)
 {
-	return asCInt(dict->raw->tally);
+	return (size_t) asCInt(dictionary->raw->tally);
 }
 
 
-Association *dictAtPut(Dictionary *dict, DictComparator cmp, Object *key, Value hash, Value value)
+// How a key is compared and hashed. The two flavours differ ONLY here, so the
+// probe loop below exists once.
+typedef _Bool (*KeyMatch)(RawObject *storedKey, RawString *key);
+
+
+static _Bool matchByIdentity(RawObject *storedKey, RawString *key)
 {
-	ASSERT(dict->raw->class == Handles.Dictionary->raw);
-	Array *contents = dictGetContents(dict);
-	ptrdiff_t index = findIndex(contents->raw, cmp, getTaggedPtr(key), hash);
-	Association *assoc = scopeHandle(asObject(contents->raw->vars[index]));
+	return storedKey == (RawObject *) key;
+}
 
-	if (isNil(assoc)) {
-		assoc = newObject(Handles.Association, 0);
-		objectStorePtr((Object *) assoc, &assoc->raw->key, key);
-		assoc->raw->value = value;
 
-		arrayAtPutObject(contents, index, (Object *) assoc);
-		dict->raw->tally += tagInt(1);
-		if (dictSize(dict) * 4 >= contents->raw->size * 3) {   // grow at 75% load
-			growDictionary(dict);
+static _Bool matchByContent(RawObject *storedKey, RawString *key)
+{
+	return rawStringEqualsBytes((RawString *) storedKey, key->contents,
+		rawStringSize(key));
+}
+
+
+// Find the slot a key belongs in: either the association already there, or the
+// first empty slot on its probe chain. Returns the index; `*found` says which.
+static size_t probe(RawArray *contents, RawString *key, uint32_t hash,
+	KeyMatch match, _Bool *found)
+{
+	size_t capacity = rawArraySize(contents);
+	size_t index = hash & (capacity - 1);
+	for (size_t step = 0; step < capacity; step++) {
+		Value slot = contents->vars[index];
+		if (slotIsEmpty(slot)) {
+			*found = 0;
+			return index;
 		}
+		RawAssociation *association = (RawAssociation *) asObject(slot);
+		if (match(asObject(association->key), key)) {
+			*found = 1;
+			return index;
+		}
+		index = (index + 1) & (capacity - 1);
+	}
+	FAIL(); // a dictionary kept below three quarters full always has a hole
+}
+
+
+static uint32_t keyHash(RawString *key, _Bool byIdentity)
+{
+	// For an interned Symbol the two are the SAME number by construction (see
+	// asSymbol), so this only matters for un-interned Strings.
+	return byIdentity ? rawObjectHash((RawObject *) key) : stringHash(key);
+}
+
+
+static void dictGrow(Dictionary *dictionary, _Bool byIdentity)
+{
+	HandleScope scope;
+	openHandleScope(&scope);
+
+	RawArray *old = (RawArray *) asObject(dictionary->raw->contents);
+	size_t oldCapacity = rawArraySize(old);
+	Array *fresh = newArray(oldCapacity * 2);
+
+	// Re-read after the allocation: `dictionary` may have moved.
+	old = (RawArray *) asObject(dictionary->raw->contents);
+	KeyMatch match = byIdentity ? matchByIdentity : matchByContent;
+	for (size_t i = 0; i < oldCapacity; i++) {
+		Value slot = old->vars[i];
+		if (slotIsEmpty(slot)) {
+			continue;
+		}
+		RawAssociation *association = (RawAssociation *) asObject(slot);
+		RawString *key = (RawString *) asObject(association->key);
+		_Bool found;
+		size_t index = probe(fresh->raw, key, keyHash(key, byIdentity), match, &found);
+		ASSERT(!found);
+		rawObjectStorePtr((RawObject *) fresh->raw, &fresh->raw->vars[index],
+			(RawObject *) association);
+	}
+	rawObjectStorePtr((RawObject *) dictionary->raw, &dictionary->raw->contents,
+		(RawObject *) fresh->raw);
+	closeHandleScope(&scope, NULL);
+}
+
+
+static Association *dictAtPut(Dictionary *dictionary, String *key, Value value,
+	Object *valueObject, _Bool byIdentity)
+{
+	HandleScope scope;
+	openHandleScope(&scope);
+
+	KeyMatch match = byIdentity ? matchByIdentity : matchByContent;
+	uint32_t hash = keyHash(key->raw, byIdentity);
+
+	_Bool found;
+	size_t index = probe((RawArray *) asObject(dictionary->raw->contents),
+		key->raw, hash, match, &found);
+	if (found) {
+		RawArray *contents = (RawArray *) asObject(dictionary->raw->contents);
+		RawAssociation *association =
+			(RawAssociation *) asObject(contents->vars[index]);
+		Value stored = valueObject != NULL ? tagPtr(valueObject->raw) : value;
+		if (valueTypeOf(stored, VALUE_POINTER)) {
+			rawObjectStorePtr((RawObject *) association, &association->value,
+				asObject(stored));
+		} else {
+			association->value = stored;
+		}
+		return closeHandleScope(&scope, scopeHandle(association));
+	}
+
+	// Grow BEFORE building the association, so the probe index computed above
+	// is not invalidated by a rehash between here and the store.
+	size_t tally = dictSize(dictionary) + 1;
+	if (tally * 4 >= rawArraySize((RawArray *) asObject(dictionary->raw->contents)) * 3) {
+		dictGrow(dictionary, byIdentity);
+	}
+
+	Association *association = newObject(&Handles.Association, 0);
+	rawObjectStorePtr((RawObject *) association->raw, &association->raw->key,
+		(RawObject *) key->raw);
+	Value stored = valueObject != NULL ? tagPtr(valueObject->raw) : value;
+	if (valueTypeOf(stored, VALUE_POINTER)) {
+		rawObjectStorePtr((RawObject *) association->raw, &association->raw->value,
+			asObject(stored));
 	} else {
-		ASSERT(assoc->raw->class == Handles.Association->raw);
-		assoc->raw->value = value;
+		association->raw->value = stored;
 	}
-	return assoc;
+
+	// Re-probe: the grow above rehashed, and allocating the association may
+	// have collected. Both invalidate an index computed earlier.
+	index = probe((RawArray *) asObject(dictionary->raw->contents),
+		key->raw, hash, match, &found);
+	ASSERT(!found);
+	RawArray *contents = (RawArray *) asObject(dictionary->raw->contents);
+	rawObjectStorePtr((RawObject *) contents, &contents->vars[index],
+		(RawObject *) association->raw);
+	dictionary->raw->tally = tagInt((intptr_t) tally);
+	return closeHandleScope(&scope, association);
 }
 
 
-Association *dictAtPutObject(Dictionary *dict, DictComparator cmp, Object *key, Value hash, Object *value)
+// Remove a key, answering whether there was one.
+//
+// BACKWARD-SHIFT DELETION, and it has to be. Probing is linear and it STOPS at
+// the first empty slot, so simply emptying a slot cuts every chain that ran
+// through it: an unrelated key whose home index is before the hole and whose
+// entry is after it becomes unfindable, while still occupying a slot. The
+// symptom is not "removal is broken", it is one method of a class disappearing
+// when a DIFFERENT one is removed, which is why the test for this removes a
+// selector and then looks for the ones it did not remove.
+//
+// The rule below is Knuth's: after emptying slot `hole`, walk forward, and move
+// any entry whose HOME index is not cyclically inside `(hole, cursor]` down into
+// the hole -- those are exactly the entries that were displaced past it.
+//
+// NOTHING ALLOCATES HERE, so no handle is needed and no collection can move the
+// contents array mid-shift.
+static _Bool dictRemove(Dictionary *dictionary, String *key, _Bool byIdentity)
 {
-	ASSERT(dict->raw->class == Handles.Dictionary->raw);
-	Array *contents = dictGetContents(dict);
-	ptrdiff_t index = findIndex(contents->raw, cmp, getTaggedPtr(key), hash);
-	Association *assoc = scopeHandle(asObject(contents->raw->vars[index]));
+	KeyMatch match = byIdentity ? matchByIdentity : matchByContent;
+	RawArray *contents = (RawArray *) asObject(dictionary->raw->contents);
+	_Bool found;
+	size_t hole = probe(contents, key->raw, keyHash(key->raw, byIdentity), match,
+		&found);
+	if (!found) {
+		return 0;
+	}
 
-	if (isNil(assoc)) {
-		assoc = createAssoc(key, value);
-		arrayAtPutObject(contents, index, (Object *) assoc);
-		dict->raw->tally += tagInt(1);
-		if (dictSize(dict) * 4 >= contents->raw->size * 3) {   // grow at 75% load
-			growDictionary(dict);
+	size_t capacity = rawArraySize(contents);
+	size_t mask = capacity - 1;
+	Value empty = tagPtr(Handles.nil.raw); // nil, the spelling Smalltalk reads
+	contents->vars[hole] = empty; // immortal, so no write barrier
+	for (size_t cursor = (hole + 1) & mask; ; cursor = (cursor + 1) & mask) {
+		Value slot = contents->vars[cursor];
+		if (slotIsEmpty(slot)) {
+			break;
 		}
-	} else {
-		ASSERT(assoc->raw->class == Handles.Association->raw);
-		objectStorePtr((Object *) assoc, &assoc->raw->value, value);
-	}
-	return assoc;
-}
-
-
-static void growDictionary(Dictionary *dict)
-{
-	Array *contents = scopeHandle((RawArray *) asObject(dict->raw->contents));
-	Array *newContents = newObject(Handles.Array, contents->raw->size * 2);
-
-	// Relocate the EXISTING association objects into the resized contents,
-	// preserving their object identity. The JIT bakes a fixed Association
-	// pointer into compiled code (OPERAND_ASSOC); reinserting via dictAtPut
-	// would allocate fresh associations and orphan those baked pointers, so a
-	// mutable global written through the new association would read nil through
-	// the stale one. Iterate by index (re-reading contents->raw) and allocate
-	// nothing in the loop so no scavenge can move `contents` mid-walk.
-	for (size_t i = 0; i < contents->raw->size; i++) {
-		HandleScope scope;
-		openHandleScope(&scope);
-
-		Association *assoc = scopeHandle(asObject(contents->raw->vars[i]));
-		if (!isNil(assoc) && assoc->raw->class == Handles.Association->raw) {
-			RawClass *keyClass = getClassOf(assoc->raw->key);
-			ptrdiff_t index;
-			if (keyClass == Handles.String->raw) {
-				index = findIndex(newContents->raw, &stringCmp, assoc->raw->key,
-					computeStringHash(scopeHandle(asObject(assoc->raw->key))));
-			} else if (keyClass == Handles.Symbol->raw) {
-				index = findIndex(newContents->raw, &identityCmp, assoc->raw->key,
-					objectGetHash(scopeHandle(asObject(assoc->raw->key))));
-			} else {
-				FAIL();
-			}
-			arrayAtPutObject(newContents, index, (Object *) assoc);
+		RawAssociation *association = (RawAssociation *) asObject(slot);
+		uint32_t hash = keyHash((RawString *) asObject(association->key), byIdentity);
+		size_t home = hash & mask;
+		// Is `home` cyclically within (hole, cursor]? If so the entry is on a
+		// chain that does not pass through the hole and must stay put.
+		_Bool wraps = cursor < hole;
+		_Bool stays = wraps ? (home > hole || home <= cursor)
+			: (home > hole && home <= cursor);
+		if (stays) {
+			continue;
 		}
-
-		closeHandleScope(&scope, NULL);
+		rawObjectStorePtr((RawObject *) contents, &contents->vars[hole],
+			(RawObject *) association);
+		contents->vars[cursor] = empty;
+		hole = cursor;
 	}
-
-	// Swap in the resized contents. `tally` is unchanged: the same entries were
-	// relocated, not reinserted.
-	objectStorePtr((Object *) dict, &dict->raw->contents, (Object *) newContents);
+	dictionary->raw->tally = tagInt((intptr_t) (dictSize(dictionary) - 1));
+	return 1;
 }
 
 
-static Association *createAssoc(Object *key, Object *value)
+_Bool symbolDictRemove(Dictionary *dictionary, String *key)
 {
-	Association *assoc = newObject(Handles.Association, 0);
-	objectStorePtr((Object *) assoc, &assoc->raw->key, key);
-	objectStorePtr((Object *) assoc, &assoc->raw->value, value);
-	return assoc;
+	return dictRemove(dictionary, key, 1);
 }
 
 
-Value dictAt(Dictionary *dict, DictComparator cmp, Value key, Value hash)
+static Association *dictAssocAt(Dictionary *dictionary, String *key, _Bool byIdentity)
 {
-	ASSERT(dict->raw->class == Handles.Dictionary->raw);
-	RawArray *contents = (RawArray *) asObject(dict->raw->contents);
-	ASSERT(contents->class == Handles.Array->raw);
-	ptrdiff_t index = findIndex(contents, cmp, key, hash);
-	RawAssociation *assoc = (RawAssociation *) asObject(contents->vars[index]);
-	if (isRawNil(assoc)) {
-		return getTaggedPtr(Handles.nil);
+	KeyMatch match = byIdentity ? matchByIdentity : matchByContent;
+	_Bool found;
+	RawArray *contents = (RawArray *) asObject(dictionary->raw->contents);
+	size_t index = probe(contents, key->raw, keyHash(key->raw, byIdentity),
+		match, &found);
+	if (!found) {
+		return NULL;
 	}
-	ASSERT(assoc->class == Handles.Association->raw);
-	return assoc->value;
-}
-
-
-Association *dictAssocAt(Dictionary *dict, DictComparator cmp, Value key, Value hash)
-{
-	ASSERT(dict->raw->class == Handles.Dictionary->raw);
-	RawArray *contents = (RawArray *) asObject(dict->raw->contents);
-	ASSERT(contents->class == Handles.Array->raw);
-	ptrdiff_t index = findIndex(contents, cmp, key, hash);
 	return scopeHandle(asObject(contents->vars[index]));
 }
 
 
-static _Bool identityCmp(Value a, Value b)
+Association *symbolDictAtPut(Dictionary *dictionary, String *key, Value value)
 {
-	return a == b;
+	return dictAtPut(dictionary, key, value, NULL, 1);
 }
 
 
-Association *symbolDictAtPut(Dictionary *dict, String *key, Value value)
+Association *symbolDictAtPutObject(Dictionary *dictionary, String *key, Object *value)
 {
-	ASSERT(key->raw->class == Handles.Symbol->raw);
-	return dictAtPut(dict, &identityCmp, (Object *) key, objectGetHash((Object *) key), value);
+	return dictAtPut(dictionary, key, 0, value, 1);
 }
 
 
-Association *symbolDictAtPutObject(Dictionary *dict, String *key, Object *value)
+Association *symbolDictAssocAt(Dictionary *dictionary, String *key)
 {
-	ASSERT(key->raw->class == Handles.Symbol->raw);
-	return dictAtPutObject(dict, &identityCmp, (Object *) key, objectGetHash((Object *) key), value);
+	return dictAssocAt(dictionary, key, 1);
 }
 
 
-Value symbolDictAt(Dictionary *dict, String *key)
+Value symbolDictAt(Dictionary *dictionary, String *key)
 {
-	ASSERT(key->raw->class == Handles.Symbol->raw);
-	return dictAt(dict, &identityCmp, getTaggedPtr(key), objectGetHash((Object *) key));
+	Association *association = dictAssocAt(dictionary, key, 1);
+	return association == NULL ? 0 : association->raw->value;
 }
 
 
-Object *symbolDictObjectAt(Dictionary *dict, String *key)
+Association *stringDictAtPut(Dictionary *dictionary, String *key, Value value)
 {
-	return scopeHandle(asObject(symbolDictAt(dict, key)));
+	return dictAtPut(dictionary, key, value, NULL, 0);
 }
 
 
-Association *symbolDictAssocAt(Dictionary *dict, String *key)
+Association *stringDictAssocAt(Dictionary *dictionary, String *key)
 {
-	ASSERT(key->raw->class == Handles.Symbol->raw);
-	return dictAssocAt(dict, &identityCmp, getTaggedPtr(key), objectGetHash((Object *) key));
+	return dictAssocAt(dictionary, key, 0);
 }
 
 
-static _Bool stringCmp(Value a, Value b)
+Value stringDictAt(Dictionary *dictionary, String *key)
 {
-	return stringEquals(scopeHandle(asObject(a)), scopeHandle(asObject(b)));
-}
-
-
-Association *stringDictAtPut(Dictionary *dict, String *key, Value value)
-{
-	ASSERT(key->raw->class == Handles.String->raw);
-	return dictAtPut(dict, &stringCmp, (Object *) key, computeStringHash(key), value);
-}
-
-
-Association *stringDictAtPutObject(Dictionary *dict, String *key, Object *value)
-{
-	ASSERT(key->raw->class == Handles.String->raw);
-	return dictAtPutObject(dict, &stringCmp, (Object *) key, computeStringHash(key), value);
-}
-
-
-Value stringDictAt(Dictionary *dict, String *key)
-{
-	ASSERT(key->raw->class == Handles.String->raw);
-	return dictAt(dict, &stringCmp, getTaggedPtr(key), computeStringHash(key));
-}
-
-
-Object *stringDictObjectAt(Dictionary *dict, String *key)
-{
-	return scopeHandle(asObject(stringDictAt(dict, key)));
-}
-
-
-Association *stringDictAssocAt(Dictionary *dict, String *key)
-{
-	ASSERT(key->raw->class == Handles.String->raw);
-	return dictAssocAt(dict, &stringCmp, getTaggedPtr(key), computeStringHash(key));
-}
-
-
-static size_t findIndex(RawArray *contents, DictComparator cmp, Value key, Value hash)
-{
-	RawAssociation *assoc;
-	ptrdiff_t index = hash & contents->size - 1;
-
-	do {
-		assoc = (RawAssociation *) asObject(contents->vars[index]);
-		if (isRawNil(assoc) || cmp(assoc->key, key)) {
-			return index;
-		}
-		index = index == contents->size - 1 ? 0 : index + 1;
-	} while (1);
+	Association *association = dictAssocAt(dictionary, key, 0);
+	return association == NULL ? 0 : association->raw->value;
 }

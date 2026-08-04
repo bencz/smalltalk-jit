@@ -1,0 +1,247 @@
+// Every primitive the kernel can name, and which of them the VM implements.
+//
+// THE NAMES ARE THE CONTRACT. packages/Core declares a primitive by pragma:
+//
+//     + aNumber [
+//         <primitive: IntAddPrimitive>
+//         ...the general case, in Smalltalk...
+//     ]
+//
+// so this list is not the VM's private numbering, it is the vocabulary the
+// image speaks. It was extracted from packages/ rather than invented: 173
+// distinct names in 186 declarations.
+//
+// ONE entry is not from packages/ and says so at its line: PrintValuePrimitive,
+// which is how the VM's BUILT-IN kernel shows a value before packages/Core
+// exists to be loaded. It is deliberately not wired into packages/Core, whose
+// printNl goes through Transcript and a buffered stream; a C primitive writing
+// straight to the descriptor would interleave with that buffer.
+//
+// An X-macro, included to build the enum, the table, and the DECLARATIONS of
+// the implementations, so a name and its implementation cannot drift apart. The
+// old VM kept a positional array whose comment said in capitals never to reorder
+// it; here the position is generated from the name.
+//
+// TWO MACROS, because the two states are different things and not one thing with
+// a null in it:
+//
+//   PRIMITIVE(id, "KernelName", implementation)
+//   PRIMITIVE_ABSENT(id, "KernelName")
+//
+// PRIMITIVE_ABSENT means DECLARED BY THE KERNEL, NOT IMPLEMENTED HERE. That is
+// not an error: the method still compiles, the primitive attempt is simply not
+// emitted, and the method runs the Smalltalk fallback it already carries. Which
+// is also how this file doubles as the parity checklist -- the count of
+// PRIMITIVE entries is the honest measure of how much of the kernel can run.
+//
+// It used to be one macro with NULL in the third column, and splitting it is
+// what lets runtime/primitives/Shared.h GENERATE the declaration of every
+// implementation from this same list: `Value NULL(Value *, uint64_t);` is not a
+// prototype, so as long as absence was spelled NULL the declarations had to be a
+// SECOND list of the same fact, maintained by hand beside this one. It also
+// makes absence a NAMED case rather than a null pointer the reader has to
+// interpret, which is the rule this VM already applies to an unknown shape.
+//
+// Every include site must define BOTH macros. Defining only one is a compile
+// error at the first line that uses the other, which is the intended behaviour:
+// a site that silently skipped the absent entries would renumber the enum.
+
+PRIMITIVE(ArrayEquals, "ArrayEqualsPrimitive", primArrayEquals)  // String>>= aCollection
+PRIMITIVE(At, "AtPrimitive", primAt)  // Object>>at: anInteger; Object>>basicAt: anInteger
+PRIMITIVE(AtPut, "AtPutPrimitive", primAtPut)  // Object>>at: anInteger put: anObject; Object>>basicAt: anInteger put: anObject
+PRIMITIVE(AtomicArrayAt, "AtomicArrayAtPrimitive", primAtomicArrayAt)  // AtomicArray>>at: i
+PRIMITIVE(AtomicArrayAtPut, "AtomicArrayAtPutPrimitive", primAtomicArrayAtPut)  // AtomicArray>>at: i put: aValue
+PRIMITIVE(AtomicArrayCompareAndSet, "AtomicArrayCompareAndSetPrimitive", primAtomicArrayCompareAndSet)  // AtomicArray>>at: i compareAndSet: expected with: newValue
+PRIMITIVE(AtomicArrayGetAndAdd, "AtomicArrayGetAndAddPrimitive", primAtomicArrayGetAndAdd)  // AtomicArray>>at: i getAndAdd: anInteger
+PRIMITIVE(AtomicArrayGetAndSet, "AtomicArrayGetAndSetPrimitive", primAtomicArrayGetAndSet)  // AtomicArray>>at: i getAndSet: aValue
+PRIMITIVE(AtomicCompareAndSet, "AtomicCompareAndSetPrimitive", primAtomicCompareAndSet)  // Atomic>>compareAndSet: expected with: newValue
+PRIMITIVE(AtomicGetAndAdd, "AtomicGetAndAddPrimitive", primAtomicGetAndAdd)  // AtomicInteger>>getAndAdd: anInteger
+PRIMITIVE(AtomicGetAndSet, "AtomicGetAndSetPrimitive", primAtomicGetAndSet)  // Atomic>>getAndSet: aValue
+PRIMITIVE(AtomicLoad, "AtomicLoadPrimitive", primAtomicLoad)  // Atomic>>get
+PRIMITIVE(AtomicStore, "AtomicStorePrimitive", primAtomicStore)  // Atomic>>set: aValue
+PRIMITIVE(Backtrace, "BacktracePrimitive", primPrintBacktrace)  // VMTools>>class backtrace
+PRIMITIVE(Base64DecodeBytes, "Base64DecodeBytesPrimitive", primBase64DecodeBytes)  // Base64>>class decodeBytes: aString
+PRIMITIVE(Base64Decode, "Base64DecodePrimitive", primBase64Decode)  // Base64>>class decode: aString
+PRIMITIVE(Base64Encode, "Base64EncodePrimitive", primBase64Encode)  // Base64>>class encode: aCollection
+PRIMITIVE(Become, "BecomePrimitive", primBecome)  // Object>>become: otherObject
+PRIMITIVE(BehaviorLookupSelector, "BehaviorLookupSelectorPrimitive", primLookupSelector)  // Behavior>>lookupSelector: aSymbol
+PRIMITIVE(BehaviorInstanceShape, "BehaviorInstanceShapePrimitive", primInstanceShape)  // Behavior>>instanceShape
+PRIMITIVE(BehaviorNew, "BehaviorNewPrimitive", primBasicNew)  // Behavior>>new; Behavior>>basicNew
+PRIMITIVE(BehaviorNewSize, "BehaviorNewSizePrimitive", primBasicNewSized)  // Behavior>>new: anInteger; Behavior>>basicNew: anInteger
+PRIMITIVE(BlockOnException, "BlockOnExceptionPrimitive", primBlockOnException)  // Block>>basicOn: anException do: aBlock
+PRIMITIVE(BlockUnwind, "BlockUnwindPrimitive", primBlockUnwindProtected)  // Block>>valueUnwindProtected: aBlock
+PRIMITIVE(BlockValueArgs, "BlockValueArgsPrimitive", primClosureValueArgs)  // Block>>valueWithArguments: anArray
+PRIMITIVE(BlockValue, "BlockValuePrimitive", primClosureValue)  // Block>>value
+PRIMITIVE(BlockValue1, "BlockValuePrimitive1", primClosureValue1)  // Block>>value: arg
+PRIMITIVE(BlockValue2, "BlockValuePrimitive2", primClosureValue2)  // Block>>value: arg1 value: arg2
+PRIMITIVE(BlockValue3, "BlockValuePrimitive3", primClosureValue3)  // Block>>value: arg1 value: arg2 value: arg3
+PRIMITIVE(BlockHomeContext, "BlockHomeContextPrimitive", primBlockHomeContext)  // Block>>homeContext
+PRIMITIVE(BlockOuterContext, "BlockOuterContextPrimitive", primBlockOuterContext)  // Block>>outerContext
+PRIMITIVE(BlockWhileTrue2, "BlockWhileTrue2Primitive", primBlockWhileTrue2)  // Block>>whileTrue: aBlock
+PRIMITIVE(BlockWhileTrue, "BlockWhileTruePrimitive", primBlockWhileTrue)  // Block>>whileTrue
+PRIMITIVE(BuildClassIn, "BuildClassInPrimitive", primBuildClassIn)  // Compiler>>basicBuildClass: aClassNode in: aNamespace
+PRIMITIVE(BuildClass, "BuildClassPrimitive", primBuildClass)  // Compiler>>basicBuildClass: aClassNode
+PRIMITIVE(CharacterCode, "CharacterCodePrimitive", primCharacterCode)  // Character>>codePoint
+PRIMITIVE(CharacterNew, "CharacterNewPrimitive", primCharacterNew)  // Character>>class codePoint: anInteger
+PRIMITIVE(Class, "ClassPrimitive", primClass)  // Object>>class
+PRIMITIVE(ClassRemoveSelector, "ClassRemoveSelectorPrimitive", primClassRemoveSelector)  // Behavior>>removeSelector: aSymbol
+PRIMITIVE(CommandLine, "CommandLinePrimitive", primCommandLine)  // System>>class primitiveCommandLine
+PRIMITIVE(CodeArgumentCount, "CodeArgumentCountPrimitive", primCodeArgumentCount)  // CompiledCode>>argumentsSize
+PRIMITIVE(CodeDescriptors, "CodeDescriptorsPrimitive", primCodeDescriptors)  // CompiledCode>>descriptors
+PRIMITIVE(CodeHasContext, "CodeHasContextPrimitive", primCodeHasContext)  // CompiledCode>>hasContext
+PRIMITIVE(CodeHomeMethod, "CodeHomeMethodPrimitive", primCodeHomeMethod)  // CompiledBlock>>method
+PRIMITIVE(CodeLiterals, "CodeLiteralsPrimitive", primCodeLiterals)  // CompiledCode>>literals
+PRIMITIVE(CodeOuterReturns, "CodeOuterReturnsPrimitive", primCodeOuterReturns)  // CompiledCode>>outerReturns
+PRIMITIVE(CodePrimitiveNumber, "CodePrimitiveNumberPrimitive", primCodePrimitiveNumber)  // CompiledCode>>primitive
+PRIMITIVE(CodeSource, "CodeSourcePrimitive", primCodeSource)  // CompiledCode>>sourceCode
+PRIMITIVE(BlockCode, "BlockCodePrimitive", primBlockCode)  // Block>>compiledBlock
+PRIMITIVE(CompileMethodIn, "CompileMethodInPrimitive", primCompileMethodIn)  // Compiler>>basicCompileMethod: aMethodNode in: aClass namespace: aNamespace
+PRIMITIVE(CompileMethod, "CompileMethodPrimitive", primCompileMethod)  // Compiler>>basicCompileMethod: aMethodNode in: aClass
+PRIMITIVE(ContextArgumentAt, "ContextArgumentAt", primContextArgumentAt)  // Context>>argumentAt: anInteger
+PRIMITIVE(ContextParent, "ContextParentPrimitive", primContextParent)  // Context>>parent
+PRIMITIVE(ContextPositionDescriptor, "ContextPositionDescriptorPrimitive", primContextPositionDescriptor)  // Context>>positionDescriptor
+PRIMITIVE(ContextTemporaryAt, "ContextTemporaryAt", primContextTemporaryAt)  // Context>>temporaryAt: anInteger
+PRIMITIVE(CpuCount, "CpuCountPrimitive", primCpuCount)  // System>>class primitiveCpuCount
+PRIMITIVE(CurrentMicroTime, "CurrentMicroTimePrimitive", primCurrentMicroTime)  // DateTime>>class currentMicroTime
+PRIMITIVE(DefaultNamespace, "DefaultNamespacePrimitive", primDefaultNamespace)  // Namespace>>class default
+PRIMITIVE(ExceptionSignal, "ExceptionSignal", primExceptionSignal)  // Exception>>basicSignal; HandlerEscape>>signal
+PRIMITIVE(ExecutablePath, "ExecutablePathPrimitive", primExecutablePath)  // System>>class executablePath
+PRIMITIVE(ExitWithCode, "ExitWithCodePrimitive", primExitWithCode)  // System>>class primitiveExit: anInteger
+PRIMITIVE(FileChdir, "FileChdirPrimitive", primFileChdir)  // System>>class primitiveChdir: aString
+PRIMITIVE(FileGetCwd, "FileGetCwdPrimitive", primFileGetCwd)  // Directory>>class getCwd; System>>class primitiveGetCwd
+PRIMITIVE(FileListDir, "FileListDirPrimitive", primFileListDir)  // Directory>>class listDirPath: aString
+PRIMITIVE(FileMkdir, "FileMkdirPrimitive", primFileMkdir)  // Directory>>class mkdirPath: aString
+PRIMITIVE(FileRealpath, "FileRealpathPrimitive", primFileRealpath)  // File>>class realpath: aPath
+PRIMITIVE(FileRename, "FileRenamePrimitive", primFileRename)  // File>>class renamePath: fromString to: toString
+PRIMITIVE(FileRmdir, "FileRmdirPrimitive", primFileRmdir)  // Directory>>class rmdirPath: aString
+PRIMITIVE(FileStat, "FileStatPrimitive", primFileStat)  // Directory>>class statPath: aString; File>>class statPath: aString
+PRIMITIVE(FileUnlink, "FileUnlinkPrimitive", primFileUnlink)  // File>>class unlinkPath: aString
+PRIMITIVE(FloatAdd, "FloatAddPrimitive", primAdd)  // Float>>+ aNumber
+PRIMITIVE(FloatArcCos, "FloatArcCosPrimitive", primFloatArcCos)  // Float>>arcCos
+PRIMITIVE(FloatArcSin, "FloatArcSinPrimitive", primFloatArcSin)  // Float>>arcSin
+PRIMITIVE(FloatArcTan2, "FloatArcTan2Primitive", primFloatArcTan2)  // Float>>arcTan: aNumber
+PRIMITIVE(FloatArcTan, "FloatArcTanPrimitive", primFloatArcTan)  // Float>>arcTan
+PRIMITIVE(FloatArrayAt, "FloatArrayAtPrimitive", primFloatArrayAt)  // FloatArray>>at: index
+PRIMITIVE(FloatArrayAtPut, "FloatArrayAtPutPrimitive", primFloatArrayAtPut)  // FloatArray>>at: index put: aNumber
+PRIMITIVE(FloatArrayBinary, "FloatArrayBinaryPrimitive", primFloatArrayBinary)  // FloatArray>>primBinary: other into: result op: opcode
+PRIMITIVE(FloatArrayDot, "FloatArrayDotPrimitive", primFloatArrayDot)  // FloatArray>>dot: aFloatArray
+PRIMITIVE(FloatArrayFill, "FloatArrayFillPrimitive", primFloatArrayFill)  // FloatArray>>atAllPut: aNumber
+PRIMITIVE(FloatArrayReduce, "FloatArrayReducePrimitive", primFloatArrayReduce)  // FloatArray>>primReduce: opcode
+PRIMITIVE(FloatArrayScalar, "FloatArrayScalarPrimitive", primFloatArrayScalar)  // FloatArray>>primScalar: scalar into: result op: opcode
+PRIMITIVE(FloatAsString, "FloatAsStringPrimitive", primFloatAsString)  // Float>>printString
+PRIMITIVE(FloatCeiling, "FloatCeilingPrimitive", primFloatCeiling)  // Float>>ceiling
+PRIMITIVE(FloatCos, "FloatCosPrimitive", primFloatCos)  // Float>>cos
+PRIMITIVE(FloatDiv, "FloatDivPrimitive", primDivide)  // Float>>/ aNumber
+PRIMITIVE(FloatEquals, "FloatEqualsPrimitive", primNumericEqual)  // Float>>= aNumber
+PRIMITIVE(FloatGreaterEquals, "FloatGreaterEqualsPrimitive", primGreaterEqual)  // Float>>>= aNumber
+PRIMITIVE(FloatGreaterThan, "FloatGreaterThanPrimitive", primGreater)  // Float>>> aNumber
+PRIMITIVE(FloatExp, "FloatExpPrimitive", primFloatExp)  // Float>>exp
+PRIMITIVE(FloatExponent, "FloatExponentPrimitive", primFloatExponent)  // Float>>exponent
+PRIMITIVE(FloatFloor, "FloatFloorPrimitive", primFloatFloor)  // Float>>floor
+PRIMITIVE(FloatLessThan, "FloatLessThanPrimitive", primLess)  // Float>>< aNumber
+PRIMITIVE(FloatLessEquals, "FloatLessEqualsPrimitive", primLessEqual)  // Float>><= aNumber
+PRIMITIVE(FloatLn, "FloatLnPrimitive", primFloatLn)  // Float>>ln
+PRIMITIVE(FloatMul, "FloatMulPrimitive", primMultiply)  // Float>>* aNumber
+PRIMITIVE(FloatNotEquals, "FloatNotEqualsPrimitive", primNumericNotEqual)  // Float>>~= aNumber
+PRIMITIVE(FloatRounded, "FloatRoundedPrimitive", primFloatRounded)  // Float>>rounded
+PRIMITIVE(FloatSin, "FloatSinPrimitive", primFloatSin)  // Float>>sin
+PRIMITIVE(FloatSqrt, "FloatSqrtPrimitive", primFloatSqrt)  // Float>>sqrt
+PRIMITIVE(FloatSub, "FloatSubPrimitive", primSubtract)  // Float>>- aNumber
+PRIMITIVE(FloatTan, "FloatTanPrimitive", primFloatTan)  // Float>>tan
+PRIMITIVE(FloatTimesTwoPower, "FloatTimesTwoPowerPrimitive", primFloatTimesTwoPower)  // Float>>timesTwoPower: anInteger
+PRIMITIVE(FloatTruncated, "FloatTruncatedPrimitive", primFloatTruncated)  // Float>>truncated
+PRIMITIVE(FlushSendCaches, "FlushSendCachesPrimitive", primFlushSendCaches)  // System>>class flushSendCaches
+PRIMITIVE(GC, "GCPrimitive", primCollectGarbage)  // GarbageCollector>>class collectGarbage
+PRIMITIVE(GetEnv, "GetEnvPrimitive", primGetEnv)  // System>>class primitiveGetEnv: aString
+PRIMITIVE(Hash, "HashPrimitive", primIdentityHash)  // Symbol>>hash; Object>>hash
+PRIMITIVE(Identity, "IdentityPrimitive", primIdentical)  // Object>>= anObject; Object>>== anObject
+PRIMITIVE(IndexOfByte, "IndexOfBytePrimitive", primIndexOfByte)  // String>>indexOfByte: anInteger startingAt: start
+PRIMITIVE(InstVarAt, "InstVarAtPrimitive", primInstVarAt)  // Object>>instVarAt: anInteger
+PRIMITIVE(InstVarAtPut, "InstVarAtPutPrimitive", primInstVarAtPut)  // Object>>instVarAt: anInteger put: anObject
+PRIMITIVE(IntAdd, "IntAddPrimitive", primAdd)  // SmallInteger>>+ aNumber
+PRIMITIVE(IntAnd, "IntAndPrimitive", primBitAnd)  // SmallInteger>>bitAnd: anInteger
+PRIMITIVE(IntAsFloat, "IntAsFloatPrimitive", primAsFloat)  // SmallInteger>>asFloat
+PRIMITIVE(IntAsStringBase, "IntAsStringBasePrimitive", primIntAsStringBase)  // SmallInteger>>printStringBase: base
+PRIMITIVE(IntEquals, "IntEqualsPrimitive", primNumericEqual)  // SmallInteger>>= aNumber
+PRIMITIVE(IntGreaterEquals, "IntGreaterEqualsPrimitive", primGreaterEqual)  // SmallInteger>>>= aNumber
+PRIMITIVE(IntGreaterThan, "IntGreaterThanPrimitive", primGreater)  // SmallInteger>>> aNumber
+PRIMITIVE(IntFloorDiv, "IntFloorDivPrimitive", primFloorDivide)  // SmallInteger>>// aNumber
+PRIMITIVE(IntLessThan, "IntLessThanPrimitive", primLess)  // SmallInteger>>< aNumber
+PRIMITIVE(IntLessEquals, "IntLessEqualsPrimitive", primLessEqual)  // SmallInteger>><= aNumber
+PRIMITIVE(IntMod, "IntModPrimitive", primFloorModulo)  // SmallInteger>>\\ aNumber
+PRIMITIVE(IntMul, "IntMulPrimitive", primMultiply)  // SmallInteger>>* aNumber
+PRIMITIVE(IntNeg, "IntNegPrimitive", primNegated)  // SmallInteger>>negated
+PRIMITIVE(IntNotEquals, "IntNotEqualsPrimitive", primNumericNotEqual)  // SmallInteger>>~= aNumber
+PRIMITIVE(IntOr, "IntOrPrimitive", primBitOr)  // SmallInteger>>bitOr: anInteger
+PRIMITIVE(IntQuo, "IntQuoPrimitive", primQuotient)  // SmallInteger>>quo: aNumber
+PRIMITIVE(IntRem, "IntRemPrimitive", primRemainder)  // SmallInteger>>rem: aNumber
+PRIMITIVE(IntShift, "IntShiftPrimitive", primBitShift)  // SmallInteger>>bitShift: anInteger
+PRIMITIVE(IntSub, "IntSubPrimitive", primSubtract)  // SmallInteger>>- aNumber
+PRIMITIVE(IntXor, "IntXorPrimitive", primBitXor)  // SmallInteger>>bitXor: anInteger
+PRIMITIVE(InstrumentMark, "InstrumentMarkPrimitive", primInstrumentMark)  // benchmarks/Vec3Boxed.st: region bracketing over the execution counters (core/Instrument.h)
+PRIMITIVE(InstrumentReport, "InstrumentReportPrimitive", primInstrumentReport)  // the same; on a build without -DST_INSTRUMENT=1 the report prints that the counters are unavailable
+PRIMITIVE(Interrupt, "InterruptPrimitive", primInterrupt)  // Debugger>>class break: native breakpoint when a debugger is attached, a note otherwise
+PRIMITIVE(JsonEncode, "JsonEncodePrimitive", primJsonEncode)  // JsonError>>class encode: anObject; JsonError>>class primEncode: anObject
+PRIMITIVE(JsonParse, "JsonParsePrimitive", primJsonParse)  // JsonError>>class parse: aString
+PRIMITIVE(LargeIntAsFloat, "LargeIntAsFloatPrimitive", primLargeIntAsFloat)  // LargeInteger>>primAsFloatWithClasses: classPair
+PRIMITIVE(LargeIntBinary, "LargeIntBinaryPrimitive", primLargeIntBinary)  // Integer>>primLargeWith: aNumber op: opcode classes: classPair
+PRIMITIVE(LargeIntCompare, "LargeIntComparePrimitive", primLargeIntCompare)  // Integer>>primLargeCompareWith: aNumber classes: classPair
+PRIMITIVE(LargeIntFromString, "LargeIntFromStringPrimitive", primLargeIntFromString)  // String>>largeIntegerBase: anInteger negative: aBoolean classes: classPair
+PRIMITIVE(LargeIntPrintString, "LargeIntPrintStringPrimitive", primLargeIntPrintString)  // LargeInteger>>digitsStringBase: anInteger
+PRIMITIVE(LargeIntShift, "LargeIntShiftPrimitive", primLargeIntShift)  // Integer>>primLargeShift: anInteger classes: classPair
+PRIMITIVE(LastGCStats, "LastGCStatsPrimitive", primLastGCStats)  // GarbageCollector>>class lastStats
+PRIMITIVE(LastIoError, "LastIoErrorPrimitive", primLastIoError)  // IoError>>class last
+PRIMITIVE(LocalUtcOffset, "LocalUtcOffsetPrimitive", primLocalUtcOffset)  // DateTime>>class localUtcOffsetAt: epochSeconds
+PRIMITIVE(MemoryReleaseFence, "MemoryReleaseFencePrimitive", primMemoryReleaseFence)  // Atomic>>class releaseFence
+PRIMITIVE(MethodSendArgs, "MethodSendArgsPrimitive", primMethodSendArgs)  // CompiledMethod>>sendTo: anObject withArguments: anArray
+PRIMITIVE(MethodSend, "MethodSendPrimitive", primMethodSend)  // CompiledMethod>>sendTo: anObject
+PRIMITIVE(MonitorEnterOn, "MonitorEnterOnPrimitive", primMonitorEnterOn)  // ProcessorScheduler>>monitorEnterOn: anObject
+PRIMITIVE(MonitorEnter, "MonitorEnterPrimitive", primMonitorEnter)  // ProcessorScheduler>>monitorEnter
+PRIMITIVE(MonitorExit, "MonitorExitPrimitive", primMonitorExit)  // ProcessorScheduler>>monitorExit
+PRIMITIVE(MonitorPark, "MonitorParkPrimitive", primMonitorPark)  // ProcessorScheduler>>parkOnMonitor
+PRIMITIVE(MonotonicNanoTime, "MonotonicNanoTimePrimitive", primMonotonicNanos)  // Stopwatch>>class monotonicNanos; System>>class primitiveMonotonicNanos
+PRIMITIVE(ParseClass, "ParseClassPrimitive", primParseClass)  // Parser>>basicParseClass
+PRIMITIVE(ParseMethodOrBlock, "ParseMethodOrBlockPrimitive", primParseMethodOrBlock)  // Parser>>basicParseMethodOrBlock
+PRIMITIVE(ParseMethod, "ParseMethodPrimitive", primParseMethod)  // Parser>>basicParseMethod
+PRIMITIVE(PrintHeap, "PrintHeapPrimitive", primPrintHeap)  // GarbageCollector>>class printHeap
+PRIMITIVE(PrintValue, "PrintValuePrimitive", primPrintValue)  // the BUILT-IN kernel's Object>>printNl, see the note at the top
+PRIMITIVE(ProcessCurrentId, "ProcessCurrentIdPrimitive", primProcessCurrentId)  // ProcessorScheduler>>currentId
+PRIMITIVE(ProcessResume, "ProcessResumePrimitive", primProcessResume)  // ProcessorScheduler>>resumeId: anId
+PRIMITIVE(ProcessSleep, "ProcessSleepPrimitive", primProcessSleep)  // ProcessorScheduler>>sleepMicroseconds: micros
+PRIMITIVE(ProcessSpawn, "ProcessSpawnPrimitive", primProcessSpawn)  // Block>>basicSpawn
+PRIMITIVE(ProcessSuspend, "ProcessSuspendPrimitive", primProcessSuspend)  // ProcessorScheduler>>suspendCurrent
+PRIMITIVE(ProcessTerminate, "ProcessTerminatePrimitive", primProcessTerminate)  // ProcessorScheduler>>terminateId: anId
+PRIMITIVE(ProcessYield, "ProcessYieldPrimitive", primProcessYield)  // ProcessorScheduler>>yield
+PRIMITIVE(RandomBytes, "RandomBytesPrimitive", primRandomBytes)  // Random>>primitiveRandomBytes: aByteArray; System>>class primitiveRandomBytes: aByteArray
+PRIMITIVE(ReplaceBytes, "ReplaceBytesPrimitive", primReplaceBytes)  // SequenceableCollection>>replaceFrom: start to: stop with: replacement startingAt: repStart
+PRIMITIVE(SetDefaultNamespace, "SetDefaultNamespacePrimitive", primSetDefaultNamespace)  // Namespace>>class default: aNamespace
+PRIMITIVE(Size, "SizePrimitive", primBasicSize)  // Object>>size; Object>>basicSize
+PRIMITIVE(SocketAccept, "SocketAcceptPrimitive", primSocketAccept)  // ServerSocket>>basicAccept
+PRIMITIVE(SocketBind, "SocketBindPrimitive", primSocketBind)  // ServerSocket>>class bind: address port: port queueSize: queueSize
+PRIMITIVE(SocketConnect, "SocketConnectPrimitive", primSocketConnect)  // Socket>>class connect: address port: port
+PRIMITIVE(SocketHostLookup, "SocketHostLookup", primSocketHostLookup)  // InternetAddress>>class lookup: aString
+PRIMITIVE(SocketRead, "SocketReadPrimitive", primSocketRead)  // Socket>>class read: descriptor into: aString size: anInteger startingAt: start
+PRIMITIVE(SocketSetNoDelay, "SocketSetNoDelayPrimitive", primSocketSetNoDelay)  // Socket>>class setNoDelay: descriptor
+PRIMITIVE(SocketWrite, "SocketWritePrimitive", primSocketWrite)  // Socket>>class write: descriptor from: aString size: anInteger
+PRIMITIVE(StreamAvailable, "StreamAvailablePrimitive", primStreamAvailable)  // ExternalStream>>class available: descriptor
+PRIMITIVE(StreamClose, "StreamClosePrimitive", primStreamClose)  // ExternalStream>>class close: descriptor
+PRIMITIVE(StreamFlush, "StreamFlushPrimitive", primStreamFlush)  // ExternalStream>>class flush: descriptor
+PRIMITIVE(StreamGetPosition, "StreamGetPositionPrimitive", primStreamGetPosition)  // ExternalStream>>class position: descriptor
+PRIMITIVE(StreamOpen, "StreamOpenPrimitive", primStreamOpen)  // FileStream>>class open: aString mode: anInteger
+PRIMITIVE(StreamRead, "StreamReadPrimitive", primStreamRead)  // ExternalStream>>class read: descriptor next: anInteger into: aString startingAt: start
+PRIMITIVE(StreamSetPosition, "StreamSetPositionPrimitive", primStreamSetPosition)  // ExternalStream>>class position: descriptor to: anInteger
+PRIMITIVE(StreamWrite, "StreamWritePrimitive", primStreamWrite)  // ExternalStream>>class write: descriptor next: anInteger from: aString
+PRIMITIVE(StringAsSymbol, "StringAsSymbolPrimitive", primStringAsSymbol)  // String>>asSymbol
+PRIMITIVE(StringAsciiCaseEquals, "StringAsciiCaseEqualsPrimitive", primStringAsciiCaseEquals)  // String>>sameAsciiCaseAs: aString
+PRIMITIVE(StringAsciiLowercase, "StringAsciiLowercasePrimitive", primStringAsciiLowercase)  // String>>asLowercase
+PRIMITIVE(StringAsciiUppercase, "StringAsciiUppercasePrimitive", primStringAsciiUppercase)  // String>>asUppercase
+PRIMITIVE(StringCopyFromTo, "StringCopyFromToPrimitive", primStringCopyFromTo)  // SequenceableCollection>>copyFrom: start to: stop
+PRIMITIVE(StringHash, "StringHashPrimitive", primStringHash)  // String>>hash
+PRIMITIVE(StringSplitBy, "StringSplitByPrimitive", primStringSplitBy)  // SequenceableCollection>>splitBy: anObject
+PRIMITIVE(StringStartsWithAsciiCase, "StringStartsWithAsciiCasePrimitive", primStringStartsWithAsciiCase)  // String>>startsWithAsciiCase: aPrefix
+PRIMITIVE(StringToInteger, "StringToIntegerPrimitive", primStringToInteger)  // String>>asNumber
+PRIMITIVE(StringTrimSeparators, "StringTrimSeparatorsPrimitive", primStringTrimSeparators)  // String>>trimSeparators
+PRIMITIVE(ThisContext, "ThisContextPrimitive", primThisContext)  // Object>>thisContext (the compiler rewrites the pseudo-variable into this send)
+PRIMITIVE(UnhandledErrorNote, "UnhandledErrorNotePrimitive", primUnhandledErrorNote)  // Exception>>noteUnhandled
+PRIMITIVE(UnhandledErrorTake, "UnhandledErrorTakePrimitive", primUnhandledErrorTake)  // ProcessorScheduler>>takeUnhandledErrorCount
+PRIMITIVE(WorkerParallel, "WorkerParallelPrimitive", primWorkerParallel)  // Worker>>class parallel: anArrayOfBlocks

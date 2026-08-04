@@ -49,6 +49,17 @@ True := Boolean [
 	]
 
 
+	"controlling, the cold arm"
+
+	mustBeBoolean [
+		"An inlined conditional reached its cold arm with this receiver, which
+		 means the receiver is not the `true` singleton. It is still an instance
+		 of True, so it stands for true, and the singleton is what the branch
+		 above can test by identity."
+		^true
+	]
+
+
 	"printing"
 
 	printOn: aStream [
