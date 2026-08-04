@@ -7,6 +7,7 @@
 #include "runtime/String.h"
 #include "jit/Jit.h"
 #include "os/Os.h"
+#include "core/Instrument.h"
 #include "runtime/Collection.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -127,6 +128,51 @@ Value primPrintBacktrace(Value *args, uint64_t argc)
 		return PRIMITIVE_FAILED;
 	}
 	jitPrintBacktrace(stderr);
+	return primitiveReceiver(args);
+}
+
+
+// Debugger>>class break
+//
+// A NATIVE breakpoint, for the developer already sitting in gdb: the process
+// stops here and every frame below is the program that asked. With no
+// debugger attached it says so and keeps running, because an unhandled
+// SIGTRAP would kill the process and "break" does not mean "die".
+Value primInterrupt(Value *args, uint64_t argc)
+{
+	if (argc != 0) {
+		return PRIMITIVE_FAILED;
+	}
+	if (!osDebugBreak()) {
+		fprintf(stderr, "Debugger break: no debugger attached, continuing\n");
+	}
+	return primitiveReceiver(args);
+}
+
+
+// Instr class mark / Instr class report (benchmarks/Vec3Boxed.st)
+//
+// Region bracketing over the execution counters: mark snapshots them, report
+// prints the delta since the mark. Both are cheap and always safe to call;
+// on a build without -DST_INSTRUMENT=1 the report itself prints that the
+// counters are unavailable (core/Instrument.c), which is the honest answer
+// and better than a silent table of zeros.
+Value primInstrumentMark(Value *args, uint64_t argc)
+{
+	if (argc != 0) {
+		return PRIMITIVE_FAILED;
+	}
+	instrumentMark();
+	return primitiveReceiver(args);
+}
+
+
+Value primInstrumentReport(Value *args, uint64_t argc)
+{
+	if (argc != 0) {
+		return PRIMITIVE_FAILED;
+	}
+	instrumentPrintSince("region");
 	return primitiveReceiver(args);
 }
 

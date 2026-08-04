@@ -165,6 +165,14 @@ _Bool osEnvironmentValue(const char *name, char *buffer, size_t size);
 // Linux: /tmp/perf-<pid>.map for `perf`. PORT_ME(jit-map): others return 0.
 _Bool osJitMapPath(char *buffer, size_t size);
 
+// Stop in the NATIVE debugger, when one is attached; answers whether it was.
+// A trap with nobody tracing would KILL the process (that is what an
+// undisposed SIGTRAP does), so with no debugger this does nothing and answers
+// 0, and the caller says so instead of dying. Linux: TracerPid in
+// /proc/self/status decides, then raise(SIGTRAP). PORT_ME(debug-break):
+// Windows IsDebuggerPresent + DebugBreak.
+_Bool osDebugBreak(void);
+
 // ---- scheduling ----------------------------------------------------------------
 
 // CPUs this process may actually run on — respects taskset/cgroup limits

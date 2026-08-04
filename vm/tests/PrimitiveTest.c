@@ -805,11 +805,13 @@ int main(void)
 		primitiveFunctionAt(PRIM_IntAdd) == primitiveFunctionAt(PRIM_FloatAdd)
 		&& primitiveFunctionAt(PRIM_IntLessThan) == primitiveFunctionAt(PRIM_FloatLessThan));
 	{
-		// SEARCHED, not named. This used to point at PRIM_FloatSin, and the check
-		// then failed the day sin was implemented: it was asserting a fact about
-		// one primitive when what it means to assert is a fact about the TABLE,
-		// that a declared name with no function is still a real number so the
-		// method compiles and runs its fallback.
+		// The PRIMITIVE_ABSENT mechanism (a declared name with no function
+		// still compiles, and the method runs its fallback) currently has NO
+		// instance: every name the .def declares is implemented. That is
+		// asserted as the fact it is, so the day a name is declared ahead of
+		// its implementation again this check is revisited deliberately --
+		// the older form SEARCHED for an unimplemented number and proved it
+		// had no function, which stops being satisfiable at full coverage.
 		PrimitiveNumber unimplemented = PRIM_NONE;
 		for (int i = 1; i < PRIM_COUNT; i++) {
 			if (primitiveFunctionAt((PrimitiveNumber) i) == NULL) {
@@ -817,10 +819,8 @@ int main(void)
 				break;
 			}
 		}
-		check("a DECLARED but unimplemented primitive is a real number with no "
-			"function, so the method compiles and runs its fallback",
-			unimplemented != PRIM_NONE
-			&& primitiveFunctionAt(unimplemented) == NULL);
+		check("every declared primitive number has a function behind it",
+			unimplemented == PRIM_NONE);
 
 		size_t implemented = 0, declared = 0;
 		primitiveCoverage(&implemented, &declared);

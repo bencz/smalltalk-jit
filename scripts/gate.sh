@@ -100,7 +100,7 @@ PRIMITIVE_SOURCES_NEEDING_FRONTEND="Reflect.c Process.c Socket.c"
 # level 8 had listed runtime/BigInt.c -- the kernels it calls. The gate caught
 # it, which is the system working; listing them once is what stops the next one.
 primitiveSupportSources() {
-	printf '%s ' vm/runtime/Number.c vm/runtime/BigInt.c vm/runtime/Closure.c vm/runtime/Json.c vm/runtime/Base64.c
+	printf '%s ' vm/runtime/Number.c vm/runtime/BigInt.c vm/runtime/Closure.c vm/runtime/Json.c vm/runtime/Base64.c vm/core/Instrument.c
 }
 
 # The OS layer the hand-linked levels need. ONE definition, same reason as the

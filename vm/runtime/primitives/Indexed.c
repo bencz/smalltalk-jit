@@ -20,6 +20,7 @@
 // carried across.
 
 #include "runtime/primitives/Shared.h"
+#include <string.h>
 
 
 // Named instance variables sit between the element count and the indexed
@@ -282,4 +283,62 @@ Value primInstVarAtPut(Value *args, uint64_t argc)
 		slots[i - 1] = value;
 	}
 	return value;
+}
+
+
+// SequenceableCollection>>replaceFrom: start to: stop with: replacement startingAt: repStart
+//
+// ONE memmove FOR BYTE COLLECTIONS (String, Symbol, ByteArray), which is what
+// bulk copying is for; a pointer Array falls through to the kernel's at:put:
+// loop, whose stores run the GC write barrier this cannot skip. memmove and
+// not memcpy, because `self` and `replacement` may be the SAME object shifted
+// (that is how an OrderedCollection of bytes makes room).
+//
+// The bounds are checked here and a violation FAILS to the fallback, whose
+// at:put: raises the same OutOfRangeError a wrong index raises everywhere
+// else. An empty range (stop < start) answers the receiver untouched, exactly
+// as the fallback's `start to: stop do:` would.
+Value primReplaceBytes(Value *args, uint64_t argc)
+{
+	if (argc != 4) {
+		return PRIMITIVE_FAILED;
+	}
+	Value receiver = primitiveReceiver(args);
+	Value startValue = primitiveArgument(args, 0);
+	Value stopValue = primitiveArgument(args, 1);
+	Value replacementValue = primitiveArgument(args, 2);
+	Value replacementStartValue = primitiveArgument(args, 3);
+	if (!valueTypeOf(receiver, VALUE_POINTER)
+			|| !valueTypeOf(startValue, VALUE_INT)
+			|| !valueTypeOf(stopValue, VALUE_INT)
+			|| !valueTypeOf(replacementStartValue, VALUE_INT)) {
+		return PRIMITIVE_FAILED;
+	}
+	RawObject *object = asObject(receiver);
+	if (rawObjectFormat(object) != FORMAT_BYTES) {
+		return PRIMITIVE_FAILED; // a pointer Array copies through the barrier
+	}
+	intptr_t start = asCInt(startValue);
+	intptr_t stop = asCInt(stopValue);
+	intptr_t replacementStart = asCInt(replacementStartValue);
+	if (stop < start) {
+		return receiver; // empty range: the fallback loop would not run either
+	}
+	if (!valueTypeOf(replacementValue, VALUE_POINTER)) {
+		return PRIMITIVE_FAILED;
+	}
+	RawObject *replacement = asObject(replacementValue);
+	if (rawObjectFormat(replacement) != FORMAT_BYTES) {
+		return PRIMITIVE_FAILED;
+	}
+	size_t count = (size_t) (stop - start + 1);
+	if (start < 1 || replacementStart < 1
+			|| (size_t) stop > rawObjectElementCount(object)
+			|| (size_t) (replacementStart - 1) + count
+				> rawObjectElementCount(replacement)) {
+		return PRIMITIVE_FAILED;
+	}
+	memmove(rawObjectBytes(object) + (start - 1),
+		rawObjectBytes(replacement) + (replacementStart - 1), count);
+	return receiver;
 }

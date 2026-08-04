@@ -64,7 +64,7 @@ PRIMITIVE(Base64DecodeBytes, "Base64DecodeBytesPrimitive", primBase64DecodeBytes
 PRIMITIVE(Base64Decode, "Base64DecodePrimitive", primBase64Decode)  // Base64>>class decode: aString
 PRIMITIVE(Base64Encode, "Base64EncodePrimitive", primBase64Encode)  // Base64>>class encode: aCollection
 PRIMITIVE(Become, "BecomePrimitive", primBecome)  // Object>>become: otherObject
-PRIMITIVE_ABSENT(BehaviorLookupSelector, "BehaviorLookupSelectorPrimitive")  // Behavior>>lookupSelector: aSymbol
+PRIMITIVE(BehaviorLookupSelector, "BehaviorLookupSelectorPrimitive", primLookupSelector)  // Behavior>>lookupSelector: aSymbol
 PRIMITIVE(BehaviorInstanceShape, "BehaviorInstanceShapePrimitive", primInstanceShape)  // Behavior>>instanceShape
 PRIMITIVE(BehaviorNew, "BehaviorNewPrimitive", primBasicNew)  // Behavior>>new; Behavior>>basicNew
 PRIMITIVE(BehaviorNewSize, "BehaviorNewSizePrimitive", primBasicNewSized)  // Behavior>>new: anInteger; Behavior>>basicNew: anInteger
@@ -169,9 +169,9 @@ PRIMITIVE(IntRem, "IntRemPrimitive", primRemainder)  // SmallInteger>>rem: aNumb
 PRIMITIVE(IntShift, "IntShiftPrimitive", primBitShift)  // SmallInteger>>bitShift: anInteger
 PRIMITIVE(IntSub, "IntSubPrimitive", primSubtract)  // SmallInteger>>- aNumber
 PRIMITIVE(IntXor, "IntXorPrimitive", primBitXor)  // SmallInteger>>bitXor: anInteger
-PRIMITIVE_ABSENT(InstrumentMark, "InstrumentMarkPrimitive")  // benchmarks/Vec3Boxed.st: region bracketing, a no-op unless built with -DST_INSTRUMENT=1
-PRIMITIVE_ABSENT(InstrumentReport, "InstrumentReportPrimitive")  // the same, and the reason both are DECLARED here is at the top of this file: an unknown name is a compile ERROR, so a primitive the shipped code names has to be listed even when nothing implements it
-PRIMITIVE_ABSENT(Interrupt, "InterruptPrimitive")  // Debugger>>class break
+PRIMITIVE(InstrumentMark, "InstrumentMarkPrimitive", primInstrumentMark)  // benchmarks/Vec3Boxed.st: region bracketing over the execution counters (core/Instrument.h)
+PRIMITIVE(InstrumentReport, "InstrumentReportPrimitive", primInstrumentReport)  // the same; on a build without -DST_INSTRUMENT=1 the report prints that the counters are unavailable
+PRIMITIVE(Interrupt, "InterruptPrimitive", primInterrupt)  // Debugger>>class break: native breakpoint when a debugger is attached, a note otherwise
 PRIMITIVE(JsonEncode, "JsonEncodePrimitive", primJsonEncode)  // JsonError>>class encode: anObject; JsonError>>class primEncode: anObject
 PRIMITIVE(JsonParse, "JsonParsePrimitive", primJsonParse)  // JsonError>>class parse: aString
 PRIMITIVE(LargeIntAsFloat, "LargeIntAsFloatPrimitive", primLargeIntAsFloat)  // LargeInteger>>primAsFloatWithClasses: classPair
@@ -204,7 +204,7 @@ PRIMITIVE(ProcessSuspend, "ProcessSuspendPrimitive", primProcessSuspend)  // Pro
 PRIMITIVE(ProcessTerminate, "ProcessTerminatePrimitive", primProcessTerminate)  // ProcessorScheduler>>terminateId: anId
 PRIMITIVE(ProcessYield, "ProcessYieldPrimitive", primProcessYield)  // ProcessorScheduler>>yield
 PRIMITIVE(RandomBytes, "RandomBytesPrimitive", primRandomBytes)  // Random>>primitiveRandomBytes: aByteArray; System>>class primitiveRandomBytes: aByteArray
-PRIMITIVE_ABSENT(ReplaceBytes, "ReplaceBytesPrimitive")
+PRIMITIVE(ReplaceBytes, "ReplaceBytesPrimitive", primReplaceBytes)  // SequenceableCollection>>replaceFrom: start to: stop with: replacement startingAt: repStart
 PRIMITIVE(SetDefaultNamespace, "SetDefaultNamespacePrimitive", primSetDefaultNamespace)  // Namespace>>class default: aNamespace
 PRIMITIVE(Size, "SizePrimitive", primBasicSize)  // Object>>size; Object>>basicSize
 PRIMITIVE(SocketAccept, "SocketAcceptPrimitive", primSocketAccept)  // ServerSocket>>basicAccept

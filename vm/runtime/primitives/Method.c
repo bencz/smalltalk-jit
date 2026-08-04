@@ -16,6 +16,8 @@
 #include "jit/CompiledMethod.h"
 #include "runtime/Collection.h"
 #include "runtime/Closure.h"
+#include "runtime/Dictionary.h"
+#include "runtime/String.h"
 
 // Receiver must be a CompiledMethod with runnable code. Answers NULL when it is
 // not one, or when the tier cannot compile it.
@@ -292,4 +294,57 @@ Value primBlockCode(Value *args, uint64_t argc)
 		return PRIMITIVE_FAILED;
 	}
 	return ((RawClosure *) asObject(receiver))->method;
+}
+
+
+// Behavior>>lookupSelector: aSymbol
+//
+// The same superclass-chain walk the kernel's fallback writes, in C, and the
+// same answers: the CompiledMethod, or nil when nothing in the chain
+// implements the selector. A String argument is interned first (a selector
+// that was never interned can be implemented by nothing, but asSymbol is the
+// one comparison contract symbolDictAt has); anything that is not a byte
+// object is the fallback's to reject.
+Value primLookupSelector(Value *args, uint64_t argc)
+{
+	if (argc != 1) {
+		return PRIMITIVE_FAILED;
+	}
+	Value selectorValue = primitiveArgument(args, 0);
+	if (!valueTypeOf(selectorValue, VALUE_POINTER)
+			|| rawObjectFormat(asObject(selectorValue)) != FORMAT_BYTES) {
+		return PRIMITIVE_FAILED;
+	}
+	// asSymbol allocates when the argument is a String rather than an interned
+	// Symbol, so the frame is anchored for the whole of it.
+	PRIMITIVE_ALLOCATES(args);
+	HandleScope scope;
+	openHandleScope(&scope);
+
+	Class *class = receiverAsClass(primitiveReceiver(args));
+	Value answer;
+	if (class == NULL) {
+		answer = PRIMITIVE_FAILED;
+	} else {
+		String *symbol = asSymbol(scopeHandle(asObject(primitiveArgument(args, 0))));
+		answer = tagPtr(Handles.nil.raw);
+		while (class->raw != NULL) {
+			Value dictionary = class->raw->methodDictionary;
+			if (valueTypeOf(dictionary, VALUE_POINTER)) {
+				Value found = symbolDictAt(scopeHandle(asObject(dictionary)), symbol);
+				if (valueTypeOf(found, VALUE_POINTER)) {
+					answer = found;
+					break;
+				}
+			}
+			RawClass *super = rawClassSuperclass(class->raw);
+			if (super == NULL) {
+				break;
+			}
+			class = scopeHandle(super);
+		}
+	}
+	closeHandleScope(&scope, NULL);
+	PRIMITIVE_DONE_ALLOCATING();
+	return answer;
 }
