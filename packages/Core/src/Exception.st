@@ -206,15 +206,22 @@ Exception := Object [
 
 
 	signalingContext [
-		"The activation that signalled, found by walking OUT of the Exception
-		 frames that got here.
+		"The context the handler runs in, found by walking OUT of the Exception
+		 frames that got here: every frame whose receiver is this exception is
+		 one of its own methods (this one, generateBacktrace, defaultAction),
+		 and the first frame beyond them belongs to whoever asked. The handler
+		 runs on top of the signaling frames (nothing was unwound), so the walk
+		 is over live frames.
 
-		 It starts from `thisContext`, and in jit-v2 that is not a field read: an
-		 activation is a native frame, and a Context is MATERIALISED from one on
-		 demand using the slot map deoptimization already carries (ADR 0008). The
-		 materialiser is not written yet, so this raises rather than answering an
-		 activation that would be a fiction."
-		^self notYetImplemented
+		 thisContext is not a field read in jit-v2: an activation is a native
+		 frame, and a Context is MATERIALISED from it on demand (ADR 0008).
+		 nil when the walk runs out (the signal came straight from the VM)."
+		| context |
+
+		context := thisContext.
+		[context notNil and: [context receiver == self]]
+			whileTrue: [context := context parent].
+		^context
 	]
 
 

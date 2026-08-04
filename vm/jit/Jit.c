@@ -206,6 +206,9 @@ void rootsVisitCompiledCode(RootVisitor visit, void *ctx)
 		visitUnitField(visit, ctx, &unit->blocks);
 		visitUnitField(visit, ctx, &unit->selector);
 		visitUnitField(visit, ctx, &unit->ownerClass);
+		visitUnitField(visit, ctx, &unit->source);
+		visitUnitField(visit, ctx, &unit->homeMethod);
+		visitUnitField(visit, ctx, &unit->codeObject);
 	}
 	for (size_t index = 0; index < gCompiledCount; index++) {
 		NativeCode *code = gCompiledCode[index];
@@ -444,6 +447,88 @@ void rootsVisitNativeFrames(struct Thread *thread, RootVisitor visit, void *ctx)
 			frame = parent;
 		}
 	}
+}
+
+
+// ---------------------------------------------------------------------------
+// The same walk, for a human
+// ---------------------------------------------------------------------------
+//
+// A backtrace is the SAME traversal the collector does, and it is here rather
+// than beside it because there is exactly one description of a compiled frame
+// and this is the file that owns it.
+//
+// It exists because the alternative was measured: an actor stress test failed
+// with "primitive SizePrimitive failed" on a receiver that printed as a
+// nanosecond timestamp, and with no way to ask WHO sent #size the search was
+// down to grepping for senders. v1 had core/StackFrame.c's printBacktrace and
+// the dry cut left it out of the build with nothing in its place.
+//
+// It prints and does not allocate, deliberately: what it is for is the moment
+// something is already wrong, and a reporter that can trigger a collection (or
+// a lookup, or a send) is one that cannot be trusted at that moment.
+
+static void printUnitFrame(FILE *out, const CodeUnit *unit, const void *at)
+{
+	const char *className = "?";
+	int classLength = 1;
+	_Bool onMetaclass = 0;
+
+	if (unit != NULL && valueTypeOf(unit->ownerClass, VALUE_POINTER)
+			&& asObject(unit->ownerClass) != Handles.nil.raw) {
+		RawClass *class = (RawClass *) asObject(unit->ownerClass);
+		// A metaclass keeps the class it belongs to where a class keeps its
+		// name (core/Object.h), so asking which kind this is comes first.
+		if (Handles.MetaClass.raw != NULL
+				&& rawObjectClassIndex((RawObject *) class)
+					== classIndexOf(&Handles.MetaClass)) {
+			onMetaclass = 1;
+			class = (RawClass *) asObject(((RawMetaClass *) class)->instanceClass);
+		}
+		if (valueTypeOf(class->name, VALUE_POINTER)) {
+			RawString *name = (RawString *) asObject(class->name);
+			className = (const char *) name->contents;
+			classLength = (int) name->size;
+		}
+	}
+
+	const char *selector = "?";
+	int selectorLength = 1;
+	if (unit != NULL && valueTypeOf(unit->selector, VALUE_POINTER)) {
+		RawString *string = (RawString *) asObject(unit->selector);
+		selector = (const char *) string->contents;
+		selectorLength = (int) string->size;
+	}
+
+	fprintf(out, "  %.*s%s>>%.*s%s   [%p]\n",
+		classLength, className, onMetaclass ? " class" : "",
+		selectorLength, selector,
+		unit != NULL && unit->isBlock ? " []" : "", at);
+}
+
+
+void jitPrintBacktrace(FILE *out)
+{
+	if (out == NULL) {
+		out = stderr;
+	}
+	fprintf(out, "backtrace (newest first):\n");
+	for (const CompiledFrameGuard *guard = CurrentThread.compiledFrames;
+			guard != NULL; guard = guard->previous) {
+		uint8_t *frame = guard->frame;
+		NativeCode *code = guard->code;
+		const void *at = guard->returnAddress;
+		while (frame != NULL && code != NULL) {
+			printUnitFrame(out, code->unit, at);
+			void *returnAddress = *(void **) (frame + sizeof(Value));
+			uint8_t *parent = *(uint8_t **) frame;
+			code = jitCodeContaining(returnAddress);
+			at = returnAddress;
+			frame = parent;
+		}
+		fprintf(out, "  ---- C ----\n");
+	}
+	fflush(out);
 }
 
 
@@ -1437,11 +1522,10 @@ Value jitMakeCell(void *unused, Value *valueSlot, uint64_t packed)
 // and the only safe reading of an indistinguishable pair is the conservative
 // one -- barrier both.
 //
-// Which is also STRICTLY MORE CORRECT than what tier 1 does. OP_SETIVAR there
-// is an inline store with `PENDING: the write barrier` written at it, so an old
-// object receiving a young one in an instance variable is not remembered. That
-// is a real hole; it is simply not this file's to close today, and closing it
-// for tier 2 costs a call that tier 1 does not pay.
+// Tier 1 calls it too, on the pointer arm of OP_SETIVAR's tag test. It did not
+// until an actor stress test proved what the hole cost (see OP_SETIVAR), and the
+// difference between the two callers is now only WHEN: tier 2 cannot tell an
+// immediate store from a pointer one in the IR, so it calls always.
 //
 // The packed integer carries the value's register and the object's, exactly as
 // jitSetCell's does, because the same two slots have to be found.
@@ -1544,10 +1628,43 @@ static _Bool emitInstruction(JitContext *jit, size_t index, Opcode *unsupported)
 		maStoreSlot(ma, instruction->a);
 		return 1;
 
-	case OP_SETIVAR:
-		// PENDING: the write barrier.
+	case OP_SETIVAR: {
+		// THROUGH THE BARRIER, and this used to say "PENDING: the write
+		// barrier" and store inline.
+		//
+		// What that cost was measured, not argued: an actor stress test read a
+		// ConcurrentDictionary whose `snapshot` field held a raw C pointer
+		// where a Dictionary belonged. The registry is OLD by the time the
+		// tests run (a project build promotes it), every published snapshot is
+		// YOUNG, and an old object receiving a young one without being
+		// remembered is not scanned by a minor collection -- so the snapshot
+		// was reclaimed under a live reference and the slot was left naming
+		// memory that had since become something else. It only reproduced when
+		// the image was built in the SAME process, which is exactly the run
+		// that makes the registry old.
+		//
+		// AN IMMEDIATE NEVER NEEDS REMEMBERING, so the tag test decides it
+		// inline and only a pointer store pays the call. That matters here:
+		// `count := count + 1` in a loop is the shape this opcode is hot in,
+		// and it stores a SmallInteger every time.
+		MaLabel *immediate = maNewLabel(ma);
+		MaLabel *done = maNewLabel(ma);
+		maBranchIfTag(ma, instruction->c, MA_TAG_NOT_POINTER, immediate);
+		// The helper does the store itself, so the two arms are exclusive.
+		// Packed exactly as jitStoreField reads it: the object's register in
+		// the high half (it is also the slot whose ADDRESS is passed, which is
+		// what turns the frame back into slots), the field index in the middle
+		// and the value's register in the low half.
+		maCallRuntime3(ma, jitStoreField, NULL, instruction->a,
+			(uint64_t) instruction->c
+				| ((uint64_t) instruction->b << 16)
+				| ((uint64_t) instruction->a << 32));
+		maJump(ma, done);
+		maBind(ma, immediate);
 		maStoreField(ma, instruction->a, instruction->b, instruction->c);
+		maBind(ma, done);
 		return 1;
+	}
 
 	case OP_GETGLOBAL:
 		// literals[b] is the global's Association, and its value is field 1.

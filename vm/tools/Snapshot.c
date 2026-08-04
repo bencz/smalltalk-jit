@@ -204,9 +204,17 @@ static void discoverValue(Snapshot *snapshot, Value value)
 }
 
 
+// A compiled-code object: a method or a block's code. BOTH, because the two
+// differ only in class -- a block's code is the same object laid out the same
+// way (jit/CompiledMethod.h) -- and what matters here is the raw word holding
+// the CodeUnit, which both carry. Checking only CompiledMethod wrote every
+// block's unit reference as a dangling C pointer.
 static _Bool isCompiledMethod(RawObject *object)
 {
-	return rawObjectClassIndex(object) == classIndexOf(&Handles.CompiledMethod);
+	uint32_t index = rawObjectClassIndex(object);
+	return index == classIndexOf(&Handles.CompiledMethod)
+		|| (Handles.CompiledBlock.raw != NULL
+			&& index == classIndexOf(&Handles.CompiledBlock));
 }
 
 
@@ -234,6 +242,9 @@ static void discoverFromUnit(Snapshot *snapshot, CodeUnit *unit)
 	discoverValue(snapshot, unit->blocks);
 	discoverValue(snapshot, unit->selector);
 	discoverValue(snapshot, unit->ownerClass);
+	discoverValue(snapshot, unit->source);
+	discoverValue(snapshot, unit->homeMethod);
+	discoverValue(snapshot, unit->codeObject);
 }
 
 
@@ -332,6 +343,9 @@ static void writeUnitRecord(Snapshot *snapshot, CodeUnit *unit)
 	writeWord(snapshot, encodedValue(snapshot, unit->blocks));
 	writeWord(snapshot, encodedValue(snapshot, unit->selector));
 	writeWord(snapshot, encodedValue(snapshot, unit->ownerClass));
+	writeWord(snapshot, encodedValue(snapshot, unit->source));
+	writeWord(snapshot, encodedValue(snapshot, unit->homeMethod));
+	writeWord(snapshot, encodedValue(snapshot, unit->codeObject));
 	writeBytes(snapshot, unit->code, unit->instructionCount * sizeof(Instruction));
 
 	// The side tables are OPTIONAL and every one of them is absent today: the
@@ -616,6 +630,9 @@ int snapshotRead(FILE *file)
 		unit->blocks = (Value) readWord(&snapshot);
 		unit->selector = (Value) readWord(&snapshot);
 		unit->ownerClass = (Value) readWord(&snapshot);
+		unit->source = (Value) readWord(&snapshot);
+		unit->homeMethod = (Value) readWord(&snapshot);
+		unit->codeObject = (Value) readWord(&snapshot);
 		unit->code = calloc(unit->instructionCount == 0 ? 1 : unit->instructionCount,
 			sizeof(Instruction));
 		ASSERT(unit->code != NULL);
@@ -670,7 +687,6 @@ int snapshotRead(FILE *file)
 
 	// PASS 5: turn every encoded reference into an address. Objects first, then
 	// units, then the raw word that binds a method to its unit.
-	uint32_t methodClass = classIndexOf(&Handles.CompiledMethod);
 	for (size_t i = 0; i < snapshot.objectCount; i++) {
 		RawObject *object = snapshot.byId[i];
 		size_t count;
@@ -678,7 +694,9 @@ int snapshotRead(FILE *file)
 		for (size_t s = 0; s < count; s++) {
 			slots[s] = decodedValue(&snapshot, (uint64_t) slots[s]);
 		}
-		if (rawObjectClassIndex(object) == methodClass) {
+		// isCompiledMethod and not one class index: a block's code is a
+		// compiled-code object too and its unit reference needs the same fixup.
+		if (isCompiledMethod(object)) {
 			RawCompiledMethod *method = (RawCompiledMethod *) object;
 			uint64_t ref = (uint64_t) (uintptr_t) method->unit;
 			ASSERT(ref == SNAPSHOT_NO_REF || ref - 1 < snapshot.unitCount);
@@ -693,6 +711,9 @@ int snapshotRead(FILE *file)
 		unit->blocks = decodedValue(&snapshot, (uint64_t) unit->blocks);
 		unit->selector = decodedValue(&snapshot, (uint64_t) unit->selector);
 		unit->ownerClass = decodedValue(&snapshot, (uint64_t) unit->ownerClass);
+		unit->source = decodedValue(&snapshot, (uint64_t) unit->source);
+		unit->homeMethod = decodedValue(&snapshot, (uint64_t) unit->homeMethod);
+		unit->codeObject = decodedValue(&snapshot, (uint64_t) unit->codeObject);
 		// On the registry, so the literal frame is a GC root from now on. A unit
 		// is a malloc'd C struct holding tagged Values; without this the first
 		// collection after the load moves exactly the objects it names and

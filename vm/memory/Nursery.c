@@ -78,6 +78,14 @@ _Bool nurseryIncludes(Nursery *nursery, uint8_t *address)
 }
 
 
+uint8_t *nurseryFirstObject(Nursery *nursery)
+{
+	// The SAME function that armed the space, so the walk and the allocator
+	// cannot disagree about where the first object is.
+	return armSemispace(nursery->fromSpace);
+}
+
+
 _Bool nurseryInFromSpace(Nursery *nursery, uint8_t *address)
 {
 	uint8_t *base = nursery->fromSpace;

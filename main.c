@@ -303,6 +303,15 @@ static Value runBody(BlockNode *body, const char *what, int *failed)
 		return tagPtr(Handles.nil.raw);
 	}
 
+	// A real CompiledMethod object for the doIt, not just its unit: reflection
+	// runs in test files too, and a top-level block's `homeContext code`, or a
+	// materialised Context of the doIt itself, answers this object. Binding
+	// gives every block inside the doIt its home the same way a class method's
+	// blocks get theirs (jit/CompiledMethod.h).
+	CompiledMethod *method = compiledMethodCreate(unit,
+		asSymbol(stringFromC("doIt")), NULL);
+	compiledMethodBindBlocks(method);
+
 	Opcode unsupported = OP_COUNT;
 	NativeCode *code = jitCompile(unit, &unsupported);
 	if (code == NULL) {

@@ -41,6 +41,9 @@
 typedef enum {
 	COMPILE_OK,
 	COMPILE_UNDECLARED_NAME,
+	COMPILE_READONLY_NAME,      // assignment to self, super, nil, true, false
+	                            // or to a formal argument
+	COMPILE_REDEFINED_NAME,     // one name declared twice in the same scope
 	COMPILE_TOO_MANY_REGISTERS,
 	COMPILE_TOO_MANY_LITERALS,
 	COMPILE_TOO_MANY_INSTRUCTIONS,
@@ -55,6 +58,13 @@ typedef struct {
 	// The offending name or selector, for the message. A HANDLE, valid only
 	// while the caller's scope is open.
 	String *what;
+	// The AST node the failure is ABOUT, when the failing site had one: the
+	// VariableNode being assigned, the duplicate declaration. It becomes the
+	// `identifier` of the typed error the image raises (UndefinedVariableError
+	// and friends compose their message from its name and source position). In
+	// the OUTERMOST scope (outermostHandle), because it is read back by the
+	// reflective primitive after every compile scope has closed.
+	LiteralNode *node;
 } CompileError;
 
 // What a method is compiled AGAINST: the class supplying instance variables and
@@ -104,6 +114,11 @@ CodeUnit *compileMethod(MethodNode *method, const CompileContext *context,
 	CompileError *error);
 
 const char *compileStatusName(CompileStatus status);
+
+// The image-side error class a status is raised as, or NULL for the plain
+// Error. The names live in packages/Core/src/Compiler/; the reflective
+// primitive resolves them by name at raise time (runtime/primitives/Reflect.c).
+const char *compileStatusErrorClass(CompileStatus status);
 
 // Print a unit's instructions, one per line. The bci is the index, so what this
 // prints is exactly the coordinate the deopt map and the bci-to-machine map use.

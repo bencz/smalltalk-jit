@@ -42,7 +42,9 @@ typedef struct {
 	// tally.
 	const char *error;    // the FIRST failure, NULL when everything loaded
 	char errorFile[512];
-	char errorDetail[256];
+	// Large enough for the concatenation in loadFile (a 256-byte what plus a
+	// 128-byte method name), so -Wformat-truncation can see no truncation.
+	char errorDetail[384];
 } BootstrapReport;
 
 void bootstrapLoadPackage(const char *directory, BootstrapReport *report);

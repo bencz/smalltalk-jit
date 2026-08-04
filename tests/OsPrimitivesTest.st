@@ -20,8 +20,16 @@ OsPrimProbe := Object [
 		^nil
 	]
 
+	"A variable that is not set and a path that does not resolve are both
+	 PRIMITIVE FAILURES, not answers, so these two carry the fallback that says
+	 what absence means here -- exactly as randomBytesInto: above does. A
+	 bodyless primitive method raises `primitiveFailed:` when the primitive does
+	 not run (vm/compiler/Compile.c), which is right for the calls below that
+	 cannot fail and wrong for these two, whose whole point is to be asked about
+	 something missing."
 	class getEnv: aString [
 		<primitive: GetEnvPrimitive>
+		^nil
 	]
 
 	class commandLine [
@@ -66,6 +74,7 @@ OsPrimProbe := Object [
 
 	class realpath: aString [
 		<primitive: FileRealpathPrimitive>
+		^nil
 	]
 ]
 

@@ -6,7 +6,7 @@
 ActorContext := Object [
 
 	| system selfPid parent props actor mailbox
-	  message sender children behaviors stopping |
+	  message sender children behaviors stopping restartStats |
 
 
 	class new [
@@ -18,6 +18,10 @@ ActorContext := Object [
 		children := OrderedCollection new.
 		behaviors := OrderedCollection new.
 		stopping := false.
+		"THIS actor's failure history, which is what bounds its restarts. It
+		 survives a restart deliberately: an actor that fails every time it
+		 starts must not get a fresh budget from the restart it just spent."
+		restartStats := RestartStatistics new.
 		^self
 	]
 
@@ -153,12 +157,13 @@ ActorContext := Object [
 	failWith: anError [
 		"Suspend the mailbox and escalate to the supervisor (parent, or the
 		 system guardian for a top-level actor)."
+		| failure |
 		mailbox suspend.
+		failure := ActorFailure child: selfPid reason: anError message: message
+			statistics: restartStats.
 		parent isNil
-			ifTrue: [ system guardianHandleFailure:
-				(ActorFailure child: selfPid reason: anError message: message) ]
-			ifFalse: [ parent sendSystem:
-				(ActorFailure child: selfPid reason: anError message: message) ].
+			ifTrue: [ system guardianHandleFailure: failure ]
+			ifFalse: [ parent sendSystem: failure ].
 		^self
 	]
 

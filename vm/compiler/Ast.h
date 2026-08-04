@@ -45,6 +45,25 @@ static inline void *newAstNode(Class *class)
 	return node;
 }
 
+
+// An AST slot that can be ABSENT, read from C: nil (what newAstNode filled and
+// nobody overwrote) answers NULL, so the caller asks with one compare. Every
+// getter below whose slot has a meaning for "unset" goes through this; the
+// ones that do not are the slots the parser always fills.
+//
+// The nil case is NOT theoretical: a MethodNode built by hand (main.c runBody,
+// core/Entry.c evalBlockNode) sets only the slots it has values for. Testing
+// the tag alone let nil through here -- nil IS a heap pointer -- and the first
+// consumer that treated the nil object as a collection read the words after it
+// in the heap, which held whatever the image layout put there. That decoded as
+// a harmless integer for as long as it happened to, and aborted the whole of
+// `st -f` the day a new class in the bootstrap moved the neighbor.
+static inline void *astSlotOrNull(Value slot)
+{
+	return valueTypeOf(slot, VALUE_POINTER) && !isTaggedNil(slot)
+		? scopeHandle(asObject(slot)) : NULL;
+}
+
 typedef struct
 {
 	OBJECT_HEADER;
@@ -329,8 +348,7 @@ static inline String *methodNodeGetClassName(MethodNode *method)
 {
 	// Set only for a CLASS-SIDE method, written `class foo [ ... ]`, so an
 	// instance-side method leaves it unset and this is how that is asked.
-	return valueTypeOf(method->raw->className, VALUE_POINTER)
-		? (String *) scopeHandle(asObject(method->raw->className)) : NULL;
+	return (String *) astSlotOrNull(method->raw->className);
 }
 
 
@@ -355,11 +373,8 @@ static inline void methodNodeSetPragmas(MethodNode *method, OrderedCollection *p
 static inline OrderedCollection *methodNodeGetPragmas(MethodNode *method)
 {
 	// A node the PARSER built always has one, even empty; a node built by hand
-	// does not. `st -f` makes one to wrap a top-level block, which is the first
-	// caller that ever left it unset, and dereferencing the zero aborted before
-	// the file's first statement ran.
-	return valueTypeOf(method->raw->pragmas, VALUE_POINTER)
-		? (OrderedCollection *) scopeHandle(asObject(method->raw->pragmas)) : NULL;
+	// (`st -f` wrapping a top-level block) leaves it nil.
+	return (OrderedCollection *) astSlotOrNull(method->raw->pragmas);
 }
 
 
@@ -383,7 +398,10 @@ static inline void methodNodeSetSourceCode(MethodNode *method, SourceCode *sourc
 
 static inline SourceCode *methodNodeGetSourceCode(MethodNode *method)
 {
-	return (SourceCode *) scopeHandle(asObject(method->raw->sourceCode));
+	// nil for a node built by hand (main.c runBody): the unit then keeps the
+	// source compileUnit read off the body block, which for a wrapped
+	// top-level block is the same text.
+	return (SourceCode *) astSlotOrNull(method->raw->sourceCode);
 }
 
 
@@ -433,8 +451,7 @@ static inline union BlockScope *blockNodeGetScope(BlockNode *block)
 {
 	// Never set in v2: the front end keeps its capture analysis in its own
 	// tables rather than on the tree (vm/compiler/Compile.c).
-	return valueTypeOf(block->raw->scope, VALUE_POINTER)
-		? scopeHandle(asObject(block->raw->scope)) : NULL;
+	return (union BlockScope *) astSlotOrNull(block->raw->scope);
 }
 
 
@@ -446,7 +463,10 @@ static inline void blockNodeSetSourceCode(BlockNode *block, SourceCode *sourceCo
 
 static inline SourceCode *blockNodeGetSourceCode(BlockNode *block)
 {
-	return (SourceCode *) scopeHandle(asObject(block->raw->sourceCode));
+	// nil for the BODY block of a parsed method: parseMethod records the
+	// source (pattern included) on the MethodNode, not here, and
+	// compileMethod reads it from there over anything taken from the body.
+	return (SourceCode *) astSlotOrNull(block->raw->sourceCode);
 }
 
 

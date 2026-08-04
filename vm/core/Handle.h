@@ -135,6 +135,14 @@ void openHandleScope(HandleScope *scope);
 void *closeHandleScope(HandleScope *scope, void *result);
 // Wrap a raw object in a handle belonging to the innermost open scope.
 void *scopeHandle(void *rawObject);
+// Wrap a raw object in a handle belonging to the OUTERMOST open scope: for the
+// rare object that must outlive every scope between here and the top of the
+// call chain. A compile error's offending AST node is the motivating case: the
+// failure happens under scopes the compiler closes on its way out, and the
+// error is only read back at the primitive that asked for the compile. The
+// slot is never reclaimed before the chain unwinds completely, so use this for
+// error paths, not in loops.
+void *outermostHandle(void *rawObject);
 
 // Allocate an instance of `class` with `elements` indexed elements, already
 // wrapped in a handle. THE ONLY way C code should create objects: the raw

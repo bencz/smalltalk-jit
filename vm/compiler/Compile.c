@@ -67,6 +67,12 @@ static int indexOfObject(OrderedCollection *objects, Object *object)
 // and false are SINGLETONS, so testing identity against them is one compare
 // against an immediate, while a class guard is a load, a mask and a compare, and
 // it would take TWO of them to establish "Boolean" rather than "True".
+//
+// The pair REORDERS the class check, it does not replace it: `True new` is a
+// second instance of True, so identity against the singleton answers no while
+// the class answers yes, and the two must not disagree. What settles it is the
+// COLD arm, which asks the receiver by message which singleton it stands for
+// (emitBooleanCoercion below), so nothing is paid for it on either hot path.
 
 typedef enum {
 	INLINE_NONE = 0,
@@ -205,6 +211,9 @@ static Inline inlineFormOf(Object *receiverNode, String *selector,
 enum {
 	DECL_ASSIGNED = 1,
 	DECL_CAPTURED = 2,
+	// A formal argument, of the method or of a block. Marked so an assignment
+	// to one can be refused: arguments are readonly in Smalltalk.
+	DECL_ARGUMENT = 4,
 };
 
 typedef struct {
@@ -218,7 +227,25 @@ typedef struct {
 	// be findable by one at runtime (jit/Jit.c). Set while emitting a block and
 	// read when the METHOD's unit is finished, which is after every block of it.
 	_Bool hasNonLocalReturn;
+	// Where the analysis reports what it refuses: duplicate declarations and
+	// writes to readonly names are its to see, because it is the walk that
+	// knows what each name IS. Same first-failure-wins rule as the emitter's.
+	CompileError *error;
 } Analysis;
+
+
+// The analysis's fail(): first failure wins, and the offending node rides in
+// the OUTERMOST scope because the error outlives every compile scope.
+static void analysisFail(Analysis *a, CompileStatus status, LiteralNode *node)
+{
+	if (a->error->status != COMPILE_OK) {
+		return;
+	}
+	a->error->status = status;
+	a->error->node = outermostHandle(node->raw);
+	a->error->what = (String *) outermostHandle(
+		((Object *) literalNodeGetStringValue(node))->raw);
+}
 
 // One lexical level for the analysis. `block` is NULL for the method and for
 // every INLINED block, because an inlined block shares the enclosing frame and
@@ -233,14 +260,22 @@ typedef struct AnalysisScope {
 } AnalysisScope;
 
 
-static void analysisDeclare(Analysis *a, AnalysisScope *scope, LiteralNode *declaration)
+static void analysisDeclare(Analysis *a, AnalysisScope *scope,
+	LiteralNode *declaration, _Bool isArgument)
 {
 	String *name = literalNodeGetStringValue(declaration);
+	// The SAME scope declaring one name twice is refused: `| a a |`, `:x :x`,
+	// or a temporary spelled like an argument of the same pattern. A block
+	// REUSING an outer name is not this -- that is shadowing, one name per
+	// scope, and analysisUse resolves it backward on purpose.
+	if (indexOfSymbol(scope->names, symbolOf(name)) >= 0) {
+		analysisFail(a, COMPILE_REDEFINED_NAME, declaration);
+	}
 	ordCollAdd(scope->names, objectTagged(asSymbol(name)));
 	ordCollAddObject(scope->declarations, (Object *) declaration);
 	if (indexOfObject(a->declarations, (Object *) declaration) < 0) {
 		ordCollAddObject(a->declarations, (Object *) declaration);
-		ordCollAdd(a->flags, tagInt(0));
+		ordCollAdd(a->flags, tagInt(isArgument ? DECL_ARGUMENT : 0));
 	}
 }
 
@@ -319,13 +354,20 @@ static _Bool isInstanceVariable(Analysis *a, RawObject *symbol)
 }
 
 
-// One reference to a name. `assigned` says whether this is the target of an
-// assignment rather than a read.
+// One reference to a name. `target` is the assignment's target node when this
+// reference IS the target of an assignment, NULL for a read: the two questions
+// an assignment raises (is the name writable at all, is it an argument) are
+// decided here, because this walk is the one that knows what the name is.
 static void analysisUse(Analysis *a, AnalysisScope *scope, String *name,
-	_Bool assigned)
+	LiteralNode *target)
 {
+	_Bool assigned = target != NULL;
 	RawObject *symbol = symbolOf(name);
 	if (nameIs(symbol, "self") || nameIs(symbol, "super")) {
+		if (assigned) {
+			analysisFail(a, COMPILE_READONLY_NAME, target);
+			return;
+		}
 		analysisCaptureSelf(a, scope);
 		return;
 	}
@@ -344,6 +386,16 @@ static void analysisUse(Analysis *a, AnalysisScope *scope, String *name,
 		}
 		Object *declaration = ordCollObjectAt(s->declarations, (size_t) found);
 		if (assigned) {
+			// A formal argument is READONLY: the caller's value is the whole
+			// meaning of the name, of a method's argument and of a block's
+			// alike. Said here rather than at emission because the emitter
+			// only sees a register index, and a register is writable.
+			int index = indexOfObject(a->declarations, declaration);
+			if (index >= 0
+					&& (asCInt(ordCollAt(a->flags, (size_t) index)) & DECL_ARGUMENT) != 0) {
+				analysisFail(a, COMPILE_READONLY_NAME, target);
+				return;
+			}
 			analysisSetFlag(a, declaration, DECL_ASSIGNED);
 		}
 		// Every closure boundary strictly INSIDE the declaring scope has to
@@ -402,13 +454,13 @@ static void analyzeInlineBlock(Analysis *a, AnalysisScope *parent, BlockNode *bl
 	scope.declarations = newOrdColl(4);
 
 	if (boundArgument != NULL) {
-		analysisDeclare(a, &scope, boundArgument);
+		analysisDeclare(a, &scope, boundArgument, 1);
 	}
 	OrderedCollection *temps = blockNodeGetTempVars(block);
 	size_t tempCount = temps == NULL ? 0 : ordCollSize(temps);
 	for (size_t i = 0; i < tempCount; i++) {
 		analysisDeclare(a, &scope,
-			(LiteralNode *) scopeHandle(asObject(ordCollAt(temps, i))));
+			(LiteralNode *) scopeHandle(asObject(ordCollAt(temps, i))), 0);
 	}
 	analyzeStatements(a, &scope, blockNodeGetExpressions(block));
 }
@@ -429,13 +481,13 @@ static void analyzeClosureBlock(Analysis *a, AnalysisScope *parent, BlockNode *b
 	size_t argCount = args == NULL ? 0 : ordCollSize(args);
 	for (size_t i = 0; i < argCount; i++) {
 		analysisDeclare(a, &scope,
-			(LiteralNode *) scopeHandle(asObject(ordCollAt(args, i))));
+			(LiteralNode *) scopeHandle(asObject(ordCollAt(args, i))), 1);
 	}
 	OrderedCollection *temps = blockNodeGetTempVars(block);
 	size_t tempCount = temps == NULL ? 0 : ordCollSize(temps);
 	for (size_t i = 0; i < tempCount; i++) {
 		analysisDeclare(a, &scope,
-			(LiteralNode *) scopeHandle(asObject(ordCollAt(temps, i))));
+			(LiteralNode *) scopeHandle(asObject(ordCollAt(temps, i))), 0);
 	}
 	analyzeStatements(a, &scope, blockNodeGetExpressions(block));
 }
@@ -471,7 +523,7 @@ static void analyzeMessage(Analysis *a, AnalysisScope *scope,
 static void analyzeValue(Analysis *a, AnalysisScope *scope, Object *node)
 {
 	if (isInstanceOf(node->raw, &Handles.VariableNode)) {
-		analysisUse(a, scope, literalNodeGetStringValue((LiteralNode *) node), 0);
+		analysisUse(a, scope, literalNodeGetStringValue((LiteralNode *) node), NULL);
 	} else if (isInstanceOf(node->raw, &Handles.ExpressionNode)) {
 		analyzeExpression(a, scope, (ExpressionNode *) node);
 	} else if (isInstanceOf(node->raw, &Handles.BlockNode)) {
@@ -525,7 +577,16 @@ static void analyzeExpression(Analysis *a, AnalysisScope *scope, ExpressionNode 
 	size_t targetCount = targets == NULL ? 0 : ordCollSize(targets);
 	for (size_t i = 0; i < targetCount; i++) {
 		LiteralNode *target = scopeHandle(asObject(ordCollAt(targets, i)));
-		analysisUse(a, scope, literalNodeGetStringValue(target), 1);
+		// `nil := 3` arrives as a NilNode target, not a VariableNode: the
+		// parser reads the name and answers the literal's class
+		// (parseVariable). The literal classes ARE the readonly verdict.
+		if (isInstanceOf((RawObject *) target->raw, &Handles.NilNode)
+				|| isInstanceOf((RawObject *) target->raw, &Handles.TrueNode)
+				|| isInstanceOf((RawObject *) target->raw, &Handles.FalseNode)) {
+			analysisFail(a, COMPILE_READONLY_NAME, target);
+			continue;
+		}
+		analysisUse(a, scope, literalNodeGetStringValue(target), target);
 	}
 }
 
@@ -587,6 +648,14 @@ typedef struct {
 	OrderedCollection *instanceVariables; // Symbols, in slot order
 	Analysis *analysis;
 	CompileError *error;
+
+	// -- what this unit IS, for the units nested inside it
+	//
+	// A block's code is named after the METHOD it was written in ("aBlock" said
+	// nothing at all in a backtrace), and a nested block inherits that name the
+	// same way it inherits its home: from the emitter around it, not from the
+	// block around it.
+	String *selector;
 
 	// -- only when this unit is a BLOCK
 	_Bool isBlock;
@@ -1277,23 +1346,48 @@ static void emitNil(Emitter *e, uint16_t dest)
 }
 
 
-// `receiver ifTrue: [...] ifFalse: [...]`, with either arm possibly absent.
-static void emitConditional(Emitter *e, uint16_t testReg, BlockNode *whenTrue,
-	BlockNode *whenFalse, uint16_t dest)
+// The cold arm of every inlined Boolean form: the value in `testReg` is neither
+// singleton, which is NOT the same as it not being a Boolean.
+//
+// It is asked, by the only means Smalltalk has, which singleton it stands for:
+// True and False answer the canonical one, and everything else raises out of
+// Object>>mustBeBoolean. The answer is canonical BY CONSTRUCTION, so the same
+// two identity tests decide it and the arms below need no second shape. The
+// third way out stays what it was: the value the send left in `dest`, live only
+// when a handler resumed the error with something that is still not a Boolean.
+//
+// Three jumps come back, all forward and all unpatched: to the true arm, to the
+// false arm, and past the whole form.
+static void emitBooleanCoercion(Emitter *e, uint16_t testReg, uint16_t dest,
+	uint16_t *toTrue, uint16_t *toFalse, uint16_t *toEnd)
 {
-	// Not true and not false: neither arm is legal, so the receiver is told so
-	// by the only means Smalltalk has, which is a message.
-	uint16_t toTrue = emitJumpForward(e, OP_JUMPTRUE, testReg);
-	uint16_t toFalse = emitJumpForward(e, OP_JUMPFALSE, testReg);
-
 	uint16_t mark = e->top;
 	uint16_t base = allocRegister(e);
 	emit(e, OP_MOVE, 0, base, testReg, 0);
 	emit(e, OP_SEND, 0, dest, selectorIndex(e, stringFromC("mustBeBoolean")), base);
 	releaseTo(e, mark);
-	uint16_t overNonBoolean = emitJumpForward(e, OP_JUMP, 0);
+
+	*toTrue = emitJumpForward(e, OP_JUMPTRUE, dest);
+	*toFalse = emitJumpForward(e, OP_JUMPFALSE, dest);
+	*toEnd = emitJumpForward(e, OP_JUMP, 0);
+}
+
+
+// `receiver ifTrue: [...] ifFalse: [...]`, with either arm possibly absent.
+static void emitConditional(Emitter *e, uint16_t testReg, BlockNode *whenTrue,
+	BlockNode *whenFalse, uint16_t dest)
+{
+	// Not the true singleton and not the false one: the class decides, and it
+	// decides in the cold arm.
+	uint16_t toTrue = emitJumpForward(e, OP_JUMPTRUE, testReg);
+	uint16_t toFalse = emitJumpForward(e, OP_JUMPFALSE, testReg);
+
+	uint16_t coercedTrue, coercedFalse, overNonBoolean;
+	emitBooleanCoercion(e, testReg, dest, &coercedTrue, &coercedFalse,
+		&overNonBoolean);
 
 	patchHere(e, toTrue);
+	patchHere(e, coercedTrue);
 	if (whenTrue != NULL) {
 		emitInlineBlock(e, whenTrue, dest, 1);
 	} else {
@@ -1302,6 +1396,7 @@ static void emitConditional(Emitter *e, uint16_t testReg, BlockNode *whenTrue,
 	uint16_t overFalse = emitJumpForward(e, OP_JUMP, 0);
 
 	patchHere(e, toFalse);
+	patchHere(e, coercedFalse);
 	if (whenFalse != NULL) {
 		emitInlineBlock(e, whenFalse, dest, 1);
 	} else {
@@ -1325,18 +1420,19 @@ static void emitShortCircuit(Emitter *e, uint16_t testReg, BlockNode *rest,
 	uint16_t toRest = emitJumpForward(e, isAnd ? OP_JUMPTRUE : OP_JUMPFALSE, testReg);
 	uint16_t toShort = emitJumpForward(e, isAnd ? OP_JUMPFALSE : OP_JUMPTRUE, testReg);
 
-	uint16_t mark = e->top;
-	uint16_t base = allocRegister(e);
-	emit(e, OP_MOVE, 0, base, testReg, 0);
-	emit(e, OP_SEND, 0, dest, selectorIndex(e, stringFromC("mustBeBoolean")), base);
-	releaseTo(e, mark);
-	uint16_t overNonBoolean = emitJumpForward(e, OP_JUMP, 0);
+	uint16_t coercedTrue, coercedFalse, overNonBoolean;
+	emitBooleanCoercion(e, testReg, dest, &coercedTrue, &coercedFalse,
+		&overNonBoolean);
+	uint16_t coercedRest = isAnd ? coercedTrue : coercedFalse;
+	uint16_t coercedShort = isAnd ? coercedFalse : coercedTrue;
 
 	patchHere(e, toRest);
+	patchHere(e, coercedRest);
 	emitInlineBlock(e, rest, dest, 1);
 	uint16_t done = emitJumpForward(e, OP_JUMP, 0);
 
 	patchHere(e, toShort);
+	patchHere(e, coercedShort);
 	emit(e, isAnd ? OP_LOADFALSE : OP_LOADTRUE, 0, dest, 0, 0);
 
 	patchHere(e, done);
@@ -1448,16 +1544,16 @@ static void emitWhile(Emitter *e, BlockNode *condition, BlockNode *body,
 	uint16_t toBody = emitJumpForward(e, whileTrue ? OP_JUMPTRUE : OP_JUMPFALSE, test);
 	uint16_t toExit = emitJumpForward(e, whileTrue ? OP_JUMPFALSE : OP_JUMPTRUE, test);
 
-	// Neither true nor false: tell the receiver so, by the only means Smalltalk
-	// has. `test` is still live here, so the register is released after.
-	uint16_t nonBooleanMark = e->top;
-	uint16_t base = allocRegister(e);
-	emit(e, OP_MOVE, 0, base, test, 0);
-	emit(e, OP_SEND, 0, dest, selectorIndex(e, stringFromC("mustBeBoolean")), base);
-	releaseTo(e, nonBooleanMark);
-	uint16_t overNonBoolean = emitJumpForward(e, OP_JUMP, 0);
+	// Neither singleton: the cold arm asks the class, and `test` is still live
+	// across it, so the scratch register it takes is released inside.
+	uint16_t coercedTrue, coercedFalse, overNonBoolean;
+	emitBooleanCoercion(e, test, dest, &coercedTrue, &coercedFalse,
+		&overNonBoolean);
+	uint16_t coercedBody = whileTrue ? coercedTrue : coercedFalse;
+	uint16_t coercedExit = whileTrue ? coercedFalse : coercedTrue;
 
 	patchHere(e, toBody);
+	patchHere(e, coercedBody);
 	releaseTo(e, mark);
 
 	if (body != NULL) {
@@ -1468,6 +1564,7 @@ static void emitWhile(Emitter *e, BlockNode *condition, BlockNode *body,
 	}
 	emit(e, OP_JUMP, 0, loop, 0, 0);
 	patchHere(e, toExit);
+	patchHere(e, coercedExit);
 	patchHere(e, overNonBoolean);
 	emitNil(e, dest); // whileTrue: answers nil
 }
@@ -1526,9 +1623,11 @@ static void emitBlockClosure(Emitter *e, BlockNode *block, uint16_t dest)
 
 	OrderedCollection *args = blockNodeGetArgs(block);
 	size_t arity = args == NULL ? 0 : ordCollSize(args);
-	// PENDING: a block's unit is named "aBlock" rather than after the method it
-	// was written in, which is what a backtrace will want once there is one.
-	String *selector = asSymbol(stringFromC("aBlock"));
+	// NAMED AFTER THE METHOD IT WAS WRITTEN IN, which is what a backtrace wants
+	// and what `printString` answers ("a Foo#bar[]"). It used to be the literal
+	// "aBlock" for every block in the system, which named nothing.
+	String *selector = e->selector != NULL
+		? e->selector : asSymbol(stringFromC("aBlock"));
 	CodeUnit *unit = compileUnit(e, block, (uint16_t) arity, captures, isCell,
 		selector, PRIM_NONE, 1);
 	if (unit == NULL) {
@@ -1541,7 +1640,11 @@ static void emitBlockClosure(Emitter *e, BlockNode *block, uint16_t dest)
 	// as any closure over it: the alternative is a word the collector cannot
 	// follow.
 	Class *owner = e->context->ownerClass;
-	CompiledMethod *method = compiledMethodCreate(unit, selector, owner);
+	// The INTERNED selector off the unit, which is what ClassBuilder installs
+	// on a method object: the block then prints "a Foo#bar[]" the way a method
+	// prints "a Foo#bar", instead of quoting the parse tree's plain String.
+	String *symbol = scopeHandle(asObject(unit->selector));
+	CompiledMethod *method = compiledBlockCreate(unit, symbol, owner);
 	uint16_t slot = (uint16_t) ordCollSize(e->blocks);
 	ordCollAddObject(e->blocks, (Object *) method);
 
@@ -1630,7 +1733,27 @@ static void emitValue(Emitter *e, Object *node, uint16_t dest)
 		emit(e, OP_LOADFALSE, 0, dest, 0, 0);
 	} else if (isInstance(node, &Handles.VariableNode)) {
 		String *name = literalNodeGetStringValue((LiteralNode *) node);
+		// `thisContext` is a PSEUDO-VARIABLE that reads no slot: the activation
+		// is a native frame (ADR 0008) and a Context is materialised from it on
+		// demand. Compiled as a send of #thisContext, whose primitive
+		// materialises its SENDER, which is exactly this activation. The
+		// receiver is nil purely to have one; Object>>thisContext ignores it,
+		// and nil avoids capturing self into blocks that only ask this.
+		if (nameIs(symbolOf(name), "thisContext")) {
+			uint16_t mark = e->top;
+			uint16_t base = allocRegister(e);
+			emit(e, OP_LOADNIL, 0, base, 0, 0);
+			emitSendTo(e, dest, stringFromC("thisContext"), base, 0, 0);
+			releaseTo(e, mark);
+			return;
+		}
+		_Bool wasOk = !failed(e);
 		emitLoad(e, resolveName(e, name), name, dest);
+		// An undeclared name fails inside emitLoad, which only has the String;
+		// the NODE, with the source position the raised error prints, is here.
+		if (wasOk && failed(e) && e->error->node == NULL) {
+			e->error->node = outermostHandle(node->raw);
+		}
 	} else if (isLiteralNode(node)) {
 		emitLiteral(e, (LiteralNode *) node, dest);
 	} else if (isInstance(node, &Handles.ExpressionNode)) {
@@ -1702,7 +1825,13 @@ assignments:
 		for (size_t i = count; i > 0; i--) {
 			LiteralNode *target = scopeHandle(asObject(ordCollAt(targets, i - 1)));
 			String *name = literalNodeGetStringValue(target);
+			_Bool wasOk = !failed(e);
 			emitStore(e, resolveName(e, name), name, dest);
+			// Same as emitValue: the store site has the node, emitStore only
+			// the name (an undeclared assignment target fails in there).
+			if (wasOk && failed(e) && e->error->node == NULL) {
+				e->error->node = outermostHandle(target->raw);
+			}
 		}
 	}
 	closeHandleScope(&scope, NULL);
@@ -1779,6 +1908,7 @@ static CodeUnit *compileUnit(Emitter *parent, BlockNode *body, uint16_t arity,
 	e.literals = newOrdColl(8);
 	e.blocks = newOrdColl(2);
 	e.isBlock = isBlock;
+	e.selector = selector;
 	e.captureNames = captureNames;
 	e.captureIsCell = captureIsCell;
 
@@ -1889,6 +2019,15 @@ static CodeUnit *compileUnit(Emitter *parent, BlockNode *body, uint16_t arity,
 	if (e.context->ownerClass != NULL) {
 		unit->ownerClass = objectTagged(e.context->ownerClass);
 	}
+	// WHERE THIS CODE CAME FROM, which is what every reflective question about
+	// a method reparses through: argument names, temporary names, and the text
+	// a debugger or a backtrace shows. The parser already built it (one per
+	// MethodNode and per BlockNode, with the position and length of the text);
+	// until now nothing carried it past the parse tree.
+	SourceCode *source = blockNodeGetSourceCode(body);
+	if (source != NULL) {
+		unit->source = objectTagged(source);
+	}
 	jitRegisterUnit(unit);
 	return unit;
 }
@@ -1906,6 +2045,7 @@ CodeUnit *compileMethod(MethodNode *method, const CompileContext *context,
 
 	error->status = COMPILE_OK;
 	error->what = NULL;
+	error->node = NULL;
 
 	// <primitive: IntAddPrimitive>
 	//
@@ -1956,6 +2096,7 @@ CodeUnit *compileMethod(MethodNode *method, const CompileContext *context,
 	analysis.blockUses = newOrdColl(4);
 	analysis.instanceVariables = collectInstanceVariables(context->ownerClass);
 	analysis.hasNonLocalReturn = 0;
+	analysis.error = error;
 
 	// The capture analysis runs over the WHOLE method before a single
 	// instruction exists, because whether a variable lives in a register or in a
@@ -1973,13 +2114,13 @@ CodeUnit *compileMethod(MethodNode *method, const CompileContext *context,
 		size_t argumentCount = args == NULL ? 0 : ordCollSize(args);
 		for (size_t i = 0; i < argumentCount; i++) {
 			analysisDeclare(&analysis, &scope,
-				(LiteralNode *) scopeHandle(asObject(ordCollAt(args, i))));
+				(LiteralNode *) scopeHandle(asObject(ordCollAt(args, i))), 1);
 		}
 		OrderedCollection *temps = blockNodeGetTempVars(body);
 		size_t tempCount = temps == NULL ? 0 : ordCollSize(temps);
 		for (size_t i = 0; i < tempCount; i++) {
 			analysisDeclare(&analysis, &scope,
-				(LiteralNode *) scopeHandle(asObject(ordCollAt(temps, i))));
+				(LiteralNode *) scopeHandle(asObject(ordCollAt(temps, i))), 0);
 		}
 		analyzeStatements(&analysis, &scope, blockNodeGetExpressions(body));
 	}
@@ -2007,6 +2148,16 @@ CodeUnit *compileMethod(MethodNode *method, const CompileContext *context,
 		return NULL;
 	}
 
+	// THE METHOD'S source, not its body's. compileUnit takes what it compiled,
+	// which for a method is the BlockNode after the message pattern, and the
+	// pattern is exactly where the argument names are: reparsing a body alone
+	// answers a block with no arguments at all. A block's unit keeps what
+	// compileUnit gave it, because there the two are the same node.
+	SourceCode *methodSource = methodNodeGetSourceCode(method);
+	if (methodSource != NULL) {
+		unit->source = objectTagged(methodSource);
+	}
+
 	// Every block the analysis prepared was emitted exactly once. The other
 	// direction of a disagreement between the two walks (a block the emitter
 	// inlined and the analysis did not) leaves an unused capture list and a
@@ -2027,6 +2178,8 @@ const char *compileStatusName(CompileStatus status)
 	switch (status) {
 	case COMPILE_OK: return "ok";
 	case COMPILE_UNDECLARED_NAME: return "undeclared name";
+	case COMPILE_READONLY_NAME: return "assignment to a readonly variable";
+	case COMPILE_REDEFINED_NAME: return "a name declared twice";
 	case COMPILE_TOO_MANY_REGISTERS: return "too many registers";
 	case COMPILE_TOO_MANY_LITERALS: return "too many literals";
 	case COMPILE_TOO_MANY_INSTRUCTIONS: return "too many instructions";
@@ -2034,6 +2187,17 @@ const char *compileStatusName(CompileStatus status)
 	case COMPILE_BAD_INLINE_BLOCK: return "block of the wrong shape";
 	case COMPILE_UNKNOWN_PRIMITIVE: return "unknown primitive name";
 	default: return "unsupported construct";
+	}
+}
+
+
+const char *compileStatusErrorClass(CompileStatus status)
+{
+	switch (status) {
+	case COMPILE_UNDECLARED_NAME: return "UndefinedVariableError";
+	case COMPILE_READONLY_NAME: return "ReadonlyVariableError";
+	case COMPILE_REDEFINED_NAME: return "RedefinitionError";
+	default: return NULL; // plain Error: nothing catches these by kind yet
 	}
 }
 

@@ -49,6 +49,7 @@
 #include "core/Object.h"
 #include <setjmp.h>
 #include <stddef.h>
+#include <stdio.h>
 
 // How many arguments the NARROW convention can carry, and it is a fact about
 // THIS FILE and not about any ABI: the narrow convention is entered from C
@@ -290,6 +291,12 @@ void compiledFrameEnter(CompiledFrameGuard *guard, Value *slotAddress,
 	uint16_t slotIndex, void *returnAddress);
 void compiledFrameLeave(const CompiledFrameGuard *guard);
 
+// The compiled frames, newest first, as text. The collector's walk with a
+// printf instead of a visitor; `out` may be NULL for stderr. Allocates nothing
+// and sends nothing, because what it is for is the moment something is already
+// wrong. Reachable from Smalltalk as `VMTools backtrace`.
+void jitPrintBacktrace(FILE *out);
+
 // Put a finished NativeCode on the list the collector and jitCodeContaining
 // read. Called LAST, once every field the visitor reads is populated: a
 // collection between the allocation and this call would walk a half-built
@@ -370,9 +377,10 @@ Value jitMakeClosure(void *unit, Value *baseSlot, uint64_t packed);
 Value jitMakeCell(void *unused, Value *valueSlot, uint64_t packed);
 Value jitSetCell(void *unused, Value *cellSlot, uint64_t packed);
 Value jitReturnOuter(void *unused, Value *valueSlot, uint64_t packed);
-// A barriered store into ANY tagged field, which tier 1 has no caller for: its
-// OP_SETIVAR is an inline store and its cell store goes through jitSetCell. The
-// SSA backend needs the general one because the SSA IR models both as
+// A barriered store into ANY tagged field. BOTH tiers call it: tier 1's
+// OP_SETIVAR takes it on the pointer arm of a tag test (an immediate needs no
+// remembering, so it stores inline), and the SSA backend takes it always,
+// because the SSA IR models a cell store and an instance-variable store as one
 // IR_SETFIELD_T and cannot tell them apart. See the definition.
 Value jitStoreField(void *unused, Value *objectSlot, uint64_t packed);
 

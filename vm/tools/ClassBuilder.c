@@ -276,10 +276,19 @@ CompiledMethod *classCompileMethodInto(MethodNode *node, Class *target,
 		error->status = compileError.status;
 		error->inMethod = methodNodeGetSelector(node);
 		fail(error, compileStatusName(compileError.status), compileError.what);
+		// The compile statuses that the image catches BY KIND carry their
+		// class and the offending node up to the reflective primitive, which
+		// is what turns `zzzTypo foo` into an UndefinedVariableError instead
+		// of a plain Error (compileStatusErrorClass in compiler/Compile.c).
+		error->errorClass = compileStatusErrorClass(compileError.status);
+		error->identifier = compileError.node;
 		return NULL;
 	}
 	String *selector = scopeHandle(asObject(unit->selector));
 	CompiledMethod *method = compiledMethodCreate(unit, selector, target);
+	// The blocks inside it can only learn which method they belong to once that
+	// method object exists, which is here (jit/CompiledMethod.h).
+	compiledMethodBindBlocks(method);
 	symbolDictAtPutObject(methodsOf(target), selector, (Object *) method);
 	// INSTALLING A METHOD INVALIDATES EVERY RESOLVED SEND, and removing one
 	// already knew that (primClassRemoveSelector). Installing did not, and got
@@ -333,11 +342,48 @@ static void checkNoOwnSelectorCollision(Class *class, ClassNode *node,
 }
 
 
+// Does one DEFINITION spell the same selector twice, on the same side?
+//
+// Refused rather than resolved: installing both would have the second silently
+// replace the first in the dictionary, and half of what the file says would
+// never run. It is a per-NODE question -- reopening a class, or extending it
+// from another file, installs over the dictionary on purpose and is not this.
+static void checkNoDuplicateSelector(ClassNode *node, ClassBuildError *error)
+{
+	OrderedCollection *methods = classNodeGetMethods(node);
+	size_t count = methods == NULL ? 0 : ordCollSize(methods);
+	for (size_t i = 0; i < count && error->message == NULL; i++) {
+		for (size_t j = i + 1; j < count && error->message == NULL; j++) {
+			HandleScope scope;
+			openHandleScope(&scope);
+			MethodNode *first = scopeHandle(asObject(ordCollAt(methods, i)));
+			MethodNode *second = scopeHandle(asObject(ordCollAt(methods, j)));
+			String *firstSide = methodNodeGetClassName(first);
+			String *secondSide = methodNodeGetClassName(second);
+			_Bool firstClassSide = firstSide != NULL && stringEqualsC(firstSide, "class");
+			_Bool secondClassSide = secondSide != NULL && stringEqualsC(secondSide, "class");
+			if (firstClassSide == secondClassSide
+					&& stringEquals(methodNodeGetSelector(first),
+						methodNodeGetSelector(second))) {
+				// Re-homed to the outermost scope: this scope closes on the
+				// next line, and the name is read by whoever reports the error
+				// long after every build scope is gone.
+				failAs(error, "RedefinitionError",
+					"one definition spells this selector twice", (String *)
+					outermostHandle(methodNodeGetSelector(second)->raw));
+			}
+			closeHandleScope(&scope, NULL);
+		}
+	}
+}
+
+
 static void buildMethods(Class *class, ClassNode *node, Namespace *namespace,
 	ClassBuildError *error)
 {
 	OrderedCollection *methods = classNodeGetMethods(node);
 	size_t count = methods == NULL ? 0 : ordCollSize(methods);
+	checkNoDuplicateSelector(node, error);
 	for (size_t i = 0; i < count && error->message == NULL; i++) {
 		HandleScope scope;
 		openHandleScope(&scope);
@@ -683,7 +729,12 @@ Class *classBuildIn(ClassNode *node, Namespace *namespace,
 	if (!stringEqualsC(superName, "nil")) {
 		super = resolvedClassNamed(namespace, superName);
 		if (super == NULL) {
-			fail(error, "superclass is not defined yet", superName);
+			// The same kind of failure an undefined name in a method body is,
+			// and raised as the same class: the name after `:=` resolves to no
+			// class, and the node carries where it was written.
+			failAs(error, "UndefinedVariableError",
+				"superclass is not defined yet", superName);
+			error->identifier = outermostHandle(classNodeGetSuperName(node)->raw);
 			closeHandleScope(&scope, NULL);
 			return NULL;
 		}

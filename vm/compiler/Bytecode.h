@@ -135,6 +135,25 @@ typedef struct CodeUnit {
 	Value selector;
 	Value ownerClass;
 
+	// The SourceCode this unit was compiled from: WHERE the text is, not the
+	// text itself (a file name plus a position and a length for a file parse,
+	// the string itself for a string parse). Reflection over a method --
+	// argument names, temporary names, the source a debugger shows -- reparses
+	// through it, which is why nothing here has to keep a parse tree alive.
+	Value source;
+	// For a BLOCK, the CompiledMethod it was written inside; 0 for a method.
+	// A block's code is a heap object like a method's, so `aBlock method` is a
+	// field read rather than a search, and it is filled in AFTER the enclosing
+	// method object exists (compiledMethodBindBlocks).
+	Value homeMethod;
+	// The CompiledMethod (or CompiledBlock) OBJECT whose code this unit is; 0
+	// only for a unit no object was ever made for. It is what turns a native
+	// FRAME back into something the image can hold: a materialised Context's
+	// `code` is this field, read off the frame's NativeCode->unit
+	// (runtime/primitives/Context.c). Filled where the object is created
+	// (jit/CompiledMethod.c codeCreate).
+	Value codeObject;
+
 	// Parallel to `code`: source position per instruction, for backtraces.
 	// A side table and not a field of Instruction, because it is cold.
 	uint32_t *sourcePositions;

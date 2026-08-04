@@ -231,12 +231,25 @@ Value primInstVarAt(Value *args, uint64_t argc)
 	if (slots == NULL || i < 1 || (size_t) i > count) {
 		return PRIMITIVE_FAILED; // the kernel raises with the honest range
 	}
-	// The allocator's ZERO reads back as nil, because a slot nothing has set is
-	// ABSENT in the VM and there is no such thing in Smalltalk (memory/Heap.c).
-	// Answering the raw zero would hand the image a SmallInteger 0 where it can
-	// only mean "not set", which is a wrong answer rather than a missing one.
-	Value value = slots[i - 1];
-	return valueTypeOf(value, VALUE_POINTER) ? value : tagPtr(Handles.nil.raw);
+	// THE SLOT, UNTRANSLATED, exactly as `at:` above answers an element and as a
+	// compiled GETIVAR reads one.
+	//
+	// It used to answer nil for anything that was not a pointer, to turn the
+	// allocator's zero into the nil Smalltalk promises for an unset variable.
+	// That rejected EVERY IMMEDIATE: an instance variable holding a
+	// SmallInteger, a Character or a SmallFloat64 read back as nil through this
+	// primitive while the same variable read as itself from compiled code.
+	// Measured: `Object>>shallowCopy` walks instVarAt:/instVarAt:put:, so
+	// `(Dictionary new at: #a put: 1; yourself) copy size` answered nil -- the
+	// copy's `tally` was dropped on the way across and the copy claimed to have
+	// no size at all.
+	//
+	// The zero it was defending against cannot reach here from an object the
+	// image made: allocateInstance (runtime/primitives/Allocation.c) fills every
+	// pointer slot with nil precisely because that is where the Smalltalk rule
+	// starts applying, and classFillAbsentSmalltalkFields does the same for the
+	// classes the VM builds itself.
+	return slots[i - 1];
 }
 
 

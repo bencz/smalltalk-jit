@@ -46,6 +46,16 @@ void freeNursery(Nursery *nursery);
 uint8_t *nurseryCarve(Nursery *nursery, size_t bytes);
 // Bytes still uncarved in the current from-space.
 size_t nurseryAvailable(Nursery *nursery);
+// The first address a young object can occupy in the current from-space, which
+// is where a LINEAR WALK of the young generation has to start.
+//
+// It is not `fromSpace`: the base is 16-aligned and every young object sits at
+// 8 modulo 16 (the address-tag invariant above), so a walk starting at the base
+// reads its first header 8 bytes early. Measured: `become:` did exactly that,
+// found a zero header, stopped at the first object, and so never rewrote a
+// single reference held by a young object -- `a become: b` worked when `a` was
+// in a frame slot and did nothing when it was in a captured variable's cell.
+uint8_t *nurseryFirstObject(Nursery *nursery);
 _Bool nurseryIncludes(Nursery *nursery, uint8_t *address);
 // True while an address lies in the space being EVACUATED. Used to decide
 // whether a pointer needs forwarding; never used to validate a slot.

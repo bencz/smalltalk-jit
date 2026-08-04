@@ -13,35 +13,76 @@ CompiledCode := Object [
 	"accessing"
 
 	"WHAT THE OLD `header` WORD PACKED now lives in the CodeUnit, which is a C
-	 struct and not a heap object (vm/compiler/Bytecode.h): argument count,
-	 register count and primitive number. Reaching them from Smalltalk needs a
-	 primitive apiece, and until one exists these say so rather than answering a
-	 plausible zero."
+	 struct and not a heap object (vm/compiler/Bytecode.h), so each of these is
+	 a primitive where v1 had a field read. They accept a method or a block:
+	 the two are the same object with different classes and every question here
+	 is about the unit."
 
 	argumentsSize [
-		^self notYetImplemented
+		<primitive: CodeArgumentCountPrimitive>
 	]
 
 
 	temporariesSize [
-		^self notYetImplemented
+		"DERIVED FROM THE SOURCE, like `temporaries` and `arguments` below, and
+		 not from the register count: the frame also holds `self`, the captures
+		 and whatever scratch registers the emitter needed, and a method with no
+		 temporaries at all has several. What the question means is how many the
+		 programmer DECLARED."
+		^self temporaries size
 	]
 
 
 	hasContext [
-		"Every activation can materialise a Context on demand in jit-v2
-		 (ADR 0008), so no method is marked as needing one."
-		^false
+		<primitive: CodeHasContextPrimitive>
 	]
 
 
 	outerReturns [
-		^self notYetImplemented
+		<primitive: CodeOuterReturnsPrimitive>
 	]
 
 
 	primitive [
-		^self notYetImplemented
+		"The primitive NUMBER, or nil for a method that has none."
+		<primitive: CodePrimitiveNumberPrimitive>
+	]
+
+
+	literals [
+		<primitive: CodeLiteralsPrimitive>
+	]
+
+
+	descriptors [
+		<primitive: CodeDescriptorsPrimitive>
+	]
+
+
+	sourceCode [
+		"WHERE the text is, not the text: a SourceCode names a file (or a
+		 string) plus a position and a length, and `sourceContents` is what
+		 fetches it. That is what makes reflection over a method possible
+		 without keeping a parse tree alive."
+		<primitive: CodeSourcePrimitive>
+	]
+
+
+	header [
+		"THE OLD PACKED WORD, REBUILT from the parts that replaced it, because
+		 the image still asks for it. It is a DERIVED value now and not a field:
+		 argument count in the low byte, declared temporaries in the next, the
+		 primitive number above that, and the hasContext flag at the top. Zero
+		 for a method that takes nothing, declares nothing, has no primitive and
+		 is nobody's home, which is what the trivial case meant in v1 too."
+		| bits |
+
+		bits := self argumentsSize.
+		bits := bits bitOr: (self temporariesSize bitShift: 8).
+		self primitive ifNotNil: [ :number |
+			bits := bits bitOr: (number bitShift: 16) ].
+		self hasContext ifTrue: [ bits := bits bitOr: (1 bitShift: 30) ].
+		^bits
 	]
 
 

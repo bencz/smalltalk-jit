@@ -6,7 +6,13 @@ Context := Object [
 	 from one on demand, using the same slot map deoptimization uses. So this
 	 class describes what a materialised context holds, not what the VM keeps."
 
-	| ic code parent outer home |
+	"The last two are the VM's frame identity: the native frame pointer and
+	 the code it was running, both as SmallIntegers (address >> 3), 0 when the
+	 context never had a frame. Every frame-reading primitive proves the frame
+	 is still on the stack through them before touching it, which is what makes
+	 a dead context answer nil instead of reading a reused frame."
+
+	| ic code parent outer home frame native |
 
 
 	"accessing"

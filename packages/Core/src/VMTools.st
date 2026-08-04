@@ -1,5 +1,13 @@
 VMTools := Object [
 
+	class backtrace [
+		"Print the compiled frames under this send on stderr, newest first.
+		 For the moment something is already wrong: it allocates nothing and
+		 sends nothing, so it works where printString would not."
+		<primitive: BacktracePrimitive>
+	]
+
+
 	class printCCharacters [
 		0 to: 255 do: [ :i |
 			| ch defined |

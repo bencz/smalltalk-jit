@@ -832,15 +832,16 @@ int main(void)
 		// to be declared, and a name quietly added or dropped is a file that
 		// stops compiling somewhere far from here.
 		//
-		// 177 = the 173 packages/ declares, PLUS PrintValuePrimitive which only
-		// the built-in kernel needs, PLUS InstrumentMark/InstrumentReport, which
-		// benchmarks/Vec3Boxed.st names and nothing implements: they are no-ops
-		// unless the VM is built with -DST_INSTRUMENT=1. That last pair is why
-		// this check no longer says "packages/" -- packages/ is not the only
-		// shipped code that names a primitive, and pretending otherwise is what
-		// left Vec3Boxed failing to compile.
+		// 190 = every name packages/ writes in a <primitive:> pragma, PLUS
+		// PrintValuePrimitive which only the built-in kernel needs, PLUS
+		// InstrumentMark/InstrumentReport, which benchmarks/Vec3Boxed.st names
+		// and nothing implements outside -DST_INSTRUMENT=1 builds. That pair
+		// is why this check does not say "packages/" -- packages/ is not the
+		// only shipped code that names a primitive. Last moved for the Context
+		// materialisation trio (ThisContext, BlockHomeContext,
+		// BlockOuterContext, runtime/primitives/Context.c).
 		check("every name the shipped image can write is declared here",
-			declared == 177);
+			declared == 190);
 	}
 
 	// ---- closures, at the bytecode level ------------------------------------

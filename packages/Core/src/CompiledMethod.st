@@ -11,11 +11,8 @@ CompiledMethod := CompiledCode [
 
 	"accessing"
 
-	literals [
-		"The literal frame belongs to the CodeUnit now, not to this object."
-		^self notYetImplemented
-	]
-
+	"literals, sourceCode and descriptors are inherited from CompiledCode: all
+	 three live in the CodeUnit, which is what the primitives there read."
 
 	selector [
 		^selector
@@ -24,17 +21,6 @@ CompiledMethod := CompiledCode [
 
 	ownerClass [
 		^ownerClass
-	]
-
-
-	sourceCode [
-		^self notYetImplemented
-	]
-
-
-	descriptors [
-		"An array beside the native code in jit-v2, not a field here."
-		^self notYetImplemented
 	]
 
 

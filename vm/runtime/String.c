@@ -1,5 +1,6 @@
 #include "runtime/String.h"
 #include "core/Assert.h"
+#include "core/Smalltalk.h"
 #include "memory/Heap.h"
 #include "runtime/Collection.h"
 #include <stdio.h>
@@ -216,6 +217,23 @@ static void growSymbolTable(void)
 	// Handles.symbolTable is itself a root, so it is written AFTER the scope
 	// closes and holds the raw pointer directly.
 	Handles.symbolTable.raw = published;
+
+	// AND THE GLOBAL FOLLOWS THE TABLE. `SymbolTable` names the current array
+	// (tools/Bootstrap.c installs it), and the table is REPLACED here rather
+	// than resized, so a binding left alone would name the array as it was
+	// before this grow -- correct-looking, and short by every symbol interned
+	// since.
+	//
+	// The lookup interns nothing new: the bootstrap interned this name to make
+	// the binding, so asSymbol finds it and no insert (and therefore no second
+	// grow) can happen underneath. Before the bootstrap gets there, there is no
+	// dictionary to write into and the global does not exist yet.
+	if (Handles.globals.raw != NULL) {
+		String *name = asSymbol(stringFromC("SymbolTable"));
+		if (globalAt(name) != 0) { // 0 is globalAt's "no such binding"
+			globalAtPut(name, objectTagged((Object *) &Handles.symbolTable));
+		}
+	}
 }
 
 

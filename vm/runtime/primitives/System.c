@@ -115,6 +115,22 @@ Value primFlushSendCaches(Value *args, uint64_t argc)
 }
 
 
+// VMTools class backtrace
+//
+// The compiled frames under this send, printed newest first. It answers the
+// receiver so it can be dropped into a cascade, and it prints on stderr for the
+// reason every diagnostic here does: stdout is what a test's own output is
+// compared on, and a backtrace must not become part of it.
+Value primPrintBacktrace(Value *args, uint64_t argc)
+{
+	if (argc != 0) {
+		return PRIMITIVE_FAILED;
+	}
+	jitPrintBacktrace(stderr);
+	return primitiveReceiver(args);
+}
+
+
 Value primCommandLine(Value *args, uint64_t argc)
 {
 	if (argc != 0) {

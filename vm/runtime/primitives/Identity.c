@@ -245,14 +245,26 @@ Value primBecome(Value *args, uint64_t argc)
 		becomeInObject(object, &rewrite, classes);
 	}
 
-	// The young space is a bump region, so it walks from the base of the
-	// from-space to the cursor. Every gap is a free chunk by now, and
+	// The young space is a bump region, so it walks from the FIRST OBJECT
+	// ADDRESS to the cursor. Every gap is a free chunk by now, and
 	// objectSizeInBytes strides over one exactly as it strides over a live
 	// object -- which is the whole reason a free chunk IS an object here.
+	//
+	// nurseryFirstObject and not `fromSpace`: a young object sits at 8 modulo
+	// 16 (memory/Nursery.h), so starting at the base read the first header 8
+	// bytes early, got a size of zero and stopped -- silently, at the first
+	// object, with the entire young generation unwalked. See the note there for
+	// what that cost.
 	Nursery *nursery = &heap->newSpace;
-	for (uint8_t *cursor = nursery->fromSpace; cursor < nursery->top; ) {
+	for (uint8_t *cursor = nurseryFirstObject(nursery); cursor < nursery->top; ) {
 		RawObject *object = (RawObject *) cursor;
-		size_t size = objectSizeInBytes(classes, object);
+		// heapWalkStride and not objectSizeInBytes: a TLAB tail capped by
+		// retireTlab is a FREE chunk, and one bigger than the header's size
+		// field keeps its length in its BODY (memory/PageSpace.h). Asking the
+		// general size function for it reaches for a class index a free chunk
+		// deliberately does not have, and aborts on the assertion that exists
+		// to catch exactly that read.
+		size_t size = heapWalkStride(classes, object);
 		if (size == 0) {
 			break; // a header that describes nothing: stop rather than loop
 		}

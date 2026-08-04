@@ -204,23 +204,19 @@ Value primFloatAsString(Value *args, uint64_t argc)
 			snprintf(buffer, sizeof buffer, "%.*f", decimals < 0 ? 0 : decimals,
 				value);
 		}
-		// A bare digit string has to read back as a Float, so it gets ".0"; a
-		// scientific mantissa with no point gets one before the exponent.
-		if (strpbrk(buffer, ".n") == NULL) {
-			char *exponent = strpbrk(buffer, "eE");
-			if (exponent == NULL) {
-				size_t length = strlen(buffer);
-				if (length + 3 <= sizeof buffer) {
-					memcpy(buffer + length, ".0", 3);
-				}
-			} else {
-				char tail[64];
-				snprintf(tail, sizeof tail, "%s", exponent);
-				size_t head = (size_t) (exponent - buffer);
-				if (head + 2 + strlen(tail) + 1 <= sizeof buffer) {
-					memcpy(buffer + head, ".0", 2);
-					memcpy(buffer + head + 2, tail, strlen(tail) + 1);
-				}
+		// A BARE DIGIT STRING has to read back as a Float, so it gets ".0".
+		//
+		// A SCIENTIFIC ONE DOES NOT, and that is a fact about this dialect's
+		// literals rather than a style choice: `1e+300` and `5e-324` already
+		// parse as Floats here (compiler/Tokenizer.c), so the exponent is
+		// itself the mark, and padding the mantissa only makes the answer
+		// longer than the shortest string that round-trips -- which is the one
+		// thing this whole function is computing. `1e+300` printed as
+		// `1.0e+300` and `5e-324` as `5.0e-324`.
+		if (strpbrk(buffer, ".n") == NULL && strpbrk(buffer, "eE") == NULL) {
+			size_t length = strlen(buffer);
+			if (length + 3 <= sizeof buffer) {
+				memcpy(buffer + length, ".0", 3);
 			}
 		}
 	}

@@ -40,7 +40,9 @@
 // v6: the jit-v2 object model. One-word object headers with a class INDEX, a
 // restored class table, and code units written explicitly. Nothing before this
 // version shares a single record with it.
-#define SNAPSHOT_FORMAT_VERSION 6
+// 7: CodeUnit gained `codeObject` (the CompiledMethod a unit belongs to, for
+// Context materialisation), one more word per unit record.
+#define SNAPSHOT_FORMAT_VERSION 7
 #define SNAPSHOT_BYTE_ORDER_LITTLE 1
 #define SNAPSHOT_BYTE_ORDER_BIG 2
 

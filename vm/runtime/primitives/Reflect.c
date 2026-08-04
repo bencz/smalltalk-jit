@@ -27,6 +27,7 @@
 #include "runtime/primitives/Shared.h"
 #include "compiler/Ast.h"
 #include "compiler/Parser.h"
+#include "memory/ObjectWalk.h"
 #include "jit/CompiledMethod.h"
 #include "core/Smalltalk.h"
 #include "os/OsFile.h"
@@ -56,6 +57,34 @@ typedef struct {
 	OBJECT_HEADER;
 	Value messageText;
 } RawExceptionHead;
+
+// A COMPILE error adds `identifier` right after (CompileError.st): the AST
+// node the failure is about, from which the defaultMessageText of
+// UndefinedVariableError and friends composes name, line and column.
+typedef struct {
+	OBJECT_HEADER;
+	Value messageText;
+	Value identifier;
+} RawCompileErrorHead;
+
+
+// nil in every pointer slot, which newObject deliberately does not do: the
+// error objects built here are handed straight to Smalltalk, and an unset slot
+// must answer nil there, not the allocator's zero (the SmallInteger 0). The
+// concrete failure this closes: `messageText isNil` was false on a fresh
+// ParseError, so messageText answered 0 instead of running defaultMessageText.
+static void fillPointerSlotsWithNil(Object *instance)
+{
+	if (!formatHasPointers(rawObjectFormat(instance->raw))) {
+		return;
+	}
+	size_t count;
+	Value *slots = objectPointerSlots(&CurrentThread.heap->classes,
+		instance->raw, &count);
+	for (size_t i = 0; i < count; i++) {
+		slots[i] = tagPtr(Handles.nil.raw);
+	}
+}
 
 
 // ---------------------------------------------------------------------------
@@ -173,6 +202,7 @@ static Value parseErrorFrom(Parser *parser)
 	HandleScope scope;
 	openHandleScope(&scope);
 	ParseError *error = newObject(parseErrorClass, 0);
+	fillPointerSlotsWithNil((Object *) error);
 	Token *token = currentToken(&parser->tokenizer);
 	// messageText stays nil: ParseError>>defaultMessageText builds the sentence
 	// from the token and the position, which is where that wording belongs.
@@ -267,30 +297,41 @@ static Value buildErrorFrom(const ClassBuildError *error)
 	// Error, and the message string is not something a handler can match on.
 	// A name the image does not have falls back to Error rather than failing:
 	// reporting the wrong class of error still reports the error.
-	Class *errorClass = error->errorClass != NULL
+	Class *namedClass = error->errorClass != NULL
 		? getClass((char *) error->errorClass) : NULL;
-	if (errorClass == NULL) {
-		errorClass = getClass("Error");
-	}
+	Class *errorClass = namedClass != NULL ? namedClass : getClass("Error");
 	if (errorClass == NULL) {
 		return PRIMITIVE_FAILED;
 	}
 	HandleScope scope;
 	openHandleScope(&scope);
 	Object *raised = newObject(errorClass, 0);
-	char text[512];
-	if (error->what != NULL) {
-		char name[256];
-		stringPrintOn(error->what, name);
-		snprintf(text, sizeof text, "%s: %s", error->message, name);
+	fillPointerSlotsWithNil(raised);
+	// TWO SHAPES OF MESSAGE. With the offending NODE in hand and the NAMED
+	// class found, the node becomes the error's `identifier` and messageText
+	// stays nil: the class's own defaultMessageText composes the sentence,
+	// with the name, the line and the column, which no text built here could
+	// carry. `identifier` is a slot only the CompileError family declares, so
+	// the fallback Error takes the composed-text path instead.
+	if (namedClass != NULL && error->identifier != NULL) {
+		rawObjectStorePtr((RawObject *) raised->raw,
+			&((RawCompileErrorHead *) raised->raw)->identifier,
+			(RawObject *) error->identifier->raw);
 	} else {
-		snprintf(text, sizeof text, "%s", error->message);
+		char text[512];
+		if (error->what != NULL) {
+			char name[256];
+			stringPrintOn(error->what, name);
+			snprintf(text, sizeof text, "%s: %s", error->message, name);
+		} else {
+			snprintf(text, sizeof text, "%s", error->message);
+		}
+		// Through the barrier: the String is young and the Error may already
+		// have been promoted.
+		rawObjectStorePtr((RawObject *) raised->raw,
+			&((RawExceptionHead *) raised->raw)->messageText,
+			(RawObject *) stringFromC(text)->raw);
 	}
-	// Through the barrier: the String is young and the Error may already have
-	// been promoted.
-	rawObjectStorePtr((RawObject *) raised->raw,
-		&((RawExceptionHead *) raised->raw)->messageText,
-		(RawObject *) stringFromC(text)->raw);
 	Value answer = objectTagged(raised);
 	closeHandleScope(&scope, NULL);
 	return answer;

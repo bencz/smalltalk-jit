@@ -148,6 +148,16 @@ Object := nil [
 	]
 
 
+	thisContext [
+		"The SENDER's activation, materialised as a Context (ADR 0008). The
+		 compiler rewrites the pseudo-variable `thisContext` into this send, so
+		 the activation that asked is the one answered; the receiver plays no
+		 part. nil when the sender's frame cannot be described (optimized
+		 code)."
+		<primitive: ThisContextPrimitive>
+	]
+
+
 	isKindOf: aClass [
 		^self class == aClass
 			ifTrue: [true]
@@ -317,8 +327,24 @@ Object := nil [
 
 	mustBeBoolean [
 		"Sent by inlined conditionals (ifTrue:/and:/...) when the receiver is
-		 neither true nor false."
+		 neither the true singleton nor the false one. The contract is to answer
+		 the singleton the receiver stands for, which True and False override to
+		 do; anything else stands for neither and says so."
 		^self error: 'NonBoolean receiver: does not understand a Boolean message'
+	]
+
+
+	primitiveFailed: primitiveName [
+		"Sent by a method whose whole body is a primitive, when the primitive
+		 did not run (see the fallback the compiler emits in Compile.c). Nobody
+		 implemented it until now, so the failure arrived as a
+		 doesNotUnderstand: #primitiveFailed: -- a message about the WRONG
+		 selector, on a receiver that had nothing to do with the mistake, which
+		 is exactly the report that costs a debugging session.
+
+		 It names the primitive, because the receiver's class alone says what
+		 did not work and leaves out what was being attempted."
+		^self error: 'primitive ', primitiveName asString, ' failed'
 	]
 
 

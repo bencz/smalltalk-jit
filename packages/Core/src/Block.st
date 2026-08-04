@@ -22,7 +22,8 @@ Block := Object [
 	"accessing"
 
 	compiledBlock [
-		^self notYetImplemented
+		"The code this closure runs, as a CompiledBlock."
+		<primitive: BlockCodePrimitive>
 	]
 
 
@@ -33,12 +34,17 @@ Block := Object [
 
 
 	outerContext [
-		^self notYetImplemented
+		"A flat closure records no enclosing activation (ADR 0008), so the
+		 honest answer is a frameless BlockContext describing this block, with
+		 its home attached; frame-reading questions on it answer nil."
+		<primitive: BlockOuterContextPrimitive>
 	]
 
 
 	homeContext [
-		^self notYetImplemented
+		"The activation of the method this block was written in: live while it
+		 is still on the stack, frameless once it has returned."
+		<primitive: BlockHomeContextPrimitive>
 	]
 
 

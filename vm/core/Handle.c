@@ -53,6 +53,24 @@ static Object *scopeSlot(HandleScope *scope, size_t index)
 }
 
 
+void *outermostHandle(void *rawObject)
+{
+	HandleScope *inner = CurrentThread.handleScopes;
+	ASSERT(inner != NULL);
+	HandleScope *outer = inner;
+	while (outer->parent != NULL) {
+		outer = outer->parent;
+	}
+	// scopeHandle allocates in whatever CurrentThread says is innermost, so the
+	// outermost is made innermost for exactly one call. No allocation happens
+	// in between, so nothing observes the swap.
+	CurrentThread.handleScopes = outer;
+	void *handle = scopeHandle(rawObject);
+	CurrentThread.handleScopes = inner;
+	return handle;
+}
+
+
 void *scopeHandle(void *rawObject)
 {
 	HandleScope *scope = CurrentThread.handleScopes;

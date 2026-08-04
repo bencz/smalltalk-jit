@@ -222,6 +222,7 @@ set(vmSources
 	vm/runtime/primitives/Block.c
 	vm/runtime/primitives/Characters.c
 	vm/runtime/primitives/Comparison.c
+	vm/runtime/primitives/Context.c
 	vm/runtime/primitives/Exceptions.c
 	vm/runtime/primitives/FileSystem.c
 	vm/runtime/primitives/FloatArray.c

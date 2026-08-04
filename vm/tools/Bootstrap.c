@@ -82,6 +82,11 @@ static void bootstrapClasses(Heap *heap)
 	Handles.Dictionary.raw = fixedClass(object, 2)->raw;
 	Handles.OrderedCollection.raw = fixedClass(object, 3)->raw;
 	Handles.CompiledMethod.raw = classCreate(object, NULL, COMPILED_METHOD_SHAPE)->raw;
+	// A BLOCK'S CODE IS THE SAME OBJECT with a different class, so it gets the
+	// same shape: what differs is what the image can ask it (a block knows the
+	// method it was written in; a method has a selector in a dictionary).
+	// packages/Core reopens both, exactly as it reopens every class here.
+	Handles.CompiledBlock.raw = classCreate(object, NULL, COMPILED_METHOD_SHAPE)->raw;
 	Handles.UndefinedObject.raw = fixedClass(object, 0)->raw;
 	Handles.True.raw = fixedClass(object, 0)->raw;
 	Handles.False.raw = fixedClass(object, 0)->raw;
@@ -121,7 +126,12 @@ static void bootstrapClasses(Heap *heap)
 	// until its classes exist. The field counts come from the structs in Ast.h;
 	// one too few and the parser writes past the object.
 	Handles.SourceCode.raw = fixedClass(object, 5)->raw;
-	Handles.FileSourceCode.raw = fixedClass(object, 5)->raw;
+	// Under SourceCode from birth, same five slots: packages/Core reopens it
+	// (src/FileSourceCode.st) to add the file re-reading sourceContents, and
+	// reopening finds it BY NAME (nameClasses below). Unnamed, the .st made a
+	// SECOND class called FileSourceCode, and every method parsed from a file
+	// held a source of the anonymous first one, which understood nothing.
+	Handles.FileSourceCode.raw = fixedClass(&Handles.SourceCode, 5)->raw;
 	Handles.ClassNode.raw = fixedClass(object, 8)->raw;
 	Handles.MethodNode.raw = fixedClass(object, 5)->raw;
 	Handles.BlockNode.raw = fixedClass(object, 5)->raw;
@@ -187,6 +197,7 @@ static void nameClasses(void)
 	nameClass(&Handles.Dictionary, "Dictionary");
 	nameClass(&Handles.OrderedCollection, "OrderedCollection");
 	nameClass(&Handles.CompiledMethod, "CompiledMethod");
+	nameClass(&Handles.CompiledBlock, "CompiledBlock");
 	nameClass(&Handles.UndefinedObject, "UndefinedObject");
 	nameClass(&Handles.True, "True");
 	nameClass(&Handles.False, "False");
@@ -217,6 +228,7 @@ static void nameClasses(void)
 	// nodes get 2 here and declare none of their own there, inheriting both from
 	// LiteralNode.
 	nameClass(&Handles.SourceCode, "SourceCode");
+	nameClass(&Handles.FileSourceCode, "FileSourceCode");
 	nameClass(&Handles.ClassNode, "ClassNode");
 	nameClass(&Handles.MethodNode, "MethodNode");
 	nameClass(&Handles.BlockNode, "BlockNode");
@@ -244,6 +256,16 @@ static void nameClasses(void)
 	// handles cycles.
 	globalAtPut(asSymbol(stringFromC("Smalltalk")),
 		objectTagged(smalltalkGlobals()));
+
+	// THE SYMBOL TABLE, under its own name, and it is a v1 name the image still
+	// asks for (tests/MiscRuntimeTest.st). It is an ordinary Array of interned
+	// Symbols, so reflection can read it like any other.
+	//
+	// The binding is REPUBLISHED when the table grows (runtime/String.c): the
+	// table is replaced rather than resized, so a global bound once would name
+	// the array as it was at bootstrap and quietly go stale.
+	globalAtPut(asSymbol(stringFromC("SymbolTable")),
+		objectTagged((Object *) &Handles.symbolTable));
 }
 
 
@@ -330,6 +352,7 @@ static void defineSourceMethod(Class *class, const char *source)
 	}
 	String *selector = scopeHandle(asObject(unit->selector));
 	CompiledMethod *method = compiledMethodCreate(unit, selector, class);
+	compiledMethodBindBlocks(method);
 	Dictionary *methods = scopeHandle(asObject(class->raw->methodDictionary));
 	symbolDictAtPutObject(methods, selector, (Object *) method);
 	closeHandleScope(&scope, NULL);

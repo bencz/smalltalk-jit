@@ -203,6 +203,7 @@ level2() {
 		-Ivm -I. -Ivm/os/linux \
 		vm/tests/ObjectTest.c vm/core/Class.c vm/core/ClassTable.c vm/core/Handle.c \
 		vm/runtime/String.c vm/runtime/Collection.c \
+		vm/runtime/Dictionary.c vm/core/Smalltalk.c \
 		vm/memory/Heap.c vm/memory/Collector.c vm/memory/PageSpace.c \
 		vm/memory/Nursery.c vm/memory/RememberedSet.c vm/memory/Roots.c \
 		$(osSources) \
@@ -260,6 +261,7 @@ level6() {
 		vm/tests/DeoptTest.c vm/jit/Ir.c vm/jit/Passes.c vm/jit/Deopt.c \
 		vm/core/Class.c vm/core/ClassTable.c vm/core/Handle.c \
 		vm/runtime/String.c vm/runtime/Collection.c \
+		vm/runtime/Dictionary.c vm/core/Smalltalk.c \
 		vm/memory/Heap.c vm/memory/Collector.c vm/memory/PageSpace.c \
 		vm/memory/Nursery.c vm/memory/RememberedSet.c vm/memory/Roots.c \
 		$(osSources) \

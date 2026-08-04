@@ -36,11 +36,17 @@ typedef struct {
 	// distinguish "you redefined something" from "the shape pragma is wrong"
 	// needs the class, and a message string is not one.
 	const char *errorClass;
+	// The AST node the failure is about, or NULL: it becomes the `identifier`
+	// of the typed error, whose defaultMessageText prints its name and source
+	// position. A handle in the OUTERMOST scope (outermostHandle), because the
+	// error is read back after every build scope has closed.
+	LiteralNode *identifier;
 } ClassBuildError;
 
 // A zeroed one. Every field means "not set", so one initializer, and adding a
 // field does not make four call sites list one fewer than the struct has.
-#define CLASS_BUILD_ERROR_NONE ((ClassBuildError) { NULL, NULL, NULL, COMPILE_OK, NULL })
+#define CLASS_BUILD_ERROR_NONE \
+	((ClassBuildError) { NULL, NULL, NULL, COMPILE_OK, NULL, NULL })
 
 // Build or REOPEN the class this node describes. Reopening matters: the
 // built-in kernel already defines Object, Array, SmallInteger and the rest, and

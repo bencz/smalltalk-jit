@@ -33,4 +33,18 @@ OBJECT_HANDLE(CompiledMethod);
 
 CompiledMethod *compiledMethodCreate(CodeUnit *unit, String *selector, Class *owner);
 
+// A BLOCK'S CODE: the same object with the class CompiledBlock, which is the
+// only difference between the two. What the class buys is what the image can
+// ask: `aBlock method` answers the method the block was written in, and a
+// backtrace can say so.
+CompiledMethod *compiledBlockCreate(CodeUnit *unit, String *selector, Class *owner);
+
+// Point every block inside `method` at it, recursively.
+//
+// It is a SEPARATE STEP because of the order the compiler works in: a block's
+// code object exists before the enclosing method's does (the method's unit
+// names its blocks, so they are compiled first), so the back reference cannot
+// be filled at creation. Called once, by whoever creates the method object.
+void compiledMethodBindBlocks(CompiledMethod *method);
+
 #endif

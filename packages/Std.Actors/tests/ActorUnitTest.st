@@ -80,13 +80,19 @@ BecomeProbe := Actor [
 		| p | p := Props fromProducer: [ UnitProbe new ]. p producer value isKindOf: UnitProbe ].
 	t check: 'producer yields a fresh instance each call' that: [
 		| p | p := Props fromActorClass: UnitProbe. (p producer value == p producer value) = false ].
-	t check: 'withThroughput sets throughput' equals: 5 is: [
+	t check: 'withThroughput answers a props with the new throughput' equals: 5 is: [
+		| p | p := Props fromActorClass: UnitProbe. (p withThroughput: 5) throughput ].
+	t check: 'withThroughput leaves the receiver alone' equals: 30 is: [
 		| p | p := Props fromActorClass: UnitProbe. p withThroughput: 5. p throughput ].
-	t check: 'withSupervisor sets strategy and returns self' that: [
+	t check: 'withSupervisor sets strategy on a COPY' that: [
 		| p s r | p := Props fromActorClass: UnitProbe.
 		s := OneForOneStrategy decider: [:reason | #stop].
 		r := p withSupervisor: s.
-		(r == p) and: [ p supervisor == s ] ].
+		(r == p) = false and: [ (r supervisor == s) and: [ (p supervisor == s) = false ] ] ].
+	t check: 'a copy keeps the producer' that: [
+		| p r | p := Props fromActorClass: UnitProbe.
+		r := p withThroughput: 7.
+		r producer value isKindOf: UnitProbe ].
 
 	"------------------------------------------------ Mailbox: queue level"
 	"Tested standalone WITHOUT start (no runner fiber), so the queue state is
@@ -165,9 +171,12 @@ BecomeProbe := Actor [
 		(r1 = #pong) and: [ (r2 = #switched) and: [ r3 = #pong ] ] ].
 
 	"---------------------------------------------------------- dead letters"
-	"A dead letter is not directly readable (DeadLetterProcess only prints), so
-	 it is observed as ActorTest does: the reply never arrives and the request
-	 future times out to nil. The '[dead-letter]' lines printed below are expected."
+	"A dead letter is observed two ways here. Indirectly, as ActorTest does: the
+	 reply never arrives and the request future times out to nil -- which is
+	 also what a merely SLOW actor looks like. And directly, through the count
+	 DeadLetterProcess now keeps, which distinguishes the two. The
+	 '[dead-letter]' lines printed below are expected; the counted cases silence
+	 them so an expected drop does not look like a fault in the log."
 
 	t check: 'request to an unknown pid times out to nil' that: [
 		| dead | dead := Pid id: 987654321 isolate: 0.
@@ -178,6 +187,24 @@ BecomeProbe := Actor [
 		| a | a := Actors spawn: (Props fromActorClass: UnitProbe).
 		a stop. Processor yield.
 		((a request: #count) awaitFor: 50) isNil ].
+	t check: 'an undeliverable USER message is counted' that: [
+		| dl before dead |
+		dl := Actors deadLetters.
+		dl silent: true.
+		before := dl count.
+		dead := Pid id: 987654323 isolate: 0.
+		dead tell: #hi.
+		dl silent: false.
+		dl count = (before + 1) ].
+	t check: 'an undeliverable SYSTEM message is counted, not dropped in silence' that: [
+		| dl before dead |
+		dl := Actors deadLetters.
+		dl silent: true.
+		before := dl count.
+		dead := Pid id: 987654324 isolate: 0.
+		dead sendSystem: SystemStop.
+		dl silent: false.
+		dl count = (before + 1) ].
 
 	^t report
 ]
