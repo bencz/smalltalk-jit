@@ -133,12 +133,16 @@ PRIMITIVE(FloatCeiling, "FloatCeilingPrimitive", primFloatCeiling)  // Float>>ce
 PRIMITIVE(FloatCos, "FloatCosPrimitive", primFloatCos)  // Float>>cos
 PRIMITIVE(FloatDiv, "FloatDivPrimitive", primDivide)  // Float>>/ aNumber
 PRIMITIVE(FloatEquals, "FloatEqualsPrimitive", primNumericEqual)  // Float>>= aNumber
+PRIMITIVE(FloatGreaterEquals, "FloatGreaterEqualsPrimitive", primGreaterEqual)  // Float>>>= aNumber
+PRIMITIVE(FloatGreaterThan, "FloatGreaterThanPrimitive", primGreater)  // Float>>> aNumber
 PRIMITIVE(FloatExp, "FloatExpPrimitive", primFloatExp)  // Float>>exp
 PRIMITIVE(FloatExponent, "FloatExponentPrimitive", primFloatExponent)  // Float>>exponent
 PRIMITIVE(FloatFloor, "FloatFloorPrimitive", primFloatFloor)  // Float>>floor
 PRIMITIVE(FloatLessThan, "FloatLessThanPrimitive", primLess)  // Float>>< aNumber
+PRIMITIVE(FloatLessEquals, "FloatLessEqualsPrimitive", primLessEqual)  // Float>><= aNumber
 PRIMITIVE(FloatLn, "FloatLnPrimitive", primFloatLn)  // Float>>ln
 PRIMITIVE(FloatMul, "FloatMulPrimitive", primMultiply)  // Float>>* aNumber
+PRIMITIVE(FloatNotEquals, "FloatNotEqualsPrimitive", primNumericNotEqual)  // Float>>~= aNumber
 PRIMITIVE(FloatRounded, "FloatRoundedPrimitive", primFloatRounded)  // Float>>rounded
 PRIMITIVE(FloatSin, "FloatSinPrimitive", primFloatSin)  // Float>>sin
 PRIMITIVE(FloatSqrt, "FloatSqrtPrimitive", primFloatSqrt)  // Float>>sqrt
@@ -158,11 +162,16 @@ PRIMITIVE(IntAdd, "IntAddPrimitive", primAdd)  // SmallInteger>>+ aNumber
 PRIMITIVE(IntAnd, "IntAndPrimitive", primBitAnd)  // SmallInteger>>bitAnd: anInteger
 PRIMITIVE(IntAsFloat, "IntAsFloatPrimitive", primAsFloat)  // SmallInteger>>asFloat
 PRIMITIVE(IntAsStringBase, "IntAsStringBasePrimitive", primIntAsStringBase)  // SmallInteger>>printStringBase: base
+PRIMITIVE(IntEquals, "IntEqualsPrimitive", primNumericEqual)  // SmallInteger>>= aNumber
+PRIMITIVE(IntGreaterEquals, "IntGreaterEqualsPrimitive", primGreaterEqual)  // SmallInteger>>>= aNumber
+PRIMITIVE(IntGreaterThan, "IntGreaterThanPrimitive", primGreater)  // SmallInteger>>> aNumber
 PRIMITIVE(IntFloorDiv, "IntFloorDivPrimitive", primFloorDivide)  // SmallInteger>>// aNumber
 PRIMITIVE(IntLessThan, "IntLessThanPrimitive", primLess)  // SmallInteger>>< aNumber
+PRIMITIVE(IntLessEquals, "IntLessEqualsPrimitive", primLessEqual)  // SmallInteger>><= aNumber
 PRIMITIVE(IntMod, "IntModPrimitive", primFloorModulo)  // SmallInteger>>\\ aNumber
 PRIMITIVE(IntMul, "IntMulPrimitive", primMultiply)  // SmallInteger>>* aNumber
 PRIMITIVE(IntNeg, "IntNegPrimitive", primNegated)  // SmallInteger>>negated
+PRIMITIVE(IntNotEquals, "IntNotEqualsPrimitive", primNumericNotEqual)  // SmallInteger>>~= aNumber
 PRIMITIVE(IntOr, "IntOrPrimitive", primBitOr)  // SmallInteger>>bitOr: anInteger
 PRIMITIVE(IntQuo, "IntQuoPrimitive", primQuotient)  // SmallInteger>>quo: aNumber
 PRIMITIVE(IntRem, "IntRemPrimitive", primRemainder)  // SmallInteger>>rem: aNumber

@@ -832,16 +832,26 @@ int main(void)
 		// to be declared, and a name quietly added or dropped is a file that
 		// stops compiling somewhere far from here.
 		//
-		// 190 = every name packages/ writes in a <primitive:> pragma, PLUS
+		// 199 = every name packages/ writes in a <primitive:> pragma, PLUS
 		// PrintValuePrimitive which only the built-in kernel needs, PLUS
 		// InstrumentMark/InstrumentReport, which benchmarks/Vec3Boxed.st names
 		// and nothing implements outside -DST_INSTRUMENT=1 builds. That pair
 		// is why this check does not say "packages/" -- packages/ is not the
-		// only shipped code that names a primitive. Last moved for the Context
-		// materialisation trio (ThisContext, BlockHomeContext,
-		// BlockOuterContext, runtime/primitives/Context.c).
+		// only shipped code that names a primitive.
+		//
+		// Last moved from 190 for the RELATIONAL FAMILY: SmallInteger and Float
+		// each gained the four comparisons they used to inherit as Smalltalk
+		// derivations (Int/Float GreaterThan, LessEquals, GreaterEquals,
+		// NotEquals) plus IntEquals, which SmallInteger had never had at all --
+		// its `=` was an isKindOf: followed by ==. Nine names, all of them
+		// written by packages/Core/src/Magnitudes/, all of them landing on
+		// compareNumbers, which already had the six shapes and said in its own
+		// comment that promoting one was meant to be a line in the .def.
+		// Measured cause: `x > 1000.0` reached Float>>>, which sends isKindOf:,
+		// then asFloat, then <, so ONE source comparison was four sends.
+		// Before this the previous move was the Context materialisation trio.
 		check("every name the shipped image can write is declared here",
-			declared == 190);
+			declared == 199);
 	}
 
 	// ---- closures, at the bytecode level ------------------------------------

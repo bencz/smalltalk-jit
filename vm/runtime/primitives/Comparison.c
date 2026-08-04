@@ -62,9 +62,20 @@ static Value compareNumbers(Value *args, uint64_t argc, Comparison how)
 }
 
 
-// Only `<` and `=` are primitives, because only those two are what the kernel
-// declares: Magnitude derives >, <= and >= from < in Smalltalk. The other four
-// comparison shapes stay reachable through compareNumbers so that promoting one
-// to a primitive later is a line in Primitives.def and not a rewrite.
+// ALL SIX ARE PRIMITIVES NOW, and the line that used to be here -- "only `<` and
+// `=`, because Magnitude derives the rest in Smalltalk" -- described a cost
+// rather than a design. Measured, on the float benchmark: `x > 1000.0` reached
+// Float>>> , which sends `isKindOf:`, then `asFloat`, then `<`, so ONE source
+// comparison was four sends and two method activations. `primIdentical`,
+// `classOf` and `primClass` together held 11% of that benchmark's cycles and
+// every one of those samples came from a comparison walking a class chain.
+//
+// Deriving them in Smalltalk is still what happens for every OTHER Magnitude.
+// What changed is that the two classes on the arithmetic fast path stopped
+// paying for the derivation.
 Value primLess(Value *a, uint64_t n) { return compareNumbers(a, n, CMP_LESS); }
 Value primNumericEqual(Value *a, uint64_t n) { return compareNumbers(a, n, CMP_EQUAL); }
+Value primGreater(Value *a, uint64_t n) { return compareNumbers(a, n, CMP_GREATER); }
+Value primLessEqual(Value *a, uint64_t n) { return compareNumbers(a, n, CMP_LESS_EQUAL); }
+Value primGreaterEqual(Value *a, uint64_t n) { return compareNumbers(a, n, CMP_GREATER_EQUAL); }
+Value primNumericNotEqual(Value *a, uint64_t n) { return compareNumbers(a, n, CMP_NOT_EQUAL); }

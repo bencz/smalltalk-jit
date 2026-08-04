@@ -58,12 +58,20 @@ static const PrimitiveRule gRules[] = {
 	{ PRIM_IntAdd, IR_IADD, 0, 1 },
 	{ PRIM_IntSub, IR_ISUB, 0, 1 },
 	{ PRIM_IntMul, IR_IMUL, 0, 1 },
-	// Integer comparison. `<` is the only relational primitive the kernel
-	// declares: Magnitude derives >, <= and >= from it in Smalltalk, so those
-	// three arrive as sends to methods with no primitive and are not specialized
-	// here. That is the correct answer and not a gap -- specializing `>` by name
-	// would be specializing a method this site never called.
+	// Integer comparison, ALL SIX. This used to be `<` alone, and the comment
+	// here said that was correct rather than a gap, because Magnitude derived the
+	// other five in Smalltalk and specializing `>` by name would be specializing a
+	// method the site never called. Both halves of that still hold; what changed
+	// is the KERNEL. SmallInteger now carries a primitive for each of the six
+	// (packages/Core/src/Magnitudes/SmallInteger.st), so a site that sends `>` to
+	// an integer resolves to a method that really does carry PRIM_IntGreaterThan,
+	// and this table still keys on the primitive and never on the name.
 	{ PRIM_IntLessThan, IR_ICMP, IR_CMP_LT, 0 },
+	{ PRIM_IntGreaterThan, IR_ICMP, IR_CMP_GT, 0 },
+	{ PRIM_IntLessEquals, IR_ICMP, IR_CMP_LE, 0 },
+	{ PRIM_IntGreaterEquals, IR_ICMP, IR_CMP_GE, 0 },
+	{ PRIM_IntEquals, IR_ICMP, IR_CMP_EQ, 0 },
+	{ PRIM_IntNotEquals, IR_ICMP, IR_CMP_NE, 0 },
 	// Float arithmetic. No overflow check: an IEEE double has no result that
 	// fails to be a double, and infinity is an answer rather than a failure.
 	{ PRIM_FloatAdd, IR_FADD, 0, 0 },
@@ -71,7 +79,28 @@ static const PrimitiveRule gRules[] = {
 	{ PRIM_FloatMul, IR_FMUL, 0, 0 },
 	{ PRIM_FloatDiv, IR_FDIV, 0, 0 },
 	{ PRIM_FloatLessThan, IR_FCMP, IR_CMP_LT, 0 },
+	{ PRIM_FloatGreaterThan, IR_FCMP, IR_CMP_GT, 0 },
+	{ PRIM_FloatLessEquals, IR_FCMP, IR_CMP_LE, 0 },
+	{ PRIM_FloatGreaterEquals, IR_FCMP, IR_CMP_GE, 0 },
 	{ PRIM_FloatEquals, IR_FCMP, IR_CMP_EQ, 0 },
+	{ PRIM_FloatNotEquals, IR_FCMP, IR_CMP_NE, 0 },
+	// NOT HERE, and each absence has a different cause worth telling apart.
+	//
+	// PRIM_IntFloorDiv and PRIM_IntMod: tier 1's emitted block DOES take these.
+	// The two tiers differ here on purpose. That block guards itself to a
+	// non-negative dividend and a positive divisor and sends everything else,
+	// which is a runtime test it can afford; an IR rule has no such guard to
+	// offer, so it would have to model the floor correction and the zero divisor
+	// as control flow.
+	//
+	// PRIM_IntAnd, PRIM_IntOr, PRIM_IntXor: tier 1 takes these too, and they are
+	// its CHEAPEST arms -- one instruction, because tag 00 survives a bitwise
+	// operation. They are absent here for a reason that is neither semantic nor a
+	// judgement: the IR HAS NO BITWISE OPERATION. It carries IADD, ISUB, IMUL,
+	// IDIV, IMOD and nothing else (jit/Ir.h). The LIR already has AND, OR and XOR,
+	// so closing this is an IR opcode plus a case in jit/Lower.c, not a design
+	// question -- but it is a change to the IR and not a line in this table, and
+	// writing it here as a table entry would not have compiled.
 };
 
 

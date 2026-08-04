@@ -41,9 +41,26 @@ typedef enum {
 	COND_EQUAL = 0x4, COND_NOT_EQUAL = 0x5,
 	COND_BELOW_EQUAL = 0x6, COND_ABOVE = 0x7,
 	COND_SIGN = 0x8, COND_NO_SIGN = 0x9,
+	// PARITY is how an SSE comparison reports NaN: ucomisd sets it instead of
+	// raising, and every ordered answer about a NaN is false. A float fast path
+	// that ignored it would answer `NaN < 1.0` with whatever the other flags
+	// happened to hold.
+	COND_PARITY = 0xA, COND_NO_PARITY = 0xB,
 	COND_LESS = 0xC, COND_GREATER_EQUAL = 0xD,
 	COND_LESS_EQUAL = 0xE, COND_GREATER = 0xF,
 } Condition;
+
+
+// The opposite test. x86 numbers its condition codes in PAIRS, each condition
+// immediately followed by its negation, so flipping the low bit is the whole
+// operation -- which is exactly why every pair above is written on one line.
+// A caller that has a condition in a variable and needs to branch the other way
+// asks for it here rather than carrying a second column in its table.
+static inline Condition invertCondition(Condition condition)
+{
+	return (Condition) (condition ^ 1);
+}
+
 
 // A forward reference: emitted with a placeholder displacement, patched when
 // the label is bound. A LIST of references, not one slot: the old assembler
@@ -259,6 +276,40 @@ static inline void asmShlRegImm8(CodeBuffer *buffer, Register reg, uint8_t bits)
 }
 
 
+// LOGICAL right shift, which is a different instruction from asmSarRegImm8 above
+// and not a stylistic choice: the SmallFloat64 payload is an unsigned bit
+// pattern, and shifting its top bit in as a sign would corrupt every value in
+// the upper half of the encoding's range (core/Object.h).
+static inline void asmShrRegImm8(CodeBuffer *buffer, Register reg, uint8_t bits)
+{
+	emitRexW(buffer, (Register) 5, reg);
+	emit8(buffer, 0xC1);
+	emitModRmReg(buffer, (Register) 5, reg);
+	emit8(buffer, bits);
+}
+
+
+// Rotates. The SmallFloat64 encoding is a one-bit rotation of the IEEE pattern,
+// so these two ARE the encode and decode step, not an optimization of one: the
+// C spells it `(bits >> 1) | (bits << 63)` because ISO C has no rotate.
+static inline void asmRolRegImm8(CodeBuffer *buffer, Register reg, uint8_t bits)
+{
+	emitRexW(buffer, (Register) 0, reg);
+	emit8(buffer, 0xC1);
+	emitModRmReg(buffer, (Register) 0, reg);
+	emit8(buffer, bits);
+}
+
+
+static inline void asmRorRegImm8(CodeBuffer *buffer, Register reg, uint8_t bits)
+{
+	emitRexW(buffer, (Register) 1, reg);
+	emit8(buffer, 0xC1);
+	emitModRmReg(buffer, (Register) 1, reg);
+	emit8(buffer, bits);
+}
+
+
 // ---- 32-bit forms, for reading the low half of an object header -------------
 //
 // No REX.W: these operate on 32 bits and zero-extend into the full register,
@@ -319,6 +370,20 @@ static inline void asmCmp32RegImm32(CodeBuffer *buffer, Register reg, uint32_t v
 // INDEX rather than a pointer (ADR 0005): `cmp dword [obj], imm32` compares the
 // low half of the header, where the 22-bit class index lives, without loading
 // the class and without touching a second cache line.
+// The SIXTY-FOUR bit form, which the one below is deliberately not: that one
+// compares a 32-bit field and this one compares a whole word. A caller testing a
+// uint64 counter with the 32-bit version would be testing the low half and
+// answering differently every time the counter crossed 2^32.
+static inline void asmCmpMemImm32(CodeBuffer *buffer, Register base,
+	int32_t displacement, int32_t value)
+{
+	emitRexW(buffer, (Register) 7, base);
+	emit8(buffer, 0x81);
+	emitModRmMem(buffer, (Register) 7, base, displacement);
+	emit32(buffer, (uint32_t) value);
+}
+
+
 static inline void asmCmpMem32Imm32(CodeBuffer *buffer, Register base,
 	int32_t displacement, uint32_t value)
 {

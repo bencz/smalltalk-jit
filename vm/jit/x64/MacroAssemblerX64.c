@@ -16,6 +16,7 @@
 #include "jit/Jit.h"
 #include "core/Assert.h"
 #include "core/Class.h"
+#include "core/Handle.h"
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
@@ -332,6 +333,7 @@ void x64CallRuntime3(MacroAssembler *a, MaRuntimeFunction function,
 // reads, which is what icPromoteHottest exists to keep true.
 #define IC_OFF_SENDS  ((int32_t) offsetof(IcCell, sends))
 #define IC_OFF_WAYS   ((int32_t) offsetof(IcCell, ways))
+#define IC_OFF_INLINE ((int32_t) offsetof(IcCell, inlineOp))
 // And into one way, which a register walks along, so the block that commits to
 // a hit is emitted ONCE however many ways are tested.
 #define WAY_OFF_CLASS  ((int32_t) offsetof(IcWay, classIndex))
@@ -350,6 +352,14 @@ void x64CallRuntime3(MacroAssembler *a, MaRuntimeFunction function,
 // else answers from gClassIndexByTag. Emitting a switch over the three immediate
 // tags instead would be a second encoding of a fact the C already owns, and the
 // two would drift the first time a tag is added.
+// WHICH ARM FALLS THROUGH is the pointer one, and it is worth saying why the
+// obvious next step was measured and NOT taken: the pointer arm still ends in a
+// `jmp` over the immediate arm, and removing that would mean emitting the
+// immediate arm OUT OF LINE, past the end of the whole send sequence. That needs
+// deferred-block machinery in the emitter, and what it buys is one correctly
+// predicted taken branch. The machinery was written and reverted; if this is
+// ever revisited, the reason to do it is instruction FETCH density across the
+// whole image, not the branch itself.
 static void emitClassIndexOfSlot(MacroAssembler *a, uint16_t slot)
 {
 	CodeBuffer *buffer = maBuffer(a);
@@ -423,6 +433,438 @@ static _Bool inlineCacheEnabled(void)
 }
 
 
+// ST_NO_INLINE_ARITH=1 kill-switch for the block below, for the same two reasons
+// the cache has one: an A/B needs the other side, and the profile claim needs to
+// be checkable. A deterministic program under ST_IC_STATS=1 must report the SAME
+// send and way totals with this on and off, because the fast path below does the
+// same three updates the cache's own hit path does.
+static _Bool inlineArithmeticEnabled(void)
+{
+	static int enabled = -1;
+	if (enabled < 0) {
+		enabled = getenv("ST_NO_INLINE_ARITH") == NULL;
+	}
+	return enabled != 0;
+}
+
+
+// The arithmetic the site may do WITHOUT dispatching, ahead of the cache probe.
+//
+// WHAT THIS IS NOT: it is not the previous VM's arithmetic fast path. That one
+// was keyed on the SELECTOR at compile time and, when it hit, skipped the cache
+// -- so an arithmetic site's profile described exactly the executions that had
+// FAILED (ADR 0004, ADR 0006). Nothing here is decided at compile time except
+// "this site takes one argument": WHICH operation, or whether any is allowed at
+// all, is a word the runtime wrote into the cell after seeing which method way 0
+// resolved to and which primitive that method carries. The compiler still does
+// not know that `+` means addition, which is the property both ADRs protect.
+//
+// AND IT PAYS THE PROFILE. The commit block below bumps the site's total, way
+// zero's count and the argument's class, exactly as the cache's hit path does
+// twenty lines further down, so `sends == sum of way counts` still holds and the
+// optimizer still sees every execution. Three memory operations, the same three.
+//
+// WHY WAY ZERO NEEDS NO CLASS TEST HERE. `inlineOp` is written only in
+// jit/Jit.c, only after icPromoteHottest has settled way 0, and only when way 0
+// is the SmallInteger way. Way 0 can change only on a MISS, and a miss runs that
+// same code again. So an armed cell means way 0 is the integer way, and the tag
+// tests below prove the operands are integers now.
+//
+// COST AT A SITE THAT IS NOT ARMED: three instructions, and the cell was being
+// materialised anyway. That is what buys not having to know at compile time
+// which selectors are arithmetic -- the question the ADRs forbid asking.
+// The six relational operations, in the order jit/InlineCache.h lists them for
+// BOTH groups. ONE table walked twice, because "which comparison" is a fact that
+// must not be written down in two places that can drift.
+//
+// The two condition columns differ and the difference is not cosmetic: an
+// integer `cmp` sets the SIGNED flags, and `ucomisd` sets the UNSIGNED ones
+// (that is what makes an SSE compare able to report NaN in the parity flag at
+// all). Using COND_LESS on float flags would answer by the sign flag, which an
+// SSE comparison never writes.
+typedef struct {
+	uint16_t integerOp;
+	uint16_t floatOp;
+	Condition integerCondition;
+	Condition floatCondition;
+} RelationalArm;
+
+static const RelationalArm gRelationalArms[IC_INLINE_RELATIONAL_COUNT] = {
+	{ IC_INLINE_INT_LT, IC_INLINE_FLOAT_LT, COND_LESS,          COND_BELOW },
+	{ IC_INLINE_INT_GT, IC_INLINE_FLOAT_GT, COND_GREATER,       COND_ABOVE },
+	{ IC_INLINE_INT_LE, IC_INLINE_FLOAT_LE, COND_LESS_EQUAL,    COND_BELOW_EQUAL },
+	{ IC_INLINE_INT_GE, IC_INLINE_FLOAT_GE, COND_GREATER_EQUAL, COND_ABOVE_EQUAL },
+	{ IC_INLINE_INT_EQ, IC_INLINE_FLOAT_EQ, COND_EQUAL,         COND_EQUAL },
+	{ IC_INLINE_INT_NE, IC_INLINE_FLOAT_NE, COND_NOT_EQUAL,     COND_NOT_EQUAL },
+};
+
+
+// One relational arm: test whether this site is armed for `op`, and if it is,
+// compare and answer a boolean.
+//
+// THE COMPARISON IS INSIDE THE ARM AND NOT SHARED ABOVE THE CHAIN, and that is
+// forced rather than chosen. A shared compare would have its flags destroyed by
+// the very next `cmp` in the dispatch chain, which is how the chain asks which
+// operation this is. So each arm re-compares -- one instruction -- and only the
+// arm that matches ever executes it.
+//
+// `false` is materialised BEFORE the conditional jump because both booleans are
+// 64-bit immediates: there is no conditional move that selects between two of
+// those, and `mov` does not disturb the flags the compare just set.
+static void emitRelationalArm(MacroAssembler *a, Register opRegister,
+	uint16_t op, Condition condition, void (*compare)(MacroAssembler *),
+	MaLabel *nan, MaLabel *commit, MaLabel *next)
+{
+	CodeBuffer *buffer = maBuffer(a);
+	asmCmp32RegImm32(buffer, opRegister, op);
+	asmJcc(buffer, COND_NOT_EQUAL, (X64Label *) next);
+	compare(a);
+	if (nan != NULL) {
+		// NaN FIRST, and it leaves. Every ordered comparison against a NaN is
+		// false and `~=` against one is true; the primitive already answers all
+		// six correctly, so the cheapest correct thing is to let it.
+		asmJcc(buffer, COND_PARITY, (X64Label *) nan);
+	}
+	asmMovRegImm64(buffer, X64_ACCUMULATOR, tagPtr(Handles.false_.raw));
+	asmJcc(buffer, invertCondition(condition), (X64Label *) commit);
+	asmMovRegImm64(buffer, X64_ACCUMULATOR, tagPtr(Handles.true_.raw));
+	asmJmp(buffer, (X64Label *) commit);
+}
+
+
+static void emitIntegerCompare(MacroAssembler *a)
+{
+	// On the TAGGED values, which answers what a comparison of the payloads
+	// would: both carry the same two low bits, so the shift is order-preserving
+	// over the whole signed range.
+	asmCmpRegReg(maBuffer(a), X64_ACCUMULATOR, X64_SCRATCH);
+}
+
+
+static void emitFloatCompare(MacroAssembler *a)
+{
+	asmUcomisd(maBuffer(a), XMM0, XMM1);
+}
+
+
+static void emitInlineArithmetic(MacroAssembler *a, const MaSendSite *site,
+	MaLabel *slow, MaLabel *done)
+{
+	CodeBuffer *buffer = maBuffer(a);
+	MaLabel *commit = x64NewLabel(a);
+	MaLabel *commitFloat = x64NewLabel(a);
+	MaLabel *floating = x64NewLabel(a);
+	MaLabel *next;
+	uint8_t i;
+
+	// The armed operation, into the way register -- free here, because the cache
+	// probe that owns it has not started.
+	asmMov32RegMem(buffer, X64_WAY, X64_CELL, IC_OFF_INLINE);
+	asmCmp32RegImm32(buffer, X64_WAY, IC_INLINE_NONE);
+	asmJcc(buffer, COND_EQUAL, (X64Label *) slow);
+	// The two groups need different tag tests, so they split before the operands
+	// are even loaded. ONE unsigned compare, which is what keeping the integer
+	// operations contiguous in the enum buys (jit/InlineCache.h).
+	asmCmp32RegImm32(buffer, X64_WAY, IC_INLINE_INT_LAST);
+	asmJcc(buffer, COND_ABOVE, (X64Label *) floating);
+
+	// ---- the integer group -------------------------------------------------
+	//
+	// Both operands SmallInteger, which is tag 00 and therefore a test against
+	// the low two bits. TWO tests rather than one on their OR, because the OR
+	// needs a fourth register this sequence does not have (the file header
+	// explains why there are only three) and both branches are perfectly
+	// predicted at a site that is armed.
+	asmMovRegMem(buffer, X64_ACCUMULATOR, X64_FRAME, slotOffset(site->receiverSlot));
+	asmTestRegImm32(buffer, X64_ACCUMULATOR, 3);
+	asmJcc(buffer, COND_NOT_EQUAL, (X64Label *) slow);
+	asmMovRegMem(buffer, X64_SCRATCH, X64_FRAME,
+		slotOffset((uint16_t) (site->receiverSlot + 1)));
+	asmTestRegImm32(buffer, X64_SCRATCH, 3);
+	asmJcc(buffer, COND_NOT_EQUAL, (X64Label *) slow);
+
+	// A tagged SmallInteger IS its payload shifted left by two (core/Object.h),
+	// so the tags cancel in addition and subtraction and the tagged operands add
+	// directly. Overflow of the 62-bit payload is exactly overflow of the 64-bit
+	// signed operation, so one `jo` is the whole range check -- and it goes to
+	// the slow path, where the method's own Smalltalk builds the LargeInteger.
+	//
+	// The accumulator is dead on that branch, which is why clobbering it before
+	// the test is safe: the cache probe reloads the receiver from its slot.
+	next = x64NewLabel(a);
+	asmCmp32RegImm32(buffer, X64_WAY, IC_INLINE_INT_ADD);
+	asmJcc(buffer, COND_NOT_EQUAL, (X64Label *) next);
+	asmAddRegReg(buffer, X64_ACCUMULATOR, X64_SCRATCH);
+	asmJcc(buffer, COND_OVERFLOW, (X64Label *) slow);
+	asmJmp(buffer, (X64Label *) commit);
+
+	// THE RELATIONAL SIX GO SECOND, AND THE ORDER OF THESE ARMS IS A MEASURED
+	// DECISION rather than a taxonomy. The chain is walked at run time: an arm at
+	// position n pays n compare-and-branch pairs before it, and only the arm that
+	// matches ever runs. Measured, 20M iterations each: an operation at position 1
+	// costs nothing over the empty loop, one at position 6 costs 1.4 ns.
+	//
+	// A COUNTED LOOP EXECUTES A COMPARISON AND AN ADDITION PER ITERATION, and
+	// every `to:do:` and `whileTrue:` in the system is one, which makes `<=` and
+	// `<` the two hottest armed operations there are. They were at positions 9 and
+	// 10 behind the arithmetic and the bitwise ops, so every loop in the image
+	// walked past eight arms it would never take.
+	for (i = 0; i < IC_INLINE_RELATIONAL_COUNT; i++) {
+		x64Bind(a, next);
+		next = x64NewLabel(a);
+		emitRelationalArm(a, X64_WAY, gRelationalArms[i].integerOp,
+			gRelationalArms[i].integerCondition, emitIntegerCompare, NULL,
+			commit, next);
+	}
+
+	x64Bind(a, next);
+	next = x64NewLabel(a);
+	asmCmp32RegImm32(buffer, X64_WAY, IC_INLINE_INT_SUB);
+	asmJcc(buffer, COND_NOT_EQUAL, (X64Label *) next);
+	asmSubRegReg(buffer, X64_ACCUMULATOR, X64_SCRATCH);
+	asmJcc(buffer, COND_OVERFLOW, (X64Label *) slow);
+	asmJmp(buffer, (X64Label *) commit);
+
+	// Multiplication cannot let both tags cancel -- the product would carry four
+	// tag bits -- so one side is untagged first. Overflow is again exactly the
+	// 64-bit signed one, because the result that fits is the payload product
+	// shifted back up by two.
+	x64Bind(a, next);
+	next = x64NewLabel(a);
+	asmCmp32RegImm32(buffer, X64_WAY, IC_INLINE_INT_MUL);
+	asmJcc(buffer, COND_NOT_EQUAL, (X64Label *) next);
+	asmSarRegImm8(buffer, X64_ACCUMULATOR, 2);
+	asmImulRegReg(buffer, X64_ACCUMULATOR, X64_SCRATCH);
+	asmJcc(buffer, COND_OVERFLOW, (X64Label *) slow);
+	asmJmp(buffer, (X64Label *) commit);
+
+	// THE CHEAPEST THREE IN THE WHOLE BLOCK. The SmallInteger tag is 00, so it
+	// survives and, or and xor untouched and the TAGGED operands combine
+	// directly: no untagging, no retagging, and no range check, because a
+	// bitwise combination of two 62-bit payloads is always a 62-bit payload.
+	// One instruction each, against roughly ninety for the send they replace.
+	x64Bind(a, next);
+	next = x64NewLabel(a);
+	asmCmp32RegImm32(buffer, X64_WAY, IC_INLINE_INT_AND);
+	asmJcc(buffer, COND_NOT_EQUAL, (X64Label *) next);
+	asmAndRegReg(buffer, X64_ACCUMULATOR, X64_SCRATCH);
+	asmJmp(buffer, (X64Label *) commit);
+
+	x64Bind(a, next);
+	next = x64NewLabel(a);
+	asmCmp32RegImm32(buffer, X64_WAY, IC_INLINE_INT_OR);
+	asmJcc(buffer, COND_NOT_EQUAL, (X64Label *) next);
+	asmOrRegReg(buffer, X64_ACCUMULATOR, X64_SCRATCH);
+	asmJmp(buffer, (X64Label *) commit);
+
+	x64Bind(a, next);
+	next = x64NewLabel(a);
+	asmCmp32RegImm32(buffer, X64_WAY, IC_INLINE_INT_XOR);
+	asmJcc(buffer, COND_NOT_EQUAL, (X64Label *) next);
+	asmXorRegReg(buffer, X64_ACCUMULATOR, X64_SCRATCH);
+	asmJmp(buffer, (X64Label *) commit);
+
+	// Floor division and modulo, sharing one divide.
+	//
+	// GUARDED TO NON-NEGATIVE DIVIDEND AND POSITIVE DIVISOR, which is narrower
+	// than the operations are, and deliberately: `//` and `\\` FLOOR, the machine
+	// divide TRUNCATES, and the two disagree for exactly one operand sign. Inside
+	// the guard they agree, so no correction is needed; outside it the send runs
+	// and the kernel's own Smalltalk answers, which is also where a zero divisor
+	// has to go because ZeroDivide is raised there.
+	//
+	// AND THE TAGS ARE LEFT ON, which is not a shortcut but the arithmetic:
+	// dividing 4a by 4b answers the untagged quotient a/b and a remainder
+	// (a mod b)*4 that is ALREADY TAGGED. So modulo costs nothing to convert
+	// back and division costs one shift.
+	x64Bind(a, next);
+	next = x64NewLabel(a);
+	MaLabel *divide = x64NewLabel(a);
+	asmCmp32RegImm32(buffer, X64_WAY, IC_INLINE_INT_FLOORDIV);
+	asmJcc(buffer, COND_EQUAL, (X64Label *) divide);
+	asmCmp32RegImm32(buffer, X64_WAY, IC_INLINE_INT_MOD);
+	asmJcc(buffer, COND_NOT_EQUAL, (X64Label *) next);
+	x64Bind(a, divide);
+	asmCmpRegImm32(buffer, X64_SCRATCH, 0);
+	asmJcc(buffer, COND_LESS_EQUAL, (X64Label *) slow);
+	asmCmpRegImm32(buffer, X64_ACCUMULATOR, 0);
+	asmJcc(buffer, COND_LESS, (X64Label *) slow);
+	// idiv reads RDX:RAX, so the high half has to exist. The dividend is known
+	// non-negative here, so cqo writes zero -- but it is the instruction the
+	// architecture requires and omitting it divides by whatever RDX held.
+	asmCqo(buffer);
+	asmIdivReg(buffer, X64_SCRATCH);
+	MaLabel *modulo = x64NewLabel(a);
+	asmCmp32RegImm32(buffer, X64_WAY, IC_INLINE_INT_MOD);
+	asmJcc(buffer, COND_EQUAL, (X64Label *) modulo);
+	asmShlRegImm8(buffer, X64_ACCUMULATOR, 2);
+	asmJmp(buffer, (X64Label *) commit);
+	x64Bind(a, modulo);
+	asmMovRegReg(buffer, X64_ACCUMULATOR, RDX);
+	asmJmp(buffer, (X64Label *) commit);
+
+	// Nothing matched, which an armed cell cannot produce -- every value the
+	// runtime writes has an arm above. The send is what runs if it ever does.
+	x64Bind(a, next);
+	asmJmp(buffer, (X64Label *) slow);
+
+	// THE PROFILE, and it is not optional. See the head of this function.
+	x64Bind(a, commit);
+	asmAddMemImm32(buffer, X64_CELL, IC_OFF_SENDS, 1);
+	asmAddMemImm32(buffer, X64_CELL, IC_OFF_WAYS + WAY_OFF_COUNT, 1);
+	// The argument's class needs no computing: the tag test above PROVED it is a
+	// SmallInteger, and the class of every SmallInteger is one index out of the
+	// same table emitClassIndexOfSlot reads.
+	asmMovRegImm64(buffer, X64_WAY, gClassIndexByTag[VALUE_INT]);
+	asmMov32MemReg(buffer, X64_CELL, IC_OFF_WAYS + WAY_OFF_ARG, X64_WAY);
+	asmJmp(buffer, (X64Label *) done);
+
+	// ---- the float group ---------------------------------------------------
+	//
+	// SmallFloat64 is a ROTATION of the IEEE pattern, biased so the exponents
+	// that occur in practice land in 62 bits (core/Object.h). Decoding is
+	// therefore real work -- a shift, a bias, a rotate -- and it is paid twice on
+	// the way in and once on the way out. That tax is why this block is worth
+	// perhaps three times its cost and not thirty: what it removes is the send,
+	// the C frame and the primitive's own re-derivation of both classes, but the
+	// boxing between one operation and the next stays. Removing THAT is the SSA
+	// optimizer's job and cannot be done here, because tier 1's frame law says
+	// every bytecode register is a tagged slot (jit/Lir.h).
+	//
+	// THE DECODE IS SHARED BY ALL TEN OPERATIONS and only the middle differs,
+	// which is what keeps the emitted block at one decode rather than one per
+	// operation.
+	x64Bind(a, floating);
+
+	// Tag 11 on both, tested as two bits rather than as a value, because
+	// comparing against 3 would need a fourth register to hold the masked copy.
+	asmMovRegMem(buffer, X64_ACCUMULATOR, X64_FRAME, slotOffset(site->receiverSlot));
+	asmTestRegImm32(buffer, X64_ACCUMULATOR, 1);
+	asmJcc(buffer, COND_EQUAL, (X64Label *) slow);
+	asmTestRegImm32(buffer, X64_ACCUMULATOR, 2);
+	asmJcc(buffer, COND_EQUAL, (X64Label *) slow);
+	asmMovRegMem(buffer, X64_SCRATCH, X64_FRAME,
+		slotOffset((uint16_t) (site->receiverSlot + 1)));
+	asmTestRegImm32(buffer, X64_SCRATCH, 1);
+	asmJcc(buffer, COND_EQUAL, (X64Label *) slow);
+	asmTestRegImm32(buffer, X64_SCRATCH, 2);
+	asmJcc(buffer, COND_EQUAL, (X64Label *) slow);
+
+	// The bias, which needs a register because it does not fit an imm32. The way
+	// register is free from here to the dispatch below, which is why the armed
+	// operation is RE-READ there instead of being kept: one reload against a
+	// fourth register this sequence does not have.
+	asmMovRegImm64(buffer, X64_WAY, SMALLFLOAT_OFFSET);
+
+	// value -> double, twice. `payload <= 1` is the signed-zero pair, which the
+	// encoding maps to payloads 0 and 1 instead of biasing; everything else is
+	// unbiased and rotated. Exactly floatValueOf, instruction for instruction.
+	MaLabel *receiverZero = x64NewLabel(a);
+	asmShrRegImm8(buffer, X64_ACCUMULATOR, 2);
+	asmCmpRegImm32(buffer, X64_ACCUMULATOR, 1);
+	asmJcc(buffer, COND_BELOW_EQUAL, (X64Label *) receiverZero);
+	asmAddRegReg(buffer, X64_ACCUMULATOR, X64_WAY);
+	x64Bind(a, receiverZero);
+	asmRorRegImm8(buffer, X64_ACCUMULATOR, 1);
+	asmMovqXmmFromGpr(buffer, XMM0, X64_ACCUMULATOR);
+
+	MaLabel *argumentZero = x64NewLabel(a);
+	asmShrRegImm8(buffer, X64_SCRATCH, 2);
+	asmCmpRegImm32(buffer, X64_SCRATCH, 1);
+	asmJcc(buffer, COND_BELOW_EQUAL, (X64Label *) argumentZero);
+	asmAddRegReg(buffer, X64_SCRATCH, X64_WAY);
+	x64Bind(a, argumentZero);
+	asmRorRegImm8(buffer, X64_SCRATCH, 1);
+	asmMovqXmmFromGpr(buffer, XMM1, X64_SCRATCH);
+
+	// WHICH operation, re-read now that both operands are in the float bank and
+	// the accumulator is free to hold it. The way register keeps the bias, which
+	// the boxing step below still needs.
+	MaLabel *box = x64NewLabel(a);
+	asmMov32RegMem(buffer, X64_ACCUMULATOR, X64_CELL, IC_OFF_INLINE);
+
+	next = x64NewLabel(a);
+	asmCmp32RegImm32(buffer, X64_ACCUMULATOR, IC_INLINE_FLOAT_ADD);
+	asmJcc(buffer, COND_NOT_EQUAL, (X64Label *) next);
+	asmAddsd(buffer, XMM0, XMM1);
+	asmJmp(buffer, (X64Label *) box);
+
+	// SECOND, for the reason the integer group states at the same place: a loop
+	// runs its comparison every iteration. These six also do NOT answer a float,
+	// so they leave the boxing path below alone entirely.
+	for (i = 0; i < IC_INLINE_RELATIONAL_COUNT; i++) {
+		x64Bind(a, next);
+		next = x64NewLabel(a);
+		emitRelationalArm(a, X64_ACCUMULATOR, gRelationalArms[i].floatOp,
+			gRelationalArms[i].floatCondition, emitFloatCompare, slow,
+			commitFloat, next);
+	}
+
+	x64Bind(a, next);
+	next = x64NewLabel(a);
+	asmCmp32RegImm32(buffer, X64_ACCUMULATOR, IC_INLINE_FLOAT_SUB);
+	asmJcc(buffer, COND_NOT_EQUAL, (X64Label *) next);
+	asmSubsd(buffer, XMM0, XMM1);
+	asmJmp(buffer, (X64Label *) box);
+
+	x64Bind(a, next);
+	next = x64NewLabel(a);
+	asmCmp32RegImm32(buffer, X64_ACCUMULATOR, IC_INLINE_FLOAT_MUL);
+	asmJcc(buffer, COND_NOT_EQUAL, (X64Label *) next);
+	asmMulsd(buffer, XMM0, XMM1);
+	asmJmp(buffer, (X64Label *) box);
+
+	x64Bind(a, next);
+	next = x64NewLabel(a);
+	asmCmp32RegImm32(buffer, X64_ACCUMULATOR, IC_INLINE_FLOAT_DIV);
+	asmJcc(buffer, COND_NOT_EQUAL, (X64Label *) next);
+	// NO ZERO TEST. IEEE division by zero answers an infinity, which is a Float
+	// and an answer; it is the SmallInteger division that has to fail, and that
+	// one is not in this group.
+	asmDivsd(buffer, XMM0, XMM1);
+	asmJmp(buffer, (X64Label *) box);
+
+	x64Bind(a, next);
+	asmJmp(buffer, (X64Label *) slow);
+
+	// double -> value, the exact inverse, INCLUDING the range refusal. A result
+	// outside the SmallFloat64 window needs a BoxedFloat64, which is an
+	// allocation, and allocating is what this whole block exists not to do -- so
+	// it goes to the send, whose primitive answers by the ordinary path.
+	x64Bind(a, box);
+	MaLabel *pack = x64NewLabel(a);
+	asmMovqGprFromXmm(buffer, X64_ACCUMULATOR, XMM0);
+	// The rotation first. It maps +-0.0 to 0 and 1, which is exactly the pair
+	// tagFloat special-cases, so the test below is the same test and not a
+	// second encoding of it.
+	asmRolRegImm8(buffer, X64_ACCUMULATOR, 1);
+	asmCmpRegImm32(buffer, X64_ACCUMULATOR, 1);
+	asmJcc(buffer, COND_BELOW_EQUAL, (X64Label *) pack);
+	asmSubRegReg(buffer, X64_ACCUMULATOR, X64_WAY);
+	// payload >= 2. Below that are the two zero payloads, which this arm did not
+	// produce, and the wrap-around of the subtraction, which lands far above.
+	asmCmpRegImm32(buffer, X64_ACCUMULATOR, 2);
+	asmJcc(buffer, COND_BELOW, (X64Label *) slow);
+	// payload < 2^62, tested by shifting the two bits the tag needs off the top.
+	// The scratch is free: the argument was consumed into XMM1.
+	asmMovRegReg(buffer, X64_SCRATCH, X64_ACCUMULATOR);
+	asmShrRegImm8(buffer, X64_SCRATCH, 62);
+	asmJcc(buffer, COND_NOT_EQUAL, (X64Label *) slow);
+	x64Bind(a, pack);
+	asmShlRegImm8(buffer, X64_ACCUMULATOR, 2);
+	// The low two bits are zero after the shift, so adding the tag IS or-ing it,
+	// and every backend has an add-immediate.
+	asmAddRegImm32(buffer, X64_ACCUMULATOR, VALUE_FLOAT);
+
+	x64Bind(a, commitFloat);
+	asmAddMemImm32(buffer, X64_CELL, IC_OFF_SENDS, 1);
+	asmAddMemImm32(buffer, X64_CELL, IC_OFF_WAYS + WAY_OFF_COUNT, 1);
+	asmMovRegImm64(buffer, X64_WAY, gClassIndexByTag[VALUE_FLOAT]);
+	asmMov32MemReg(buffer, X64_CELL, IC_OFF_WAYS + WAY_OFF_ARG, X64_WAY);
+	asmJmp(buffer, (X64Label *) done);
+}
+
+
 void x64Send(MacroAssembler *a, const MaSendSite *site)
 {
 	CodeBuffer *buffer = maBuffer(a);
@@ -446,6 +888,17 @@ void x64Send(MacroAssembler *a, const MaSendSite *site)
 
 	MaLabel *found = x64NewLabel(a);
 	asmMovRegImm64(buffer, X64_CELL, (uint64_t) (uintptr_t) site->cell);
+
+	// The one thing decided at COMPILE time about the block below: a binary send.
+	// Arithmetic takes one argument, so a site that takes none or several can
+	// never be armed and is spared the three instructions. Which operation, and
+	// whether any is allowed, remains the runtime's answer.
+	if (site->argumentCount == 1 && inlineArithmeticEnabled()) {
+		MaLabel *probe = x64NewLabel(a);
+		emitInlineArithmetic(a, site, probe, done);
+		x64Bind(a, probe);
+	}
+
 	emitClassIndexOfSlot(a, site->receiverSlot);
 
 	// Walk the emitted ways, in order, with a REGISTER pointing at the candidate.
@@ -488,9 +941,39 @@ void x64Send(MacroAssembler *a, const MaSendSite *site)
 	// bumping them before the decision would count this send twice.
 	asmAddMemImm32(buffer, X64_CELL, IC_OFF_SENDS, 1);
 	asmAddMemImm32(buffer, X64_WAY, WAY_OFF_COUNT, 1);
+	MaLabel *argumentProfiled = NULL;
 	if (site->argumentCount > 0) {
-		// The first argument's class, kept as LAST SEEN exactly as icRecord
-		// keeps it. It clobbers the accumulator, so the target is re-read from
+		// THE ARGUMENT'S CLASS IS PROFILED ONLY WHILE THE WAY IS YOUNG, and this
+		// is the largest single cost that used to be paid on every execution of
+		// every binary send in the system.
+		//
+		// Deriving a class index is eight or nine instructions: a tag test, and
+		// then either a header load and a mask or a shift and a table load. It ran
+		// unconditionally, and the only thing it produced was a field the runtime
+		// keeps as LAST SEEN -- read by exactly one consumer, jit/Specialize.c,
+		// which asks whether this site's argument has a representation worth
+		// specializing on and refuses below SPECIALIZE_MIN_SENDS executions
+		// anyway. Two instructions now decide whether to pay the other nine.
+		//
+		// WHAT IS LOST, stated rather than glossed: the field stops meaning "last
+		// seen" and starts meaning "seen during the first ARGUMENT_PROFILE_SENDS
+		// executions of this way". For a site whose argument class is stable the
+		// two are the same answer. For a site that ALTERNATES -- `a + b` seeing
+		// SmallInteger and Float by turns -- "last seen" was already an arbitrary
+		// sample of a mixed population, so neither reading was ever the truth
+		// there; that is what the per-class way counts on the RECEIVER exist for,
+		// and they are untouched. For a site that genuinely changes argument class
+		// late, the optimizer can now speculate on the old one, its guard fails at
+		// run time and the method deoptimizes: a cost on that site, not a wrong
+		// answer, because the guard is emitted from the same field it speculated
+		// on.
+		//
+		// A SIXTY-FOUR BIT COMPARE. The counter is a uint64 and testing its low
+		// half would restart profiling every time it crossed 2^32.
+		argumentProfiled = x64NewLabel(a);
+		asmCmpMemImm32(buffer, X64_WAY, WAY_OFF_COUNT, ARGUMENT_PROFILE_SENDS);
+		asmJcc(buffer, COND_ABOVE, (X64Label *) argumentProfiled);
+		// It clobbers the accumulator, so the target is re-read from
 		// the way afterwards rather than parked somewhere across it: one load
 		// against a fourth register this sequence would have to find.
 		emitClassIndexOfSlot(a, (uint16_t) (site->receiverSlot + 1));
@@ -510,6 +993,12 @@ void x64Send(MacroAssembler *a, const MaSendSite *site)
 		// carry an argument -- a unary send never re-reads and never needed it.
 		asmCmpRegImm32(buffer, X64_ACCUMULATOR, 0);
 		asmJcc(buffer, COND_EQUAL, (X64Label *) miss);
+		// The warm path rejoins HERE, past the re-read and past its test, and it
+		// owes neither: the window those two close is opened by the class
+		// derivation between the first read and the second, and the warm path does
+		// not derive anything. The target it still carries is the one the test
+		// above already approved.
+		x64Bind(a, argumentProfiled);
 	}
 
 	// The entry point, in the ACCUMULATOR, where it survives the marshalling

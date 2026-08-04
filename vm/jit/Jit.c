@@ -295,6 +295,16 @@ void jitFlushSendCaches(void)
 			for (uint8_t way = 0; way < IC_MAX_WAYS; way++) {
 				code->cells[i].ways[way].target = NULL;
 			}
+			// AND THE ARMED ARITHMETIC, which is the same obligation one step
+			// further on. Clearing the targets disarms the cache's fast path
+			// because that path tests the target; the arithmetic path tests
+			// neither, by design -- it answers without reading a method at all.
+			// A site left armed here would therefore keep computing the OLD
+			// SmallInteger>>+ forever and never miss again, so nothing would ever
+			// bring it back to the runtime to notice the redefinition. Exactly the
+			// stale answer this function exists to prevent, at the one site shape
+			// that cannot self-correct.
+			code->cells[i].inlineOp = IC_INLINE_NONE;
 		}
 	}
 	heapCodegenLockLeave(heap);
@@ -823,6 +833,121 @@ static _Bool jitMayEnterDirectly(const NativeCode *code)
 }
 
 
+// What the emitted fast path at this site may compute without dispatching, or
+// IC_INLINE_NONE. THE ONLY PLACE THIS IS DECIDED, and the reason it is decided
+// here rather than when the method was compiled is the whole of ADR 0004 and ADR
+// 0006: the compiler must not learn that `+` means addition, because a compiler
+// that resolves arithmetic statically leaves the optimizer no profile to read.
+//
+// KEYED BY THE PRIMITIVE way 0 resolved to. Not by the selector, which is a
+// name: a program that redefines SmallInteger>>+ installs a method carrying no
+// primitive, the switch below finds nothing, and the site quietly stops being
+// armed. No name is ever compared and no redefinition is ever missed.
+//
+// CALLED ON EVERY MISS, and it CLEARS before it decides, so it disarms as
+// readily as it arms. That matters more than it looks: way 0 moves under
+// icPromoteHottest, and a cell still claiming INT_ADD after way 0 became the
+// Float way would have the fast path credit an integer send to the float way's
+// count -- a profile the optimizer would then act on.
+static void icArmInlineArithmetic(IcCell *cell)
+{
+	cell->inlineOp = IC_INLINE_NONE;
+	const IcWay *way = &cell->ways[0];
+	if (way->target == NULL || way->target->unit == NULL) {
+		return;
+	}
+	// The receiver class way 0 holds decides which GROUP is even possible, and it
+	// has to be an IMMEDIATE class: the emitted block reads the operands straight
+	// out of their frame slots and never follows a pointer, so a BoxedFloat64
+	// receiver has nothing there to unbox. Those keep going through the send.
+	_Bool integer = way->classIndex == gClassIndexByTag[VALUE_INT];
+	_Bool floating = way->classIndex == gClassIndexByTag[VALUE_FLOAT];
+	if (!integer && !floating) {
+		return;
+	}
+	switch (way->target->unit->primitive) {
+	case PRIM_IntAdd:
+		cell->inlineOp = integer ? IC_INLINE_INT_ADD : IC_INLINE_NONE;
+		break;
+	case PRIM_IntSub:
+		cell->inlineOp = integer ? IC_INLINE_INT_SUB : IC_INLINE_NONE;
+		break;
+	case PRIM_IntMul:
+		cell->inlineOp = integer ? IC_INLINE_INT_MUL : IC_INLINE_NONE;
+		break;
+	case PRIM_IntAnd:
+		cell->inlineOp = integer ? IC_INLINE_INT_AND : IC_INLINE_NONE;
+		break;
+	case PRIM_IntOr:
+		cell->inlineOp = integer ? IC_INLINE_INT_OR : IC_INLINE_NONE;
+		break;
+	case PRIM_IntXor:
+		cell->inlineOp = integer ? IC_INLINE_INT_XOR : IC_INLINE_NONE;
+		break;
+	case PRIM_IntFloorDiv:
+		cell->inlineOp = integer ? IC_INLINE_INT_FLOORDIV : IC_INLINE_NONE;
+		break;
+	case PRIM_IntMod:
+		cell->inlineOp = integer ? IC_INLINE_INT_MOD : IC_INLINE_NONE;
+		break;
+	case PRIM_IntLessThan:
+		cell->inlineOp = integer ? IC_INLINE_INT_LT : IC_INLINE_NONE;
+		break;
+	case PRIM_IntGreaterThan:
+		cell->inlineOp = integer ? IC_INLINE_INT_GT : IC_INLINE_NONE;
+		break;
+	case PRIM_IntLessEquals:
+		cell->inlineOp = integer ? IC_INLINE_INT_LE : IC_INLINE_NONE;
+		break;
+	case PRIM_IntGreaterEquals:
+		cell->inlineOp = integer ? IC_INLINE_INT_GE : IC_INLINE_NONE;
+		break;
+	case PRIM_IntEquals:
+		cell->inlineOp = integer ? IC_INLINE_INT_EQ : IC_INLINE_NONE;
+		break;
+	case PRIM_IntNotEquals:
+		cell->inlineOp = integer ? IC_INLINE_INT_NE : IC_INLINE_NONE;
+		break;
+	// The float pairs are separate primitive NUMBERS even though they name the
+	// same C function (runtime/primitives/Arithmetic.c): the number says which
+	// method packages/Core installed, and Float>>+ is a different method from
+	// SmallInteger>>+ even where the implementation coincides.
+	case PRIM_FloatAdd:
+		cell->inlineOp = floating ? IC_INLINE_FLOAT_ADD : IC_INLINE_NONE;
+		break;
+	case PRIM_FloatSub:
+		cell->inlineOp = floating ? IC_INLINE_FLOAT_SUB : IC_INLINE_NONE;
+		break;
+	case PRIM_FloatMul:
+		cell->inlineOp = floating ? IC_INLINE_FLOAT_MUL : IC_INLINE_NONE;
+		break;
+	case PRIM_FloatDiv:
+		cell->inlineOp = floating ? IC_INLINE_FLOAT_DIV : IC_INLINE_NONE;
+		break;
+	case PRIM_FloatLessThan:
+		cell->inlineOp = floating ? IC_INLINE_FLOAT_LT : IC_INLINE_NONE;
+		break;
+	case PRIM_FloatGreaterThan:
+		cell->inlineOp = floating ? IC_INLINE_FLOAT_GT : IC_INLINE_NONE;
+		break;
+	case PRIM_FloatLessEquals:
+		cell->inlineOp = floating ? IC_INLINE_FLOAT_LE : IC_INLINE_NONE;
+		break;
+	case PRIM_FloatGreaterEquals:
+		cell->inlineOp = floating ? IC_INLINE_FLOAT_GE : IC_INLINE_NONE;
+		break;
+	case PRIM_FloatEquals:
+		cell->inlineOp = floating ? IC_INLINE_FLOAT_EQ : IC_INLINE_NONE;
+		break;
+	case PRIM_FloatNotEquals:
+		cell->inlineOp = floating ? IC_INLINE_FLOAT_NE : IC_INLINE_NONE;
+		break;
+	default:
+		break;
+	}
+}
+
+
 // The body of both send paths. `lookupStart` is the class the method search
 // begins at, and it is the ONLY thing that differs between an ordinary send and
 // a super send: everything else, the profile included, is the same site
@@ -949,6 +1074,12 @@ static Value dispatchFrom(IcCell *cell, Value *receiverSlot, uint64_t packed,
 		// BE way 0 or the cache tests a class it rarely sees.
 		icPromoteHottest(cell);
 	}
+	// AND, NOW THAT WAY 0 HAS SETTLED, decide what this site's emitted code may
+	// compute on its own. Unconditionally, including when the arming above did
+	// not happen: this is also where a site that WAS armed gets disarmed, and a
+	// cell that keeps its old answer after way 0 moved would count an integer
+	// send against a way that is no longer the integer one.
+	icArmInlineArithmetic(cell);
 	// Arguments are at DESCENDING addresses from the receiver's slot, because
 	// consecutive registers are consecutive slots and slots grow down.
 	//

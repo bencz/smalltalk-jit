@@ -35,6 +35,7 @@ SmallInteger := Integer [
 
 
 	= aNumber [
+		<primitive: IntEqualsPrimitive>
 		(aNumber isKindOf: SmallInteger) ifTrue: [^self == aNumber].
 		"An Integer argument is handled HERE, never through retry:coercing:.
 		 LargeInteger>>coerce: answers its argument unchanged (there is nothing
@@ -48,11 +49,42 @@ SmallInteger := Integer [
 
 	< aNumber [
 		 <primitive: IntLessThanPrimitive>
-		"See = below for why an Integer argument must not reach retry:coercing:.
-		 Magnitude derives >, <= and >= from this one, so fixing < and = covers
-		 the whole relational protocol."
+		"See = above for why an Integer argument must not reach retry:coercing:."
 		(aNumber isKindOf: Integer) ifTrue: [^(self largeCompare: aNumber) < 0].
 		^self retryRelationalOp: #< coercing: aNumber
+	]
+
+
+	"The other four relational operators. Magnitude DERIVES all of these from <,
+	 and Object derives ~= from =, and those derivations are still what runs for
+	 every other Magnitude in the system. They are overridden HERE, on the two
+	 classes that carry the arithmetic fast path, because the derivation is not
+	 free: it is a full method activation plus a second send, and measured on the
+	 float benchmark one source comparison cost four sends. The fallback body of
+	 each one below IS the derivation it replaces, character for character, so a
+	 failed primitive answers exactly what the inherited method would have."
+
+	> aNumber [
+		<primitive: IntGreaterThanPrimitive>
+		^aNumber < self
+	]
+
+
+	>= aNumber [
+		<primitive: IntGreaterEqualsPrimitive>
+		^(self < aNumber) not
+	]
+
+
+	<= aNumber [
+		<primitive: IntLessEqualsPrimitive>
+		^(aNumber < self) not
+	]
+
+
+	~= aNumber [
+		<primitive: IntNotEqualsPrimitive>
+		^self = aNumber == false
 	]
 
 

@@ -46,16 +46,122 @@ struct NativeCode;
 // monomorphic sites to help the few polymorphic ones.
 #define IC_EMITTED_WAYS 2
 
+// How many executions of a WAY still pay to record the argument's class.
+//
+// Deriving a class index costs eight or nine instructions and it ran on every
+// execution of every binary send in the system, to maintain a field whose only
+// consumer (jit/Specialize.c) refuses to look below SPECIALIZE_MIN_SENDS
+// executions and asks one question of it: does this argument have a
+// representation worth specializing on. A few dozen samples answer that as well
+// as a few million do.
+//
+// 64 rather than 8: the floor Specialize.c applies is on the SITE's total, and a
+// polymorphic site reaches it long before any single way has been through the
+// argument enough times to have seen more than one shape.
+//
+// The cost of the bound is written where it is paid, in the emitted sequence in
+// jit/x64/MacroAssemblerX64.c: past it the field means "seen while young"
+// instead of "last seen".
+#define ARGUMENT_PROFILE_SENDS 64
+
 typedef struct {
 	uint32_t classIndex;    // receiver class this way matches
-	uint32_t argClassIndex; // dominant class of the first argument here
+	// The class of the first argument, as seen during this way's first
+	// ARGUMENT_PROFILE_SENDS executions. NOT "last seen" -- see the constant.
+	uint32_t argClassIndex;
 	uint64_t count;
 	struct NativeCode *target;
 } IcWay;
 
+// What the emitted fast path at a site is allowed to compute WITHOUT calling
+// anything, or IC_INLINE_NONE, which is what every site holds until the runtime
+// proves otherwise.
+//
+// THE RUNTIME DECIDES THIS, NOT THE COMPILER, and that is the whole design. The
+// template compiler never learns that `+` means addition -- ADR 0004 and ADR
+// 0006 both turn on it not learning that, because a compiler that resolves
+// arithmetic statically destroys the profile the optimizer is built to read.
+// What is emitted is a sequence that asks the CELL what it may do; what fills
+// the cell in is jit/Jit.c, from the primitive number of the method way 0
+// actually resolved to. A program that redefines SmallInteger>>+ installs a
+// method carrying no primitive, the site stops being armed, and the fast path
+// stops firing -- with no name ever compared.
+//
+// Keyed by PRIMITIVE and not by selector for the same reason jit/Specialize.c
+// is: `+` is a name, PRIM_IntAdd is what packages/Core installed.
+// THE INTEGER OPERATIONS COME FIRST AND STAY CONTIGUOUS. The emitted code splits
+// the two groups with one unsigned compare against IC_INLINE_INT_LAST rather
+// than testing four values, because the two groups need DIFFERENT tag tests --
+// tag 00 against tag 11 -- and sharing the operand load between them is what
+// keeps the block from being one arm per operation.
+// THE ORDER IS LOAD-BEARING, in three ways, and each one removes instructions
+// from a sequence that runs at every send in the system:
+//
+//   * the integer operations are one contiguous run, so ONE unsigned compare
+//     splits the two groups -- they need different tag tests (00 against 11) and
+//     nothing else about them can be shared;
+//   * the six relational operations of each group are contiguous and in the SAME
+//     order in both, so the emitter builds those twelve arms from one table
+//     instead of twelve hand-written blocks;
+//   * within a group, everything that shares a prefix is adjacent: the three
+//     that are one instruction on tagged operands, the two that share a divide,
+//     the six that share a compare.
+typedef enum {
+	IC_INLINE_NONE = 0,
+
+	IC_INLINE_INT_ADD,
+	IC_INLINE_INT_SUB,
+	IC_INLINE_INT_MUL,
+	// Bitwise, and these are the cheapest of all: the SmallInteger tag is 00, so
+	// it survives and, or and xor untouched and the tagged operands combine
+	// directly. One instruction, no untagging, no range check -- a bitwise result
+	// of two SmallIntegers is always a SmallInteger.
+	IC_INLINE_INT_AND,
+	IC_INLINE_INT_OR,
+	IC_INLINE_INT_XOR,
+	// Floor division and modulo, which share one divide.
+	IC_INLINE_INT_FLOORDIV,
+	IC_INLINE_INT_MOD,
+	// Relational. Contiguous and ordered to match the float six below.
+	IC_INLINE_INT_LT,
+	IC_INLINE_INT_GT,
+	IC_INLINE_INT_LE,
+	IC_INLINE_INT_GE,
+	IC_INLINE_INT_EQ,
+	IC_INLINE_INT_NE,
+	IC_INLINE_INT_LAST = IC_INLINE_INT_NE,
+
+	IC_INLINE_FLOAT_ADD,
+	IC_INLINE_FLOAT_SUB,
+	IC_INLINE_FLOAT_MUL,
+	IC_INLINE_FLOAT_DIV,
+	IC_INLINE_FLOAT_LT,
+	IC_INLINE_FLOAT_GT,
+	IC_INLINE_FLOAT_LE,
+	IC_INLINE_FLOAT_GE,
+	IC_INLINE_FLOAT_EQ,
+	IC_INLINE_FLOAT_NE,
+} IcInlineOp;
+
+// The relational six, in the order both groups list them. The emitter walks this
+// to build twelve arms, and jit/Jit.c walks the same shape to arm them, so
+// "which comparison" is written down once.
+#define IC_INLINE_RELATIONAL_COUNT 6
+
 typedef struct IcCell {
 	RawObject *selector;
 	uint64_t sends;         // total executions of this site
+	// See IcInlineOp. Written by the runtime on a miss, once way 0 has settled,
+	// and CLEARED by jitFlushSendCaches: a site that keeps computing the answer
+	// itself never misses again, so if a method-dictionary change did not disarm
+	// it here the site would serve the replaced method forever. That is the same
+	// wrong ANSWER jitFlushSendCaches exists to prevent, reached by the newer
+	// half of the system.
+	//
+	// A FULL WORD for a value that needs three bits, because the emitted code
+	// reads it on every send and a 32-bit load is one instruction where a byte
+	// load and a mask are two. The struct had the padding to spare.
+	uint32_t inlineOp;
 	// Where lookup STARTS at a `super` site: the class above the one that
 	// defined the running method, as an INDEX, resolved once when the method is
 	// compiled. CLASS_INDEX_INVALID at an ordinary site, and also at a super site

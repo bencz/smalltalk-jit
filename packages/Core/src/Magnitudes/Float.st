@@ -156,7 +156,14 @@ Float := Number [
 	the same semantics directly (unordered = false); these methods keep the
 	dispatch (mixed-type / intrinsic-miss) path consistent with it."
 
+	"The primitives answer IEEE-754 directly, which is the same rule these
+	 fallbacks spell out: every ordered comparison against NaN is false, and the C
+	 operators behind them already do that. The bodies are unchanged and still run
+	 whenever the primitive fails, which is every argument that is not a
+	 SmallInteger or a Float."
+
 	> aNumber [
+		<primitive: FloatGreaterThanPrimitive>
 		^(aNumber isKindOf: Number)
 			ifTrue: [aNumber asFloat < self]
 			ifFalse: [self retryRelationalOp: #> coercing: aNumber]
@@ -164,12 +171,22 @@ Float := Number [
 
 
 	>= aNumber [
+		<primitive: FloatGreaterEqualsPrimitive>
 		^(self > aNumber) or: [self = aNumber]
 	]
 
 
 	<= aNumber [
+		<primitive: FloatLessEqualsPrimitive>
 		^(self < aNumber) or: [self = aNumber]
+	]
+
+
+	~= aNumber [
+		"Object derives this as `= not`, which is right for NaN too: NaN = NaN is
+		 false, so NaN ~= NaN is true, and C's != agrees."
+		<primitive: FloatNotEqualsPrimitive>
+		^self = aNumber == false
 	]
 
 
